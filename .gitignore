@@ -1,0 +1,97 @@
+# ---- OS / Editor ----
+.DS_Store
+.AppleDouble
+.LSOverride
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Type checker caches
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Environments
+.env
+.env.*.local
+.env.local
+.venv/
+venv/
+ENV/
+env/
+venv.bak/
+env.bak/
+
+# Project secrets (explicit)
+src/.env
+Documents/NexiusLabs_Projects/Lead_Management_Agent/src/.env
+*.env
+*.key
+*.pem
+*.p12
+*.cer
+
+# Logs
+*.log
+logs/
+
+# Caches
+__pypackages__/
+pip-wheel-metadata/
+
+# Databases / local data
+*.sqlite
+*.db
+*.db-journal
+
+# Node (if any nested)
+node_modules/
+yarn.lock
+package-lock.json
+pnpm-lock.yaml

@@ -1,0 +1,14 @@
+python-dotenv
+langgraph
+langchain-core
+langchain-openai
+grandalf
+black
+isort
+langchain_community
+langgraph-prebuilt
+asyncpg
+psycopg2
+scikit-learn
+httpx
+beautifulsoup4
