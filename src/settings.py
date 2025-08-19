@@ -27,8 +27,8 @@ ZEROBOUNCE_API_KEY = os.getenv('ZEROBOUNCE_API_KEY')
 
 # Add new settings below this line if needed
 CRAWLER_USER_AGENT = "ICPFinder-Bot/1.0 (+https://nexiuslabs.com)"
-CRAWLER_TIMEOUT_S = 12
-CRAWLER_MAX_PAGES = 6
+CRAWLER_TIMEOUT_S = 30
+CRAWLER_MAX_PAGES = 50
 
 # How many on-site pages to crawl after homepage (for Tavily + merged corpus flow)
 CRAWL_MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES", str(CRAWLER_MAX_PAGES)))

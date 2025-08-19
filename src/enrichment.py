@@ -55,7 +55,7 @@ def _clean_text(s: str) -> str:
     return s
 
 async def _fetch(client: httpx.AsyncClient, url: str) -> str:
-    r = await client.get(url, follow_redirects=True, timeout=12)
+    r = await client.get(url, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
     r.raise_for_status()
     return r.text
 
@@ -102,9 +102,63 @@ def _combine_pages(pages: list[dict], char_limit: int) -> str:
             continue
         blobs.append(f"[URL] {url}\n[TITLE] {title}\n[BODY]\n{body}\n")
     combined = "\n\n".join(blobs)
+    print('combined', combined)
     if len(combined) > char_limit:
         combined = combined[:char_limit] + "\n\n[TRUNCATED]"
     return combined
+
+def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
+    """Build corpus chunks from pages without truncation. Each chunk length <= chunk_char_size."""
+    blocks: list[str] = []
+    for p in pages:
+        url = p.get("url") or ""
+        title = _clean_text(p.get("title") or "")
+        body = p.get("raw_content") or p.get("content") or p.get("html") or ""
+        if isinstance(body, dict):
+            body = body.get("text") or ""
+        body = _clean_text(body)
+        if not body and title:
+            body = title
+        if not body:
+            continue
+        blocks.append(f"[URL] {url}\n[TITLE] {title}\n[BODY]\n{body}\n")
+
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for blk in blocks:
+        if cur and (cur_len + len(blk) > chunk_char_size):
+            chunks.append("\n\n".join(cur))
+            cur = [blk]
+            cur_len = len(blk)
+        else:
+            cur.append(blk)
+            cur_len += len(blk)
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+def _merge_extracted_records(base: dict, new: dict) -> dict:
+    """Merge two extraction results. Arrays are unioned; scalars prefer non-null; about_text prefers longer."""
+    if not base:
+        base = {}
+    base = dict(base)
+    array_keys = {"email", "phone_number", "tech_stack"}
+    for k, v in (new or {}).items():
+        if v is None:
+            continue
+        if k in array_keys:
+            a = base.get(k) or []
+            b = v if isinstance(v, list) else [v]
+            base[k] = list({*a, *b})
+        elif k == "about_text":
+            prev = base.get(k) or ""
+            nv = v or ""
+            base[k] = nv if len(nv) > len(prev) else prev
+        else:
+            if base.get(k) in (None, ""):
+                base[k] = v
+    return base
 
 def _ensure_list(v):
     if v is None:
@@ -312,9 +366,72 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
     if not filtered_urls:
         filtered_urls = [home]
 
+    # If we have filtered URLs, first Tavily-crawl their roots to expand coverage
+    page_urls: list[str] = []
+    try:
+        # derive unique roots from filtered URLs
+        roots: list[str] = []
+        for u in filtered_urls:
+            parsed = urlparse(u)
+            if not parsed.scheme:
+                u = "https://" + u
+                parsed = urlparse(u)
+            root = f"{parsed.scheme}://{parsed.netloc}"
+            roots.append(root)
+        # include home as a root as well
+        roots.append(home)
+        roots = list(dict.fromkeys(roots))
+
+        # Ensure common About pages are included explicitly when filtered URLs exist
+        if filtered_urls:
+            for _root in roots:
+                for _p in ("about", "aboutus"):
+                    page_urls.append(f"{_root}/{_p}")
+
+        # crawl each root/* to discover high-signal pages
+        for root in roots[:3]:  # cap roots to control cost
+            try:
+                crawl_input = {
+                    "url": f"{root}/*",
+                    "limit": CRAWL_MAX_PAGES,
+                    "crawl_depth": 2,
+                    "instructions": f"get all pages from {root}",
+                    "enable_web_search": False,
+                }
+                crawl_result = tavily_crawl.run(crawl_input)
+                raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+                #print('raw_urls', raw_urls)
+                for item in raw_urls:
+                    if isinstance(item, dict) and item.get("url"):
+                        page_urls.append(item["url"])
+                    elif isinstance(item, str) and item.startswith("http"):
+                        page_urls.append(item)
+                # always ensure root is included
+                page_urls.append(root)
+            except Exception as exc:
+                print(f"          ↳ TavilyCrawl error for {root}: {exc}")
+                page_urls.append(root)
+        # dedupe; do not clip to ensure we process all crawled URLs
+        page_urls = list(dict.fromkeys(page_urls))
+        # filter out wildcard pattern URLs like "https://domain/*" which are not fetchable
+        page_urls = [u for u in page_urls if "*" not in u]
+        # log discovered URLs (including about seeds)
+        try:
+            print(f"       ↳ Seeded/Discovered {len(page_urls)} URLs (incl. about seeds)")
+            for _dbg in page_urls[:25]:
+                print(f"          - {_dbg}")
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"          ↳ TavilyCrawl expansion skipped: {exc}")
+        page_urls = []
+    if not page_urls:
+        page_urls = filtered_urls
+
     # Try TavilyExtract per URL
     extracted_pages: list[dict] = []
-    for u in filtered_urls:
+    fallback_urls: list[str] = []
+    for u in page_urls:
         payload = {
             "urls": [u],
             "schema": {"raw_content": "str"},
@@ -332,13 +449,36 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                 raw_content = raw_data["results"][0].get("raw_content")
         if raw_content and isinstance(raw_content, str) and raw_content.strip():
             extracted_pages.append({"url": u, "title": "", "raw_content": raw_content})
+        else:
+            fallback_urls.append(u)
+
+    # Per-URL HTTP fallback for pages where TavilyExtract returned empty
+    if fallback_urls:
+        try:
+            print(f"       ↳ TavilyExtract empty for {len(fallback_urls)} URLs; attempting HTTP fallback")
+            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                resps = await asyncio.gather(
+                    *(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in fallback_urls),
+                    return_exceptions=True
+                )
+            recovered = 0
+            for resp, u in zip(resps, fallback_urls):
+                if isinstance(resp, Exception):
+                    continue
+                body = getattr(resp, "text", "")
+                if body:
+                    extracted_pages.append({"url": u, "html": body})
+                    recovered += 1
+            print(f"       ↳ HTTP fallback recovered {recovered}/{len(fallback_urls)} pages")
+        except Exception as _per_url_fb_exc:
+            print(f"       ↳ Per-URL HTTP fallback failed: {_per_url_fb_exc}")
 
     # If Tavily had no bodies, fall back to HTTP fetch
     if not extracted_pages:
         try:
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
-                resps = await asyncio.gather(*(client.get(u, follow_redirects=True, timeout=12) for u in filtered_urls), return_exceptions=True)
-            for resp, u in zip(resps, filtered_urls):
+                resps = await asyncio.gather(*(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in page_urls), return_exceptions=True)
+            for resp, u in zip(resps, page_urls):
                 if isinstance(resp, Exception):
                     continue
                 extracted_pages.append({"url": u, "html": resp.text})
@@ -351,34 +491,45 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
             await _deterministic_crawl_and_persist(company_id, home)
             return
 
-    # Build combined corpus
-    combined = _combine_pages(extracted_pages, EXTRACT_CORPUS_CHAR_LIMIT)
+    # Build combined corpus without truncation by chunking
+    chunks = _make_corpus_chunks(extracted_pages, EXTRACT_CORPUS_CHAR_LIMIT)
+    print(f"       ↳ {len(extracted_pages)} pages -> {len(chunks)} chunks for extraction")
+    # Log the full combined content for debugging (no truncation)
+    try:
+        full_combined = "\n\n".join(chunks)
+        print("===== BEGIN FULL COMBINED CORPUS =====")
+        print(full_combined)
+        print("===== END FULL COMBINED CORPUS =====")
+    except Exception as _log_exc:
+        print(f"       ↳ Failed to log full combined corpus: {_log_exc}")
 
-    # Use existing extraction chain with expanded schema
+    # Use existing extraction chain with expanded schema across chunks
     schema_keys = [
         "name","industry_norm","employees_est","revenue_bucket","incorporation_year","sg_registered",
         "last_seen","website_domain","industry_code","company_size","annual_revenue","hq_city","hq_country",
         "linkedin_url","founded_year","tech_stack","ownership_type","funding_status","employee_turnover",
         "web_traffic","email","phone_number","location_city","location_country","about_text"
     ]
-    try:
-        ai_output = extract_chain.invoke({
-            "raw_content": f"Company: {company_name}\n\n{combined}",
-            "schema_keys": schema_keys,
-            "instructions": (
-                "Return a single JSON object with only the above keys. Use null for unknown. "
-                "For tech_stack, email, and phone_number return arrays of strings. "
-                "Use integers for employees_est and incorporation_year when possible. "
-                "website_domain should be the official domain for the company. "
-                "about_text should be a concise 1-3 sentence summary of the company."
-            )
-        })
-        m = re.search(r"\{.*\}", ai_output, re.S)
-        data = json.loads(m.group(0)) if m else json.loads(ai_output)
-    except Exception as e:
-        print(f"   ↳ Extraction failed to parse JSON: {e}\nRAW:\n{ai_output if 'ai_output' in locals() else ''}")
-        await _deterministic_crawl_and_persist(company_id, home)
-        return
+    data = {}
+    for i, chunk in enumerate(chunks, start=1):
+        try:
+            ai_output = extract_chain.invoke({
+                "raw_content": f"Company: {company_name}\n\n{chunk}",
+                "schema_keys": schema_keys,
+                "instructions": (
+                    "Return a single JSON object with only the above keys. Use null for unknown. "
+                    "For tech_stack, email, and phone_number return arrays of strings. "
+                    "Use integers for employees_est and incorporation_year when possible. "
+                    "website_domain should be the official domain for the company. "
+                    "about_text should be a concise 1-3 sentence summary of the company."
+                )
+            })
+            m = re.search(r"\{.*\}", ai_output, re.S)
+            piece = json.loads(m.group(0)) if m else json.loads(ai_output)
+            data = _merge_extracted_records(data, piece)
+        except Exception as e:
+            print(f"   ↳ Chunk {i} extraction parse failed: {e}")
+            continue
 
     # Normalize arrays
     for k in ["email", "phone_number", "tech_stack"]:
