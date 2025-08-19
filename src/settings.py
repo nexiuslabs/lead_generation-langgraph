@@ -44,3 +44,17 @@ CRAWL_KEYWORDS = [
 
 # Max combined characters to send to LLM extraction (cost guard)
 EXTRACT_CORPUS_CHAR_LIMIT = int(os.getenv("EXTRACT_CORPUS_CHAR_LIMIT", "35000"))
+
+# --- Lusha configuration -------------------------------------------------------
+# Minimal flags and keys for optional Lusha fallbacks
+LUSHA_API_KEY = os.getenv("LUSHA_API_KEY", "")
+LUSHA_BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")
+
+# Toggle to enable/disable Lusha fallback without redeploying
+ENABLE_LUSHA_FALLBACK = os.getenv("ENABLE_LUSHA_FALLBACK", "true").lower() in ("1","true","yes","on")
+
+# Titles we prefer when using Lusha to search contacts
+LUSHA_PREFERRED_TITLES = [t.strip() for t in os.getenv(
+    "LUSHA_PREFERRED_TITLES",
+    "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal"
+).split(",") if t.strip()]

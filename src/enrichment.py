@@ -7,13 +7,14 @@ from psycopg2.extras import Json
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch, TavilyCrawl, TavilyExtract
 from openai_client import get_embedding
-from settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT
+from settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES
 from urllib.parse import urlparse, urljoin
 import requests
 from crawler import crawl_site
 import asyncio
 import httpx
 from bs4 import BeautifulSoup
+from lusha_client import LushaClient, LushaError
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
@@ -47,6 +48,215 @@ extract_chain = prompt_template | llm | StrOutputParser()
 
 def get_db_connection():
     return psycopg2.connect(dsn=POSTGRES_DSN)
+
+# ---------- Contacts persistence helpers (DB-introspective) ----------
+def _get_table_columns(conn, table_name: str) -> set:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                """,
+                (table_name,)
+            )
+            return {r[0] for r in cur.fetchall()}
+    except Exception:
+        return set()
+
+def _get_contact_stats(company_id: int):
+    """Return (total_contacts, has_named_contact, founder_present).
+    Uses best-effort checks based on available columns.
+    """
+    total = 0
+    has_named = False
+    founder_present = False
+    conn = None
+    try:
+        conn = get_db_connection()
+        cols = _get_table_columns(conn, "contacts")
+        with conn, conn.cursor() as cur:
+            # total contacts
+            cur.execute("SELECT COUNT(*) FROM contacts WHERE company_id=%s", (company_id,))
+            total = int(cur.fetchone()[0] or 0)
+
+            # any named contact
+            name_conds = []
+            if "title" in cols:
+                name_conds.append("(title IS NOT NULL AND title <> '')")
+            if "full_name" in cols:
+                name_conds.append("(full_name IS NOT NULL AND full_name <> '')")
+            if "first_name" in cols:
+                name_conds.append("(first_name IS NOT NULL AND first_name <> '')")
+            if name_conds:
+                q = "SELECT COUNT(*) FROM contacts WHERE company_id=%s AND (" + " OR ".join(name_conds) + ")"
+                cur.execute(q, (company_id,))
+                has_named = int(cur.fetchone()[0] or 0) > 0
+
+            # founder / leadership presence by title
+            if "title" in cols:
+                terms = [(t or "").strip().lower() for t in (LUSHA_PREFERRED_TITLES or "").split(",") if (t or "").strip()]
+                # If titles list is empty, use a default set
+                if not terms:
+                    terms = ["founder", "co-founder", "ceo", "cto", "owner", "director", "head of", "principal"]
+                like_clauses = ["LOWER(title) LIKE %s" for _ in terms]
+                params = [f"%{t}%" for t in terms]
+                q = "SELECT COUNT(*) FROM contacts WHERE company_id=%s AND (" + " OR ".join(like_clauses) + ")"
+                cur.execute(q, (company_id, *params))
+                founder_present = int(cur.fetchone()[0] or 0) > 0
+    except Exception:
+        pass
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+    return total, has_named, founder_present
+
+def _normalize_lusha_contact(c: dict) -> dict:
+    """Flatten/normalize contact from Lusha enrich payload to a common schema."""
+    out = {}
+    out["lusha_contact_id"] = c.get("lushaContactId") or c.get("contactId") or c.get("id")
+    out["first_name"] = c.get("firstName")
+    out["last_name"] = c.get("lastName")
+    name = c.get("name")
+    if not name and (out["first_name"] or out["last_name"]):
+        name = " ".join([p for p in [out["first_name"], out["last_name"]] if p])
+    out["full_name"] = name
+    out["title"] = c.get("jobTitle") or c.get("title")
+    out["linkedin_url"] = c.get("linkedinUrl") or c.get("linkedinProfileUrl") or c.get("linkedin")
+    out["company_name"] = c.get("companyName")
+    out["company_domain"] = c.get("companyDomain")
+    out["seniority"] = c.get("seniority")
+    out["department"] = c.get("department")
+    out["city"] = c.get("city") or (c.get("location") or {}).get("city") if isinstance(c.get("location"), dict) else c.get("location")
+    out["country"] = c.get("country") or (c.get("location") or {}).get("country") if isinstance(c.get("location"), dict) else None
+
+    # Emails
+    emails = []
+    src_emails = c.get("emailAddresses") or c.get("emails") or c.get("email_addresses")
+    if isinstance(src_emails, list):
+        for e in src_emails:
+            if isinstance(e, dict):
+                v = e.get("email") or e.get("value")
+                if v:
+                    emails.append(v)
+            elif isinstance(e, str):
+                emails.append(e)
+    elif isinstance(src_emails, str):
+        emails.append(src_emails)
+    out["emails"] = [e for e in emails if e]
+
+    # Phones
+    phones = []
+    src_phones = c.get("phoneNumbers") or c.get("phones") or c.get("phone_numbers")
+    if isinstance(src_phones, list):
+        for p in src_phones:
+            if isinstance(p, dict):
+                v = p.get("internationalNumber") or p.get("number") or p.get("value") or p.get("e164")
+                if v:
+                    phones.append(v)
+            elif isinstance(p, str):
+                phones.append(p)
+    elif isinstance(src_phones, str):
+        phones.append(src_phones)
+    out["phones"] = [p for p in phones if p]
+    return out
+
+def upsert_contacts_from_lusha(company_id: int, lusha_contacts: list[dict]) -> tuple[int, int]:
+    """Upsert contacts from Lusha into contacts table. Returns (inserted, updated)."""
+    if not lusha_contacts:
+        return (0, 0)
+    inserted = 0
+    updated = 0
+    conn = get_db_connection()
+    try:
+        cols = _get_table_columns(conn, "contacts")
+        has_email = "email" in cols
+        has_updated_at = "updated_at" in cols
+        for raw in lusha_contacts:
+            c = _normalize_lusha_contact(raw)
+            emails = c.get("emails") or [None]
+            phone_primary = (c.get("phones") or [None])[0]
+            for email in emails:
+                # Build payload dynamically based on existing columns
+                row = {"company_id": company_id, "contact_source": "lusha"}
+                if "lusha_contact_id" in cols and c.get("lusha_contact_id"):
+                    row["lusha_contact_id"] = c.get("lusha_contact_id")
+                if "first_name" in cols and c.get("first_name"):
+                    row["first_name"] = c.get("first_name")
+                if "last_name" in cols and c.get("last_name"):
+                    row["last_name"] = c.get("last_name")
+                if "full_name" in cols and c.get("full_name"):
+                    row["full_name"] = c.get("full_name")
+                if "title" in cols and c.get("title"):
+                    row["title"] = c.get("title")
+                if "linkedin_url" in cols and c.get("linkedin_url"):
+                    row["linkedin_url"] = c.get("linkedin_url")
+                if "seniority" in cols and c.get("seniority"):
+                    row["seniority"] = c.get("seniority")
+                if "department" in cols and c.get("department"):
+                    row["department"] = c.get("department")
+                if "city" in cols and c.get("city"):
+                    row["city"] = c.get("city")
+                if "country" in cols and c.get("country"):
+                    row["country"] = c.get("country")
+                # phones
+                if "phone_number" in cols and phone_primary:
+                    row["phone_number"] = phone_primary
+                elif "phone" in cols and phone_primary:
+                    row["phone"] = phone_primary
+                # email and verification placeholders
+                if has_email:
+                    row["email"] = email
+                if "email_verified" in cols and email is not None:
+                    row["email_verified"] = None
+                if "verification_confidence" in cols and email is not None:
+                    row["verification_confidence"] = None
+
+                # Decide existence
+                with conn, conn.cursor() as cur:
+                    exists = False
+                    if has_email:
+                        cur.execute(
+                            "SELECT 1 FROM contacts WHERE company_id=%s AND email IS NOT DISTINCT FROM %s LIMIT 1",
+                            (company_id, email),
+                        )
+                        exists = bool(cur.fetchone())
+                    # Build SQL dynamically
+                    if exists:
+                        set_cols = [k for k in row.keys() if k not in ("company_id", "email")]
+                        if set_cols:
+                            assignments = ", ".join([f"{k}=%s" for k in set_cols])
+                            params = [row[k] for k in set_cols]
+                            where_clause = "company_id=%s AND email IS NOT DISTINCT FROM %s" if has_email else "company_id=%s"
+                            params.extend([company_id, email] if has_email else [company_id])
+                            if has_updated_at:
+                                assignments = assignments + ", updated_at=now()"
+                            cur.execute(
+                                f"UPDATE contacts SET {assignments} WHERE {where_clause}",
+                                params,
+                            )
+                            updated += cur.rowcount or 0
+                    else:
+                        cols_list = list(row.keys())
+                        placeholders = ",".join(["%s"] * len(cols_list))
+                        cur.execute(
+                            f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                            [row[k] for k in cols_list],
+                        )
+                        inserted += cur.rowcount or 0
+        return inserted, updated
+    except Exception as e:
+        print(f"       ↳ Lusha contacts upsert failed: {e}")
+        return (inserted, updated)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # -------------- Tavily merged-corpus helpers --------------
 
@@ -354,6 +564,18 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
     """
     # Resolve homepage/domain
     domains = find_domain(company_name, uen=uen) if "find_domain" in globals() else []
+    # If no domain discovered, try Lusha fallback before giving up
+    if not domains and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
+        try:
+            print("   ↳ No domain found via search; trying Lusha fallback…")
+            lc = LushaClient()
+            lusha_domain = lc.find_company_domain(company_name)
+            if lusha_domain:
+                normalized = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
+                domains = [normalized]
+                print(f"   ↳ Lusha provided domain: {normalized}")
+        except Exception as _lusha_exc:
+            print(f"   ↳ Lusha domain fallback failed: {_lusha_exc}")
     if not domains:
         print("   ↳ No domain found; skipping")
         return
@@ -364,7 +586,21 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
     # Discover a small set of relevant URLs
     filtered_urls = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
     if not filtered_urls:
-        filtered_urls = [home]
+        # If discovery yielded nothing, attempt Lusha domain fallback and retry discovery
+        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
+            try:
+                lc = LushaClient()
+                lusha_domain = lc.find_company_domain(company_name)
+                if lusha_domain:
+                    candidate_home = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
+                    if urlparse(candidate_home).netloc and urlparse(candidate_home).netloc != urlparse(home).netloc:
+                        print(f"   ↳ Using Lusha-discovered domain for crawl: {candidate_home}")
+                        home = candidate_home
+                        filtered_urls = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
+            except Exception as _lusha_exc:
+                print(f"   ↳ Lusha fallback for filtered URLs failed: {_lusha_exc}")
+        if not filtered_urls:
+            filtered_urls = [home]
 
     # If we have filtered URLs, first Tavily-crawl their roots to expand coverage
     page_urls: list[str] = []
@@ -539,6 +775,95 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         data = await _merge_with_deterministic(data, home)
     except Exception as exc:
         print(f"   ↳ deterministic merge skipped: {exc}")
+
+    # Lusha contacts fallback if missing contacts/names/phones/emails
+    try:
+        need_emails = not (data.get("email") or [])
+        need_phones = not (data.get("phone_number") or [])
+        total_contacts, has_named, founder_present = _get_contact_stats(company_id)
+        needs_contacts = total_contacts == 0
+        missing_names = not has_named
+        missing_founder = not founder_present
+        trigger = need_emails or need_phones or needs_contacts or missing_names or missing_founder
+        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger:
+            lc = LushaClient()
+            # Resolve a domain for Lusha contact search
+            website_hint = data.get("website_domain") or home
+            try:
+                if website_hint.startswith("http"):
+                    company_domain = urlparse(website_hint).netloc
+                else:
+                    company_domain = urlparse(f"https://{website_hint}").netloc
+            except Exception:
+                company_domain = None
+            # First attempt with preferred titles
+            lusha_contacts = lc.search_and_enrich_contacts(
+                company_name=company_name,
+                company_domain=company_domain,
+                country=data.get("hq_country"),
+                titles=LUSHA_PREFERRED_TITLES,
+                limit=15,
+            )
+            # Retry without titles to maximize recall if none
+            if not lusha_contacts:
+                lusha_contacts = lc.search_and_enrich_contacts(
+                    company_name=company_name,
+                    company_domain=company_domain,
+                    country=data.get("hq_country"),
+                    titles=None,
+                    limit=15,
+                )
+            added_emails: list[str] = []
+            added_phones: list[str] = []
+            for c in lusha_contacts or []:
+                # Emails
+                for key in ("emails", "emailAddresses", "email_addresses"):
+                    val = c.get(key)
+                    if isinstance(val, list):
+                        for e in val:
+                            if isinstance(e, dict):
+                                v = e.get("email") or e.get("value")
+                                if v:
+                                    added_emails.append(v)
+                            elif isinstance(e, str):
+                                added_emails.append(e)
+                    elif isinstance(val, str):
+                        added_emails.append(val)
+                # Phones
+                for key in ("phones", "phoneNumbers", "phone_numbers"):
+                    val = c.get(key)
+                    if isinstance(val, list):
+                        for p in val:
+                            if isinstance(p, dict):
+                                v = p.get("internationalNumber") or p.get("number") or p.get("value")
+                                if v:
+                                    added_phones.append(v)
+                            elif isinstance(p, str):
+                                added_phones.append(p)
+                    elif isinstance(val, str):
+                        added_phones.append(val)
+            # Dedupe and assign to company-level arrays
+            def _unique(seq: list[str]) -> list[str]:
+                seen: set[str] = set()
+                out: list[str] = []
+                for x in seq:
+                    if not x or x in seen:
+                        continue
+                    seen.add(x)
+                    out.append(x)
+                return out
+            if added_emails or added_phones:
+                data["email"] = _unique((data.get("email") or []) + added_emails)
+                data["phone_number"] = _unique((data.get("phone_number") or []) + added_phones)
+                print(f"       ↳ Lusha contacts fallback added {len(added_emails)} emails, {len(added_phones)} phones")
+            # Upsert full contact rows into contacts table
+            try:
+                ins, upd = upsert_contacts_from_lusha(company_id, lusha_contacts or [])
+                print(f"       ↳ Lusha contacts upserted: inserted={ins}, updated={upd}")
+            except Exception as _upsert_exc:
+                print(f"       ↳ Lusha contacts upsert error: {_upsert_exc}")
+    except Exception as _lusha_contacts_exc:
+        print(f"       ↳ Lusha contacts fallback failed: {_lusha_contacts_exc}")
 
     # Persist core fields
     update_company_core_fields(company_id, data)
