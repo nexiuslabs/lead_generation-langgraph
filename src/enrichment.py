@@ -20,6 +20,8 @@ from lusha_client import LushaClient, LushaError
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from typing import TypedDict, List, Dict, Any, Optional
+from langgraph.graph import StateGraph, END
 
 load_dotenv()
 
@@ -558,74 +560,131 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
 
 async def enrich_company_with_tavily(company_id: int, company_name: str, uen: str | None = None):
     """
-    Tavily-first enrichment: discover high-signal pages, extract raw text, merge corpus,
-    run existing LLM extraction on the combined text, then persist.
-    Falls back to direct HTTP fetch if Tavily returns no bodies.
+    Orchestrated enrichment flow using LangGraph. This wrapper constructs
+    the initial state and invokes the compiled enrichment_agent graph.
     """
-    # Resolve homepage/domain
-    domains = find_domain(company_name, uen=uen) if "find_domain" in globals() else []
-    # If no domain discovered, try Lusha fallback before giving up
-    if not domains and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
+    initial_state = {
+        "company_id": company_id,
+        "company_name": company_name,
+        "uen": uen,
+        "domains": [],
+        "home": None,
+        "filtered_urls": [],
+        "page_urls": [],
+        "extracted_pages": [],
+        "chunks": [],
+        "data": {},
+        "lusha_used": False,
+        "completed": False,
+        "error": None,
+    }
+    try:
+        final_state = await enrichment_agent.ainvoke(initial_state)
+        return final_state
+    except Exception as e:
+        print(f"   ↳ Enrichment graph invoke failed: {e}")
+        return initial_state
+
+
+class EnrichmentState(TypedDict, total=False):
+    company_id: int
+    company_name: str
+    uen: Optional[str]
+    domains: List[str]
+    home: Optional[str]
+    filtered_urls: List[str]
+    page_urls: List[str]
+    extracted_pages: List[Dict[str, Any]]
+    chunks: List[str]
+    data: Dict[str, Any]
+    lusha_used: bool
+    completed: bool
+    error: Optional[str]
+
+
+async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed"):
+        return state
+    name = state.get("company_name") or ""
+    uen = state.get("uen")
+    try:
+        domains = find_domain(name, uen=uen)
+    except TypeError:
+        # Backward compatibility in case signature differs
+        domains = find_domain(name)
+    # Lusha fallback if needed
+    if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
-            print("   ↳ No domain found via search; trying Lusha fallback…")
+            print("   ↳ No domain via search; trying Lusha fallback…")
             lc = LushaClient()
-            lusha_domain = lc.find_company_domain(company_name)
+            lusha_domain = lc.find_company_domain(name)
             if lusha_domain:
                 normalized = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
                 domains = [normalized]
+                state["lusha_used"] = True
                 print(f"   ↳ Lusha provided domain: {normalized}")
-        except Exception as _lusha_exc:
-            print(f"   ↳ Lusha domain fallback failed: {_lusha_exc}")
+        except Exception as e:
+            print(f"   ↳ Lusha domain fallback failed: {e}")
     if not domains:
-        print("   ↳ No domain found; skipping")
-        return
+        state["error"] = "no_domain"
+        return state
     home = domains[0]
     if not home.startswith("http"):
         home = "https://" + home
+    state["domains"] = domains
+    state["home"] = home
+    return state
 
-    # Discover a small set of relevant URLs
-    filtered_urls = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
+
+async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("home"):
+        return state
+    home = state["home"]
+    filtered_urls: List[str] = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
+    if not filtered_urls and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
+        try:
+            lc = LushaClient()
+            lusha_domain = lc.find_company_domain(state.get("company_name") or "")
+            if lusha_domain:
+                candidate_home = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
+                if urlparse(candidate_home).netloc and urlparse(candidate_home).netloc != urlparse(home).netloc:
+                    print(f"   ↳ Using Lusha-discovered domain for crawl: {candidate_home}")
+                    state["home"] = candidate_home
+                    state["lusha_used"] = True
+                    filtered_urls = await _discover_relevant_urls(candidate_home, CRAWL_MAX_PAGES)
+        except Exception as e:
+            print(f"   ↳ Lusha fallback for filtered URLs failed: {e}")
     if not filtered_urls:
-        # If discovery yielded nothing, attempt Lusha domain fallback and retry discovery
-        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
-            try:
-                lc = LushaClient()
-                lusha_domain = lc.find_company_domain(company_name)
-                if lusha_domain:
-                    candidate_home = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
-                    if urlparse(candidate_home).netloc and urlparse(candidate_home).netloc != urlparse(home).netloc:
-                        print(f"   ↳ Using Lusha-discovered domain for crawl: {candidate_home}")
-                        home = candidate_home
-                        filtered_urls = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
-            except Exception as _lusha_exc:
-                print(f"   ↳ Lusha fallback for filtered URLs failed: {_lusha_exc}")
-        if not filtered_urls:
-            filtered_urls = [home]
+        filtered_urls = [state["home"]]
+    state["filtered_urls"] = filtered_urls
+    return state
 
-    # If we have filtered URLs, first Tavily-crawl their roots to expand coverage
-    page_urls: list[str] = []
+
+async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("filtered_urls"):
+        return state
+    filtered_urls = state["filtered_urls"]
+    home = state.get("home")
+    page_urls: List[str] = []
     try:
-        # derive unique roots from filtered URLs
-        roots: list[str] = []
+        roots: List[str] = []
         for u in filtered_urls:
             parsed = urlparse(u)
             if not parsed.scheme:
                 u = "https://" + u
                 parsed = urlparse(u)
-            root = f"{parsed.scheme}://{parsed.netloc}"
-            roots.append(root)
-        # include home as a root as well
-        roots.append(home)
+            roots.append(f"{parsed.scheme}://{parsed.netloc}")
+        if home:
+            roots.append(home)
         roots = list(dict.fromkeys(roots))
 
-        # Ensure common About pages are included explicitly when filtered URLs exist
+        # Seed About pages explicitly when we have filtered URLs
         if filtered_urls:
             for _root in roots:
                 for _p in ("about", "aboutus"):
                     page_urls.append(f"{_root}/{_p}")
 
-        # crawl each root/* to discover high-signal pages
-        for root in roots[:3]:  # cap roots to control cost
+        for root in roots[:3]:
             try:
                 crawl_input = {
                     "url": f"{root}/*",
@@ -636,22 +695,17 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                 }
                 crawl_result = tavily_crawl.run(crawl_input)
                 raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
-                #print('raw_urls', raw_urls)
                 for item in raw_urls:
                     if isinstance(item, dict) and item.get("url"):
                         page_urls.append(item["url"])
                     elif isinstance(item, str) and item.startswith("http"):
                         page_urls.append(item)
-                # always ensure root is included
                 page_urls.append(root)
             except Exception as exc:
                 print(f"          ↳ TavilyCrawl error for {root}: {exc}")
                 page_urls.append(root)
-        # dedupe; do not clip to ensure we process all crawled URLs
         page_urls = list(dict.fromkeys(page_urls))
-        # filter out wildcard pattern URLs like "https://domain/*" which are not fetchable
         page_urls = [u for u in page_urls if "*" not in u]
-        # log discovered URLs (including about seeds)
         try:
             print(f"       ↳ Seeded/Discovered {len(page_urls)} URLs (incl. about seeds)")
             for _dbg in page_urls[:25]:
@@ -663,15 +717,21 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         page_urls = []
     if not page_urls:
         page_urls = filtered_urls
+    state["page_urls"] = page_urls
+    return state
 
-    # Try TavilyExtract per URL
-    extracted_pages: list[dict] = []
-    fallback_urls: list[str] = []
+
+async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("page_urls"):
+        return state
+    page_urls = state["page_urls"]
+    extracted_pages: List[Dict[str, Any]] = []
+    fallback_urls: List[str] = []
     for u in page_urls:
         payload = {
             "urls": [u],
             "schema": {"raw_content": "str"},
-            "instructions": "Retrieve the main textual content from this page."
+            "instructions": "Retrieve the main textual content from this page.",
         }
         try:
             raw_data = tavily_extract.run(payload)
@@ -681,21 +741,20 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         raw_content = None
         if isinstance(raw_data, dict):
             raw_content = raw_data.get("raw_content")
-            if raw_content is None and isinstance(raw_data.get("results"), list) and raw_data["results"]:
+            if raw_content is None and isinstance(raw_data.get("results"), list) and raw_data.get("results"):
                 raw_content = raw_data["results"][0].get("raw_content")
         if raw_content and isinstance(raw_content, str) and raw_content.strip():
             extracted_pages.append({"url": u, "title": "", "raw_content": raw_content})
         else:
             fallback_urls.append(u)
 
-    # Per-URL HTTP fallback for pages where TavilyExtract returned empty
     if fallback_urls:
         try:
             print(f"       ↳ TavilyExtract empty for {len(fallback_urls)} URLs; attempting HTTP fallback")
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
                 resps = await asyncio.gather(
                     *(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in fallback_urls),
-                    return_exceptions=True
+                    return_exceptions=True,
                 )
             recovered = 0
             for resp, u in zip(resps, fallback_urls):
@@ -709,28 +768,49 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         except Exception as _per_url_fb_exc:
             print(f"       ↳ Per-URL HTTP fallback failed: {_per_url_fb_exc}")
 
-    # If Tavily had no bodies, fall back to HTTP fetch
     if not extracted_pages:
         try:
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
-                resps = await asyncio.gather(*(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in page_urls), return_exceptions=True)
+                resps = await asyncio.gather(
+                    *(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in page_urls),
+                    return_exceptions=True,
+                )
             for resp, u in zip(resps, page_urls):
                 if isinstance(resp, Exception):
                     continue
-                extracted_pages.append({"url": u, "html": resp.text})
+                extracted_pages.append({"url": u, "html": getattr(resp, "text", "")})
         except Exception as e:
             print(f"   ↳ Fallback HTTP fetch failed: {e}")
-            await _deterministic_crawl_and_persist(company_id, home)
-            return
-        # Still nothing? fall back to deterministic
-        if not extracted_pages:
-            await _deterministic_crawl_and_persist(company_id, home)
-            return
+    # If still nothing, run deterministic crawler fallback and finish
+    if not extracted_pages:
+        try:
+            if state.get("company_id") and state.get("home"):
+                await _deterministic_crawl_and_persist(state["company_id"], state["home"]) 
+                state["completed"] = True
+                state["extracted_pages"] = []
+                return state
+        except Exception as exc:
+            print(f"   ↳ deterministic crawler fallback failed: {exc}")
+    state["extracted_pages"] = extracted_pages
+    return state
 
-    # Build combined corpus without truncation by chunking
-    chunks = _make_corpus_chunks(extracted_pages, EXTRACT_CORPUS_CHAR_LIMIT)
-    print(f"       ↳ {len(extracted_pages)} pages -> {len(chunks)} chunks for extraction")
-    # Log the full combined content for debugging (no truncation)
+
+async def node_deterministic_fallback(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("home"):
+        return state
+    try:
+        await _deterministic_crawl_and_persist(state["company_id"], state["home"]) 
+        state["completed"] = True
+    except Exception as exc:
+        print(f"   ↳ deterministic crawler fallback failed: {exc}")
+    return state
+
+
+async def node_build_chunks(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("extracted_pages"):
+        return state
+    chunks = _make_corpus_chunks(state["extracted_pages"], EXTRACT_CORPUS_CHAR_LIMIT)
+    print(f"       ↳ {len(state['extracted_pages'])} pages -> {len(chunks)} chunks for extraction")
     try:
         full_combined = "\n\n".join(chunks)
         print("===== BEGIN FULL COMBINED CORPUS =====")
@@ -738,16 +818,22 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         print("===== END FULL COMBINED CORPUS =====")
     except Exception as _log_exc:
         print(f"       ↳ Failed to log full combined corpus: {_log_exc}")
+    state["chunks"] = chunks
+    return state
 
-    # Use existing extraction chain with expanded schema across chunks
+
+async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("chunks"):
+        return state
+    company_name = state.get("company_name") or ""
     schema_keys = [
         "name","industry_norm","employees_est","revenue_bucket","incorporation_year","sg_registered",
         "last_seen","website_domain","industry_code","company_size","annual_revenue","hq_city","hq_country",
         "linkedin_url","founded_year","tech_stack","ownership_type","funding_status","employee_turnover",
-        "web_traffic","email","phone_number","location_city","location_country","about_text"
+        "web_traffic","email","phone_number","location_city","location_country","about_text",
     ]
-    data = {}
-    for i, chunk in enumerate(chunks, start=1):
+    data: Dict[str, Any] = {}
+    for i, chunk in enumerate(state["chunks"], start=1):
         try:
             ai_output = extract_chain.invoke({
                 "raw_content": f"Company: {company_name}\n\n{chunk}",
@@ -758,7 +844,7 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                     "Use integers for employees_est and incorporation_year when possible. "
                     "website_domain should be the official domain for the company. "
                     "about_text should be a concise 1-3 sentence summary of the company."
-                )
+                ),
             })
             m = re.search(r"\{.*\}", ai_output, re.S)
             piece = json.loads(m.group(0)) if m else json.loads(ai_output)
@@ -766,17 +852,24 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         except Exception as e:
             print(f"   ↳ Chunk {i} extraction parse failed: {e}")
             continue
-
-    # Normalize arrays
     for k in ["email", "phone_number", "tech_stack"]:
         data[k] = _ensure_list(data.get(k)) or []
-    # Augment with deterministic crawler signals to fill missing fields
     try:
-        data = await _merge_with_deterministic(data, home)
+        if state.get("home"):
+            data = await _merge_with_deterministic(data, state["home"])  # augment with crawler signals
     except Exception as exc:
         print(f"   ↳ deterministic merge skipped: {exc}")
+    state["data"] = data
+    return state
 
-    # Lusha contacts fallback if missing contacts/names/phones/emails
+
+async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed"):
+        return state
+    data = state.get("data") or {}
+    company_id = state.get("company_id")
+    if not company_id:
+        return state
     try:
         need_emails = not (data.get("email") or [])
         need_phones = not (data.get("phone_number") or [])
@@ -787,8 +880,7 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         trigger = need_emails or need_phones or needs_contacts or missing_names or missing_founder
         if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger:
             lc = LushaClient()
-            # Resolve a domain for Lusha contact search
-            website_hint = data.get("website_domain") or home
+            website_hint = data.get("website_domain") or state.get("home") or ""
             try:
                 if website_hint.startswith("http"):
                     company_domain = urlparse(website_hint).netloc
@@ -796,27 +888,24 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                     company_domain = urlparse(f"https://{website_hint}").netloc
             except Exception:
                 company_domain = None
-            # First attempt with preferred titles
             lusha_contacts = lc.search_and_enrich_contacts(
-                company_name=company_name,
+                company_name=state.get("company_name") or "",
                 company_domain=company_domain,
                 country=data.get("hq_country"),
                 titles=LUSHA_PREFERRED_TITLES,
                 limit=15,
             )
-            # Retry without titles to maximize recall if none
             if not lusha_contacts:
                 lusha_contacts = lc.search_and_enrich_contacts(
-                    company_name=company_name,
+                    company_name=state.get("company_name") or "",
                     company_domain=company_domain,
                     country=data.get("hq_country"),
                     titles=None,
                     limit=15,
                 )
-            added_emails: list[str] = []
-            added_phones: list[str] = []
+            added_emails: List[str] = []
+            added_phones: List[str] = []
             for c in lusha_contacts or []:
-                # Emails
                 for key in ("emails", "emailAddresses", "email_addresses"):
                     val = c.get(key)
                     if isinstance(val, list):
@@ -829,7 +918,6 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                                 added_emails.append(e)
                     elif isinstance(val, str):
                         added_emails.append(val)
-                # Phones
                 for key in ("phones", "phoneNumbers", "phone_numbers"):
                     val = c.get(key)
                     if isinstance(val, list):
@@ -842,10 +930,9 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                                 added_phones.append(p)
                     elif isinstance(val, str):
                         added_phones.append(val)
-            # Dedupe and assign to company-level arrays
-            def _unique(seq: list[str]) -> list[str]:
+            def _unique(seq: List[str]) -> List[str]:
                 seen: set[str] = set()
-                out: list[str] = []
+                out: List[str] = []
                 for x in seq:
                     if not x or x in seen:
                         continue
@@ -856,19 +943,39 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
                 data["email"] = _unique((data.get("email") or []) + added_emails)
                 data["phone_number"] = _unique((data.get("phone_number") or []) + added_phones)
                 print(f"       ↳ Lusha contacts fallback added {len(added_emails)} emails, {len(added_phones)} phones")
-            # Upsert full contact rows into contacts table
             try:
                 ins, upd = upsert_contacts_from_lusha(company_id, lusha_contacts or [])
                 print(f"       ↳ Lusha contacts upserted: inserted={ins}, updated={upd}")
             except Exception as _upsert_exc:
                 print(f"       ↳ Lusha contacts upsert error: {_upsert_exc}")
+            state["lusha_used"] = True
     except Exception as _lusha_contacts_exc:
         print(f"       ↳ Lusha contacts fallback failed: {_lusha_contacts_exc}")
+    state["data"] = data
+    return state
 
-    # Persist core fields
-    update_company_core_fields(company_id, data)
 
-    # Persist arrays and ZeroBounce via existing store_enrichment
+async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed"):
+        return state
+    data = state.get("data") or {}
+    company_id = state.get("company_id")
+    if company_id and data:
+        try:
+            update_company_core_fields(company_id, data)
+        except Exception as exc:
+            print(f"   ↳ update_company_core_fields failed: {exc}")
+    return state
+
+
+async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed"):
+        return state
+    data = state.get("data") or {}
+    home = state.get("home") or ""
+    company_id = state.get("company_id")
+    if not (company_id and data and home):
+        return state
     legacy = {
         "about_text": data.get("about_text") or "",
         "tech_stack": data.get("tech_stack") or [],
@@ -880,13 +987,48 @@ async def enrich_company_with_tavily(company_id: int, company_name: str, uen: st
         "hq_country": data.get("hq_country"),
         "website_domain": data.get("website_domain") or home,
         "email": data.get("email") or [],
-        "products_services": [],
-        "value_props": [],
-        "pricing": [],
+        "products_services": data.get("products_services") or [],
+        "value_props": data.get("value_props") or [],
+        "pricing": data.get("pricing") or [],
     }
-    store_enrichment(company_id, home, legacy)
-    print(f"    💾 stored extracted fields for company_id={company_id}")
+    try:
+        store_enrichment(company_id, home, legacy)
+        print(f"    💾 stored extracted fields for company_id={company_id}")
+        state["completed"] = True
+    except Exception as exc:
+        print(f"   ↳ store_enrichment failed: {exc}")
+    return state
 
+
+# Build the LangGraph for enrichment
+enrichment_graph = StateGraph(EnrichmentState)
+enrichment_graph.add_node("find_domain", node_find_domain)
+enrichment_graph.add_node("discover_urls", node_discover_urls)
+enrichment_graph.add_node("expand_crawl", node_expand_crawl)
+enrichment_graph.add_node("extract_pages", node_extract_pages)
+enrichment_graph.add_node("deterministic_fallback", node_deterministic_fallback)
+enrichment_graph.add_node("build_chunks", node_build_chunks)
+enrichment_graph.add_node("llm_extract", node_llm_extract)
+enrichment_graph.add_node("lusha_contacts", node_lusha_contacts)
+enrichment_graph.add_node("persist_core", node_persist_core)
+enrichment_graph.add_node("persist_legacy", node_persist_legacy)
+
+enrichment_graph.set_entry_point("find_domain")
+enrichment_graph.add_edge("find_domain", "discover_urls")
+enrichment_graph.add_edge("discover_urls", "expand_crawl")
+enrichment_graph.add_edge("expand_crawl", "extract_pages")
+# Branching handled inside nodes; keep linear edges for compatibility
+enrichment_graph.add_edge("extract_pages", "build_chunks")
+enrichment_graph.add_edge("build_chunks", "llm_extract")
+enrichment_graph.add_edge("llm_extract", "lusha_contacts")
+enrichment_graph.add_edge("lusha_contacts", "persist_core")
+enrichment_graph.add_edge("persist_core", "persist_legacy")
+
+enrichment_agent = enrichment_graph.compile()
+try:
+    enrichment_agent.get_graph().draw_mermaid_png()
+except Exception as e:
+    print(f"enrichment graph diagram generation skipped: {e}")
 
 def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> list[str]:
 
