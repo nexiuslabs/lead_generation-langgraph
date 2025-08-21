@@ -24,14 +24,40 @@ def main():
         print(f"ERROR: Migration file not found: {MIGRATION_FILE}")
         sys.exit(1)
 
-    print(f"Applying Odoo migration: {MIGRATION_FILE}")
-    with open(MIGRATION_FILE, "r", encoding="utf-8") as f:
-        sql = f.read()
-
     conn = psycopg2.connect(dsn=POSTGRES_DSN)
     try:
         with conn:
             with conn.cursor() as cur:
+                # Check for required Odoo tables
+                def has_table(name: str) -> bool:
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                          SELECT 1
+                          FROM pg_class c
+                          JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE c.relkind = 'r' AND c.relname = %s
+                        );
+                        """,
+                        (name,)
+                    )
+                    return bool(cur.fetchone()[0])
+
+                has_res_partner = has_table("res_partner")
+                has_crm_lead = has_table("crm_lead")
+
+                if not (has_res_partner and has_crm_lead):
+                    print("\n❌ Odoo core tables not found in the target database.")
+                    print("   Expected tables: res_partner, crm_lead")
+                    print("   Current DSN:", POSTGRES_DSN)
+                    print("\nAction needed:")
+                    print(" - Point POSTGRES_DSN in your .env to the actual Odoo Postgres database.")
+                    print(" - Ensure the Odoo server has initialized its schema (start Odoo once).\n")
+                    sys.exit(2)
+
+                print(f"Applying Odoo migration: {MIGRATION_FILE}")
+                with open(MIGRATION_FILE, "r", encoding="utf-8") as f:
+                    sql = f.read()
                 cur.execute(sql)
         print("✅ Migration applied (safe/idempotent)")
     finally:

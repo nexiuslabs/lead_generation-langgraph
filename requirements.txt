@@ -19,3 +19,4 @@ langchain
 requests
 langchain-tavily
 sse-starlette
+pydantic
