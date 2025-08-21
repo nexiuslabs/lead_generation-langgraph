@@ -12,3 +12,10 @@ psycopg2
 scikit-learn
 httpx
 beautifulsoup4
+fastapi
+uvicorn
+langserve
+langchain
+requests
+langchain-tavily
+sse-starlette

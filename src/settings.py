@@ -1,11 +1,20 @@
 import os
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
+from pathlib import Path
 
 # Load environment variables
-load_dotenv(find_dotenv())
+load_dotenv()  # default search
+# Also load from project root and src/.env if present
+_SRC_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _SRC_DIR.parent
+load_dotenv(_ROOT_DIR / ".env")
+load_dotenv(_SRC_DIR / ".env")
 
 # Database DSN (postgres://user:pass@host:port/db)
-POSTGRES_DSN = os.getenv('POSTGRES_DSN') or os.getenv('DATABASE_URL')
+POSTGRES_DSN = os.getenv("POSTGRES_DSN")
+# Single source: both “app” and “odoo” use the same DSN
+ODOO_POSTGRES_DSN = POSTGRES_DSN
+APP_POSTGRES_DSN = POSTGRES_DSN
 
 # OpenAI / LangChain config
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')

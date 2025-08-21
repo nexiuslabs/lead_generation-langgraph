@@ -1,5 +1,5 @@
 import asyncpg
-from settings import POSTGRES_DSN
+from src.settings import POSTGRES_DSN
 
 _pool = None
 

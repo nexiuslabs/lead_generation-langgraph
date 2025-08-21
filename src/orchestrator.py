@@ -1,16 +1,16 @@
 import asyncio
-from icp import normalize_agent, icp_refresh_agent
-from settings import ICP_RULE_NAME
-from openai_client import generate_rationale
-from lead_scoring import lead_scoring_agent
+from src.icp import normalize_agent, icp_refresh_agent
+from src.settings import ICP_RULE_NAME
+from src.openai_client import generate_rationale
+from src.lead_scoring import lead_scoring_agent
 import logging
 import sys
 
 
-from enrichment import enrich_company_with_tavily
+from src.enrichment import enrich_company_with_tavily
 import psycopg2
 import json
-from settings import POSTGRES_DSN
+from src.settings import POSTGRES_DSN
 
 def fetch_companies(company_ids):
     conn = psycopg2.connect(dsn=POSTGRES_DSN)

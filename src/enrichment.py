@@ -6,15 +6,15 @@ import psycopg2
 from psycopg2.extras import Json
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch, TavilyCrawl, TavilyExtract
-from openai_client import get_embedding
-from settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES
+from src.openai_client import get_embedding
+from src.settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES
 from urllib.parse import urlparse, urljoin
 import requests
-from crawler import crawl_site
+from src.crawler import crawl_site
 import asyncio
 import httpx
 from bs4 import BeautifulSoup
-from lusha_client import LushaClient, LushaError
+from src.lusha_client import LushaClient, LushaError
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI

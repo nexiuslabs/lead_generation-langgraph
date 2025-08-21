@@ -2,8 +2,8 @@
 import os
 import json
 from langchain_openai import ChatOpenAI        # install langchain-openai
-from langchain.schema import SystemMessage, HumanMessage
-from settings import OPENAI_API_KEY, LANGCHAIN_MODEL, TEMPERATURE
+from langchain_core.messages import SystemMessage, HumanMessage
+from src.settings import OPENAI_API_KEY, LANGCHAIN_MODEL, TEMPERATURE
 
 os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
 

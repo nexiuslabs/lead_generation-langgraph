@@ -1,182 +1,210 @@
-# ---------- src/langgraph_agents.py ----------
-from typing import TypedDict, List, Dict, Any
-from langgraph.graph import StateGraph
-from database import get_pg_pool
-from settings import ICP_RULE_NAME
+# icp.py
+import logging
+from typing import Any, Dict, List, TypedDict, Optional
 
-# --- Agent 1: Normalize staging_acra_companies into canonical companies table ---
-class NormalizeState(TypedDict):
+from langgraph.graph import StateGraph, END
+from database import get_conn
+
+log = logging.getLogger(__name__)
+
+# ---------- State types ----------
+
+class NormState(TypedDict, total=False):
     raw_records: List[Dict[str, Any]]
-    normalized_records: List[Dict[str, Any]]
-
-async def fetch_raw_records(state: NormalizeState) -> NormalizeState:
-    # Acquire pool and connection for fetching raw staging data
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        # set search path to ensure public schema
-        await conn.execute("SET search_path TO public, pg_catalog;")
-        # select from fully-qualified table
-        rows = await conn.fetch("SELECT * FROM public.staging_acra_companies;")
-        # Convert to plain dicts so downstream code can use .get safely
-        rows = [dict(r) for r in rows]
-    state['raw_records'] = rows
-    return state
-
-async def normalize_records(state: NormalizeState) -> NormalizeState:
-    normalized: List[Dict[str, Any]] = []
-    for row in state['raw_records']:
-        uen = row['uen']
-        name = row['entity_name']
-        uen_issue_date = row.get('uen_issue_date')
-        if uen_issue_date:
-            try:
-                founded_year = int(str(uen_issue_date).split('-')[0])
-            except:
-                founded_year = None
-        else:
-            founded_year = None
-        ownership_type = row.get('entity_type_description')
-        industry_norm = (row.get('primary_ssic_description') or '').lower()
-        employees_est = row.get('no_of_officers') or 0
-        # revenue bucket categorization
-        if employees_est < 10:
-            revenue_bucket = 'small'
-        elif employees_est <= 200:
-            revenue_bucket = 'medium'
-        else:
-            revenue_bucket = 'large'
-        # parse incorporation year
-        inc_year = None
-        inc_date = row.get('registration_incorporation_date')
-        if inc_date:
-            try:
-                inc_year = int(str(inc_date).split('-')[0])
-            except:
-                inc_year = None
-        sg_registered = (row.get('entity_status_description') == 'Live')
-        # Ensure industry_code is text for DB insert
-        ssic_code = row.get('primary_ssic_code')
-        if ssic_code is not None:
-            ssic_code = str(ssic_code)
-        normalized.append({
-            'uen': uen,
-            'name': name,
-            'founded_year': founded_year,
-            'ownership_type': ownership_type,
-            'industry_norm': industry_norm,
-            'industry_code': ssic_code,
-            'employees_est': employees_est,
-            'revenue_bucket': revenue_bucket,
-            'incorporation_year': inc_year,
-            'sg_registered': sg_registered
-        })
-    state['normalized_records'] = normalized
-    return state
-
-async def upsert_companies(state: NormalizeState) -> NormalizeState:
-    # Batch upsert normalized records into companies table for performance
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        upsert_sql = '''
-        INSERT INTO companies
-          (uen, name, founded_year, ownership_type, industry_norm, industry_code, employees_est, revenue_bucket, incorporation_year, sg_registered)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (uen) DO UPDATE SET
-          name = EXCLUDED.name,
-          founded_year = EXCLUDED.founded_year,
-          ownership_type = EXCLUDED.ownership_type,
-          industry_norm = EXCLUDED.industry_norm,
-          industry_code = EXCLUDED.industry_code,
-          employees_est = EXCLUDED.employees_est,
-          revenue_bucket = EXCLUDED.revenue_bucket,
-          incorporation_year = EXCLUDED.incorporation_year,
-          sg_registered = EXCLUDED.sg_registered,
-          last_seen = now();
-        '''
-        # Prepare batch arguments
-        args = [(
-            comp['uen'],
-            comp['name'],
-            comp['founded_year'],
-            comp['ownership_type'],
-            comp['industry_norm'],
-            comp['industry_code'],
-            comp['employees_est'],
-            comp['revenue_bucket'],
-            comp['incorporation_year'],
-            comp['sg_registered']
-        ) for comp in state['normalized_records']]
-        # Execute as a batch
-        await conn.executemany(upsert_sql, args)
-        print(f"Upserted {len(args)} companies in batch")
-    return state
-
-# Build the graph for normalization
-normalize_graph = StateGraph(NormalizeState)
-normalize_graph.add_node('fetch_raw_records', fetch_raw_records)
-normalize_graph.add_node('normalize_records', normalize_records)
-normalize_graph.add_node('upsert_companies', upsert_companies)
-normalize_graph.set_entry_point('fetch_raw_records')
-normalize_graph.add_edge('fetch_raw_records', 'normalize_records')
-normalize_graph.add_edge('normalize_records', 'upsert_companies')
-normalize_agent = normalize_graph.compile()
-try:
-    normalize_agent.get_graph().draw_mermaid_png()
-except Exception as e:
-    print(f"normalize graph diagram generation skipped: {e}")
+    normalized_records: List[Dict[str, Any]]  # what we upserted
 
 
-# --- Agent 2: Refresh ICP rules & candidate view ---
-class ICPRefreshState(TypedDict):
+class ICPState(TypedDict, total=False):
     rule_name: str
     payload: Dict[str, Any]
     candidate_ids: List[int]
 
-import json
 
-async def refresh_icp_rules(state: ICPRefreshState) -> ICPRefreshState:
+# ---------- Helpers ----------
+
+def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
+    """Fetch raw rows from a staging table; fall back if table is absent."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                # Prefer your staging table if it exists
+                cur.execute(
+                    """
+                    SELECT
+                        uen,
+                        entity_name,
+                        primary_ssic_description,
+                        primary_ssic_code,
+                        website,
+                        incorporation_year,
+                        entity_status_de
+                    FROM staging_acra_companies
+                    ORDER BY uen
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            except Exception:
+                # Fallback: use companies as a source of 'raw' rows
+                cur.execute(
+                    """
+                    SELECT
+                        company_id,
+                        uen,
+                        entity_name,
+                        primary_ssic_description,
+                        primary_ssic_code,
+                        website,
+                        incorporation_year,
+                        sg_registered
+                    FROM companies
+                    ORDER BY uen
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Minimal normalization pass."""
+    def _norm_str(x: Optional[str]) -> Optional[str]:
+        if x is None:
+            return None
+        s = str(x).strip()
+        return s or None
+
+    norm = {
+        "company_id": r.get("company_id"),
+        "uen": _norm_str(r.get("uen")),
+        "name": _norm_str(r.get("name")),
+        "industry_norm": _norm_str(r.get("industry_norm")).lower() if r.get("industry_norm") else None,
+        "industry_code": _norm_str(str(r.get("industry_code")) if r.get("industry_code") is not None else None),
+        "website_domain": _norm_str(r.get("website_domain")),
+        "incorporation_year": r.get("incorporation_year"),
+        "sg_registered": r.get("sg_registered"),
+    }
+    return norm
+
+
+def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
+    """Upsert normalized rows into companies table."""
+    if not rows:
+        return 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                cur.execute(
+                    """
+                    INSERT INTO companies (
+                        company_id, uen, name, industry_norm, industry_code,
+                        website_domain, incorporation_year, sg_registered, last_seen
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+                    ON CONFLICT (company_id) DO UPDATE SET
+                        uen = EXCLUDED.uen,
+                        name = EXCLUDED.name,
+                        industry_norm = EXCLUDED.industry_norm,
+                        industry_code = EXCLUDED.industry_code,
+                        website_domain = EXCLUDED.website_domain,
+                        incorporation_year = EXCLUDED.incorporation_year,
+                        sg_registered = EXCLUDED.sg_registered,
+                        last_seen = NOW()
+                    """,
+                    (
+                        r.get("company_id"),
+                        r.get("uen"),
+                        r.get("name"),
+                        r.get("industry_norm"),
+                        r.get("industry_code"),
+                        r.get("website_domain"),
+                        r.get("incorporation_year"),
+                        r.get("sg_registered"),
+                    ),
+                )
+        conn.commit()
+    return len(rows)
+
+
+def _select_icp_candidates(payload: Dict[str, Any]) -> List[int]:
+    """Build a simple WHERE from payload and fetch matching company_ids."""
+    industries = [s.strip().lower() for s in payload.get("industries", []) if isinstance(s, str) and s.strip()]
+    emp = payload.get("employee_range", {}) or {}
+    inc = payload.get("incorporation_year", {}) or {}
+
+    where = ["TRUE"]
+    params: List[Any] = []
+
+    if industries:
+        where.append("LOWER(industry_norm) = ANY(%s)")
+        params.append(industries)
+    if "min" in emp:
+        where.append("(employees_est IS NOT NULL AND employees_est >= %s)")
+        params.append(emp["min"])
+    if "max" in emp:
+        where.append("(employees_est IS NOT NULL AND employees_est <= %s)")
+        params.append(emp["max"])
+    if "min" in inc:
+        where.append("(incorporation_year IS NOT NULL AND incorporation_year >= %s)")
+        params.append(inc["min"])
+    if "max" in inc:
+        where.append("(incorporation_year IS NOT NULL AND incorporation_year <= %s)")
+        params.append(inc["max"])
+
+    sql = f"""
+        SELECT company_id
+        FROM companies
+        WHERE {' AND '.join(where)}
+        ORDER BY company_id
+        LIMIT 1000
     """
-    Ensure the ICP rule exists or update its payload.
-    Serializes the payload dict to JSON string for JSONB insertion.
-    """
-    pool = await get_pg_pool()
-    payload_json = json.dumps(state['payload'])
-    async with pool.acquire() as conn:
-        await conn.execute(
-            '''
-            INSERT INTO icp_rules (name, payload)
-            VALUES ($1, $2::jsonb)
-            ON CONFLICT (name) DO UPDATE SET payload = EXCLUDED.payload;
-            ''',
-            state['rule_name'], payload_json
-        )
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        return [row[0] for row in cur.fetchall()]
+
+
+# ---------- LangGraph nodes ----------
+
+async def fetch_raw_records(state: NormState) -> NormState:
+    rows = _fetch_staging_rows(limit=100)
+    state["raw_records"] = rows
+    log.info("Fetched %d staging rows", len(rows))
     return state
 
-async def refresh_candidate_view(state: ICPRefreshState) -> ICPRefreshState:
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        await conn.execute('REFRESH MATERIALIZED VIEW icp_candidate_companies;')
+
+async def normalize_and_upsert(state: NormState) -> NormState:
+    raw = state.get("raw_records", []) or []
+    normalized = [_normalize_row(r) for r in raw]
+    count = _upsert_companies_batch(normalized)
+    log.info("Upserted %d companies in batch", count)
+    state["normalized_records"] = normalized
     return state
 
-async def fetch_candidate_ids(state: ICPRefreshState) -> ICPRefreshState:
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch('SELECT company_id FROM icp_candidate_companies;')
-    state['candidate_ids'] = [r['company_id'] for r in rows]
+
+async def refresh_icp_candidates(state: ICPState) -> ICPState:
+    payload = state.get("payload", {}) or {}
+    ids = _select_icp_candidates(payload)
+    state["candidate_ids"] = ids
     return state
 
-# Build the graph for ICP refresh
-icp_graph = StateGraph(ICPRefreshState)
-icp_graph.add_node('refresh_icp_rules', refresh_icp_rules)
-icp_graph.add_node('refresh_candidate_view', refresh_candidate_view)
-icp_graph.add_node('fetch_candidate_ids', fetch_candidate_ids)
-icp_graph.set_entry_point('refresh_icp_rules')
-icp_graph.add_edge('refresh_icp_rules', 'refresh_candidate_view')
-icp_graph.add_edge('refresh_candidate_view', 'fetch_candidate_ids')
-icp_refresh_agent = icp_graph.compile()
-#ICP FLOW
-try:
-    icp_refresh_agent.get_graph().draw_mermaid_png()
-except Exception as e:
-    print(f"ICP graph diagram generation skipped: {e}")
 
+# ---------- Graphs ----------
+
+# Normalization agent
+_norm_graph = StateGraph(NormState)
+_norm_graph.add_node("fetch_raw_records", fetch_raw_records)
+_norm_graph.add_node("normalize_and_upsert", normalize_and_upsert)
+_norm_graph.set_entry_point("fetch_raw_records")
+_norm_graph.add_edge("fetch_raw_records", "normalize_and_upsert")
+_norm_graph.add_edge("normalize_and_upsert", END)
+normalize_agent = _norm_graph.compile()
+
+# ICP refresh agent
+_icp_graph = StateGraph(ICPState)
+_icp_graph.add_node("refresh", refresh_icp_candidates)
+_icp_graph.set_entry_point("refresh")
+_icp_graph.add_edge("refresh", END)
+icp_refresh_agent = _icp_graph.compile()
+
+__all__ = ["normalize_agent", "icp_refresh_agent"]
