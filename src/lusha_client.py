@@ -8,11 +8,309 @@ import time
 import logging
 from typing import Any, Dict, List, Optional
 import requests
+import asyncio
+import httpx
 
 logger = logging.getLogger(__name__)
 
 class LushaError(RuntimeError):
     pass
+
+class AsyncLushaClient:
+    BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")
+
+    def __init__(self, api_key: Optional[str] = None, client: Optional[httpx.AsyncClient] = None, timeout: float = 30):
+        self.api_key = api_key or os.getenv("LUSHA_API_KEY")
+        if not self.api_key:
+            raise LushaError("Missing LUSHA_API_KEY. Add it to your environment or settings.py.")
+        self.timeout = timeout
+        self._client = client or httpx.AsyncClient()
+        self._own_client = client is None
+        # Stores the last requestId returned by contact search, used by enrich
+        self._last_request_id: Optional[str] = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.aclose()
+
+    async def aclose(self):
+        if getattr(self, "_own_client", False) and self._client:
+            await self._client.aclose()
+
+    # --- Low-level HTTP helpers -------------------------------------------------
+    def _headers(self) -> Dict[str, str]:
+        # Lusha uses "api_key" header (not Bearer).
+        # Ref: docs.lusha.com → Security → ApiKeyAuth
+        return {"api_key": self.api_key, "accept": "application/json", "content-type": "application/json"}
+
+    async def _request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.BASE_URL}{path}"
+        # one retry on 429
+        for attempt in range(2):
+            resp = await self._client.request(method, url, headers=self._headers(), params=params, json=json, timeout=self.timeout)
+            if resp.status_code == 429 and attempt == 0:
+                retry_after = int(resp.headers.get("Retry-After", "2"))
+                logger.warning("Lusha rate-limit hit. Retrying in %ss…", retry_after)
+                await asyncio.sleep(retry_after)
+                continue
+            return self._handle(resp)
+        return self._handle(resp)
+
+    def _handle(self, resp: httpx.Response) -> Dict[str, Any]:
+        if 200 <= resp.status_code < 300:
+            try:
+                return resp.json()
+            except Exception as e:
+                raise LushaError(f"Lusha non-JSON response: {e} body={resp.text[:500]!r}")
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"message": resp.text}
+        raise LushaError(f"Lusha API error {resp.status_code}: {payload}")
+
+    # --- Company ----------------------------------------------------------------
+    async def get_company(self, *, domain: Optional[str] = None, name: Optional[str] = None, company_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if domain:
+            params["domain"] = domain
+        if name:
+            # API expects 'company' (not 'companyName')
+            params["company"] = name
+        if company_id:
+            params["companyId"] = company_id
+        data = await self._request("GET", "/v2/company", params=params)
+        if not data:
+            return None
+        return data.get("company", data)
+
+    async def prospect_companies(self, *, name: Optional[str] = None, country: Optional[str] = None, domain: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        POST /prospecting/company/search — search by name/location/etc., returns 'results'.
+        """
+        # Some accounts reject pagination parameters; send only filters.
+        body: Dict[str, Any] = {}
+        filters: Dict[str, Any] = {}
+        if name:
+            filters["companyNames"] = [name]
+        if country:
+            filters["locations"] = [{"country": country}]
+        if domain:
+            filters["companyDomains"] = [domain]
+        if filters:
+            body["filters"] = filters
+        data = await self._request("POST", "/prospecting/company/search", json=body)
+        results = data.get("results") or data.get("companies") or []
+        return results[: max(0, limit)] if isinstance(results, list) else []
+
+    # --- Contacts ---------------------------------------------------------------
+    async def prospect_contacts(self, *, company_domain: Optional[str] = None, company_name: Optional[str] = None, country: Optional[str] = None, titles: Optional[List[str]] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        POST /prospecting/contact/search — user-provided schema with pages + nested filters
+        """
+        # Lusha requires pages.size >= 10
+        size = max(10, min(50, int(limit or 10)))
+        body: Dict[str, Any] = {
+            "pages": {"page": 0, "size": size},
+            "filters": {
+                "contacts": {"include": {}, "exclude": {}},
+                "companies": {"include": {}, "exclude": {}},
+            },
+        }
+        # Contacts filters
+        contacts_inc = body["filters"]["contacts"]["include"]
+        if country:
+            contacts_inc["locations"] = [{"country": country}]
+        if titles:
+            contacts_inc["titles"] = titles
+        # Companies filters — include company names variations
+        companies_inc = body["filters"]["companies"]["include"]
+        name_variants: List[str] = []
+        if company_name:
+            name_variants.append(company_name)
+            # Add a normalized variant without common suffixes
+            ul = company_name.upper()
+            for sfx in [" PTE LTD", " PTE. LTD.", " PRIVATE LIMITED", " LTD", " LIMITED"]:
+                if ul.endswith(sfx):
+                    name_variants.append(company_name[: -len(sfx)].strip())
+                    break
+            # Add dotted/non-dotted Pte Ltd variant
+            if "Pte Ltd" in company_name:
+                name_variants.append(company_name.replace("Pte Ltd", "Pte. Ltd"))
+            if "Pte. Ltd" in company_name:
+                name_variants.append(company_name.replace("Pte. Ltd", "Pte Ltd"))
+        if name_variants:
+            # dedupe while preserving order
+            seen: set[str] = set()
+            nv: List[str] = []
+            for n in name_variants:
+                if n and n not in seen:
+                    seen.add(n)
+                    nv.append(n)
+            companies_inc["names"] = nv
+        # Execute
+        data = await self._request("POST", "/prospecting/contact/search", json=body)
+        # Persist requestId for enrich
+        try:
+            self._last_request_id = data.get("requestId")  # type: ignore[union-attr]
+        except Exception:
+            self._last_request_id = None
+        results = []
+        if isinstance(data, dict):
+            results = data.get("data") or data.get("results") or data.get("contacts") or []  # type: ignore[assignment]
+        res_list = results[: size] if isinstance(results, list) else []
+        return res_list
+
+    async def enrich_contacts(self, *, contact_ids: Optional[List[str]] = None, contacts: Optional[List[Dict[str, Any]]] = None, request_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        POST /prospecting/contact/enrich — enrich contacts returned from search.
+        Accepts contactIds and optional requestId (recommended by user-provided schema).
+        """
+        body: Dict[str, Any] = {}
+        ids: List[str] = []
+        if contact_ids:
+            ids = [i for i in contact_ids if i]
+        elif contacts:
+            for c in contacts:
+                cid = c.get("contactId") or c.get("id") or c.get("lushaContactId")
+                if cid:
+                    ids.append(cid)
+        else:
+            raise ValueError("Provide contact_ids or contacts")
+        if not ids:
+            return []
+        body["contactIds"] = ids
+        rid = request_id or self._last_request_id
+        if rid:
+            body["requestId"] = rid
+        data = await self._request("POST", "/prospecting/contact/enrich", json=body)
+        # Flatten each contact's data payload for downstream consumers
+        raw_list = []
+        if isinstance(data, dict):
+            raw_list = data.get("contacts") or data.get("results") or []  # type: ignore[assignment]
+        out: List[Dict[str, Any]] = []
+        for item in raw_list or []:
+            if isinstance(item, dict) and item.get("data"):
+                out.append(item["data"])  # flatten
+            elif isinstance(item, dict):
+                out.append(item)
+        return out
+
+    async def get_person(self, *, email: Optional[str] = None, linkedin_url: Optional[str] = None, first_name: Optional[str] = None, last_name: Optional[str] = None, company_name: Optional[str] = None, company_domain: Optional[str] = None, reveal_phones: bool = False, reveal_emails: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        GET /v2/person — single person enrich lookup.
+        Requires: email OR linkedinUrl OR (firstName & lastName & (companyName OR companyDomain)).
+        """
+        params: Dict[str, Any] = {}
+        if email: params["email"] = email
+        if linkedin_url: params["linkedinUrl"] = linkedin_url
+        if first_name: params["firstName"] = first_name
+        if last_name: params["lastName"] = last_name
+        if company_name: params["company"] = company_name
+        if company_domain: params["companyDomain"] = company_domain
+        if reveal_phones: params["revealPhones"] = "true"
+        if reveal_emails: params["revealEmails"] = "true"
+        data = await self._request("GET", "/v2/person", params=params)
+        return data or None
+
+    # --- Convenience ------------------------------------------------------------
+    async def find_company_domain(self, company_name: str, country: Optional[str] = None) -> Optional[str]:
+        """
+        Use user-provided endpoint:
+        POST /prospecting/filters/companies/names with {"text": company_name}
+        Fallbacks:
+        - try dotted/undotted Pte Ltd variants
+        - try normalized name without common suffixes
+        - finally, GET /v2/company by name
+        """
+        async def _from_filters(text: str) -> Optional[str]:
+            try:
+                resp = await self._request("POST", "/prospecting/filters/companies/names", json={"text": text})
+                if isinstance(resp, list) and resp:
+                    first = resp[0] or {}
+                    return first.get("domains_homepage") or first.get("fqdn") or first.get("companyDomain") or first.get("website")
+            except Exception as e:
+                logger.info("Lusha companies/names failed for %r: %s", text, e)
+            return None
+
+        # Try original
+        d = await _from_filters(company_name)
+        if d:
+            return d
+        # Try dotted/undotted variants
+        if "Pte Ltd" in company_name:
+            d = await _from_filters(company_name.replace("Pte Ltd", "Pte. Ltd"))
+            if d:
+                return d
+        if "Pte. Ltd" in company_name:
+            d = await _from_filters(company_name.replace("Pte. Ltd", "Pte Ltd"))
+            if d:
+                return d
+        # Try normalized (strip common suffixes)
+        ul = company_name.upper()
+        norm = ul
+        for sfx in [" PTE LTD", " PTE. LTD.", " PRIVATE LIMITED", " LTD", " LIMITED"]:
+            if ul.endswith(sfx):
+                norm = ul[: -len(sfx)].strip()
+                break
+        norm_t = norm.title()
+        if norm_t and norm_t != company_name:
+            d = await _from_filters(norm_t)
+            if d:
+                return d
+        # Last resort: GET /v2/company
+        try:
+            c = await self.get_company(name=company_name)
+            domain = (c or {}).get("domain") or (c or {}).get("website")
+            if domain:
+                return domain
+        except Exception as e:
+            logger.info("Lusha get_company fallback failed: %s", e)
+        return None
+
+    async def search_and_enrich_contacts(self, *, company_name: Optional[str], company_domain: Optional[str], country: Optional[str], titles: Optional[List[str]] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Utility to search then enrich. Returns contacts with emails/phones when available.
+        """
+        contacts = await self.prospect_contacts(company_domain=company_domain, company_name=company_name, country=country, titles=titles, limit=limit)
+        if not contacts:
+            try:
+                logger.info(
+                    "Lusha search_and_enrich_contacts: prospect returned 0 contacts for company=%r domain=%r country=%r titles=%s",
+                    company_name,
+                    company_domain,
+                    country,
+                    titles or [],
+                )
+            except Exception:
+                pass
+            return []
+        ids = [
+            (c.get("contactId") or c.get("id") or c.get("lushaContactId"))
+            for c in contacts
+            if c.get("contactId") or c.get("id") or c.get("lushaContactId")
+        ]
+        try:
+            enriched = await (self.enrich_contacts(contact_ids=ids, request_id=self._last_request_id) if ids else self.enrich_contacts(contacts=contacts, request_id=self._last_request_id))
+        except Exception as e:
+            # Fallback to single enrich calls if bulk enrich isn't available on your plan
+            logger.warning("Lusha enrich_contacts failed, falling back to GET /v2/person per contact: %s", e)
+            enriched = []
+            for c in contacts:
+                fn = c.get("firstName")
+                ln = c.get("lastName")
+                if (not fn or not ln) and c.get("name") and isinstance(c.get("name"), str):
+                    parts = c["name"].split()
+                    if len(parts) >= 2:
+                        fn, ln = parts[0], " ".join(parts[1:])
+                person = await self.get_person(first_name=fn, last_name=ln,
+                                         company_name=c.get("companyName") or company_name,
+                                         company_domain=company_domain or c.get("companyDomain"),
+                                         reveal_emails=True, reveal_phones=True)
+                if person:
+                    enriched.append(person)
+        return enriched
 
 class LushaClient:
     BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")

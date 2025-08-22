@@ -243,7 +243,10 @@ def _user_just_confirmed(state: dict) -> bool:
 def _icp_complete(icp: Dict[str, Any]) -> bool:
     has_industries = bool(icp.get("industries"))
     has_employees = bool(icp.get("employees_min") or icp.get("employees_max"))
-    return has_industries and has_employees
+    has_geos = bool(icp.get("geos"))
+    signals_done = bool(icp.get("signals")) or bool(icp.get("signals_done"))
+    # Require industries + employees + geos, and either explicit signals or explicit skip (signals_done)
+    return has_industries and has_employees and has_geos and signals_done
 
 def _parse_company_list(text: str) -> List[str]:
     raw = re.split(r"[,|\n]+", text)
@@ -325,7 +328,7 @@ async def _ensure_company_row(pool, name: str) -> int:
         row = await conn.fetchrow("INSERT INTO companies(name) VALUES ($1) RETURNING id", name)
         return row["id"]
 
-async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
+async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 20) -> List[Dict[str, Any]]:
     """
     Pulls candidates from public.companies using only existing columns
     and aliases company_id -> id for downstream compatibility.
@@ -434,7 +437,7 @@ async def icp_node(state: GraphState) -> GraphState:
 async def candidates_node(state: GraphState) -> GraphState:
     if not state.get("candidates"):
         pool = await get_pg_pool()
-        cand = await _default_candidates(pool, state.get("icp") or {}, limit=3)
+        cand = await _default_candidates(pool, state.get("icp") or {}, limit=20)
         state["candidates"] = cand
 
     n = len(state["candidates"]) if state.get("candidates") else 0
@@ -548,25 +551,59 @@ async def score_node(state: GraphState) -> GraphState:
 # ------------------------------
 
 def router(state: GraphState) -> str:
-    # If user confirmed ICP, move to confirm/candidates path
-    if state.get("icp_confirmed"):
-        return "confirm"
-    # Recursion guard: if the last speaker was the assistant, halt.
-    if _last_is_ai(state.get("messages")):
-        logger.info("↪ router -> end (last speaker was assistant)")
+    msgs = state.get("messages") or []
+    icp = state.get("icp") or {}
+
+    # 1) Always pause if the assistant was the last speaker
+    if _last_is_ai(msgs):
+        logger.info("router -> end (last speaker was assistant)")
         return "end"
+
     text = _last_user_text(state).lower()
-    if "run enrichment" in text or "enrich" == text.strip():
-        return "enrich"
-    if _parse_company_list(_last_user_text(state)):
+
+    # 2) Fast-path: user said confirm -> proceed to candidates (allow light ICP)
+    if _user_just_confirmed(state):
+        logger.info("router -> candidates (user confirmed ICP)")
         return "candidates"
-    if not _icp_complete(state.get("icp") or {}):
+
+    # 3) Fast-path: user requested enrichment
+    if "run enrichment" in text:
+        if state.get("candidates"):
+            logger.info("router -> enrich (user requested enrichment)")
+            return "enrich"
+        else:
+            logger.info("router -> candidates (prepare candidates before enrichment)")
+            return "candidates"
+
+    # 4) If user pasted an explicit company list, jump to candidates
+    if _parse_company_list(text):
+        logger.info("router -> candidates (explicit company list)")
+        return "candidates"
+
+    # 5) If ICP is not complete yet, continue ICP Q&A
+    if not _icp_complete(icp):
+        logger.info("router -> icp (need more ICP)")
         return "icp"
-    if not state.get("confirmed"):
-        return "confirm"
-    if not state.get("candidates"):
-        return "candidates"
-    return "enrich"
+
+    # 6) Pipeline progression
+    has_candidates = bool(state.get("candidates"))
+    has_results = bool(state.get("results"))
+    has_scored = bool(state.get("scored"))
+
+    if has_candidates and not has_results:
+        logger.info("router -> enrich (have candidates, no enrichment)")
+        return "enrich"
+    if has_results and not has_scored:
+        logger.info("router -> score (have enrichment, no scores)")
+        return "score"
+
+    # 7) Default
+    logger.info("router -> icp (default)")
+    return "icp"
+
+def router_entry(state: GraphState) -> GraphState:
+    """No-op node so we can attach conditional edges to a central router hub."""
+    return state
 
 # ------------------------------
 # Graph builder
@@ -574,16 +611,14 @@ def router(state: GraphState) -> str:
 
 def build_graph():
     g = StateGraph(GraphState)
+    # Central router node (no-op) to hub all control flow
+    g.add_node("router", router_entry)
     g.add_node("icp", icp_node)
     g.add_node("candidates", candidates_node)
     g.add_node("confirm", confirm_node)
     g.add_node("enrich", enrich_node)
     g.add_node("score", score_node)
-    # Auto-advance after confirmation to candidates and enrichment
-    g.add_edge("confirm", "candidates")
-    g.add_edge("candidates", "enrich")
-    g.add_edge("enrich", "score")
-    g.set_entry_point("icp")
+    # Central router: every node returns here so we can advance the workflow
     mapping = {
         "icp": "icp",
         "candidates": "candidates",
@@ -592,8 +627,12 @@ def build_graph():
         "score": "score",
         "end": END,
     }
-    g.add_conditional_edges("icp", router, mapping)
-    g.add_edge("score", END)
+    # Start in the router so we always decide the right first step
+    g.set_entry_point("router")
+    g.add_conditional_edges("router", router, mapping)
+    # Every worker node loops back to the router
+    for node in ("icp", "candidates", "confirm", "enrich", "score"):
+        g.add_edge(node, "router")
     return g.compile()
 
 GRAPH = build_graph()

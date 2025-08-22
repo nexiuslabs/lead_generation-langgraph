@@ -14,7 +14,7 @@ from src.crawler import crawl_site
 import asyncio
 import httpx
 from bs4 import BeautifulSoup
-from src.lusha_client import LushaClient, LushaError
+from src.lusha_client import AsyncLushaClient, LushaError
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
@@ -616,13 +616,13 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
             print("   ↳ No domain via search; trying Lusha fallback…")
-            lc = LushaClient()
-            lusha_domain = lc.find_company_domain(name)
-            if lusha_domain:
-                normalized = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
-                domains = [normalized]
-                state["lusha_used"] = True
-                print(f"   ↳ Lusha provided domain: {normalized}")
+            async with AsyncLushaClient() as lc:
+                lusha_domain = await lc.find_company_domain(name)
+                if lusha_domain:
+                    normalized = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
+                    domains = [normalized]
+                    state["lusha_used"] = True
+                    print(f"   ↳ Lusha provided domain: {normalized}")
         except Exception as e:
             print(f"   ↳ Lusha domain fallback failed: {e}")
     if not domains:
@@ -643,8 +643,8 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
     filtered_urls: List[str] = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
     if not filtered_urls and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
-            lc = LushaClient()
-            lusha_domain = lc.find_company_domain(state.get("company_name") or "")
+            async with AsyncLushaClient() as lc:
+                lusha_domain = await lc.find_company_domain(state.get("company_name") or "")
             if lusha_domain:
                 candidate_home = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
                 if urlparse(candidate_home).netloc and urlparse(candidate_home).netloc != urlparse(home).netloc:
@@ -879,7 +879,6 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
         missing_founder = not founder_present
         trigger = need_emails or need_phones or needs_contacts or missing_names or missing_founder
         if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger:
-            lc = LushaClient()
             website_hint = data.get("website_domain") or state.get("home") or ""
             try:
                 if website_hint.startswith("http"):
@@ -888,21 +887,23 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                     company_domain = urlparse(f"https://{website_hint}").netloc
             except Exception:
                 company_domain = None
-            lusha_contacts = lc.search_and_enrich_contacts(
-                company_name=state.get("company_name") or "",
-                company_domain=company_domain,
-                country=data.get("hq_country"),
-                titles=LUSHA_PREFERRED_TITLES,
-                limit=15,
-            )
-            if not lusha_contacts:
-                lusha_contacts = lc.search_and_enrich_contacts(
+            lusha_contacts: List[Dict[str, Any]] = []
+            async with AsyncLushaClient() as lc:
+                lusha_contacts = await lc.search_and_enrich_contacts(
                     company_name=state.get("company_name") or "",
                     company_domain=company_domain,
                     country=data.get("hq_country"),
-                    titles=None,
+                    titles=LUSHA_PREFERRED_TITLES,
                     limit=15,
                 )
+                if not lusha_contacts:
+                    lusha_contacts = await lc.search_and_enrich_contacts(
+                        company_name=state.get("company_name") or "",
+                        company_domain=company_domain,
+                        country=data.get("hq_country"),
+                        titles=None,
+                        limit=15,
+                    )
             added_emails: List[str] = []
             added_phones: List[str] = []
             for c in lusha_contacts or []:
