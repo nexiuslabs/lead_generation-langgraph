@@ -31,10 +31,16 @@ print("🛠️  Initializing enrichment pipeline...")
 # Simple in-memory cache for ZeroBounce to avoid duplicate calls per-run
 ZB_CACHE: dict[str, dict] = {}
 
-# Initialize Tavily clients
-tavily_search = TavilySearch(api_key=TAVILY_API_KEY)
-tavily_crawl = TavilyCrawl(api_key=TAVILY_API_KEY)
-tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
+# Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
+if TAVILY_API_KEY:
+    tavily_search = TavilySearch(api_key=TAVILY_API_KEY)
+    tavily_crawl = TavilyCrawl(api_key=TAVILY_API_KEY)
+    tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
+else:
+    tavily_search = None  # type: ignore[assignment]
+    tavily_crawl = None   # type: ignore[assignment]
+    tavily_extract = None # type: ignore[assignment]
+    print("⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract.")
 
 # Initialize LangChain LLM for AI extraction
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -679,11 +685,39 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         return state
     name = state.get("company_name") or ""
     uen = state.get("uen")
+    # 0) DB fallback: use existing website_domain for this company if present
     try:
-        domains = find_domain(name, uen=uen)
-    except TypeError:
-        # Backward compatibility in case signature differs
-        domains = find_domain(name)
+        cid = state.get("company_id")
+        if cid:
+            conn = get_db_connection()
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT website_domain FROM companies WHERE company_id=%s", (cid,))
+                row = cur.fetchone()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if row and row[0]:
+                dom = str(row[0])
+                if not dom.startswith("http"):
+                    dom = "https://" + dom
+                domains = [dom]
+            else:
+                domains = []
+        else:
+            domains = []
+    except Exception:
+        domains = []
+
+    # 1) Tavily search if available
+    if not domains and tavily_search is not None:
+        try:
+            domains = find_domain(name, uen=uen)
+        except TypeError:
+            # Backward compatibility in case signature differs
+            domains = find_domain(name)
+        except Exception as e:
+            print(f"   ↳ Tavily find_domain failed: {e}")
     # Lusha fallback if needed
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
@@ -756,26 +790,29 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                 for _p in ("about", "aboutus"):
                     page_urls.append(f"{_root}/{_p}")
 
-        for root in roots[:3]:
-            try:
-                crawl_input = {
-                    "url": f"{root}/*",
-                    "limit": CRAWL_MAX_PAGES,
-                    "crawl_depth": 2,
-                    "instructions": f"get all pages from {root}",
-                    "enable_web_search": False,
-                }
-                crawl_result = tavily_crawl.run(crawl_input)
-                raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
-                for item in raw_urls:
-                    if isinstance(item, dict) and item.get("url"):
-                        page_urls.append(item["url"])
-                    elif isinstance(item, str) and item.startswith("http"):
-                        page_urls.append(item)
-                page_urls.append(root)
-            except Exception as exc:
-                print(f"          ↳ TavilyCrawl error for {root}: {exc}")
-                page_urls.append(root)
+        if tavily_crawl is not None:
+            for root in roots[:3]:
+                try:
+                    crawl_input = {
+                        "url": f"{root}/*",
+                        "limit": CRAWL_MAX_PAGES,
+                        "crawl_depth": 2,
+                        "instructions": f"get all pages from {root}",
+                        "enable_web_search": False,
+                    }
+                    crawl_result = tavily_crawl.run(crawl_input)
+                    raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+                    for item in raw_urls:
+                        if isinstance(item, dict) and item.get("url"):
+                            page_urls.append(item["url"])
+                        elif isinstance(item, str) and item.startswith("http"):
+                            page_urls.append(item)
+                    page_urls.append(root)
+                except Exception as exc:
+                    print(f"          ↳ TavilyCrawl error for {root}: {exc}")
+                    page_urls.append(root)
+        else:
+            print("       ↳ TavilyCrawl unavailable; using seeded URLs only")
         page_urls = list(dict.fromkeys(page_urls))
         page_urls = [u for u in page_urls if "*" not in u]
         try:
@@ -799,22 +836,52 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     page_urls = state["page_urls"]
     extracted_pages: List[Dict[str, Any]] = []
     fallback_urls: List[str] = []
+    def _extract_raw_from(obj: Any) -> Optional[str]:
+        # Try common shapes from TavilyExtract
+        if obj is None:
+            return None
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            for key in ("raw_content", "content", "text"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val
+                if isinstance(val, dict):
+                    # nested content holder
+                    for k2 in ("raw_content", "content", "text"):
+                        v2 = val.get(k2)
+                        if isinstance(v2, str) and v2.strip():
+                            return v2
+            # results list
+            results = obj.get("results")
+            if isinstance(results, list) and results:
+                for item in results:
+                    if isinstance(item, dict):
+                        got = _extract_raw_from(item)
+                        if got:
+                            return got
+        if isinstance(obj, list):
+            for it in obj:
+                got = _extract_raw_from(it)
+                if got:
+                    return got
+        return None
+
     for u in page_urls:
-        payload = {
-            "urls": [u],
-            "schema": {"raw_content": "str"},
-            "instructions": "Retrieve the main textual content from this page.",
-        }
-        try:
-            raw_data = tavily_extract.run(payload)
-        except Exception as exc:
-            print(f"          ↳ TavilyExtract error for {u}: {exc}")
-            continue
-        raw_content = None
-        if isinstance(raw_data, dict):
-            raw_content = raw_data.get("raw_content")
-            if raw_content is None and isinstance(raw_data.get("results"), list) and raw_data.get("results"):
-                raw_content = raw_data["results"][0].get("raw_content")
+        # Try TavilyExtract if configured
+        raw_content: Optional[str] = None
+        if tavily_extract is not None:
+            payload = {
+                "urls": [u],
+                "schema": {"raw_content": "str"},
+                "instructions": "Retrieve the main textual content from this page.",
+            }
+            try:
+                raw_data = tavily_extract.run(payload)
+                raw_content = _extract_raw_from(raw_data)
+            except Exception as exc:
+                print(f"          ↳ TavilyExtract error for {u}: {exc}")
         if raw_content and isinstance(raw_content, str) and raw_content.strip():
             extracted_pages.append({"url": u, "title": "", "raw_content": raw_content})
         else:
