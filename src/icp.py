@@ -3,7 +3,7 @@ import logging
 from typing import Any, Dict, List, TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
-from database import get_conn
+from src.database import get_conn
 
 log = logging.getLogger(__name__)
 

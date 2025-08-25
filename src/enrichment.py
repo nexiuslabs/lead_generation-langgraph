@@ -1,5 +1,6 @@
 # tools.py
 from dotenv import load_dotenv
+import time
 import json
 import re
 import psycopg2
@@ -7,7 +8,7 @@ from psycopg2.extras import Json
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch, TavilyCrawl, TavilyExtract
 from src.openai_client import get_embedding
-from src.settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES
+from src.settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES, PERSIST_CRAWL_CORPUS
 from urllib.parse import urlparse, urljoin
 import requests
 from src.crawler import crawl_site
@@ -26,6 +27,9 @@ from langgraph.graph import StateGraph, END
 load_dotenv()
 
 print("🛠️  Initializing enrichment pipeline...")
+
+# Simple in-memory cache for ZeroBounce to avoid duplicate calls per-run
+ZB_CACHE: dict[str, dict] = {}
 
 # Initialize Tavily clients
 tavily_search = TavilySearch(api_key=TAVILY_API_KEY)
@@ -50,6 +54,50 @@ extract_chain = prompt_template | llm | StrOutputParser()
 
 def get_db_connection():
     return psycopg2.connect(dsn=POSTGRES_DSN)
+
+
+def _ensure_email_cache_table(conn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_verification_cache (
+                  email TEXT PRIMARY KEY,
+                  status TEXT,
+                  confidence FLOAT,
+                  checked_at TIMESTAMPTZ DEFAULT now()
+                );
+                """
+            )
+    except Exception:
+        pass
+
+
+def _cache_get(conn, email: str) -> Optional[dict]:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, confidence FROM email_verification_cache WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if row:
+                return {"email": email, "status": row[0], "confidence": float(row[1] or 0.0), "source": "zerobounce-cache"}
+    except Exception:
+        return None
+    return None
+
+
+def _cache_set(conn, email: str, status: str, confidence: float) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO email_verification_cache(email, status, confidence, checked_at)
+                VALUES (%s,%s,%s, now())
+                ON CONFLICT (email) DO UPDATE SET status=EXCLUDED.status, confidence=EXCLUDED.confidence, checked_at=now()
+                """,
+                (email, status, confidence),
+            )
+    except Exception:
+        pass
 
 # ---------- Contacts persistence helpers (DB-introspective) ----------
 def _get_table_columns(conn, table_name: str) -> set:
@@ -250,6 +298,30 @@ def upsert_contacts_from_lusha(company_id: int, lusha_contacts: list[dict]) -> t
                             [row[k] for k in cols_list],
                         )
                         inserted += cur.rowcount or 0
+                        # Also mirror into lead_emails if available
+                        if has_email and email:
+                            try:
+                                cur.execute(
+                                    """
+                                    INSERT INTO lead_emails (email, company_id, first_name, last_name, role_title, source)
+                                    VALUES (%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (email) DO UPDATE SET company_id=EXCLUDED.company_id,
+                                      first_name=COALESCE(EXCLUDED.first_name, lead_emails.first_name),
+                                      last_name=COALESCE(EXCLUDED.last_name, lead_emails.last_name),
+                                      role_title=COALESCE(EXCLUDED.role_title, lead_emails.role_title),
+                                      source=EXCLUDED.source
+                                    """,
+                                    (
+                                        email,
+                                        company_id,
+                                        row.get("first_name"),
+                                        row.get("last_name"),
+                                        row.get("title"),
+                                        "lusha",
+                                    ),
+                                )
+                            except Exception:
+                                pass
         return inserted, updated
     except Exception as e:
         print(f"       ↳ Lusha contacts upsert failed: {e}")
@@ -314,7 +386,7 @@ def _combine_pages(pages: list[dict], char_limit: int) -> str:
             continue
         blobs.append(f"[URL] {url}\n[TITLE] {title}\n[BODY]\n{body}\n")
     combined = "\n\n".join(blobs)
-    print('combined', combined)
+    # Debug print can be noisy; keep minimal
     if len(combined) > char_limit:
         combined = combined[:char_limit] + "\n\n[TRUNCATED]"
     return combined
@@ -811,13 +883,13 @@ async def node_build_chunks(state: EnrichmentState) -> EnrichmentState:
         return state
     chunks = _make_corpus_chunks(state["extracted_pages"], EXTRACT_CORPUS_CHAR_LIMIT)
     print(f"       ↳ {len(state['extracted_pages'])} pages -> {len(chunks)} chunks for extraction")
+    # Persist merged corpus for transparency/audit
     try:
-        full_combined = "\n\n".join(chunks)
-        print("===== BEGIN FULL COMBINED CORPUS =====")
-        print(full_combined)
-        print("===== END FULL COMBINED CORPUS =====")
+        if PERSIST_CRAWL_CORPUS:
+            full_combined = "\n\n".join(chunks)
+            _persist_corpus(state.get("company_id"), full_combined, len(state.get("extracted_pages") or []), source="tavily")
     except Exception as _log_exc:
-        print(f"       ↳ Failed to log full combined corpus: {_log_exc}")
+        print(f"       ↳ Failed to persist combined corpus: {_log_exc}")
     state["chunks"] = chunks
     return state
 
@@ -1031,6 +1103,19 @@ try:
 except Exception as e:
     print(f"enrichment graph diagram generation skipped: {e}")
 
+def _normalize_company_name(name: str) -> list[str]:
+    n = (name or "").lower()
+    # Replace & with 'and', remove punctuation
+    n = n.replace("&", " and ")
+    n = re.sub(r"[^a-z0-9\s-]", " ", n)
+    parts = [p for p in re.split(r"\s+", n) if p]
+    # Remove common suffixes
+    SUFFIXES = {"pte", "pte.", "ltd", "ltd.", "inc", "inc.", "co", "co.", "company", "corp", "corp.", "llc", "plc", "limited", "holdings", "group", "singapore"}
+    core = [p for p in parts if p not in SUFFIXES]
+    # Keep first 2-3 tokens for matching
+    return core[:3] or parts[:2]
+
+
 def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> list[str]:
 
     print(f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}' and UEN '{uen}'")
@@ -1050,11 +1135,17 @@ def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> lis
         hits = [results]
 
     # Filter URLs to those containing the core company name (first two words)
-    words = [w.strip('.,') for w in company_name.lower().split()]
-    core = words[:2]
+    core = _normalize_company_name(company_name)
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
     filtered_urls = []
+    AGGREGATORS = {
+        'linkedin.com','facebook.com','twitter.com','x.com','instagram.com','youtube.com','tiktok.com',
+        'glassdoor.com','indeed.com','jobsdb.com','jobstreet.com','mycareersfuture.gov.sg',
+        'wikipedia.org','crunchbase.com','bloomberg.com','reuters.com','medium.com',
+        'shopify.com','lazada.sg','shopee.sg','shopee.com','amazon.com','ebay.com','alibaba.com',
+        'google.com','maps.google.com','goo.gl'
+    }
     for h in hits:
         url = h.get("url") if isinstance(h, dict) else None
         print("       ↳ URL:", url)
@@ -1066,13 +1157,27 @@ def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> lis
             netloc_stripped = netloc[4:]
         else:
             netloc_stripped = netloc
+        # Skip obvious aggregators/marketplaces/social
+        apex = ".".join(netloc_stripped.split('.')[-2:]) if '.' in netloc_stripped else netloc_stripped
+        if apex in AGGREGATORS:
+            continue
         # match core company name in domain only (or first word)
         domain_label = netloc_stripped.split('.')[0]
         if (name_nospace in domain_label.replace("-", "") or
             name_hyphen in netloc_stripped or
             core[0] in domain_label):
             filtered_urls.append(url)
+    # Rank: prefer .sg TLD, then shorter apex domains, then https
+    def _rank(u: str) -> tuple:
+        p = urlparse(u)
+        host = p.netloc.lower()
+        tld_sg = host.endswith('.sg')
+        # prefer apex (fewer labels)
+        labels = host.split('.')
+        return (0 if tld_sg else 1, len(labels), 0 if p.scheme == 'https' else 1, u)
+
     if filtered_urls:
+        filtered_urls = sorted(set(filtered_urls), key=_rank)
         print(f"       ↳ Filtered URLs: {filtered_urls}")
         return filtered_urls
     print("       ↳ No matching URLs found.")
@@ -1235,8 +1340,29 @@ def verify_emails(emails: list[str]) -> list[dict]:
     """
     print(f"    🔒 ZeroBounce Email Verification for {emails}")
     results: list[dict] = []
+    if not emails:
+        return results
+    conn = None
+    try:
+        conn = get_db_connection()
+        _ensure_email_cache_table(conn)
+        conn.commit()
+    except Exception:
+        pass
     for e in emails:
         try:
+            # In-memory cache
+            if e in ZB_CACHE:
+                results.append(ZB_CACHE[e])
+                continue
+            # DB cache
+            cached = _cache_get(conn, e) if conn else None
+            if cached:
+                ZB_CACHE[e] = cached
+                results.append(cached)
+                continue
+            # Throttle to respect credits (simple delay)
+            time.sleep(0.75)
             resp = requests.get(
                 "https://api.zerobounce.net/v2/validate",
                 params={
@@ -1249,18 +1375,82 @@ def verify_emails(emails: list[str]) -> list[dict]:
             data = resp.json()
             status = data.get("status", "unknown")
             confidence = float(data.get("confidence", 0.0))
-            print(f"       ✅ ZeroBounce result for {e}: status={status}, confidence={confidence}, raw={data}")
+            rec = {"email": e, "status": status, "confidence": confidence, "source": "zerobounce"}
+            if conn:
+                _cache_set(conn, e, status, confidence)
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+            ZB_CACHE[e] = rec
+            print(f"       ✅ ZeroBounce result for {e}: status={status}, confidence={confidence}")
         except Exception as exc:
             print(f"       ⚠️ ZeroBounce API error for {e}: {exc}")
             status = "unknown"
             confidence = 0.0
-        results.append({
-            "email": e,
-            "status": status,
-            "confidence": confidence,
-            "source": "zerobounce"
-        })
+            results.append({
+                "email": e,
+                "status": status,
+                "confidence": confidence,
+                "source": "zerobounce"
+            })
     return results
+
+
+def _persist_corpus(company_id: Optional[int], corpus: str, page_count: int, source: str = "tavily") -> None:
+    if not company_id or not corpus:
+        return
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_corpus (
+                      id BIGSERIAL PRIMARY KEY,
+                      company_id BIGINT NOT NULL,
+                      page_count INT,
+                      source TEXT,
+                      corpus TEXT,
+                      created_at TIMESTAMPTZ DEFAULT now()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO crawl_corpus (company_id, page_count, source, corpus)
+                    VALUES (%s,%s,%s,%s)
+                    """,
+                    (company_id, page_count, source, corpus)
+                )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _normalize_phone_list(values: list[str]) -> list[str]:
+    out: list[str] = []
+    for v in values or []:
+        s = (v or "").strip()
+        if not s:
+            continue
+        # Keep leading + and digits only
+        if s.startswith('+'):
+            num = '+' + ''.join(ch for ch in s if ch.isdigit())
+        else:
+            digits = ''.join(ch for ch in s if ch.isdigit())
+            # Heuristic: 8 digits -> assume Singapore local, prefix +65
+            if len(digits) == 8:
+                num = '+65' + digits
+            elif len(digits) >= 9:
+                num = '+' + digits
+            else:
+                num = digits
+        if num and num not in out:
+            out.append(num)
+    return out
 
 
 def store_enrichment(company_id: int, domain: str, data: dict):
@@ -1268,6 +1458,13 @@ def store_enrichment(company_id: int, domain: str, data: dict):
     conn = get_db_connection()
     embedding = get_embedding(data.get("about_text", "") or "")
     verification = verify_emails(data.get("public_emails") or [])
+
+    # Normalize domain (apex, lowercase) and phone list
+    try:
+        apex = urlparse(domain).netloc.lower() or domain.lower()
+    except Exception:
+        apex = (domain or "").lower()
+    phones_norm = _normalize_phone_list(data.get("phone_number") or [])
 
     with conn:
         with conn.cursor() as cur:
@@ -1300,11 +1497,11 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                 WHERE company_id=%s
                 """,
                 (
-                    domain,
+                    apex,
                     data.get("linkedin_url"),
                     (data.get("tech_stack") if isinstance(data.get("tech_stack"), list) else [data.get("tech_stack")] if data.get("tech_stack") else None),
                     (data.get("public_emails") if isinstance(data.get("public_emails"), list) else [data.get("public_emails")] if data.get("public_emails") else None),
-                    (data.get("phone_number") if isinstance(data.get("phone_number"), list) else [data.get("phone_number")] if data.get("phone_number") else None),
+                    phones_norm,
                     data.get("hq_city"),
                     data.get("hq_country"),
                     company_id
@@ -1331,6 +1528,25 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                         contact_source
                     )
                 )
+                # Also write to lead_emails if table exists
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                        VALUES (%s,%s,%s,%s,%s, now())
+                        ON CONFLICT (email) DO UPDATE SET
+                          company_id=EXCLUDED.company_id,
+                          verification_status=EXCLUDED.verification_status,
+                          smtp_confidence=EXCLUDED.smtp_confidence,
+                          source=EXCLUDED.source,
+                          last_verified_at=now()
+                        """,
+                        (
+                            ver["email"], company_id, ver.get("status"), ver.get("confidence"), contact_source
+                        )
+                    )
+                except Exception:
+                    pass
             print("       ↳ contacts inserted")
 
     conn.close()
@@ -1351,6 +1567,33 @@ async def enrich_company(company_id: int, company_name: str):
         # Store in summaries table
         conn = psycopg2.connect(dsn=POSTGRES_DSN)
         with conn, conn.cursor() as cur:
+            # Optional per-page persistence (for auditability)
+            try:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS crawl_pages (
+                      id BIGSERIAL PRIMARY KEY,
+                      company_id BIGINT NOT NULL,
+                      url TEXT NOT NULL,
+                      title TEXT,
+                      raw_html TEXT,
+                      fetched_at TIMESTAMPTZ DEFAULT now()
+                    );
+                    """
+                )
+                # If crawl_site exposes page html, persist first-page synopsis if present
+                pages = (summary or {}).get("pages") or []
+                for p in pages[:CRAWLER_MAX_PAGES]:
+                    cur.execute(
+                        """
+                        INSERT INTO crawl_pages (company_id, url, title, raw_html)
+                        VALUES (%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (company_id, p.get("url"), p.get("title"), p.get("html") or p.get("raw_content"))
+                    )
+            except Exception:
+                pass
             cur.execute("""
                 INSERT INTO summaries (company_id, url, title, description, content_summary, key_pages, signals, rule_score, rule_band, shortlist, crawl_metadata)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -1395,7 +1638,7 @@ async def enrich_company(company_id: int, company_name: str):
             return city, country
 
         hq_city, hq_country = guess_city_country(signals, url)
-        website_domain = url.split("/")[2] if url.startswith("http") else url
+        website_domain = urlparse(url).netloc.lower() if url.startswith("http") else (url or "").lower()
         email = public_emails[0] if public_emails else None
         phones = (signals.get("contact") or {}).get("phones", [])
         phone_number = phones[0] if phones else None

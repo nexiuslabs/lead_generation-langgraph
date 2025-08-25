@@ -1,10 +1,13 @@
 # app/main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from langserve import add_routes
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.pre_sdr_graph import build_graph
+from src.database import get_pg_pool
+import csv
+from io import StringIO
 
 app = FastAPI(title="Pre-SDR LangGraph Server")
 
@@ -72,3 +75,56 @@ add_routes(app, ui_adapter, path="/agent")
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# --- Lightweight tenant middleware (optional header-based) ---
+@app.middleware("http")
+async def tenant_middleware(request: Request, call_next):
+    # Extract tenant_id from header (e.g., set by SSO/edge); no validation here
+    tenant_id = request.headers.get("X-Tenant-ID") or None
+    request.state.tenant_id = tenant_id
+    return await call_next(request)
+
+
+# --- Export endpoints (JSON/CSV) ---
+@app.get("/export/latest_scores.json")
+async def export_latest_scores_json(limit: int = 200):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
+                   s.score, s.bucket, s.rationale
+            FROM companies c
+            JOIN lead_scores s ON s.company_id = c.company_id
+            ORDER BY s.score DESC NULLS LAST
+            LIMIT $1
+            """,
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
+@app.get("/export/latest_scores.csv")
+async def export_latest_scores_csv(limit: int = 200):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
+                   s.score, s.bucket, s.rationale
+            FROM companies c
+            JOIN lead_scores s ON s.company_id = c.company_id
+            ORDER BY s.score DESC NULLS LAST
+            LIMIT $1
+            """,
+            limit,
+        )
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else [
+        "company_id","name","website_domain","industry_norm","employees_est","score","bucket","rationale"
+    ])
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(dict(r))
+    return Response(content=buf.getvalue(), media_type="text/csv")

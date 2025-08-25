@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from src.database import get_pg_pool
 from src.enrichment import enrich_company_with_tavily
+from src.lead_scoring import lead_scoring_agent
 from typing import Optional
 import re
 
@@ -330,14 +331,21 @@ async def _ensure_company_row(pool, name: str) -> int:
 
 async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 20) -> List[Dict[str, Any]]:
     """
-    Pulls candidates from public.companies using only existing columns
-    and aliases company_id -> id for downstream compatibility.
+    Pull candidates from companies using basic ICP filters:
+    - industry (industry_norm ILIKE)
+    - employees_min/max (employees_est range)
+    - geos (hq_country/hq_city ILIKE any)
+    Falls back gracefully if filters are missing.
     """
-    industry = (icp or {}).get("industry")
+    icp = icp or {}
+    industry = icp.get("industry")
     if not industry:
-        inds = (icp or {}).get("industries") or []
+        inds = icp.get("industries") or []
         if isinstance(inds, list) and inds:
             industry = inds[0]
+    emp_min = icp.get("employees_min")
+    emp_max = icp.get("employees_max")
+    geos = icp.get("geos") or []
 
     base_select = f"""
         SELECT
@@ -347,16 +355,43 @@ async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 20) -> Lis
             c.industry_norm AS industry,
             c.employees_est AS employee_count,
             c.company_size,
+            c.hq_city,
+            c.hq_country,
             c.linkedin_url
         FROM public.{COMPANY_TABLE} c
     """
 
-    where_clause = ""
+    clauses: List[str] = []
     params: List[Any] = []
-    if industry:
-        where_clause = "WHERE c.industry_norm ILIKE $1"
-        params.append(f"%{industry}%")
 
+    if industry:
+        clauses.append(f"c.industry_norm ILIKE ${len(params)+1}")
+        params.append(f"%{industry}%")
+    if isinstance(emp_min, int):
+        clauses.append(f"c.employees_est >= ${len(params)+1}")
+        params.append(emp_min)
+    if isinstance(emp_max, int):
+        clauses.append(f"c.employees_est <= ${len(params)+1}")
+        params.append(emp_max)
+    if isinstance(geos, list) and geos:
+        # Build an OR group for geos across hq_country/hq_city
+        geo_like_params = []
+        geo_subclauses = []
+        for g in geos:
+            if not isinstance(g, str) or not g.strip():
+                continue
+            like_val = f"%{g.strip()}%"
+            # country match
+            geo_subclauses.append(f"c.hq_country ILIKE ${len(params)+len(geo_like_params)+1}")
+            geo_like_params.append(like_val)
+            # city match
+            geo_subclauses.append(f"c.hq_city ILIKE ${len(params)+len(geo_like_params)+1}")
+            geo_like_params.append(like_val)
+        if geo_subclauses:
+            clauses.append("(" + " OR ".join(geo_subclauses) + ")")
+            params.extend(geo_like_params)
+
+    where_clause = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     order_by = "ORDER BY c.employees_est DESC NULLS LAST, c.name ASC"
 
     sql = f"""
@@ -486,6 +521,24 @@ async def enrich_node(state: GraphState) -> GraphState:
         state.get("messages") or [],
         [AIMessage(content=f"Enrichment complete for {len(results)} companies.")],
     )
+    # Trigger lead scoring pipeline and persist scores for UI consumption
+    try:
+        ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
+        if ids:
+            scoring_initial_state = {
+                "candidate_ids": ids,
+                "lead_features": [],
+                "lead_scores": [],
+                "icp_payload": {
+                    "employee_range": {
+                        "min": (state.get("icp") or {}).get("employees_min"),
+                        "max": (state.get("icp") or {}).get("employees_max"),
+                    }
+                },
+            }
+            await lead_scoring_agent.ainvoke(scoring_initial_state)
+    except Exception as _score_exc:
+        logger.warning("lead scoring failed: %s", _score_exc)
     return state
 
 def _fmt_table(rows: List[Dict[str, Any]]) -> str:
@@ -554,11 +607,6 @@ def router(state: GraphState) -> str:
     msgs = state.get("messages") or []
     icp = state.get("icp") or {}
 
-    # 1) Always pause if the assistant was the last speaker
-    if _last_is_ai(msgs):
-        logger.info("router -> end (last speaker was assistant)")
-        return "end"
-
     text = _last_user_text(state).lower()
 
     # 2) Fast-path: user said confirm -> proceed to candidates (allow light ICP)
@@ -585,7 +633,7 @@ def router(state: GraphState) -> str:
         logger.info("router -> icp (need more ICP)")
         return "icp"
 
-    # 6) Pipeline progression
+    # 6) Pipeline progression (allow auto-scoring even if assistant spoke last)
     has_candidates = bool(state.get("candidates"))
     has_results = bool(state.get("results"))
     has_scored = bool(state.get("scored"))
@@ -596,6 +644,11 @@ def router(state: GraphState) -> str:
     if has_results and not has_scored:
         logger.info("router -> score (have enrichment, no scores)")
         return "score"
+
+    # 6b) If no pending work, pause when assistant was last speaker
+    if _last_is_ai(msgs):
+        logger.info("router -> end (no pending work; assistant last)")
+        return "end"
 
     # 7) Default
     logger.info("router -> icp (default)")

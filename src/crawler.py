@@ -195,9 +195,15 @@ async def crawl_site(url: str, max_pages: int = MAX_PAGES) -> Dict[str, Any]:
                 if await ROBOTS.allowed(client, u): allowed.append(u)
             except Exception:
                 continue
-        pages = await asyncio.gather(*[_fetch(client, u) for u in allowed], return_exceptions=True)
+        # Respect basic rate limiting: fetch sequentially with a small delay
+        pages: List[Tuple[str, str]] = []
+        for u in allowed:
+            try:
+                await asyncio.sleep(0.4)
+                pages.append(await _fetch(client, u))
+            except Exception:
+                continue
         for res in pages:
-            if isinstance(res, Exception): continue
             _, h = res
             s2 = _extract_signals(h, base)
             for k in ["value_props","products_services","pricing","languages"]:

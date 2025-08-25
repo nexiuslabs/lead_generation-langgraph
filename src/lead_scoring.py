@@ -2,9 +2,9 @@ from typing import TypedDict, List, Dict, Any
 import hashlib
 import json
 from langgraph.graph import StateGraph
-from database import get_pg_pool
+from src.database import get_pg_pool
 from sklearn.linear_model import LogisticRegression
-from openai_client import generate_rationale
+from src.openai_client import generate_rationale
 
 # Define state for lead scoring
 class LeadScoringState(TypedDict):

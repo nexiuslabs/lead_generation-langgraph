@@ -67,3 +67,6 @@ LUSHA_PREFERRED_TITLES = [t.strip() for t in os.getenv(
     "LUSHA_PREFERRED_TITLES",
     "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal"
 ).split(",") if t.strip()]
+
+# Persist full merged crawl corpus (Tavily) for transparency (dev default off)
+PERSIST_CRAWL_CORPUS = os.getenv("PERSIST_CRAWL_CORPUS", "false").lower() in ("1","true","yes","on")

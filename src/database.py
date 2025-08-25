@@ -1,4 +1,5 @@
 import asyncpg
+import psycopg2
 from src.settings import POSTGRES_DSN
 
 _pool = None
@@ -15,3 +16,8 @@ async def get_pg_pool():
             init=lambda conn: conn.execute("SET search_path TO public;")
         )
     return _pool
+
+
+def get_conn():
+    """Synchronous psycopg2 connection for code that expects a blocking conn."""
+    return psycopg2.connect(dsn=POSTGRES_DSN)
