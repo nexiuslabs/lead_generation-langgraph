@@ -1,23 +1,30 @@
 from __future__ import annotations
-from typing import TypedDict, List, Dict, Any
-import os, asyncio, logging, inspect
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langgraph.graph.message import add_messages
+
+import asyncio
+import inspect
+import logging
+import os
+import re
+from typing import Any, Dict, List, Optional, TypedDict
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
+
 from src.database import get_pg_pool
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
-from typing import Optional
-import re
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
-_level = os.getenv("LOG_LEVEL","INFO").upper()
+_level = os.getenv("LOG_LEVEL", "INFO").upper()
 if not logger.handlers:
     h = logging.StreamHandler()
-    fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
+    fmt = logging.Formatter(
+        "[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S"
+    )
     h.setFormatter(fmt)
     logger.addHandler(h)
 logger.setLevel(_level)
@@ -26,43 +33,53 @@ logger.setLevel(_level)
 COMPANY_TABLE = os.getenv("COMPANY_TABLE", "companies")
 LEAD_SCORES_TABLE = os.getenv("LEAD_SCORES_TABLE", "lead_scores")
 
+
 class PreSDRState(TypedDict, total=False):
     messages: List[BaseMessage]
     icp: Dict[str, Any]
     candidates: List[Dict[str, Any]]
     results: List[Dict[str, Any]]
 
+
 def _last_text(msgs) -> str:
     if not msgs:
         return ""
     m = msgs[-1]
     if isinstance(m, BaseMessage):
-        return (m.content or "")
+        return m.content or ""
     if isinstance(m, dict):
-        return (m.get("content") or "")
+        return m.get("content") or ""
     return str(m)
+
 
 def _log_state(prefix: str, state: Dict[str, Any]):
     prev = _last_text(state.get("messages"))
     logger.info("%s last='%s' keys=%s", prefix, prev[:120], list(state.keys()))
 
+
 def log_node(name: str):
     def deco(fn):
         if inspect.iscoroutinefunction(fn):
+
             async def aw(state, *a, **kw):
                 _log_state(f"▶ {name}", state)
                 out = await fn(state, *a, **kw)
                 logger.info("✔ %s → keys=%s", name, list(out.keys()))
                 return out
+
             return aw
         else:
+
             def sw(state, *a, **kw):
                 _log_state(f"▶ {name}", state)
                 out = fn(state, *a, **kw)
                 logger.info("✔ %s → keys=%s", name, list(out.keys()))
                 return out
+
             return sw
+
     return deco
+
 
 def _last_is_ai(messages) -> bool:
     if not messages:
@@ -75,6 +92,7 @@ def _last_is_ai(messages) -> bool:
         return role in ("ai", "assistant")
     return False
 
+
 @log_node("icp")
 def icp_discovery(state: PreSDRState) -> PreSDRState:
     # If the user already confirmed, don't re-ask; let routing advance.
@@ -86,11 +104,15 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
     text = _last_text(state.get("messages")).lower()
 
     if "industry" not in icp:
-        state["messages"].append(AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)"))
+        state["messages"].append(
+            AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)")
+        )
         icp["industry"] = True
         return state
     if "employees" not in icp:
-        state["messages"].append(AIMessage("Typical company size? (e.g., 10–200 employees)"))
+        state["messages"].append(
+            AIMessage("Typical company size? (e.g., 10–200 employees)")
+        )
         icp["employees"] = True
         return state
     if "geo" not in icp:
@@ -98,17 +120,27 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
         icp["geo"] = True
         return state
     if "signals" not in icp:
-        state["messages"].append(AIMessage("Buying signals? (hiring, stack, certifications)"))
+        state["messages"].append(
+            AIMessage("Buying signals? (hiring, stack, certifications)")
+        )
         icp["signals"] = True
         return state
 
-    state["messages"].append(AIMessage("Great. Reply **confirm** to save, or tell me what to change."))
+    state["messages"].append(
+        AIMessage("Great. Reply **confirm** to save, or tell me what to change.")
+    )
     return state
+
 
 @log_node("confirm")
 def icp_confirm(state: PreSDRState) -> PreSDRState:
-    state["messages"].append(AIMessage("✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**."))
+    state["messages"].append(
+        AIMessage(
+            "✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**."
+        )
+    )
     return state
+
 
 @log_node("candidates")
 def parse_candidates(state: PreSDRState) -> PreSDRState:
@@ -116,10 +148,15 @@ def parse_candidates(state: PreSDRState) -> PreSDRState:
     names = [n.strip() for n in last.split(",") if 1 < len(n.strip()) < 120]
     if names:
         state["candidates"] = [{"name": n} for n in names]
-        state["messages"].append(AIMessage(f"Got {len(names)} companies. Type **run enrichment** to start."))
+        state["messages"].append(
+            AIMessage(f"Got {len(names)} companies. Type **run enrichment** to start.")
+        )
     else:
-        state["messages"].append(AIMessage("Please paste a few company names (comma-separated)."))
+        state["messages"].append(
+            AIMessage("Please paste a few company names (comma-separated).")
+        )
     return state
+
 
 @log_node("enrich")
 async def run_enrichment(state: PreSDRState) -> PreSDRState:
@@ -127,8 +164,11 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
     await asyncio.sleep(0.01)
     cands = state.get("candidates") or []
     state["results"] = [{"name": c["name"], "score": 0.7} for c in cands]
-    state["messages"].append(AIMessage(f"Enrichment complete for {len(cands)} companies."))
+    state["messages"].append(
+        AIMessage(f"Enrichment complete for {len(cands)} companies.")
+    )
     return state
+
 
 def route(state: PreSDRState) -> str:
     text = _last_text(state.get("messages")).lower()
@@ -143,6 +183,7 @@ def route(state: PreSDRState) -> str:
     logger.info("↪ router -> %s", dest)
     return dest
 
+
 def build_presdr_graph():
     g = StateGraph(PreSDRState)
     g.add_node("icp", icp_discovery)
@@ -153,27 +194,41 @@ def build_presdr_graph():
     g.set_entry_point("icp")
 
     # IMPORTANT: these keys must match what route() returns
-    g.add_conditional_edges("icp", route, {
-        "confirm": "confirm",
-        "enrich": "enrich",
-        "candidates": "candidates",
-        "icp": "icp",
-    })
-    g.add_conditional_edges("confirm", route, {
-        "enrich": "enrich",
-        "candidates": "candidates",
-        "icp": "icp",
-    })
-    g.add_conditional_edges("candidates", route, {
-        "enrich": "enrich",
-        "icp": "icp",
-    })
+    g.add_conditional_edges(
+        "icp",
+        route,
+        {
+            "confirm": "confirm",
+            "enrich": "enrich",
+            "candidates": "candidates",
+            "icp": "icp",
+        },
+    )
+    g.add_conditional_edges(
+        "confirm",
+        route,
+        {
+            "enrich": "enrich",
+            "candidates": "candidates",
+            "icp": "icp",
+        },
+    )
+    g.add_conditional_edges(
+        "candidates",
+        route,
+        {
+            "enrich": "enrich",
+            "icp": "icp",
+        },
+    )
     g.add_edge("enrich", END)
     return g.compile()
+
 
 # ------------------------------
 # New LLM-driven Pre-SDR graph (dynamic Q&A, structured extraction)
 # ------------------------------
+
 
 class GraphState(TypedDict):
     messages: List[BaseMessage]
@@ -185,6 +240,7 @@ class GraphState(TypedDict):
     ask_counts: Dict[str, int]  # how many times we asked each slot
     scored: List[Dict[str, Any]]
 
+
 # ------------------------------
 # LLMs
 # ------------------------------
@@ -195,6 +251,7 @@ EXTRACT_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 # ------------------------------
 # Helpers
 # ------------------------------
+
 
 def _to_text(content: Any) -> str:
     """Coerce Chat UI content (string OR list of blocks) into a plain string."""
@@ -217,29 +274,49 @@ def _to_text(content: Any) -> str:
         return "\n".join(p.strip() for p in parts if p)
     return str(content)
 
+
 def _last_user_text(state: GraphState) -> str:
     for msg in reversed(state.get("messages") or []):
         if isinstance(msg, HumanMessage):
             return _to_text(msg.content).strip()
     return _to_text((state.get("messages") or [AIMessage("")])[-1].content).strip()
 
+
 # None/skip/any detector for buying signals
 NEG_NONE = {
-    "none","no","n/a","na","skip","any","nope","not important",
-    "no preference","doesn't matter","dont care","don't care",
-    "anything","no specific","no specific signals","no signal","no signals"
+    "none",
+    "no",
+    "n/a",
+    "na",
+    "skip",
+    "any",
+    "nope",
+    "not important",
+    "no preference",
+    "doesn't matter",
+    "dont care",
+    "don't care",
+    "anything",
+    "no specific",
+    "no specific signals",
+    "no signal",
+    "no signals",
 }
+
+
 def _says_none(text: str) -> bool:
     t = text.strip().lower()
     return any(p in t for p in NEG_NONE)
+
 
 def _user_just_confirmed(state: dict) -> bool:
     msgs = state.get("messages") or []
     for m in reversed(msgs):
         if isinstance(m, HumanMessage):
             txt = (getattr(m, "content", "") or "").strip().lower()
-            return txt in {"confirm","yes","y","ok","okay","looks good","lgtm"}
+            return txt in {"confirm", "yes", "y", "ok", "okay", "looks good", "lgtm"}
     return False
+
 
 def _icp_complete(icp: Dict[str, Any]) -> bool:
     has_industries = bool(icp.get("industries"))
@@ -249,14 +326,17 @@ def _icp_complete(icp: Dict[str, Any]) -> bool:
     # Require industries + employees + geos, and either explicit signals or explicit skip (signals_done)
     return has_industries and has_employees and has_geos and signals_done
 
+
 def _parse_company_list(text: str) -> List[str]:
     raw = re.split(r"[,|\n]+", text)
     names = [n.strip() for n in raw if n.strip()]
     return [n for n in names if n.lower() not in {"start", "confirm", "run enrichment"}]
 
+
 # ------------------------------
 # Structured extraction
 # ------------------------------
+
 
 class ICPUpdate(BaseModel):
     industries: List[str] = Field(default_factory=list)
@@ -271,28 +351,36 @@ class ICPUpdate(BaseModel):
         description="True if user said skip/none/any for buying signals",
     )
 
-EXTRACT_SYS = SystemMessage(content=(
-    "You extract ICP details from user messages.\n"
-    "Return JSON ONLY with industries (list[str]), employees_min/max (ints if present), "
-    "geos (list[str]), signals (list[str]), confirm (bool), pasted_companies (list[str]), "
-    "and signals_done (bool).\n"
-    "If the user indicates no preference for buying signals (e.g., 'none', 'any', 'skip'), "
-    "set signals_done=true and signals=[]. If the user pasted company names (comma or newline separated), "
-    "put them into pasted_companies."
-))
+
+EXTRACT_SYS = SystemMessage(
+    content=(
+        "You extract ICP details from user messages.\n"
+        "Return JSON ONLY with industries (list[str]), employees_min/max (ints if present), "
+        "geos (list[str]), signals (list[str]), confirm (bool), pasted_companies (list[str]), "
+        "and signals_done (bool).\n"
+        "If the user indicates no preference for buying signals (e.g., 'none', 'any', 'skip'), "
+        "set signals_done=true and signals=[]. If the user pasted company names (comma or newline separated), "
+        "put them into pasted_companies."
+    )
+)
+
 
 async def extract_update_from_text(text: str) -> ICPUpdate:
     structured = EXTRACT_LLM.with_structured_output(ICPUpdate)
     return await structured.ainvoke([EXTRACT_SYS, HumanMessage(text)])
 
+
 # ------------------------------
 # Dynamic question generation
 # ------------------------------
 
-QUESTION_SYS = SystemMessage(content=(
-    "You are an expert SDR assistant. Ask exactly ONE short question at a time to help define an Ideal Customer Profile (ICP). "
-    "Keep it brief, concrete, and practical. If ICP looks complete, ask the user to confirm or adjust."
-))
+QUESTION_SYS = SystemMessage(
+    content=(
+        "You are an expert SDR assistant. Ask exactly ONE short question at a time to help define an Ideal Customer Profile (ICP). "
+        "Keep it brief, concrete, and practical. If ICP looks complete, ask the user to confirm or adjust."
+    )
+)
+
 
 def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
     order: List[str] = []
@@ -306,7 +394,10 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
         order.append("signals")
 
     if not order:
-        return ("Does this ICP look right? Reply **confirm** to save, or tell me what to change.", "confirm")
+        return (
+            "Does this ICP look right? Reply **confirm** to save, or tell me what to change.",
+            "confirm",
+        )
 
     focus = order[0]
     prompts = {
@@ -317,19 +408,26 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
     }
     return (prompts[focus], focus)
 
+
 # ------------------------------
 # Persistence helpers
 # ------------------------------
+
 
 async def _ensure_company_row(pool, name: str) -> int:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id FROM companies WHERE name = $1", name)
         if row:
             return row["id"]
-        row = await conn.fetchrow("INSERT INTO companies(name) VALUES ($1) RETURNING id", name)
+        row = await conn.fetchrow(
+            "INSERT INTO companies(name) VALUES ($1) RETURNING id", name
+        )
         return row["id"]
 
-async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 20) -> List[Dict[str, Any]]:
+
+async def _default_candidates(
+    pool, icp: Dict[str, Any], limit: int = 20
+) -> List[Dict[str, Any]]:
     """
     Pull candidates from companies using basic ICP filters:
     - industry (industry_norm ILIKE)
@@ -382,10 +480,14 @@ async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 20) -> Lis
                 continue
             like_val = f"%{g.strip()}%"
             # country match
-            geo_subclauses.append(f"c.hq_country ILIKE ${len(params)+len(geo_like_params)+1}")
+            geo_subclauses.append(
+                f"c.hq_country ILIKE ${len(params)+len(geo_like_params)+1}"
+            )
             geo_like_params.append(like_val)
             # city match
-            geo_subclauses.append(f"c.hq_city ILIKE ${len(params)+len(geo_like_params)+1}")
+            geo_subclauses.append(
+                f"c.hq_city ILIKE ${len(params)+len(geo_like_params)+1}"
+            )
             geo_like_params.append(like_val)
         if geo_subclauses:
             clauses.append("(" + " OR ".join(geo_subclauses) + ")")
@@ -412,9 +514,11 @@ async def _default_candidates(pool, icp: Dict[str, Any], limit: int = 20) -> Lis
         out.append(d)
     return out
 
+
 # ------------------------------
 # LangGraph nodes
 # ------------------------------
+
 
 async def icp_node(state: GraphState) -> GraphState:
     # If the user already confirmed, don't speak again; allow router to branch to confirm.
@@ -431,7 +535,9 @@ async def icp_node(state: GraphState) -> GraphState:
 
     # 2) Merge extractor output into ICP
     if update.industries:
-        icp["industries"] = sorted(set([s.strip() for s in update.industries if s.strip()]))
+        icp["industries"] = sorted(
+            set([s.strip() for s in update.industries if s.strip()])
+        )
     if update.employees_min is not None:
         icp["employees_min"] = update.employees_min
     if update.employees_max is not None:
@@ -451,12 +557,20 @@ async def icp_node(state: GraphState) -> GraphState:
     # If user pasted companies, preserve previous behavior
     if update.pasted_companies:
         state["candidates"] = [{"name": n} for n in update.pasted_companies]
-        new_msgs.append(AIMessage(content=f"Got {len(update.pasted_companies)} companies. Type **run enrichment** to start."))
+        new_msgs.append(
+            AIMessage(
+                content=f"Got {len(update.pasted_companies)} companies. Type **run enrichment** to start."
+            )
+        )
 
     # 4) Back-off: if we already asked about 'signals' once and still don't have them, stop asking
     ask_counts = dict(state.get("ask_counts") or {})
     q, focus = next_icp_question(icp)
-    if focus == "signals" and ask_counts.get("signals", 0) >= 1 and not icp.get("signals"):
+    if (
+        focus == "signals"
+        and ask_counts.get("signals", 0) >= 1
+        and not icp.get("signals")
+    ):
         icp["signals_done"] = True
         q, focus = next_icp_question(icp)
 
@@ -468,6 +582,7 @@ async def icp_node(state: GraphState) -> GraphState:
     state["icp"] = icp
     state["messages"] = add_messages(state.get("messages") or [], new_msgs)
     return state
+
 
 async def candidates_node(state: GraphState) -> GraphState:
     if not state.get("candidates"):
@@ -482,13 +597,19 @@ async def candidates_node(state: GraphState) -> GraphState:
     )
     return state
 
+
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
     state["messages"] = add_messages(
         state.get("messages") or [],
-        [AIMessage(content="✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**.")],
+        [
+            AIMessage(
+                content="✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**."
+            )
+        ],
     )
     return state
+
 
 async def enrich_node(state: GraphState) -> GraphState:
     text = _last_user_text(state)
@@ -501,7 +622,11 @@ async def enrich_node(state: GraphState) -> GraphState:
     if not candidates:
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [AIMessage(content="I need some companies. Paste a list (comma-separated) or say **run enrichment** to use suggestions.")],
+            [
+                AIMessage(
+                    content="I need some companies. Paste a list (comma-separated) or say **run enrichment** to use suggestions."
+                )
+            ],
         )
         return state
 
@@ -541,21 +666,32 @@ async def enrich_node(state: GraphState) -> GraphState:
         logger.warning("lead scoring failed: %s", _score_exc)
     return state
 
+
 def _fmt_table(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No candidates found."
     headers = ["Name", "Domain", "Industry", "Employees", "Score", "Bucket"]
-    md = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"]*len(headers)) + "|"]
+    md = [
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join(["---"] * len(headers)) + "|",
+    ]
     for r in rows:
-        md.append("| " + " | ".join([
-            str(r.get("name", "")),
-            str(r.get("domain", "")),
-            str(r.get("industry", "")),
-            str(r.get("employee_count", "")),
-            str(r.get("lead_score", "")),
-            str(r.get("lead_bucket", "")),
-        ]) + " |")
+        md.append(
+            "| "
+            + " | ".join(
+                [
+                    str(r.get("name", "")),
+                    str(r.get("domain", "")),
+                    str(r.get("industry", "")),
+                    str(r.get("employee_count", "")),
+                    str(r.get("lead_score", "")),
+                    str(r.get("lead_bucket", "")),
+                ]
+            )
+            + " |"
+        )
     return "\n".join(md)
+
 
 async def score_node(state: GraphState) -> GraphState:
     pool = await get_pg_pool()
@@ -599,9 +735,11 @@ async def score_node(state: GraphState) -> GraphState:
     )
     return state
 
+
 # ------------------------------
 # Router
 # ------------------------------
+
 
 def router(state: GraphState) -> str:
     msgs = state.get("messages") or []
@@ -614,26 +752,7 @@ def router(state: GraphState) -> str:
         logger.info("router -> candidates (user confirmed ICP)")
         return "candidates"
 
-    # 3) Fast-path: user requested enrichment
-    if "run enrichment" in text:
-        if state.get("candidates"):
-            logger.info("router -> enrich (user requested enrichment)")
-            return "enrich"
-        else:
-            logger.info("router -> candidates (prepare candidates before enrichment)")
-            return "candidates"
-
-    # 4) If user pasted an explicit company list, jump to candidates
-    if _parse_company_list(text):
-        logger.info("router -> candidates (explicit company list)")
-        return "candidates"
-
-    # 5) If ICP is not complete yet, continue ICP Q&A
-    if not _icp_complete(icp):
-        logger.info("router -> icp (need more ICP)")
-        return "icp"
-
-    # 6) Pipeline progression (allow auto-scoring even if assistant spoke last)
+    # 3) Pipeline progression (allow auto-scoring even if assistant spoke last)
     has_candidates = bool(state.get("candidates"))
     has_results = bool(state.get("results"))
     has_scored = bool(state.get("scored"))
@@ -645,22 +764,43 @@ def router(state: GraphState) -> str:
         logger.info("router -> score (have enrichment, no scores)")
         return "score"
 
-    # 6b) If no pending work, pause when assistant was last speaker
+    # 4) If assistant spoke last and no pending work, wait for user input
     if _last_is_ai(msgs):
-        logger.info("router -> end (no pending work; assistant last)")
+        logger.info("router -> end (assistant last, waiting on user)")
         return "end"
 
-    # 7) Default
+    # 5) Fast-path: user requested enrichment
+    if "run enrichment" in text:
+        if state.get("candidates"):
+            logger.info("router -> enrich (user requested enrichment)")
+            return "enrich"
+        logger.info("router -> candidates (prepare candidates before enrichment)")
+        return "candidates"
+
+    # 6) If user pasted an explicit company list, jump to candidates
+    if _parse_company_list(text):
+        logger.info("router -> candidates (explicit company list)")
+        return "candidates"
+
+    # 7) If ICP is not complete yet, continue ICP Q&A
+    if not _icp_complete(icp):
+        logger.info("router -> icp (need more ICP)")
+        return "icp"
+
+    # 8) Default
     logger.info("router -> icp (default)")
     return "icp"
+
 
 def router_entry(state: GraphState) -> GraphState:
     """No-op node so we can attach conditional edges to a central router hub."""
     return state
 
+
 # ------------------------------
 # Graph builder
 # ------------------------------
+
 
 def build_graph():
     g = StateGraph(GraphState)
@@ -687,5 +827,6 @@ def build_graph():
     for node in ("icp", "candidates", "confirm", "enrich", "score"):
         g.add_edge(node, "router")
     return g.compile()
+
 
 GRAPH = build_graph()
