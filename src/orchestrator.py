@@ -1,4 +1,5 @@
 import asyncio
+import os
 from src.icp import normalize_agent, icp_refresh_agent
 from src.settings import ICP_RULE_NAME
 from src.openai_client import generate_rationale
@@ -122,9 +123,11 @@ async def main():
     norm_result_state = await normalize_agent.ainvoke(norm_initial_state)
 
     # ICP refresh step
+    # Industries: read from env ICP_INDUSTRIES (comma-separated). Default to single 'Technology'.
+    inds_env = os.getenv("ICP_INDUSTRIES", "").strip()
+    industries = [s.strip() for s in inds_env.split(",") if s.strip()] or ["Technology"]
     icp_payload = {
-
-        "industries":      ["Accounting","Technology"],
+        "industries":      industries,
         "employee_range":  { "min": 2,  "max": 100 },
         "incorporation_year": {"min": 2000, "max": 2025}
     }

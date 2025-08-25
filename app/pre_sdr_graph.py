@@ -327,10 +327,56 @@ def _icp_complete(icp: Dict[str, Any]) -> bool:
     return has_industries and has_employees and has_geos and signals_done
 
 
+def _is_company_like(token: str) -> bool:
+    """Heuristic to distinguish company names/domains from industries/geos.
+
+    Rules (conservative):
+    - Domains (contain a dot) => True
+    - Contains company suffix (inc, ltd, corp, llc, pte, plc, gmbh) => True
+    - If multi-word: reject if composed only of geo/common words (e.g., "SG and SEA").
+      Otherwise require at least one capitalized word (proper noun) to reduce false positives.
+    - Single all-lowercase words (e.g., "saas", "fintech") => False
+    - Very short tokens (<= 2) => False
+    """
+    t = (token or "").strip()
+    if not t:
+        return False
+    tl = t.lower()
+    if "." in t:
+        return True
+    # company suffixes
+    suffixes = [" inc", " inc.", " ltd", " corp", " co", " llc", " pte", " plc", " gmbh", " limited", " company"]
+    if any(s in tl for s in suffixes):
+        return True
+    if len(t) <= 2:
+        return False
+    # Reject single all-lowercase words
+    if t.isalpha() and t == t.lower():
+        return False
+    # Multi-word handling
+    if " " in t:
+        words = [w for w in re.split(r"\s+", tl) if w]
+        geo_words = {
+            "sg", "singapore", "sea", "apac", "emea", "global", "us", "usa", "europe",
+            "uk", "india", "na", "latam", "southeast", "asia", "north", "south", "america",
+        }
+        connectors = {"and", "&", "/", "-", "or", "the", "of"}
+        if all((w in geo_words) or (w in connectors) for w in words):
+            return False
+        # Require at least one capitalized word (proper noun) to count as company-like
+        caps = any(part and part[0].isupper() for part in t.split())
+        return caps
+    # Mixed-case single word, likely a proper noun (company)
+    return any(ch.isupper() for ch in t)
+
+
 def _parse_company_list(text: str) -> List[str]:
-    raw = re.split(r"[,|\n]+", text)
-    names = [n.strip() for n in raw if n.strip()]
-    return [n for n in names if n.lower() not in {"start", "confirm", "run enrichment"}]
+    raw = re.split(r"[,|\n]+", text or "")
+    names = [n.strip() for n in raw if n and n.strip()]
+    names = [n for n in names if n.lower() not in {"start", "confirm", "run enrichment"}]
+    # Keep only tokens that look like companies/domains
+    names = [n for n in names if _is_company_like(n)]
+    return names
 
 
 # ------------------------------
@@ -415,14 +461,64 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
 
 
 async def _ensure_company_row(pool, name: str) -> int:
+    """
+    Find an existing company row by name and return its primary key.
+    Supports schemas where the PK column is either `company_id` or `id`.
+    As a last resort, attempts to insert a minimal row and return the new id.
+    """
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id FROM companies WHERE name = $1", name)
-        if row:
-            return row["id"]
+        # 1) Try company_id first (most common in this repo)
         row = await conn.fetchrow(
-            "INSERT INTO companies(name) VALUES ($1) RETURNING id", name
+            "SELECT company_id FROM companies WHERE name = $1",
+            name,
         )
-        return row["id"]
+        if row and "company_id" in row:
+            return int(row["company_id"])  # type: ignore[index]
+
+        # 2) Try id as fallback
+        row = await conn.fetchrow("SELECT id FROM companies WHERE name = $1", name)
+        if row and "id" in row:
+            return int(row["id"])  # type: ignore[index]
+
+        # 3) Insert minimal row; prefer returning company_id if present
+        # Try RETURNING company_id
+        try:
+            row = await conn.fetchrow(
+                "INSERT INTO companies(name) VALUES ($1) RETURNING company_id",
+                name,
+            )
+            if row and "company_id" in row:
+                return int(row["company_id"])  # type: ignore[index]
+        except Exception:
+            pass
+        # Try RETURNING id
+        try:
+            row = await conn.fetchrow(
+                "INSERT INTO companies(name) VALUES ($1) RETURNING id",
+                name,
+            )
+            if row and "id" in row:
+                return int(row["id"])  # type: ignore[index]
+        except Exception:
+            pass
+
+        # 4) As a final fallback (schemas without defaults), synthesize a new company_id
+        #    WARNING: This is best-effort and not concurrency-safe, but unblocks local flows.
+        try:
+            # Determine next id value from max(company_id)
+            row = await conn.fetchrow("SELECT COALESCE(MAX(company_id), 0) + 1 AS nid FROM companies")
+            nid = int(row["nid"]) if row and "nid" in row else None  # type: ignore[index]
+            if nid is not None:
+                await conn.execute(
+                    "INSERT INTO companies(company_id, name) VALUES ($1, $2)",
+                    nid,
+                    name,
+                )
+                return nid
+        except Exception:
+            pass
+
+        raise RuntimeError("Could not create or locate a company row for enrichment")
 
 
 async def _default_candidates(
@@ -436,11 +532,17 @@ async def _default_candidates(
     Falls back gracefully if filters are missing.
     """
     icp = icp or {}
-    industry = icp.get("industry")
-    if not industry:
-        inds = icp.get("industries") or []
-        if isinstance(inds, list) and inds:
-            industry = inds[0]
+    # Normalize industries; accept multiple. Use exact match on industry_norm (case-insensitive).
+    industries_param: List[str] = []
+    # Back-compat: allow single 'industry' or list 'industries'
+    industry_single = icp.get("industry")
+    if isinstance(industry_single, str) and industry_single.strip():
+        industries_param.append(industry_single.strip().lower())
+    inds = icp.get("industries") or []
+    if isinstance(inds, list):
+        industries_param.extend([s.strip().lower() for s in inds if isinstance(s, str) and s.strip()])
+    # Dedupe
+    industries_param = sorted(set(industries_param))
     emp_min = icp.get("employees_min")
     emp_max = icp.get("employees_max")
     geos = icp.get("geos") or []
@@ -462,9 +564,10 @@ async def _default_candidates(
     clauses: List[str] = []
     params: List[Any] = []
 
-    if industry:
-        clauses.append(f"c.industry_norm ILIKE ${len(params)+1}")
-        params.append(f"%{industry}%")
+    if industries_param:
+        # Exact equality against normalized industry names
+        clauses.append(f"LOWER(c.industry_norm) = ANY(${len(params)+1})")
+        params.append(industries_param)
     if isinstance(emp_min, int):
         clauses.append(f"c.employees_est >= ${len(params)+1}")
         params.append(emp_min)
@@ -504,8 +607,28 @@ async def _default_candidates(
     """
     params.append(limit)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
+    async def _run_query(p, q):
+        async with pool.acquire() as _conn:
+            return await _conn.fetch(q, *p)
+
+    # Pass 1: strict (all available filters)
+    rows = await _run_query(params, sql)
+    if not rows:
+        # Pass 2: relax employees + geo filters, but NEVER drop industry if provided
+        r_clauses: List[str] = []
+        r_params: List[Any] = []
+        if industries_param:
+            r_clauses.append(f"LOWER(c.industry_norm) = ANY(${len(r_params)+1})")
+            r_params.append(industries_param)
+        r_where = ("WHERE " + " AND ".join(r_clauses)) if r_clauses else ""
+        r_sql = f"{base_select} {r_where} {order_by} LIMIT ${len(r_params)+1}"
+        r_params.append(limit)
+        rows = await _run_query(r_params, r_sql)
+        if not rows:
+            # Pass 3: only if no industry given, show something to unblock the user
+            if not industries_param:
+                any_sql = f"{base_select} {order_by} LIMIT $1"
+                rows = await _run_query([limit], any_sql)
 
     out: List[Dict[str, Any]] = []
     for r in rows:
@@ -617,14 +740,27 @@ async def enrich_node(state: GraphState) -> GraphState:
         pasted = _parse_company_list(text)
         if pasted:
             state["candidates"] = [{"name": n} for n in pasted]
+        else:
+            # If user requested enrichment without pasting names, use ICP-derived suggestions
+            try:
+                pool = await get_pg_pool()
+                cand = await _default_candidates(pool, state.get("icp") or {}, limit=20)
+                state["candidates"] = cand
+            except Exception as _e:
+                # Fall-through to user prompt below
+                pass
 
     candidates = state.get("candidates") or []
     if not candidates:
+        # Offer clear next steps when no candidates could be found
         state["messages"] = add_messages(
             state.get("messages") or [],
             [
                 AIMessage(
-                    content="I need some companies. Paste a list (comma-separated) or say **run enrichment** to use suggestions."
+                    content=(
+                        "I couldn't find any companies for this ICP. "
+                        "Try relaxing employee/geography filters, or paste a few company names (comma-separated)."
+                    )
                 )
             ],
         )
@@ -747,12 +883,7 @@ def router(state: GraphState) -> str:
 
     text = _last_user_text(state).lower()
 
-    # 2) Fast-path: user said confirm -> proceed to candidates (allow light ICP)
-    if _user_just_confirmed(state):
-        logger.info("router -> candidates (user confirmed ICP)")
-        return "candidates"
-
-    # 3) Pipeline progression (allow auto-scoring even if assistant spoke last)
+    # 1) Pipeline progression (allow auto-scoring even if assistant spoke last)
     has_candidates = bool(state.get("candidates"))
     has_results = bool(state.get("results"))
     has_scored = bool(state.get("scored"))
@@ -764,12 +895,12 @@ def router(state: GraphState) -> str:
         logger.info("router -> score (have enrichment, no scores)")
         return "score"
 
-    # 4) If assistant spoke last and no pending work, wait for user input
+    # 2) If assistant spoke last and no pending work, wait for user input
     if _last_is_ai(msgs):
         logger.info("router -> end (assistant last, waiting on user)")
         return "end"
 
-    # 5) Fast-path: user requested enrichment
+    # 3) Fast-path: user requested enrichment
     if "run enrichment" in text:
         if state.get("candidates"):
             logger.info("router -> enrich (user requested enrichment)")
@@ -777,17 +908,29 @@ def router(state: GraphState) -> str:
         logger.info("router -> candidates (prepare candidates before enrichment)")
         return "candidates"
 
-    # 6) If user pasted an explicit company list, jump to candidates
-    if _parse_company_list(text):
+    # 4) If user pasted an explicit company list, jump to candidates
+    # Avoid misclassifying comma-separated industry/geo lists as companies.
+    pasted = _parse_company_list(text)
+    # Only jump early if at least one looks like a domain or multi-word name
+    if pasted and any(("." in n) or (" " in n) for n in pasted):
         logger.info("router -> candidates (explicit company list)")
         return "candidates"
 
-    # 7) If ICP is not complete yet, continue ICP Q&A
+    # 5) User said confirm: proceed forward once (avoid loops)
+    if _user_just_confirmed(state):
+        # If we already derived candidates, move ahead to enrichment; else collect candidates first.
+        if state.get("candidates"):
+            logger.info("router -> enrich (user confirmed ICP; have candidates)")
+            return "enrich"
+        logger.info("router -> candidates (user confirmed ICP)")
+        return "candidates"
+
+    # 6) If ICP is not complete yet, continue ICP Q&A
     if not _icp_complete(icp):
         logger.info("router -> icp (need more ICP)")
         return "icp"
 
-    # 8) Default
+    # 7) Default
     logger.info("router -> icp (default)")
     return "icp"
 

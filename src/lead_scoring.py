@@ -2,6 +2,7 @@ from typing import TypedDict, List, Dict, Any
 import hashlib
 import json
 from langgraph.graph import StateGraph
+import os
 from src.database import get_pg_pool
 from sklearn.linear_model import LogisticRegression
 from src.openai_client import generate_rationale
@@ -199,4 +200,10 @@ graph.add_edge('assign_buckets', 'generate_rationales')
 graph.add_edge('generate_rationales', 'persist_results')
 
 lead_scoring_agent = graph.compile()
-lead_scoring_agent.get_graph().draw_mermaid_png()
+# Only attempt network rendering of the graph if explicitly enabled
+try:
+    if os.getenv("DRAW_MERMAID", "").lower() in ("1", "true", "yes"):
+        lead_scoring_agent.get_graph().draw_mermaid_png()
+except Exception:
+    # Safe to ignore rendering issues during runtime or tests without network
+    pass
