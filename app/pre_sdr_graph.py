@@ -745,7 +745,7 @@ async def candidates_node(state: GraphState) -> GraphState:
     n = len(state["candidates"]) if state.get("candidates") else 0
     state["messages"] = add_messages(
         state.get("messages") or [],
-        [AIMessage(content=f"Got {n} companies. Type **run enrichment** to start.")],
+        [AIMessage(content=f"Got {n} companies. Started Enrichment. Please wait...")],
     )
     return state
 

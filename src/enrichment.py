@@ -163,6 +163,31 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
         cols = _get_table_columns(conn, "company_enrichment_runs")
         if not cols:
             return
+
+        # Back-compat: some databases have a NOT NULL run_id on this table
+        # that references enrichment_runs(run_id). If the column exists and
+        # caller didn't provide one, create a new enrichment_runs row and use it.
+        if "run_id" in cols and ("run_id" not in fields or fields.get("run_id") is None):
+            try:
+                with conn.cursor() as cur:
+                    # Ensure enrichment_runs table exists (idempotent create)
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS enrichment_runs (
+                          run_id BIGSERIAL PRIMARY KEY,
+                          started_at TIMESTAMPTZ DEFAULT now()
+                        );
+                        """
+                    )
+                    cur.execute(
+                        "INSERT INTO enrichment_runs DEFAULT VALUES RETURNING run_id"
+                    )
+                    rid = cur.fetchone()[0]
+                    fields["run_id"] = rid
+            except Exception:
+                # If we fail to create a run_id, proceed; insert may still work
+                pass
+
         keys = [k for k, v in fields.items() if k in cols and v is not None]
         if not keys:
             return
@@ -2000,63 +2025,6 @@ async def enrich_company(company_id: int, company_name: str):
     # 2) deterministic crawl first
     try:
         summary = await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
-        # Store in summaries table
-        conn = psycopg2.connect(dsn=POSTGRES_DSN)
-        with conn, conn.cursor() as cur:
-            # Optional per-page persistence (for auditability)
-            try:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS crawl_pages (
-                      id BIGSERIAL PRIMARY KEY,
-                      company_id BIGINT NOT NULL,
-                      url TEXT NOT NULL,
-                      title TEXT,
-                      raw_html TEXT,
-                      fetched_at TIMESTAMPTZ DEFAULT now()
-                    );
-                    """
-                )
-                # If crawl_site exposes page html, persist first-page synopsis if present
-                pages = (summary or {}).get("pages") or []
-                for p in pages[:CRAWLER_MAX_PAGES]:
-                    cur.execute(
-                        """
-                        INSERT INTO crawl_pages (company_id, url, title, raw_html)
-                        VALUES (%s,%s,%s,%s)
-                        ON CONFLICT DO NOTHING
-                        """,
-                        (
-                            company_id,
-                            p.get("url"),
-                            p.get("title"),
-                            p.get("html") or p.get("raw_content"),
-                        ),
-                    )
-            except Exception:
-                pass
-            cur.execute(
-                """
-                INSERT INTO summaries (company_id, url, title, description, content_summary, key_pages, signals, rule_score, rule_band, shortlist, crawl_metadata)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
-            """,
-                (
-                    company_id,
-                    summary["url"],
-                    summary.get("title"),
-                    summary.get("description"),
-                    summary.get("content_summary"),
-                    Json(summary.get("key_pages")),
-                    Json(summary.get("signals")),
-                    summary.get("rule_score"),
-                    summary.get("rule_band"),
-                    Json(summary.get("shortlist")),
-                    Json(summary.get("crawl_metadata")),
-                ),
-            )
-        conn.close()
-
         # Also project into enrichment_runs for downstream compatibility
         signals = summary.get("signals", {})
         about_text = summary.get("content_summary") or " ".join(
