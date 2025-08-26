@@ -9,7 +9,7 @@ from src import enrichment
 
 class DummySearch:
     def __init__(self, results):
-        self._results = {"results": results}
+        self._results = results
         self.last_query = None
 
     def run(self, query):

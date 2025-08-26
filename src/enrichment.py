@@ -12,12 +12,13 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
+from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
-from langchain_tavily import TavilyCrawl, TavilyExtract, TavilySearch
+from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 
@@ -50,7 +51,7 @@ ZB_CACHE: dict[str, dict] = {}
 
 # Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
 if TAVILY_API_KEY:
-    tavily_search = TavilySearch(api_key=TAVILY_API_KEY)
+    tavily_search = TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
     tavily_crawl = TavilyCrawl(api_key=TAVILY_API_KEY)
     tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
 else:
