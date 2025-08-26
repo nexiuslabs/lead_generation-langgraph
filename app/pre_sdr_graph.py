@@ -388,6 +388,10 @@ class ICPUpdate(BaseModel):
     industries: List[str] = Field(default_factory=list)
     employees_min: Optional[int] = Field(default=None)
     employees_max: Optional[int] = Field(default=None)
+    # New: revenue bucket and incorporation year range
+    revenue_bucket: Optional[str] = Field(default=None, description="small|medium|large")
+    year_min: Optional[int] = Field(default=None)
+    year_max: Optional[int] = Field(default=None)
     geos: List[str] = Field(default_factory=list)
     signals: List[str] = Field(default_factory=list)
     confirm: bool = Field(default=False)
@@ -402,8 +406,8 @@ EXTRACT_SYS = SystemMessage(
     content=(
         "You extract ICP details from user messages.\n"
         "Return JSON ONLY with industries (list[str]), employees_min/max (ints if present), "
-        "geos (list[str]), signals (list[str]), confirm (bool), pasted_companies (list[str]), "
-        "and signals_done (bool).\n"
+        "revenue_bucket (one of 'small','medium','large' if present), year_min/year_max (ints for incorporation year range if present), "
+        "geos (list[str]), signals (list[str]), confirm (bool), pasted_companies (list[str]), and signals_done (bool).\n"
         "If the user indicates no preference for buying signals (e.g., 'none', 'any', 'skip'), "
         "set signals_done=true and signals=[]. If the user pasted company names (comma or newline separated), "
         "put them into pasted_companies."
@@ -441,6 +445,17 @@ def _fmt_icp(icp: Dict[str, Any]) -> str:
     else:
         emp = "Any"
     geos = ", ".join(icp.get("geos") or []) or "Any"
+    rev = icp.get("revenue_bucket") or "Any"
+    y_min = icp.get("year_min")
+    y_max = icp.get("year_max")
+    if y_min and y_max:
+        years = f"{y_min}–{y_max}"
+    elif y_min:
+        years = f"{y_min}+"
+    elif y_max:
+        years = f"up to {y_max}"
+    else:
+        years = "Any"
     sigs_list = icp.get("signals") or []
     if not sigs_list and icp.get("signals_done"):
         sigs = "None specified"
@@ -450,6 +465,8 @@ def _fmt_icp(icp: Dict[str, Any]) -> str:
         [
             f"- Industries: {inds}",
             f"- Employees: {emp}",
+            f"- Revenue: {rev}",
+            f"- Inc. Years: {years}",
             f"- Geos: {geos}",
             f"- Signals: {sigs}",
         ]
@@ -462,6 +479,10 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
         order.append("industries")
     if not (icp.get("employees_min") or icp.get("employees_max")):
         order.append("employees")
+    if not icp.get("revenue_bucket"):
+        order.append("revenue")
+    if not (icp.get("year_min") or icp.get("year_max")):
+        order.append("inc_year")
     if not icp.get("geos"):
         order.append("geos")
     if not icp.get("signals") and not icp.get("signals_done", False):
@@ -478,6 +499,8 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
     prompts = {
         "industries": "Which industries or problem spaces should we target? (e.g., SaaS, logistics, fintech)",
         "employees": "What's the typical employee range? (e.g., 10–200)",
+        "revenue": "Preferred revenue bucket? (small / medium / large)",
+        "inc_year": "Incorporation year range? (e.g., 2015–2024)",
         "geos": "Which geographies or markets? (e.g., SG, SEA, global)",
         "signals": "What specific buying signals are you looking for (e.g., hiring for data roles, ISO 27001, AWS partner)?",
     }
@@ -574,6 +597,9 @@ async def _default_candidates(
     industries_param = sorted(set(industries_param))
     emp_min = icp.get("employees_min")
     emp_max = icp.get("employees_max")
+    rev_bucket = (icp.get("revenue_bucket") or "").strip().lower() if isinstance(icp.get("revenue_bucket"), str) else None
+    y_min = icp.get("year_min")
+    y_max = icp.get("year_max")
     geos = icp.get("geos") or []
 
     base_select = f"""
@@ -603,6 +629,15 @@ async def _default_candidates(
     if isinstance(emp_max, int):
         clauses.append(f"c.employees_est <= ${len(params)+1}")
         params.append(emp_max)
+    if rev_bucket in ("small", "medium", "large"):
+        clauses.append(f"LOWER(c.revenue_bucket) = ${len(params)+1}")
+        params.append(rev_bucket)
+    if isinstance(y_min, int):
+        clauses.append(f"c.incorporation_year >= ${len(params)+1}")
+        params.append(y_min)
+    if isinstance(y_max, int):
+        clauses.append(f"c.incorporation_year <= ${len(params)+1}")
+        params.append(y_max)
     if isinstance(geos, list) and geos:
         # Build an OR group for geos across hq_country/hq_city
         geo_like_params = []
@@ -694,6 +729,16 @@ async def icp_node(state: GraphState) -> GraphState:
         icp["employees_min"] = update.employees_min
     if update.employees_max is not None:
         icp["employees_max"] = update.employees_max
+    # New: revenue_bucket and incorporation year
+    if getattr(update, "revenue_bucket", None):
+        # normalize to lowercase canonical values if possible
+        rb = (update.revenue_bucket or "").strip().lower()
+        if rb in ("small", "medium", "large"):
+            icp["revenue_bucket"] = rb
+    if getattr(update, "year_min", None) is not None:
+        icp["year_min"] = update.year_min
+    if getattr(update, "year_max", None) is not None:
+        icp["year_max"] = update.year_max
     if update.geos:
         icp["geos"] = sorted(set([s.strip() for s in update.geos if s.strip()]))
     if update.signals:
@@ -827,7 +872,13 @@ async def enrich_node(state: GraphState) -> GraphState:
                         "employee_range": {
                             "min": (state.get("icp") or {}).get("employees_min"),
                             "max": (state.get("icp") or {}).get("employees_max"),
-                        }
+                        },
+                        # New: pass-through revenue_bucket and incorporation_year
+                        "revenue_bucket": (state.get("icp") or {}).get("revenue_bucket"),
+                        "incorporation_year": {
+                            "min": (state.get("icp") or {}).get("year_min"),
+                            "max": (state.get("icp") or {}).get("year_max"),
+                        },
                     },
                 }
                 await lead_scoring_agent.ainvoke(scoring_initial_state)

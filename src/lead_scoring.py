@@ -21,7 +21,7 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT company_id, employees_est, revenue_bucket, sg_registered FROM companies WHERE company_id = ANY($1)",
+            "SELECT company_id, employees_est, revenue_bucket, sg_registered, incorporation_year FROM companies WHERE company_id = ANY($1)",
             state['candidate_ids']
         )
     features: List[Dict[str, Any]] = []
@@ -30,7 +30,8 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
             'company_id': row['company_id'],
             'employees_est': row['employees_est'],
             'revenue_bucket': row['revenue_bucket'],
-            'sg_registered': row['sg_registered']
+            'sg_registered': row['sg_registered'],
+            'incorporation_year': row['incorporation_year']
         })
     state['lead_features'] = features
     return state
