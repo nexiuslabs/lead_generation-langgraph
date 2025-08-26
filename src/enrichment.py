@@ -151,6 +151,29 @@ def _get_table_columns(conn, table_name: str) -> set:
         return set()
 
 
+def _insert_company_enrichment_run(conn, fields: dict) -> None:
+    """Insert a row into company_enrichment_runs using only columns that exist.
+
+    This guards against environments where certain columns (e.g., public_emails,
+    verification_results, embedding) may be absent. It reads the live table
+    columns and builds a minimal INSERT accordingly. Relies on DB defaults for
+    run_timestamp, enrichment_id, etc.
+    """
+    try:
+        cols = _get_table_columns(conn, "company_enrichment_runs")
+        if not cols:
+            return
+        keys = [k for k, v in fields.items() if k in cols and v is not None]
+        if not keys:
+            return
+        placeholders = ",".join(["%s"] * len(keys))
+        sql = f"INSERT INTO company_enrichment_runs ({', '.join(keys)}) VALUES ({placeholders})"
+        with conn.cursor() as cur:
+            cur.execute(sql, [fields[k] for k in keys])
+    except Exception as e:
+        # Surface but don't crash callers; they may have follow-up persistence
+        print(f"   ↳ insert company_enrichment_runs skipped: {e}")
+
 def _get_contact_stats(company_id: int):
     """Return (total_contacts, has_named_contact, founder_present).
     Uses best-effort checks based on available columns.
@@ -742,13 +765,17 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
     jobs_count = signals.get("open_roles_count", 0)
 
     conn = get_db_connection()
-    with conn, conn.cursor() as cur:
-        cur.execute(
-            """
-                INSERT INTO company_enrichment_runs (company_id, run_timestamp, about_text, tech_stack, public_emails, jobs_count, linkedin_url)
-                VALUES (%s, now(), %s, %s, %s, %s, %s)
-            """,
-            (company_id, about_text, tech_stack, public_emails, jobs_count, None),
+    with conn:
+        _insert_company_enrichment_run(
+            conn,
+            {
+                "company_id": company_id,
+                "about_text": about_text,
+                "tech_stack": tech_stack,
+                "public_emails": public_emails,
+                "jobs_count": jobs_count,
+                "linkedin_url": None,
+            },
         )
     conn.close()
 
@@ -1864,27 +1891,21 @@ def store_enrichment(company_id: int, domain: str, data: dict):
     phones_norm = _normalize_phone_list(data.get("phone_number") or [])
 
     with conn:
+        _insert_company_enrichment_run(
+            conn,
+            {
+                "company_id": company_id,
+                "about_text": data.get("about_text"),
+                "tech_stack": (data.get("tech_stack") or []),
+                "public_emails": (data.get("public_emails") or []),
+                "jobs_count": data.get("jobs_count"),
+                "linkedin_url": data.get("linkedin_url"),
+                "verification_results": Json(verification),
+                "embedding": embedding,
+            },
+        )
+        print("       ↳ history saved")
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO company_enrichment_runs
-                  (company_id, about_text, tech_stack, public_emails,
-                   jobs_count, linkedin_url, verification_results, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    company_id,
-                    data.get("about_text"),
-                    (data.get("tech_stack") or []),
-                    (data.get("public_emails") or []),
-                    data.get("jobs_count"),
-                    data.get("linkedin_url"),
-                    Json(verification),
-                    embedding,
-                ),
-            )
-            print("       ↳ history saved")
-
             cur.execute(
                 """
                 UPDATE companies SET
@@ -2036,7 +2057,7 @@ async def enrich_company(company_id: int, company_name: str):
             )
         conn.close()
 
-        # Also project into company_enrichment_runs for downstream compatibility
+        # Also project into enrichment_runs for downstream compatibility
         signals = summary.get("signals", {})
         about_text = summary.get("content_summary") or " ".join(
             signals.get("value_props", [])[:6]
@@ -2059,13 +2080,17 @@ async def enrich_company(company_id: int, company_name: str):
         )
 
         conn = get_db_connection()
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO company_enrichment_runs (company_id, run_timestamp, about_text, tech_stack, public_emails, jobs_count, linkedin_url)
-                VALUES (%s, now(), %s, %s, %s, %s, %s)
-            """,
-                (company_id, about_text, tech_stack, public_emails, jobs_count, None),
+        with conn:
+            _insert_company_enrichment_run(
+                conn,
+                {
+                    "company_id": company_id,
+                    "about_text": about_text,
+                    "tech_stack": tech_stack,
+                    "public_emails": public_emails,
+                    "jobs_count": jobs_count,
+                    "linkedin_url": None,
+                },
             )
         conn.close()
 
