@@ -17,7 +17,7 @@ uvicorn
 langserve
 langchain
 requests
-langchain-tavily
+langchain-tavily>=0.2.11
 tavily-python
 sse-starlette
 pydantic
