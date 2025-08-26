@@ -9,12 +9,12 @@ from src import enrichment
 
 class DummySearch:
     def __init__(self, results):
-        self._results = {"results": results}
+        self._results = results
         self.last_query = None
 
     def run(self, query):
         self.last_query = query
-        return self._results
+        return {"results": self._results}
 
 
 def test_find_domain_allows_aggregator_when_name_matches_apex(monkeypatch):

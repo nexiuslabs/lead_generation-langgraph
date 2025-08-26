@@ -50,7 +50,7 @@ ZB_CACHE: dict[str, dict] = {}
 
 # Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
 if TAVILY_API_KEY:
-    tavily_search = TavilySearch(api_key=TAVILY_API_KEY)
+    tavily_search = TavilySearch(max_results=5)
     tavily_crawl = TavilyCrawl(api_key=TAVILY_API_KEY)
     tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
 else:
