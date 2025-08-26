@@ -10,8 +10,10 @@ from src import enrichment
 class DummySearch:
     def __init__(self, results):
         self._results = {"results": results}
+        self.last_query = None
 
     def run(self, query):
+        self.last_query = query
         return self._results
 
 
@@ -39,3 +41,18 @@ def test_find_domain_uses_title_or_snippet_when_domain_missing_name(monkeypatch)
     monkeypatch.setattr(enrichment, "tavily_search", DummySearch(dummy_results))
 
     assert enrichment.find_domain("NTUC Enterprise") == ["https://www.fairprice.com.sg"]
+
+
+def test_find_domain_normalizes_name_in_query(monkeypatch):
+    dummy_results = [
+        {
+            "url": "https://nexiuslabs.com",
+            "title": "Nexius Labs",
+            "content": "Home",
+        }
+    ]
+    dummy = DummySearch(dummy_results)
+    monkeypatch.setattr(enrichment, "tavily_search", dummy)
+
+    assert enrichment.find_domain("NEXIUS LABS PTE LTD") == ["https://nexiuslabs.com"]
+    assert dummy.last_query == "nexius labs official website"

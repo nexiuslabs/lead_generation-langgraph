@@ -831,7 +831,6 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed"):
         return state
     name = state.get("company_name") or ""
-    uen = state.get("uen")
     # 0) DB fallback: use existing website_domain for this company if present
     try:
         cid = state.get("company_id")
@@ -861,9 +860,6 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     # 1) Tavily search if available
     if not domains and tavily_search is not None:
         try:
-            domains = find_domain(name, uen=uen)
-        except TypeError:
-            # Backward compatibility in case signature differs
             domains = find_domain(name)
         except Exception as e:
             print(f"   ↳ Tavily find_domain failed: {e}")
@@ -1458,33 +1454,34 @@ def _normalize_company_name(name: str) -> list[str]:
     return core[:3] or parts[:2]
 
 
-def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> list[str]:
+def find_domain(company_name: str) -> list[str]:
 
-    print(
-        f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}' and UEN '{uen}'"
-    )
+    print(f"    🔍 Search domain for '{company_name}'")
+    core = _normalize_company_name(company_name)
+    normalized_query = " ".join(core)
+    hits: list[Any] = []
     try:
-        q_parts = [company_name, "official website"]
-        if sic_prefix:
-            q_parts.append(sic_prefix)
-        if uen:
-            q_parts.append(uen)
-        query = " ".join(q_parts)
+        query = f"{normalized_query} official website".strip()
         results = tavily_search.run(query)
+        if isinstance(results, dict) and "results" in results:
+            hits = results["results"]
+        elif isinstance(results, (list, tuple)):
+            hits = results
+        else:
+            hits = [results]
+        if not hits:
+            query = f"{company_name} official website"
+            results = tavily_search.run(query)
+            if isinstance(results, dict) and "results" in results:
+                hits = results["results"]
+            elif isinstance(results, (list, tuple)):
+                hits = results
+            else:
+                hits = [results]
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
         return []
-
-    hits = []
-    if isinstance(results, dict) and "results" in results:
-        hits = results["results"]
-    elif isinstance(results, (list, tuple)):
-        hits = results
-    else:
-        hits = [results]
-
     # Filter URLs to those containing the core company name (first two words)
-    core = _normalize_company_name(company_name)
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
     filtered_urls = []
