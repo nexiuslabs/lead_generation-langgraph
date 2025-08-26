@@ -90,6 +90,9 @@ pip-wheel-metadata/
 *.db
 *.db-journal
 
+# LangGraph local state and checkpoints
+.langgraph_api/
+
 # Node (if any nested)
 node_modules/
 yarn.lock

@@ -149,7 +149,7 @@ def parse_candidates(state: PreSDRState) -> PreSDRState:
     if names:
         state["candidates"] = [{"name": n} for n in names]
         state["messages"].append(
-            AIMessage(f"Got {len(names)} companies. Type **run enrichment** to start.")
+            AIMessage(f"Got {len(names)} companies. Running Enrichment...")
         )
     else:
         state["messages"].append(
@@ -428,6 +428,34 @@ QUESTION_SYS = SystemMessage(
 )
 
 
+def _fmt_icp(icp: Dict[str, Any]) -> str:
+    inds = ", ".join(icp.get("industries") or []) or "Any"
+    emp_min = icp.get("employees_min")
+    emp_max = icp.get("employees_max")
+    if emp_min and emp_max:
+        emp = f"{emp_min}–{emp_max}"
+    elif emp_min:
+        emp = f"{emp_min}+"
+    elif emp_max:
+        emp = f"up to {emp_max}"
+    else:
+        emp = "Any"
+    geos = ", ".join(icp.get("geos") or []) or "Any"
+    sigs_list = icp.get("signals") or []
+    if not sigs_list and icp.get("signals_done"):
+        sigs = "None specified"
+    else:
+        sigs = ", ".join(sigs_list) or "None specified"
+    return "\n".join(
+        [
+            f"- Industries: {inds}",
+            f"- Employees: {emp}",
+            f"- Geos: {geos}",
+            f"- Signals: {sigs}",
+        ]
+    )
+
+
 def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
     order: List[str] = []
     if not icp.get("industries"):
@@ -440,8 +468,9 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
         order.append("signals")
 
     if not order:
+        summary = _fmt_icp(icp)
         return (
-            "Does this ICP look right? Reply **confirm** to save, or tell me what to change.",
+            f"Does ICPs look right? Type **confirm** to enrichment.\n\n{summary}",
             "confirm",
         )
 
@@ -772,34 +801,47 @@ async def enrich_node(state: GraphState) -> GraphState:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
-        # Your pipeline is async in this codebase; run concurrently via gather
-        await enrich_company_with_tavily(cid, name, uen)
-        return {"company_id": cid, "name": name, "uen": uen}
+        final_state = await enrich_company_with_tavily(cid, name, uen)
+        completed = bool(final_state.get("completed")) if isinstance(final_state, dict) else False
+        return {"company_id": cid, "name": name, "uen": uen, "completed": completed}
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
+    all_done = all(bool(r.get("completed")) for r in results) if results else False
     state["results"] = results
-    state["messages"] = add_messages(
-        state.get("messages") or [],
-        [AIMessage(content=f"Enrichment complete for {len(results)} companies.")],
-    )
-    # Trigger lead scoring pipeline and persist scores for UI consumption
-    try:
-        ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
-        if ids:
-            scoring_initial_state = {
-                "candidate_ids": ids,
-                "lead_features": [],
-                "lead_scores": [],
-                "icp_payload": {
-                    "employee_range": {
-                        "min": (state.get("icp") or {}).get("employees_min"),
-                        "max": (state.get("icp") or {}).get("employees_max"),
-                    }
-                },
-            }
-            await lead_scoring_agent.ainvoke(scoring_initial_state)
-    except Exception as _score_exc:
-        logger.warning("lead scoring failed: %s", _score_exc)
+    state["enrichment_completed"] = all_done
+
+    if all_done:
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(content=f"Enrichment complete for {len(results)} companies.")],
+        )
+        # Trigger lead scoring pipeline and persist scores for UI consumption
+        try:
+            ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
+            if ids:
+                scoring_initial_state = {
+                    "candidate_ids": ids,
+                    "lead_features": [],
+                    "lead_scores": [],
+                    "icp_payload": {
+                        "employee_range": {
+                            "min": (state.get("icp") or {}).get("employees_min"),
+                            "max": (state.get("icp") or {}).get("employees_max"),
+                        }
+                    },
+                }
+                await lead_scoring_agent.ainvoke(scoring_initial_state)
+                # Immediately render scores into chat for better UX
+                state = await score_node(state)
+        except Exception as _score_exc:
+            logger.warning("lead scoring failed: %s", _score_exc)
+    else:
+        done = sum(1 for r in results if r.get("completed"))
+        total = len(results)
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(content=f"Enrichment finished with issues ({done}/{total} completed). I’ll wait to score until all complete.")],
+        )
     return state
 
 
@@ -887,13 +929,17 @@ def router(state: GraphState) -> str:
     has_candidates = bool(state.get("candidates"))
     has_results = bool(state.get("results"))
     has_scored = bool(state.get("scored"))
+    enrichment_completed = bool(state.get("enrichment_completed"))
 
     if has_candidates and not has_results:
         logger.info("router -> enrich (have candidates, no enrichment)")
         return "enrich"
-    if has_results and not has_scored:
-        logger.info("router -> score (have enrichment, no scores)")
+    if has_results and enrichment_completed and not has_scored:
+        logger.info("router -> score (have enrichment, no scores, all completed)")
         return "score"
+    if has_results and not enrichment_completed:
+        logger.info("router -> end (enrichment not fully completed)")
+        return "end"
 
     # 2) If assistant spoke last and no pending work, wait for user input
     if _last_is_ai(msgs):

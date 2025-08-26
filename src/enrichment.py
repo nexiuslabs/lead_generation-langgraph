@@ -1132,7 +1132,8 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
         "pricing": data.get("pricing") or [],
     }
     try:
-        store_enrichment(company_id, home, legacy)
+        # Run blocking store in a worker thread to avoid blocking the event loop
+        await asyncio.to_thread(store_enrichment, company_id, home, legacy)
         print(f"    💾 stored extracted fields for company_id={company_id}")
         state["completed"] = True
     except Exception as exc:
@@ -1408,6 +1409,9 @@ def verify_emails(emails: list[str]) -> list[dict]:
     print(f"    🔒 ZeroBounce Email Verification for {emails}")
     results: list[dict] = []
     if not emails:
+        return results
+    # Skip verification entirely if no API key configured
+    if not ZEROBOUNCE_API_KEY:
         return results
     conn = None
     try:
