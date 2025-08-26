@@ -198,7 +198,13 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                 'primary_ssic_code', 'ssic_code', 'industry_code', 'ssic', 'primary_ssic',
                 'primary_industry_code'
             )
+            # Prefer registration_incorporation_date but extract YEAR when present
             src_year = pick('registration_incorporation_date','incorporation_year','year_incorporated','inc_year','founded_year') or 'NULL'
+            # Build an expression that yields a numeric year
+            if isinstance(src_year, str) and src_year.lower() == 'registration_incorporation_date':
+                src_year_expr = f"EXTRACT(YEAR FROM CAST({src_year} AS date))::int"
+            else:
+                src_year_expr = src_year
             src_stat = pick('entity_status_de','entity_status','status','entity_status_description') or 'NULL'
 
             if not src_desc or not src_code:
@@ -238,7 +244,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                       {src_name} AS entity_name,
                       {src_desc} AS primary_ssic_description,
                       {src_code} AS primary_ssic_code,
-                      {src_year} AS incorporation_year,
+                      {src_year_expr} AS incorporation_year,
                       {src_stat} AS entity_status_de
                     FROM staging_acra_companies
                     WHERE CAST({src_code} AS TEXT) = ANY(%s::text[])
@@ -257,7 +263,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                       {src_name} AS entity_name,
                       {src_desc} AS primary_ssic_description,
                       {src_code} AS primary_ssic_code,
-                      {src_year} AS incorporation_year,
+                      {src_year_expr} AS incorporation_year,
                       {src_stat} AS entity_status_de
                     FROM staging_acra_companies
                     WHERE LOWER({src_desc}) = ANY(%s::text[])
@@ -333,7 +339,9 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                             "name": name,
                             "industry_norm": industry_norm,
                             "industry_code": industry_code,
+                            # Set both incorporation_year and founded_year from the same source year
                             "incorporation_year": inc_year,
+                            "founded_year": inc_year,
                             "sg_registered": sg_registered,
                         }
 
