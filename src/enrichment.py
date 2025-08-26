@@ -35,6 +35,7 @@ from src.settings import (
     LUSHA_API_KEY,
     LUSHA_PREFERRED_TITLES,
     PERSIST_CRAWL_CORPUS,
+    PERSIST_CRAWL_PAGES,
     POSTGRES_DSN,
     TAVILY_API_KEY,
     ZEROBOUNCE_API_KEY,
@@ -673,36 +674,60 @@ def update_company_core_fields(company_id: int, data: dict):
 
 
 async def _deterministic_crawl_and_persist(company_id: int, url: str):
-    """Run the existing deterministic crawler and persist results to summaries and companies tables."""
+    """Run deterministic crawler, persist summary and pages, and return results."""
     try:
         summary = await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
     except Exception as exc:
         print(f"   ↳ deterministic crawler failed: {exc}")
-        return
+        return None, []
 
-    # Store in summaries table
+    pages = summary.pop("pages", [])
+
     conn = psycopg2.connect(dsn=POSTGRES_DSN)
-    with conn, conn.cursor() as cur:
-        cur.execute(
-            """
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
                 INSERT INTO summaries (company_id, url, title, description, content_summary, key_pages, signals, rule_score, rule_band, shortlist, crawl_metadata)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
-            """,
-            (
-                company_id,
-                summary.get("url"),
-                summary.get("title"),
-                summary.get("description"),
-                summary.get("content_summary"),
-                Json(summary.get("key_pages")),
-                Json(summary.get("signals")),
-                summary.get("rule_score"),
-                summary.get("rule_band"),
-                Json(summary.get("shortlist")),
-                Json(summary.get("crawl_metadata")),
-            ),
-        )
+                """,
+                (
+                    company_id,
+                    summary.get("url"),
+                    summary.get("title"),
+                    summary.get("description"),
+                    summary.get("content_summary"),
+                    Json(summary.get("key_pages")),
+                    Json(summary.get("signals")),
+                    summary.get("rule_score"),
+                    summary.get("rule_band"),
+                    Json(summary.get("shortlist")),
+                    Json(summary.get("crawl_metadata")),
+                ),
+            )
+        if PERSIST_CRAWL_PAGES and pages:
+            try:
+                with conn.cursor() as cur:
+                    for p in pages:
+                        html = p.get("html") or ""
+                        title = ""
+                        try:
+                            soup = BeautifulSoup(html, "html.parser")
+                            title = (
+                                (soup.title.string or "").strip() if soup.title else ""
+                            )
+                        except Exception:
+                            title = ""
+                        cur.execute(
+                            """
+                            INSERT INTO crawl_pages (company_id, url, title, html, fetched_at)
+                            VALUES (%s,%s,%s,%s, now())
+                            """,
+                            (company_id, p.get("url"), title, html),
+                        )
+            except Exception as e:
+                print(f"   ↳ persist crawl_pages failed: {e}")
     conn.close()
 
     # Project into company_enrichment_runs for downstream compatibility
@@ -752,6 +777,8 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
     }
     store_enrichment(company_id, url, legacy)
 
+    return summary, pages
+
 
 async def enrich_company_with_tavily(
     company_id: int, company_name: str, uen: str | None = None
@@ -794,6 +821,7 @@ class EnrichmentState(TypedDict, total=False):
     extracted_pages: List[Dict[str, Any]]
     chunks: List[str]
     data: Dict[str, Any]
+    deterministic_summary: Dict[str, Any]
     lusha_used: bool
     completed: bool
     error: Optional[str]
@@ -1093,14 +1121,22 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     return state
 
 
-async def node_deterministic_fallback(state: EnrichmentState) -> EnrichmentState:
-    if state.get("completed") or not state.get("home"):
+async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
+    if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
     try:
-        await _deterministic_crawl_and_persist(state["company_id"], state["home"])
-        state["completed"] = True
+        summary, pages = await _deterministic_crawl_and_persist(
+            state["company_id"], state["home"]
+        )
+        if pages:
+            state["extracted_pages"] = [
+                {"url": p.get("url"), "title": "", "raw_content": p.get("html")}
+                for p in pages
+            ]
+        if summary:
+            state["deterministic_summary"] = summary
     except Exception as exc:
-        print(f"   ↳ deterministic crawler fallback failed: {exc}")
+        print(f"   ↳ deterministic crawl failed: {exc}")
     return state
 
 
@@ -1353,10 +1389,10 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
 # Build the LangGraph for enrichment
 enrichment_graph = StateGraph(EnrichmentState)
 enrichment_graph.add_node("find_domain", node_find_domain)
+enrichment_graph.add_node("deterministic_crawl", node_deterministic_crawl)
 enrichment_graph.add_node("discover_urls", node_discover_urls)
 enrichment_graph.add_node("expand_crawl", node_expand_crawl)
 enrichment_graph.add_node("extract_pages", node_extract_pages)
-enrichment_graph.add_node("deterministic_fallback", node_deterministic_fallback)
 enrichment_graph.add_node("build_chunks", node_build_chunks)
 enrichment_graph.add_node("llm_extract", node_llm_extract)
 enrichment_graph.add_node("lusha_contacts", node_lusha_contacts)
@@ -1364,10 +1400,20 @@ enrichment_graph.add_node("persist_core", node_persist_core)
 enrichment_graph.add_node("persist_legacy", node_persist_legacy)
 
 enrichment_graph.set_entry_point("find_domain")
-enrichment_graph.add_edge("find_domain", "discover_urls")
+enrichment_graph.add_edge("find_domain", "deterministic_crawl")
+
+
+def _after_deterministic(state: EnrichmentState) -> str:
+    return "build_chunks" if state.get("extracted_pages") else "discover_urls"
+
+
+enrichment_graph.add_conditional_edges(
+    "deterministic_crawl",
+    _after_deterministic,
+    {"build_chunks": "build_chunks", "discover_urls": "discover_urls"},
+)
 enrichment_graph.add_edge("discover_urls", "expand_crawl")
 enrichment_graph.add_edge("expand_crawl", "extract_pages")
-# Branching handled inside nodes; keep linear edges for compatibility
 enrichment_graph.add_edge("extract_pages", "build_chunks")
 enrichment_graph.add_edge("build_chunks", "llm_extract")
 enrichment_graph.add_edge("llm_extract", "lusha_contacts")
@@ -1418,9 +1464,12 @@ def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> lis
         f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}' and UEN '{uen}'"
     )
     try:
-        query = (
-            f"{company_name} official website{' ' + sic_prefix if sic_prefix else ''}"
-        )
+        q_parts = [company_name, "official website"]
+        if sic_prefix:
+            q_parts.append(sic_prefix)
+        if uen:
+            q_parts.append(uen)
+        query = " ".join(q_parts)
         results = tavily_search.run(query)
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
