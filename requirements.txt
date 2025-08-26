@@ -18,5 +18,6 @@ langserve
 langchain
 requests
 langchain-tavily
+tavily-python
 sse-starlette
 pydantic

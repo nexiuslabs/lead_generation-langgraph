@@ -12,7 +12,6 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
-from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 
@@ -21,6 +20,7 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
+from tavily import TavilyClient
 
 from src.crawler import crawl_site
 from src.lusha_client import AsyncLushaClient, LushaError
@@ -51,11 +51,11 @@ ZB_CACHE: dict[str, dict] = {}
 
 # Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
 if TAVILY_API_KEY:
-    tavily_search = TavilySearchResults(tavily_api_key=TAVILY_API_KEY)
+    tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
     tavily_crawl = TavilyCrawl(api_key=TAVILY_API_KEY)
     tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
 else:
-    tavily_search = None  # type: ignore[assignment]
+    tavily_client = None  # type: ignore[assignment]
     tavily_crawl = None  # type: ignore[assignment]
     tavily_extract = None  # type: ignore[assignment]
     print(
@@ -859,7 +859,7 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         domains = []
 
     # 1) Tavily search if available
-    if not domains and tavily_search is not None:
+    if not domains and tavily_client is not None:
         try:
             domains = find_domain(name)
         except Exception as e:
@@ -1456,32 +1456,28 @@ def _normalize_company_name(name: str) -> list[str]:
 
 
 def find_domain(company_name: str) -> list[str]:
-
     print(f"    🔍 Search domain for '{company_name}'")
+    if tavily_client is None:
+        print("       ↳ Tavily client not initialized.")
+        return []
+
     core = _normalize_company_name(company_name)
     normalized_query = " ".join(core)
-    hits: list[Any] = []
     try:
         query = f"{normalized_query} official website".strip()
-        results = tavily_search.run(query)
-        if isinstance(results, dict) and "results" in results:
-            hits = results["results"]
-        elif isinstance(results, (list, tuple)):
-            hits = results
-        else:
-            hits = [results]
+        response = tavily_client.search(query)
+        hits = response.get("results", []) if isinstance(response, dict) else []
         if not hits:
             query = f"{company_name} official website"
-            results = tavily_search.run(query)
-            if isinstance(results, dict) and "results" in results:
-                hits = results["results"]
-            elif isinstance(results, (list, tuple)):
-                hits = results
-            else:
-                hits = [results]
+            response = tavily_client.search(query)
+            hits = response.get("results", []) if isinstance(response, dict) else []
+        if not hits:
+            print("       ↳ No results from Tavily search.")
+            return []
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
         return []
+
     # Filter URLs to those containing the core company name (first two words)
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
@@ -1517,7 +1513,7 @@ def find_domain(company_name: str) -> list[str]:
     }
     for h in hits:
         url = h.get("url") if isinstance(h, dict) else None
-        print("       ↳ URL:", url)
+        print("       ↳ Found URL:", url)
         if not url:
             continue
         parsed = urlparse(url)

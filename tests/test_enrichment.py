@@ -7,14 +7,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src import enrichment
 
 
-class DummySearch:
+class DummyTavilyClient:
     def __init__(self, results):
         self._results = results
         self.last_query = None
 
-    def run(self, query):
+    def search(self, query):
         self.last_query = query
-        return self._results
+        return {"results": self._results}
 
 
 def test_find_domain_allows_aggregator_when_name_matches_apex(monkeypatch):
@@ -25,7 +25,7 @@ def test_find_domain_allows_aggregator_when_name_matches_apex(monkeypatch):
             "content": "Shop online at Amazon",
         }
     ]
-    monkeypatch.setattr(enrichment, "tavily_search", DummySearch(dummy_results))
+    monkeypatch.setattr(enrichment, "tavily_client", DummyTavilyClient(dummy_results))
 
     assert enrichment.find_domain("Amazon") == ["https://www.amazon.com"]
 
@@ -38,7 +38,7 @@ def test_find_domain_uses_title_or_snippet_when_domain_missing_name(monkeypatch)
             "content": "Part of NTUC Enterprise",
         }
     ]
-    monkeypatch.setattr(enrichment, "tavily_search", DummySearch(dummy_results))
+    monkeypatch.setattr(enrichment, "tavily_client", DummyTavilyClient(dummy_results))
 
     assert enrichment.find_domain("NTUC Enterprise") == ["https://www.fairprice.com.sg"]
 
@@ -51,8 +51,8 @@ def test_find_domain_normalizes_name_in_query(monkeypatch):
             "content": "Home",
         }
     ]
-    dummy = DummySearch(dummy_results)
-    monkeypatch.setattr(enrichment, "tavily_search", dummy)
+    dummy = DummyTavilyClient(dummy_results)
+    monkeypatch.setattr(enrichment, "tavily_client", dummy)
 
     assert enrichment.find_domain("NEXIUS LABS PTE LTD") == ["https://nexiuslabs.com"]
     assert dummy.last_query == "nexius labs official website"
