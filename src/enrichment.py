@@ -17,11 +17,7 @@ from langchain_core.tools import tool
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
-from langchain_tavily import (
-    TavilyCrawl,
-    TavilyExtract,
-    TavilySearch as TavilySearchResults,
-)
+from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 from tavily import TavilyClient
@@ -55,7 +51,7 @@ ZB_CACHE: dict[str, dict] = {}
 
 # Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
 if TAVILY_API_KEY:
-    tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+    tavily_client = TavilyClient(TAVILY_API_KEY)
     tavily_crawl = TavilyCrawl(api_key=TAVILY_API_KEY)
     tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
 else:
@@ -1470,14 +1466,12 @@ def find_domain(company_name: str) -> list[str]:
     try:
         query = f"{normalized_query} official website".strip()
         response = tavily_client.search(query)
-        hits = response.get("results", []) if isinstance(response, dict) else []
-        if not hits:
+        if not isinstance(response, dict) or not response.get("results"):
             query = f"{company_name} official website"
             response = tavily_client.search(query)
-            hits = response.get("results", []) if isinstance(response, dict) else []
-        if not hits:
-            print("       ↳ No results from Tavily search.")
-            return []
+            if not isinstance(response, dict) or not response.get("results"):
+                print("       ↳ No results from Tavily search.")
+                return []
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
         return []
@@ -1515,7 +1509,7 @@ def find_domain(company_name: str) -> list[str]:
         "maps.google.com",
         "goo.gl",
     }
-    for h in hits:
+    for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
         print("       ↳ Found URL:", url)
         if not url:
