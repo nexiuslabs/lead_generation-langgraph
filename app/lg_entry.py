@@ -198,7 +198,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                 'primary_ssic_code', 'ssic_code', 'industry_code', 'ssic', 'primary_ssic',
                 'primary_industry_code'
             )
-            src_year = pick('incorporation_year','year_incorporated','inc_year','founded_year') or 'NULL'
+            src_year = pick('registration_incorporation_date','incorporation_year','year_incorporated','inc_year','founded_year') or 'NULL'
             src_stat = pick('entity_status_de','entity_status','status','entity_status_description') or 'NULL'
 
             if not src_desc or not src_code:

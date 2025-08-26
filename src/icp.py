@@ -23,108 +23,211 @@ class ICPState(TypedDict, total=False):
 # ---------- Helpers ----------
 
 def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
-    """Fetch raw rows from a staging table; fall back if table is absent."""
+    """Fetch raw rows from staging_acra_companies with best-effort column mapping.
+
+    Falls back to companies if staging is unavailable.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                # Prefer your staging table if it exists
-                cur.execute(
-                    """
+            # Introspect staging columns
+            cur.execute(
+                """
+                SELECT LOWER(column_name) FROM information_schema.columns
+                WHERE table_name = 'staging_acra_companies'
+                """
+            )
+            staging_cols = {r[0] for r in cur.fetchall()}
+            if staging_cols:
+                # Pick available column names
+                def pick(*names: str) -> str | None:
+                    for n in names:
+                        if n.lower() in staging_cols:
+                            return n
+                    return None
+
+                src_uen = pick("uen", "uen_no", "uen_number") or "NULL"
+                src_name = pick("entity_name", "name", "company_name") or "NULL"
+                src_desc = pick("primary_ssic_description", "ssic_description", "industry_description") or "NULL"
+                src_code = pick("primary_ssic_code", "ssic_code", "industry_code", "ssic") or "NULL"
+                src_year = pick("incorporation_year", "founded_year", "registration_incorporation_date") or "NULL"
+                src_status = pick("entity_status_description", "entity_status", "status", "entity_status_de") or "NULL"
+
+                sql = f"""
                     SELECT
-                        uen,
-                        entity_name,
-                        primary_ssic_description,
-                        primary_ssic_code,
-                        website,
-                        incorporation_year,
-                        entity_status_de
+                      {src_uen}   AS uen,
+                      {src_name}  AS entity_name,
+                      {src_desc}  AS primary_ssic_description,
+                      {src_code}  AS primary_ssic_code,
+                      {src_year}  AS raw_year,
+                      {src_status} AS entity_status_description
                     FROM staging_acra_companies
-                    ORDER BY uen
+                    ORDER BY 1
                     LIMIT %s
-                    """,
-                    (limit,),
-                )
-            except Exception:
-                # Fallback: use companies as a source of 'raw' rows
-                cur.execute(
-                    """
-                    SELECT
-                        company_id,
-                        uen,
-                        entity_name,
-                        primary_ssic_description,
-                        primary_ssic_code,
-                        website,
-                        incorporation_year,
-                        sg_registered
-                    FROM companies
-                    ORDER BY uen
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
+                """
+                cur.execute(sql, (limit,))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # Fallback: use companies as a source of 'raw' rows
+            cur.execute(
+                """
+                SELECT
+                    company_id,
+                    uen,
+                    name AS entity_name,
+                    industry_norm AS primary_ssic_description,
+                    industry_code AS primary_ssic_code,
+                    incorporation_year AS raw_year,
+                    sg_registered
+                FROM companies
+                ORDER BY company_id
+                LIMIT %s
+                """,
+                (limit,),
+            )
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _parse_year(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    try:
+        if isinstance(val, int):
+            return val
+        s = str(val).strip()
+        # Extract 4-digit year
+        import re as _re
+
+        m = _re.search(r"(19|20)\d{2}", s)
+        if m:
+            return int(m.group(0))
+    except Exception:
+        return None
+    return None
+
+
 def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    """Minimal normalization pass."""
+    """Minimal normalization pass with flexible source keys."""
     def _norm_str(x: Optional[str]) -> Optional[str]:
         if x is None:
             return None
         s = str(x).strip()
         return s or None
 
+    name = r.get("name") or r.get("entity_name")
+    ind_norm = r.get("industry_norm") or r.get("primary_ssic_description")
+    ind_code = r.get("industry_code")
+    if ind_code is None:
+        ind_code = r.get("primary_ssic_code")
+    # Normalize to text
+    ind_code = str(ind_code) if ind_code is not None else None
+    raw_year = r.get("incorporation_year")
+    if raw_year is None:
+        raw_year = r.get("founded_year") or r.get("raw_year") or r.get("registration_incorporation_date")
+    year = _parse_year(raw_year)
+    # Founded year mirrors incorporation if available
+    founded = year
+    # sg_registered heuristic if missing
+    sg = r.get("sg_registered")
+    if sg is None:
+        status = (r.get("entity_status_description") or "").lower()
+        sg = True if status and ("live" in status or "active" in status) else None
+
     norm = {
         "company_id": r.get("company_id"),
         "uen": _norm_str(r.get("uen")),
-        "name": _norm_str(r.get("name")),
-        "industry_norm": _norm_str(r.get("industry_norm")).lower() if r.get("industry_norm") else None,
-        "industry_code": _norm_str(str(r.get("industry_code")) if r.get("industry_code") is not None else None),
-        "website_domain": _norm_str(r.get("website_domain")),
-        "incorporation_year": r.get("incorporation_year"),
-        "sg_registered": r.get("sg_registered"),
+        "name": _norm_str(name),
+        "industry_norm": _norm_str(ind_norm).lower() if ind_norm else None,
+        "industry_code": _norm_str(ind_code),
+        "website_domain": _norm_str(r.get("website_domain") or r.get("website")),
+        "incorporation_year": year,
+        "founded_year": founded,
+        "sg_registered": sg,
     }
     return norm
 
 
+def _table_columns(conn, table: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT LOWER(column_name) FROM information_schema.columns WHERE table_name=%s",
+            (table,),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
 def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
-    """Upsert normalized rows into companies table."""
+    """Upsert normalized rows into companies table (dynamic columns, robust conflicts)."""
     if not rows:
         return 0
+    affected = 0
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            for r in rows:
-                cur.execute(
-                    """
-                    INSERT INTO companies (
-                        company_id, uen, name, industry_norm, industry_code,
-                        website_domain, incorporation_year, sg_registered, last_seen
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s, NOW())
-                    ON CONFLICT (company_id) DO UPDATE SET
-                        uen = EXCLUDED.uen,
-                        name = EXCLUDED.name,
-                        industry_norm = EXCLUDED.industry_norm,
-                        industry_code = EXCLUDED.industry_code,
-                        website_domain = EXCLUDED.website_domain,
-                        incorporation_year = EXCLUDED.incorporation_year,
-                        sg_registered = EXCLUDED.sg_registered,
-                        last_seen = NOW()
-                    """,
-                    (
-                        r.get("company_id"),
-                        r.get("uen"),
-                        r.get("name"),
-                        r.get("industry_norm"),
-                        r.get("industry_code"),
-                        r.get("website_domain"),
-                        r.get("incorporation_year"),
-                        r.get("sg_registered"),
-                    ),
-                )
+        cols = _table_columns(conn, "companies")
+        # Resolve target column names for schema variants
+        col_industry = "industry_code" if "industry_code" in cols else ("industory_code" if "industory_code" in cols else None)
+        col_founded = "founded_year" if "founded_year" in cols else ("incorporation_year" if "incorporation_year" in cols else None)
+        col_sg = "sg_registered" if "sg_registered" in cols else None
+
+        for r in rows:
+            # Build column map for this row
+            insert_cols: List[str] = []
+            params: List[Any] = []
+
+            # Optional PK if provided
+            if r.get("company_id") is not None:
+                insert_cols.append("company_id")
+                params.append(r.get("company_id"))
+            if r.get("uen") is not None and "uen" in cols:
+                insert_cols.append("uen")
+                params.append(r.get("uen"))
+            if r.get("name") is not None and "name" in cols:
+                insert_cols.append("name")
+                params.append(r.get("name"))
+            if r.get("industry_norm") is not None and "industry_norm" in cols:
+                insert_cols.append("industry_norm")
+                params.append(r.get("industry_norm"))
+            if col_industry and r.get("industry_code") is not None:
+                insert_cols.append(col_industry)
+                params.append(r.get("industry_code"))
+            if r.get("website_domain") is not None and "website_domain" in cols:
+                insert_cols.append("website_domain")
+                params.append(r.get("website_domain"))
+            # Years
+            if col_founded and r.get("founded_year") is not None:
+                insert_cols.append(col_founded)
+                params.append(r.get("founded_year"))
+            elif "incorporation_year" in cols and r.get("incorporation_year") is not None:
+                insert_cols.append("incorporation_year")
+                params.append(r.get("incorporation_year"))
+            if col_sg and r.get("sg_registered") is not None:
+                insert_cols.append(col_sg)
+                params.append(r.get("sg_registered"))
+
+            # Always set last_seen on update; insert via NOW()
+            insert_cols_sql = ", ".join([*insert_cols, "last_seen"]) if insert_cols else "last_seen"
+            placeholders = ",".join(["%s"] * len(params) + ["NOW()"])
+
+            # Determine conflict target: prefer company_id, else uen if available
+            conflict_col = None
+            if "company_id" in insert_cols:
+                conflict_col = "company_id"
+            elif "uen" in insert_cols and "uen" in cols:
+                conflict_col = "uen"
+
+            # Build update assignments for upsert
+            set_cols = [c for c in insert_cols if c not in (conflict_col or "")] + ["last_seen"]
+            set_sql = ", ".join([f"{c} = EXCLUDED.{c}" for c in set_cols])
+
+            sql = f"INSERT INTO companies ({insert_cols_sql}) VALUES ({placeholders})"
+            if conflict_col:
+                sql += f" ON CONFLICT ({conflict_col}) DO UPDATE SET {set_sql}"
+
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                affected += cur.rowcount or 1
         conn.commit()
-    return len(rows)
+    return affected
 
 
 def _select_icp_candidates(payload: Dict[str, Any]) -> List[int]:

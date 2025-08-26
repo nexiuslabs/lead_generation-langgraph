@@ -670,13 +670,13 @@ def update_company_core_fields(company_id: int, data: dict):
                 """
                 UPDATE companies SET
                   name = COALESCE(%s, name),
-                  industry_norm = %s,
+               
                   employees_est = %s,
                   revenue_bucket = %s,
                   incorporation_year = %s,
-                  sg_registered = %s,
+                 
                   website_domain = COALESCE(%s, website_domain),
-                  industry_code = %s,
+                  
                   company_size = %s,
                   annual_revenue = %s,
                   hq_city = %s,
@@ -694,13 +694,13 @@ def update_company_core_fields(company_id: int, data: dict):
                 """,
                 (
                     data.get("name"),
-                    data.get("industry_norm"),
+                   
                     data.get("employees_est"),
                     data.get("revenue_bucket"),
-                    data.get("incorporation_year"),
-                    data.get("sg_registered"),
+                   
+                   
                     data.get("website_domain"),
-                    data.get("industry_code"),
+                   
                     data.get("company_size"),
                     data.get("annual_revenue"),
                     data.get("hq_city"),
