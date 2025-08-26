@@ -27,6 +27,10 @@
 - Fast checks: run orchestrator and server locally; validate `/health` and a minimal `/agent` call.
 - Optional: add coverage with `pytest --cov=src` when tests exist.
 
+## Repository Navigation & Search
+- Use `rg` (ripgrep) for searching across the codebase.
+- Avoid `ls -R` and `grep -R`; they are slow in large repositories.
+
 ## Commit & Pull Request Guidelines
 - Commit style: brief imperative subject; include context in body when needed.
 - Prefer Conventional Commits prefixes: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`.
