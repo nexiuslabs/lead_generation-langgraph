@@ -42,6 +42,8 @@ Optional / Recommended
 - TEMPERATURE: default `0.3`
 - CRAWL_MAX_PAGES: default `6` (total site pages after homepage)
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
+- FIND_DOMAIN_USE_UEN_HINT: default `true`; include UEN in domain search to disambiguate similar names
+- FIND_DOMAIN_USE_INDUSTRY_HINT: default `true`; append industry keywords to domain search for more precise matches
 
 Example `.env` (do not use real keys here)
 ```
@@ -126,7 +128,7 @@ Note: Arrays are handled as JSONB in this pipeline. If your schema uses `text[]`
 - Lead scoring and output
 
 4) Enrichment (src/enrichment.py)
-- Tavily search + LLM extraction (LangChain Runnable + `.invoke()`)
+- Tavily search (optionally using UEN and industry hints) + LLM extraction (LangChain Runnable + `.invoke()`)
 - Deterministic crawler merges signals (emails, phones, tech, pricing pages, etc.)
 - Persist to `summaries`, project into `company_enrichment_runs`, update `companies`
 - ZeroBounce email verification (if key provided)

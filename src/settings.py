@@ -60,13 +60,44 @@ LUSHA_API_KEY = os.getenv("LUSHA_API_KEY", "")
 LUSHA_BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")
 
 # Toggle to enable/disable Lusha fallback without redeploying
-ENABLE_LUSHA_FALLBACK = os.getenv("ENABLE_LUSHA_FALLBACK", "true").lower() in ("1","true","yes","on")
+ENABLE_LUSHA_FALLBACK = os.getenv("ENABLE_LUSHA_FALLBACK", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Titles we prefer when using Lusha to search contacts
-LUSHA_PREFERRED_TITLES = [t.strip() for t in os.getenv(
-    "LUSHA_PREFERRED_TITLES",
-    "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal"
-).split(",") if t.strip()]
+LUSHA_PREFERRED_TITLES = [
+    t.strip()
+    for t in os.getenv(
+        "LUSHA_PREFERRED_TITLES",
+        "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal",
+    ).split(",")
+    if t.strip()
+]
 
 # Persist full merged crawl corpus (Tavily) for transparency (dev default off)
-PERSIST_CRAWL_CORPUS = os.getenv("PERSIST_CRAWL_CORPUS", "false").lower() in ("1","true","yes","on")
+PERSIST_CRAWL_CORPUS = os.getenv("PERSIST_CRAWL_CORPUS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Hint enrichment for Tavily domain search
+FIND_DOMAIN_USE_UEN_HINT = os.getenv("FIND_DOMAIN_USE_UEN_HINT", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+FIND_DOMAIN_USE_INDUSTRY_HINT = os.getenv(
+    "FIND_DOMAIN_USE_INDUSTRY_HINT",
+    "true",
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

@@ -1,28 +1,46 @@
 # tools.py
-from dotenv import load_dotenv
-import time
+import asyncio
 import json
 import re
-import psycopg2
-from psycopg2.extras import Json
-from langchain_core.tools import tool
-from langchain_tavily import TavilySearch, TavilyCrawl, TavilyExtract
-from src.openai_client import get_embedding
-from src.settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES, PERSIST_CRAWL_CORPUS
-from urllib.parse import urlparse, urljoin
-import requests
-from src.crawler import crawl_site
-import asyncio
+import time
+from typing import Any, Dict, List, Optional, TypedDict
+from urllib.parse import urljoin, urlparse
+
 import httpx
+import psycopg2
+import requests
 from bs4 import BeautifulSoup
-from src.lusha_client import AsyncLushaClient, LushaError
+from dotenv import load_dotenv
+from langchain.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.tools import tool
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from typing import TypedDict, List, Dict, Any, Optional
-from langgraph.graph import StateGraph, END
+from langchain_tavily import TavilyCrawl, TavilyExtract, TavilySearch
+from langgraph.graph import END, StateGraph
+from psycopg2.extras import Json
+
+from src.crawler import crawl_site
+from src.lusha_client import AsyncLushaClient, LushaError
+from src.openai_client import get_embedding
+from src.settings import (
+    CRAWL_KEYWORDS,
+    CRAWL_MAX_PAGES,
+    CRAWLER_MAX_PAGES,
+    CRAWLER_TIMEOUT_S,
+    CRAWLER_USER_AGENT,
+    ENABLE_LUSHA_FALLBACK,
+    EXTRACT_CORPUS_CHAR_LIMIT,
+    FIND_DOMAIN_USE_INDUSTRY_HINT,
+    FIND_DOMAIN_USE_UEN_HINT,
+    LUSHA_API_KEY,
+    LUSHA_PREFERRED_TITLES,
+    PERSIST_CRAWL_CORPUS,
+    POSTGRES_DSN,
+    TAVILY_API_KEY,
+    ZEROBOUNCE_API_KEY,
+)
 
 load_dotenv()
 
@@ -668,6 +686,7 @@ class EnrichmentState(TypedDict, total=False):
     company_id: int
     company_name: str
     uen: Optional[str]
+    industry_norm: Optional[str]
     domains: List[str]
     home: Optional[str]
     filtered_urls: List[str]
@@ -685,13 +704,16 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         return state
     name = state.get("company_name") or ""
     uen = state.get("uen")
+    industry = state.get("industry_norm")
     # 0) DB fallback: use existing website_domain for this company if present
     try:
         cid = state.get("company_id")
         if cid:
             conn = get_db_connection()
             with conn, conn.cursor() as cur:
-                cur.execute("SELECT website_domain FROM companies WHERE company_id=%s", (cid,))
+                cur.execute(
+                    "SELECT website_domain FROM companies WHERE company_id=%s", (cid,)
+                )
                 row = cur.fetchone()
             try:
                 conn.close()
@@ -712,10 +734,7 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     # 1) Tavily search if available
     if not domains and tavily_search is not None:
         try:
-            domains = find_domain(name, uen=uen)
-        except TypeError:
-            # Backward compatibility in case signature differs
-            domains = find_domain(name)
+            domains = find_domain(name, uen=uen, industry=industry)
         except Exception as e:
             print(f"   ↳ Tavily find_domain failed: {e}")
     # Lusha fallback if needed
@@ -1184,11 +1203,25 @@ def _normalize_company_name(name: str) -> list[str]:
     return core[:3] or parts[:2]
 
 
-def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> list[str]:
+def find_domain(
+    company_name: str,
+    sic_prefix: str = "",
+    uen: Optional[str] = None,
+    industry: Optional[str] = None,
+) -> list[str]:
 
-    print(f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}' and UEN '{uen}'")
+    print(
+        f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}', UEN '{uen}', and industry '{industry}'"
+    )
     try:
-        query = f"{company_name} official website{' ' + sic_prefix if sic_prefix else ''}"
+        query_parts = [company_name, "official website"]
+        if sic_prefix:
+            query_parts.append(sic_prefix)
+        if uen and FIND_DOMAIN_USE_UEN_HINT:
+            query_parts.append(uen)
+        if industry and FIND_DOMAIN_USE_INDUSTRY_HINT:
+            query_parts.append(industry)
+        query = " ".join(query_parts)
         results = tavily_search.run(query)
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
