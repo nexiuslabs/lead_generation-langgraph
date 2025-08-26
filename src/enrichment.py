@@ -1,28 +1,43 @@
 # tools.py
-from dotenv import load_dotenv
-import time
+import asyncio
 import json
 import re
-import psycopg2
-from psycopg2.extras import Json
-from langchain_core.tools import tool
-from langchain_tavily import TavilySearch, TavilyCrawl, TavilyExtract
-from src.openai_client import get_embedding
-from src.settings import POSTGRES_DSN, TAVILY_API_KEY, ZEROBOUNCE_API_KEY, CRAWLER_USER_AGENT, CRAWLER_TIMEOUT_S, CRAWLER_MAX_PAGES, CRAWL_MAX_PAGES, CRAWL_KEYWORDS, EXTRACT_CORPUS_CHAR_LIMIT, ENABLE_LUSHA_FALLBACK, LUSHA_API_KEY, LUSHA_PREFERRED_TITLES, PERSIST_CRAWL_CORPUS
-from urllib.parse import urlparse, urljoin
-import requests
-from src.crawler import crawl_site
-import asyncio
+import time
+from typing import Any, Dict, List, Optional, TypedDict
+from urllib.parse import urljoin, urlparse
+
 import httpx
+import psycopg2
+import requests
 from bs4 import BeautifulSoup
-from src.lusha_client import AsyncLushaClient, LushaError
+from dotenv import load_dotenv
+from langchain.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.tools import tool
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from typing import TypedDict, List, Dict, Any, Optional
-from langgraph.graph import StateGraph, END
+from langchain_tavily import TavilyCrawl, TavilyExtract, TavilySearch
+from langgraph.graph import END, StateGraph
+from psycopg2.extras import Json
+
+from src.crawler import crawl_site
+from src.lusha_client import AsyncLushaClient, LushaError
+from src.openai_client import get_embedding
+from src.settings import (
+    CRAWL_KEYWORDS,
+    CRAWL_MAX_PAGES,
+    CRAWLER_TIMEOUT_S,
+    CRAWLER_USER_AGENT,
+    ENABLE_LUSHA_FALLBACK,
+    EXTRACT_CORPUS_CHAR_LIMIT,
+    LUSHA_API_KEY,
+    LUSHA_PREFERRED_TITLES,
+    PERSIST_CRAWL_CORPUS,
+    POSTGRES_DSN,
+    TAVILY_API_KEY,
+    ZEROBOUNCE_API_KEY,
+)
 
 load_dotenv()
 
@@ -38,9 +53,11 @@ if TAVILY_API_KEY:
     tavily_extract = TavilyExtract(api_key=TAVILY_API_KEY)
 else:
     tavily_search = None  # type: ignore[assignment]
-    tavily_crawl = None   # type: ignore[assignment]
-    tavily_extract = None # type: ignore[assignment]
-    print("⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract.")
+    tavily_crawl = None  # type: ignore[assignment]
+    tavily_extract = None  # type: ignore[assignment]
+    print(
+        "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
+    )
 
 # Initialize LangChain LLM for AI extraction
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -53,7 +70,7 @@ prompt_template = PromptTemplate(
         "Schema Keys: {schema_keys}\n"
         "Instructions: {instructions}\n\n"
         "Raw Content:\n{raw_content}\n"
-    )
+    ),
 )
 extract_chain = prompt_template | llm | StrOutputParser()
 
@@ -82,10 +99,18 @@ def _ensure_email_cache_table(conn):
 def _cache_get(conn, email: str) -> Optional[dict]:
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT status, confidence FROM email_verification_cache WHERE email=%s", (email,))
+            cur.execute(
+                "SELECT status, confidence FROM email_verification_cache WHERE email=%s",
+                (email,),
+            )
             row = cur.fetchone()
             if row:
-                return {"email": email, "status": row[0], "confidence": float(row[1] or 0.0), "source": "zerobounce-cache"}
+                return {
+                    "email": email,
+                    "status": row[0],
+                    "confidence": float(row[1] or 0.0),
+                    "source": "zerobounce-cache",
+                }
     except Exception:
         return None
     return None
@@ -105,6 +130,7 @@ def _cache_set(conn, email: str, status: str, confidence: float) -> None:
     except Exception:
         pass
 
+
 # ---------- Contacts persistence helpers (DB-introspective) ----------
 def _get_table_columns(conn, table_name: str) -> set:
     try:
@@ -115,11 +141,12 @@ def _get_table_columns(conn, table_name: str) -> set:
                 FROM information_schema.columns
                 WHERE table_name = %s
                 """,
-                (table_name,)
+                (table_name,),
             )
             return {r[0] for r in cur.fetchall()}
     except Exception:
         return set()
+
 
 def _get_contact_stats(company_id: int):
     """Return (total_contacts, has_named_contact, founder_present).
@@ -134,7 +161,9 @@ def _get_contact_stats(company_id: int):
         cols = _get_table_columns(conn, "contacts")
         with conn, conn.cursor() as cur:
             # total contacts
-            cur.execute("SELECT COUNT(*) FROM contacts WHERE company_id=%s", (company_id,))
+            cur.execute(
+                "SELECT COUNT(*) FROM contacts WHERE company_id=%s", (company_id,)
+            )
             total = int(cur.fetchone()[0] or 0)
 
             # any named contact
@@ -146,19 +175,40 @@ def _get_contact_stats(company_id: int):
             if "first_name" in cols:
                 name_conds.append("(first_name IS NOT NULL AND first_name <> '')")
             if name_conds:
-                q = "SELECT COUNT(*) FROM contacts WHERE company_id=%s AND (" + " OR ".join(name_conds) + ")"
+                q = (
+                    "SELECT COUNT(*) FROM contacts WHERE company_id=%s AND ("
+                    + " OR ".join(name_conds)
+                    + ")"
+                )
                 cur.execute(q, (company_id,))
                 has_named = int(cur.fetchone()[0] or 0) > 0
 
             # founder / leadership presence by title
             if "title" in cols:
-                terms = [(t or "").strip().lower() for t in (LUSHA_PREFERRED_TITLES or "").split(",") if (t or "").strip()]
+                terms = [
+                    (t or "").strip().lower()
+                    for t in (LUSHA_PREFERRED_TITLES or "").split(",")
+                    if (t or "").strip()
+                ]
                 # If titles list is empty, use a default set
                 if not terms:
-                    terms = ["founder", "co-founder", "ceo", "cto", "owner", "director", "head of", "principal"]
+                    terms = [
+                        "founder",
+                        "co-founder",
+                        "ceo",
+                        "cto",
+                        "owner",
+                        "director",
+                        "head of",
+                        "principal",
+                    ]
                 like_clauses = ["LOWER(title) LIKE %s" for _ in terms]
                 params = [f"%{t}%" for t in terms]
-                q = "SELECT COUNT(*) FROM contacts WHERE company_id=%s AND (" + " OR ".join(like_clauses) + ")"
+                q = (
+                    "SELECT COUNT(*) FROM contacts WHERE company_id=%s AND ("
+                    + " OR ".join(like_clauses)
+                    + ")"
+                )
                 cur.execute(q, (company_id, *params))
                 founder_present = int(cur.fetchone()[0] or 0) > 0
     except Exception:
@@ -171,10 +221,13 @@ def _get_contact_stats(company_id: int):
             pass
     return total, has_named, founder_present
 
+
 def _normalize_lusha_contact(c: dict) -> dict:
     """Flatten/normalize contact from Lusha enrich payload to a common schema."""
     out = {}
-    out["lusha_contact_id"] = c.get("lushaContactId") or c.get("contactId") or c.get("id")
+    out["lusha_contact_id"] = (
+        c.get("lushaContactId") or c.get("contactId") or c.get("id")
+    )
     out["first_name"] = c.get("firstName")
     out["last_name"] = c.get("lastName")
     name = c.get("name")
@@ -182,13 +235,23 @@ def _normalize_lusha_contact(c: dict) -> dict:
         name = " ".join([p for p in [out["first_name"], out["last_name"]] if p])
     out["full_name"] = name
     out["title"] = c.get("jobTitle") or c.get("title")
-    out["linkedin_url"] = c.get("linkedinUrl") or c.get("linkedinProfileUrl") or c.get("linkedin")
+    out["linkedin_url"] = (
+        c.get("linkedinUrl") or c.get("linkedinProfileUrl") or c.get("linkedin")
+    )
     out["company_name"] = c.get("companyName")
     out["company_domain"] = c.get("companyDomain")
     out["seniority"] = c.get("seniority")
     out["department"] = c.get("department")
-    out["city"] = c.get("city") or (c.get("location") or {}).get("city") if isinstance(c.get("location"), dict) else c.get("location")
-    out["country"] = c.get("country") or (c.get("location") or {}).get("country") if isinstance(c.get("location"), dict) else None
+    out["city"] = (
+        c.get("city") or (c.get("location") or {}).get("city")
+        if isinstance(c.get("location"), dict)
+        else c.get("location")
+    )
+    out["country"] = (
+        c.get("country") or (c.get("location") or {}).get("country")
+        if isinstance(c.get("location"), dict)
+        else None
+    )
 
     # Emails
     emails = []
@@ -211,7 +274,12 @@ def _normalize_lusha_contact(c: dict) -> dict:
     if isinstance(src_phones, list):
         for p in src_phones:
             if isinstance(p, dict):
-                v = p.get("internationalNumber") or p.get("number") or p.get("value") or p.get("e164")
+                v = (
+                    p.get("internationalNumber")
+                    or p.get("number")
+                    or p.get("value")
+                    or p.get("e164")
+                )
                 if v:
                     phones.append(v)
             elif isinstance(p, str):
@@ -221,7 +289,10 @@ def _normalize_lusha_contact(c: dict) -> dict:
     out["phones"] = [p for p in phones if p]
     return out
 
-def upsert_contacts_from_lusha(company_id: int, lusha_contacts: list[dict]) -> tuple[int, int]:
+
+def upsert_contacts_from_lusha(
+    company_id: int, lusha_contacts: list[dict]
+) -> tuple[int, int]:
     """Upsert contacts from Lusha into contacts table. Returns (inserted, updated)."""
     if not lusha_contacts:
         return (0, 0)
@@ -283,12 +354,20 @@ def upsert_contacts_from_lusha(company_id: int, lusha_contacts: list[dict]) -> t
                         exists = bool(cur.fetchone())
                     # Build SQL dynamically
                     if exists:
-                        set_cols = [k for k in row.keys() if k not in ("company_id", "email")]
+                        set_cols = [
+                            k for k in row.keys() if k not in ("company_id", "email")
+                        ]
                         if set_cols:
                             assignments = ", ".join([f"{k}=%s" for k in set_cols])
                             params = [row[k] for k in set_cols]
-                            where_clause = "company_id=%s AND email IS NOT DISTINCT FROM %s" if has_email else "company_id=%s"
-                            params.extend([company_id, email] if has_email else [company_id])
+                            where_clause = (
+                                "company_id=%s AND email IS NOT DISTINCT FROM %s"
+                                if has_email
+                                else "company_id=%s"
+                            )
+                            params.extend(
+                                [company_id, email] if has_email else [company_id]
+                            )
                             if has_updated_at:
                                 assignments = assignments + ", updated_at=now()"
                             cur.execute(
@@ -338,16 +417,20 @@ def upsert_contacts_from_lusha(company_id: int, lusha_contacts: list[dict]) -> t
         except Exception:
             pass
 
+
 # -------------- Tavily merged-corpus helpers --------------
+
 
 def _clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
     return s
 
+
 async def _fetch(client: httpx.AsyncClient, url: str) -> str:
     r = await client.get(url, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
     r.raise_for_status()
     return r.text
+
 
 async def _discover_relevant_urls(home_url: str, max_pages: int) -> list[str]:
     """Fetch homepage, parse same-domain links, keep only keyword-matching URLs."""
@@ -363,18 +446,25 @@ async def _discover_relevant_urls(home_url: str, max_pages: int) -> list[str]:
         found = set()
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-            if not href or href.startswith(("#", "mailto:", "tel:")) or "javascript:" in href:
+            if (
+                not href
+                or href.startswith(("#", "mailto:", "tel:"))
+                or "javascript:" in href
+            ):
                 continue
             full = urljoin(base, href)
             if urlparse(full).netloc != urlparse(base).netloc:
                 continue
             label = (a.get_text(" ", strip=True) or href).lower()
-            if any(k in label for k in CRAWL_KEYWORDS) or any(k in full.lower() for k in CRAWL_KEYWORDS):
+            if any(k in label for k in CRAWL_KEYWORDS) or any(
+                k in full.lower() for k in CRAWL_KEYWORDS
+            ):
                 found.add(full)
             if len(found) >= (max_pages - 1):
                 break
         urls += sorted(found)[: max_pages - 1]
         return urls
+
 
 def _combine_pages(pages: list[dict], char_limit: int) -> str:
     """Combine extracted pages (url, title, raw_content) into a single corpus."""
@@ -396,6 +486,7 @@ def _combine_pages(pages: list[dict], char_limit: int) -> str:
     if len(combined) > char_limit:
         combined = combined[:char_limit] + "\n\n[TRUNCATED]"
     return combined
+
 
 def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
     """Build corpus chunks from pages without truncation. Each chunk length <= chunk_char_size."""
@@ -428,6 +519,7 @@ def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
         chunks.append("\n\n".join(cur))
     return chunks
 
+
 def _merge_extracted_records(base: dict, new: dict) -> dict:
     """Merge two extraction results. Arrays are unioned; scalars prefer non-null; about_text prefers longer."""
     if not base:
@@ -450,6 +542,7 @@ def _merge_extracted_records(base: dict, new: dict) -> dict:
                 base[k] = v
     return base
 
+
 def _ensure_list(v):
     if v is None:
         return None
@@ -460,17 +553,18 @@ def _ensure_list(v):
         return parts or None
     return None
 
+
 async def _merge_with_deterministic(data: dict, home: str) -> dict:
     print("    🔁 Merging with deterministic signals")
     try:
-        summary = await crawl_site(home, max_pages=CRAWLER_MAX_PAGES)
+        summary = await crawl_site(home, max_pages=CRAWL_MAX_PAGES)
     except Exception as exc:
         print(f"       ↳ deterministic crawl for merge failed: {exc}")
         return data
     signals = summary.get("signals") or {}
     contact = signals.get("contact") or {}
-    sig_emails = (contact.get("emails") or [])
-    sig_phones = (contact.get("phones") or [])
+    sig_emails = contact.get("emails") or []
+    sig_phones = contact.get("phones") or []
     # merge arrays
     base_emails = _ensure_list(data.get("email")) or []
     data["email"] = sorted(set([*base_emails, *sig_emails]))[:40]
@@ -494,18 +588,27 @@ async def _merge_with_deterministic(data: dict, home: str) -> dict:
             desc = signals.get("meta_description") or ""
             data["about_text"] = (title + " - " + desc).strip(" -")
     # jobs_count from open roles
-    if (data.get("jobs_count") in (None, 0)) and isinstance(signals.get("open_roles_count"), int):
+    if (data.get("jobs_count") in (None, 0)) and isinstance(
+        signals.get("open_roles_count"), int
+    ):
         data["jobs_count"] = signals.get("open_roles_count", 0)
     # HQ guess if missing
     if not data.get("hq_city") or not data.get("hq_country"):
-        text = ((signals.get("title") or "") + " " + (signals.get("meta_description") or "")).lower()
-        if "singapore" in text or home.lower().endswith(".sg/") or ".sg" in home.lower():
+        text = (
+            (signals.get("title") or "") + " " + (signals.get("meta_description") or "")
+        ).lower()
+        if (
+            "singapore" in text
+            or home.lower().endswith(".sg/")
+            or ".sg" in home.lower()
+        ):
             data.setdefault("hq_city", "Singapore")
             data.setdefault("hq_country", "Singapore")
     # website_domain
     if not data.get("website_domain"):
         data["website_domain"] = home
     return data
+
 
 def update_company_core_fields(company_id: int, data: dict):
     """Update core scalar fields on companies table; arrays handled by store_enrichment."""
@@ -567,10 +670,11 @@ def update_company_core_fields(company_id: int, data: dict):
     finally:
         conn.close()
 
+
 async def _deterministic_crawl_and_persist(company_id: int, url: str):
     """Run the existing deterministic crawler and persist results to summaries and companies tables."""
     try:
-        summary = await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
+        summary = await crawl_site(url, max_pages=CRAWL_MAX_PAGES)
     except Exception as exc:
         print(f"   ↳ deterministic crawler failed: {exc}")
         return
@@ -586,18 +690,25 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
             """,
             (
                 company_id,
-                summary.get("url"), summary.get("title"), summary.get("description"),
-                summary.get("content_summary"), Json(summary.get("key_pages")),
-                Json(summary.get("signals")), summary.get("rule_score"),
-                summary.get("rule_band"), Json(summary.get("shortlist")),
+                summary.get("url"),
+                summary.get("title"),
+                summary.get("description"),
+                summary.get("content_summary"),
+                Json(summary.get("key_pages")),
+                Json(summary.get("signals")),
+                summary.get("rule_score"),
+                summary.get("rule_band"),
+                Json(summary.get("shortlist")),
                 Json(summary.get("crawl_metadata")),
-            )
+            ),
         )
     conn.close()
 
     # Project into company_enrichment_runs for downstream compatibility
     signals = summary.get("signals", {}) or {}
-    about_text = summary.get("content_summary") or " ".join((signals.get("value_props") or [])[:6])
+    about_text = summary.get("content_summary") or " ".join(
+        (signals.get("value_props") or [])[:6]
+    )
     tech_values = (signals.get("tech") or {}).values()
     tech_stack = sorted({t for sub in tech_values for t in (sub or [])})[:25]
     public_emails = ((signals.get("contact") or {}).get("emails") or [])[:10]
@@ -617,12 +728,16 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
     # Guess HQ city/country (simple heuristics)
     def _guess_city_country(sig: dict, url_: str):
         text = (sig.get("title") or "") + " " + (sig.get("meta_description") or "")
-        if "singapore" in text.lower() or url_.lower().endswith(".sg/") or ".sg" in url_.lower():
+        if (
+            "singapore" in text.lower()
+            or url_.lower().endswith(".sg/")
+            or ".sg" in url_.lower()
+        ):
             return ("Singapore", "Singapore")
         return (None, None)
 
     hq_city, hq_country = _guess_city_country(signals, url)
-    phones = ((signals.get("contact") or {}).get("phones") or [])
+    phones = (signals.get("contact") or {}).get("phones") or []
 
     legacy = {
         "about_text": about_text or "",
@@ -636,7 +751,10 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
     }
     store_enrichment(company_id, url, legacy)
 
-async def enrich_company_with_tavily(company_id: int, company_name: str, uen: str | None = None):
+
+async def enrich_company_with_tavily(
+    company_id: int, company_name: str, uen: str | None = None
+):
     """
     Orchestrated enrichment flow using LangGraph. This wrapper constructs
     the initial state and invokes the compiled enrichment_agent graph.
@@ -691,7 +809,9 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         if cid:
             conn = get_db_connection()
             with conn, conn.cursor() as cur:
-                cur.execute("SELECT website_domain FROM companies WHERE company_id=%s", (cid,))
+                cur.execute(
+                    "SELECT website_domain FROM companies WHERE company_id=%s", (cid,)
+                )
                 row = cur.fetchone()
             try:
                 conn.close()
@@ -725,7 +845,11 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
             async with AsyncLushaClient() as lc:
                 lusha_domain = await lc.find_company_domain(name)
                 if lusha_domain:
-                    normalized = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
+                    normalized = (
+                        lusha_domain
+                        if lusha_domain.startswith("http")
+                        else f"https://{lusha_domain}"
+                    )
                     domains = [normalized]
                     state["lusha_used"] = True
                     print(f"   ↳ Lusha provided domain: {normalized}")
@@ -750,14 +874,27 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
     if not filtered_urls and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
             async with AsyncLushaClient() as lc:
-                lusha_domain = await lc.find_company_domain(state.get("company_name") or "")
+                lusha_domain = await lc.find_company_domain(
+                    state.get("company_name") or ""
+                )
             if lusha_domain:
-                candidate_home = lusha_domain if lusha_domain.startswith("http") else f"https://{lusha_domain}"
-                if urlparse(candidate_home).netloc and urlparse(candidate_home).netloc != urlparse(home).netloc:
-                    print(f"   ↳ Using Lusha-discovered domain for crawl: {candidate_home}")
+                candidate_home = (
+                    lusha_domain
+                    if lusha_domain.startswith("http")
+                    else f"https://{lusha_domain}"
+                )
+                if (
+                    urlparse(candidate_home).netloc
+                    and urlparse(candidate_home).netloc != urlparse(home).netloc
+                ):
+                    print(
+                        f"   ↳ Using Lusha-discovered domain for crawl: {candidate_home}"
+                    )
                     state["home"] = candidate_home
                     state["lusha_used"] = True
-                    filtered_urls = await _discover_relevant_urls(candidate_home, CRAWL_MAX_PAGES)
+                    filtered_urls = await _discover_relevant_urls(
+                        candidate_home, CRAWL_MAX_PAGES
+                    )
         except Exception as e:
             print(f"   ↳ Lusha fallback for filtered URLs failed: {e}")
     if not filtered_urls:
@@ -801,7 +938,9 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         "enable_web_search": False,
                     }
                     crawl_result = tavily_crawl.run(crawl_input)
-                    raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+                    raw_urls = (
+                        crawl_result.get("results") or crawl_result.get("urls") or []
+                    )
                     for item in raw_urls:
                         if isinstance(item, dict) and item.get("url"):
                             page_urls.append(item["url"])
@@ -816,7 +955,9 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
         page_urls = list(dict.fromkeys(page_urls))
         page_urls = [u for u in page_urls if "*" not in u]
         try:
-            print(f"       ↳ Seeded/Discovered {len(page_urls)} URLs (incl. about seeds)")
+            print(
+                f"       ↳ Seeded/Discovered {len(page_urls)} URLs (incl. about seeds)"
+            )
             for _dbg in page_urls[:25]:
                 print(f"          - {_dbg}")
         except Exception:
@@ -836,6 +977,7 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     page_urls = state["page_urls"]
     extracted_pages: List[Dict[str, Any]] = []
     fallback_urls: List[str] = []
+
     def _extract_raw_from(obj: Any) -> Optional[str]:
         # Try common shapes from TavilyExtract
         if obj is None:
@@ -889,10 +1031,17 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
 
     if fallback_urls:
         try:
-            print(f"       ↳ TavilyExtract empty for {len(fallback_urls)} URLs; attempting HTTP fallback")
-            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+            print(
+                f"       ↳ TavilyExtract empty for {len(fallback_urls)} URLs; attempting HTTP fallback"
+            )
+            async with httpx.AsyncClient(
+                headers={"User-Agent": CRAWLER_USER_AGENT}
+            ) as client:
                 resps = await asyncio.gather(
-                    *(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in fallback_urls),
+                    *(
+                        client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                        for u in fallback_urls
+                    ),
                     return_exceptions=True,
                 )
             recovered = 0
@@ -903,15 +1052,22 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
                 if body:
                     extracted_pages.append({"url": u, "html": body})
                     recovered += 1
-            print(f"       ↳ HTTP fallback recovered {recovered}/{len(fallback_urls)} pages")
+            print(
+                f"       ↳ HTTP fallback recovered {recovered}/{len(fallback_urls)} pages"
+            )
         except Exception as _per_url_fb_exc:
             print(f"       ↳ Per-URL HTTP fallback failed: {_per_url_fb_exc}")
 
     if not extracted_pages:
         try:
-            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+            async with httpx.AsyncClient(
+                headers={"User-Agent": CRAWLER_USER_AGENT}
+            ) as client:
                 resps = await asyncio.gather(
-                    *(client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S) for u in page_urls),
+                    *(
+                        client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                        for u in page_urls
+                    ),
                     return_exceptions=True,
                 )
             for resp, u in zip(resps, page_urls):
@@ -924,7 +1080,9 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     if not extracted_pages:
         try:
             if state.get("company_id") and state.get("home"):
-                await _deterministic_crawl_and_persist(state["company_id"], state["home"]) 
+                await _deterministic_crawl_and_persist(
+                    state["company_id"], state["home"]
+                )
                 state["completed"] = True
                 state["extracted_pages"] = []
                 return state
@@ -938,7 +1096,7 @@ async def node_deterministic_fallback(state: EnrichmentState) -> EnrichmentState
     if state.get("completed") or not state.get("home"):
         return state
     try:
-        await _deterministic_crawl_and_persist(state["company_id"], state["home"]) 
+        await _deterministic_crawl_and_persist(state["company_id"], state["home"])
         state["completed"] = True
     except Exception as exc:
         print(f"   ↳ deterministic crawler fallback failed: {exc}")
@@ -949,12 +1107,19 @@ async def node_build_chunks(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("extracted_pages"):
         return state
     chunks = _make_corpus_chunks(state["extracted_pages"], EXTRACT_CORPUS_CHAR_LIMIT)
-    print(f"       ↳ {len(state['extracted_pages'])} pages -> {len(chunks)} chunks for extraction")
+    print(
+        f"       ↳ {len(state['extracted_pages'])} pages -> {len(chunks)} chunks for extraction"
+    )
     # Persist merged corpus for transparency/audit
     try:
         if PERSIST_CRAWL_CORPUS:
             full_combined = "\n\n".join(chunks)
-            _persist_corpus(state.get("company_id"), full_combined, len(state.get("extracted_pages") or []), source="tavily")
+            _persist_corpus(
+                state.get("company_id"),
+                full_combined,
+                len(state.get("extracted_pages") or []),
+                source="tavily",
+            )
     except Exception as _log_exc:
         print(f"       ↳ Failed to persist combined corpus: {_log_exc}")
     state["chunks"] = chunks
@@ -966,25 +1131,48 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         return state
     company_name = state.get("company_name") or ""
     schema_keys = [
-        "name","industry_norm","employees_est","revenue_bucket","incorporation_year","sg_registered",
-        "last_seen","website_domain","industry_code","company_size","annual_revenue","hq_city","hq_country",
-        "linkedin_url","founded_year","tech_stack","ownership_type","funding_status","employee_turnover",
-        "web_traffic","email","phone_number","location_city","location_country","about_text",
+        "name",
+        "industry_norm",
+        "employees_est",
+        "revenue_bucket",
+        "incorporation_year",
+        "sg_registered",
+        "last_seen",
+        "website_domain",
+        "industry_code",
+        "company_size",
+        "annual_revenue",
+        "hq_city",
+        "hq_country",
+        "linkedin_url",
+        "founded_year",
+        "tech_stack",
+        "ownership_type",
+        "funding_status",
+        "employee_turnover",
+        "web_traffic",
+        "email",
+        "phone_number",
+        "location_city",
+        "location_country",
+        "about_text",
     ]
     data: Dict[str, Any] = {}
     for i, chunk in enumerate(state["chunks"], start=1):
         try:
-            ai_output = extract_chain.invoke({
-                "raw_content": f"Company: {company_name}\n\n{chunk}",
-                "schema_keys": schema_keys,
-                "instructions": (
-                    "Return a single JSON object with only the above keys. Use null for unknown. "
-                    "For tech_stack, email, and phone_number return arrays of strings. "
-                    "Use integers for employees_est and incorporation_year when possible. "
-                    "website_domain should be the official domain for the company. "
-                    "about_text should be a concise 1-3 sentence summary of the company."
-                ),
-            })
+            ai_output = extract_chain.invoke(
+                {
+                    "raw_content": f"Company: {company_name}\n\n{chunk}",
+                    "schema_keys": schema_keys,
+                    "instructions": (
+                        "Return a single JSON object with only the above keys. Use null for unknown. "
+                        "For tech_stack, email, and phone_number return arrays of strings. "
+                        "Use integers for employees_est and incorporation_year when possible. "
+                        "website_domain should be the official domain for the company. "
+                        "about_text should be a concise 1-3 sentence summary of the company."
+                    ),
+                }
+            )
             m = re.search(r"\{.*\}", ai_output, re.S)
             piece = json.loads(m.group(0)) if m else json.loads(ai_output)
             data = _merge_extracted_records(data, piece)
@@ -995,7 +1183,9 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         data[k] = _ensure_list(data.get(k)) or []
     try:
         if state.get("home"):
-            data = await _merge_with_deterministic(data, state["home"])  # augment with crawler signals
+            data = await _merge_with_deterministic(
+                data, state["home"]
+            )  # augment with crawler signals
     except Exception as exc:
         print(f"   ↳ deterministic merge skipped: {exc}")
     state["data"] = data
@@ -1016,7 +1206,13 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
         needs_contacts = total_contacts == 0
         missing_names = not has_named
         missing_founder = not founder_present
-        trigger = need_emails or need_phones or needs_contacts or missing_names or missing_founder
+        trigger = (
+            need_emails
+            or need_phones
+            or needs_contacts
+            or missing_names
+            or missing_founder
+        )
         if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger:
             website_hint = data.get("website_domain") or state.get("home") or ""
             try:
@@ -1063,13 +1259,18 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                     if isinstance(val, list):
                         for p in val:
                             if isinstance(p, dict):
-                                v = p.get("internationalNumber") or p.get("number") or p.get("value")
+                                v = (
+                                    p.get("internationalNumber")
+                                    or p.get("number")
+                                    or p.get("value")
+                                )
                                 if v:
                                     added_phones.append(v)
                             elif isinstance(p, str):
                                 added_phones.append(p)
                     elif isinstance(val, str):
                         added_phones.append(val)
+
             def _unique(seq: List[str]) -> List[str]:
                 seen: set[str] = set()
                 out: List[str] = []
@@ -1079,13 +1280,20 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                     seen.add(x)
                     out.append(x)
                 return out
+
             if added_emails or added_phones:
                 data["email"] = _unique((data.get("email") or []) + added_emails)
-                data["phone_number"] = _unique((data.get("phone_number") or []) + added_phones)
-                print(f"       ↳ Lusha contacts fallback added {len(added_emails)} emails, {len(added_phones)} phones")
+                data["phone_number"] = _unique(
+                    (data.get("phone_number") or []) + added_phones
+                )
+                print(
+                    f"       ↳ Lusha contacts fallback added {len(added_emails)} emails, {len(added_phones)} phones"
+                )
             try:
                 ins, upd = upsert_contacts_from_lusha(company_id, lusha_contacts or [])
-                print(f"       ↳ Lusha contacts upserted: inserted={ins}, updated={upd}")
+                print(
+                    f"       ↳ Lusha contacts upserted: inserted={ins}, updated={upd}"
+                )
             except Exception as _upsert_exc:
                 print(f"       ↳ Lusha contacts upsert error: {_upsert_exc}")
             state["lusha_used"] = True
@@ -1171,6 +1379,7 @@ try:
 except Exception as e:
     print(f"enrichment graph diagram generation skipped: {e}")
 
+
 def _normalize_company_name(name: str) -> list[str]:
     n = (name or "").lower()
     # Replace & with 'and', remove punctuation
@@ -1178,7 +1387,25 @@ def _normalize_company_name(name: str) -> list[str]:
     n = re.sub(r"[^a-z0-9\s-]", " ", n)
     parts = [p for p in re.split(r"\s+", n) if p]
     # Remove common suffixes
-    SUFFIXES = {"pte", "pte.", "ltd", "ltd.", "inc", "inc.", "co", "co.", "company", "corp", "corp.", "llc", "plc", "limited", "holdings", "group", "singapore"}
+    SUFFIXES = {
+        "pte",
+        "pte.",
+        "ltd",
+        "ltd.",
+        "inc",
+        "inc.",
+        "co",
+        "co.",
+        "company",
+        "corp",
+        "corp.",
+        "llc",
+        "plc",
+        "limited",
+        "holdings",
+        "group",
+        "singapore",
+    }
     core = [p for p in parts if p not in SUFFIXES]
     # Keep first 2-3 tokens for matching
     return core[:3] or parts[:2]
@@ -1186,9 +1413,13 @@ def _normalize_company_name(name: str) -> list[str]:
 
 def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> list[str]:
 
-    print(f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}' and UEN '{uen}'")
+    print(
+        f"    🔍 Search domain for '{company_name}' with SIC prefix '{sic_prefix}' and UEN '{uen}'"
+    )
     try:
-        query = f"{company_name} official website{' ' + sic_prefix if sic_prefix else ''}"
+        query = (
+            f"{company_name} official website{' ' + sic_prefix if sic_prefix else ''}"
+        )
         results = tavily_search.run(query)
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
@@ -1208,11 +1439,33 @@ def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> lis
     name_hyphen = "-".join(core)
     filtered_urls = []
     AGGREGATORS = {
-        'linkedin.com','facebook.com','twitter.com','x.com','instagram.com','youtube.com','tiktok.com',
-        'glassdoor.com','indeed.com','jobsdb.com','jobstreet.com','mycareersfuture.gov.sg',
-        'wikipedia.org','crunchbase.com','bloomberg.com','reuters.com','medium.com',
-        'shopify.com','lazada.sg','shopee.sg','shopee.com','amazon.com','ebay.com','alibaba.com',
-        'google.com','maps.google.com','goo.gl'
+        "linkedin.com",
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "instagram.com",
+        "youtube.com",
+        "tiktok.com",
+        "glassdoor.com",
+        "indeed.com",
+        "jobsdb.com",
+        "jobstreet.com",
+        "mycareersfuture.gov.sg",
+        "wikipedia.org",
+        "crunchbase.com",
+        "bloomberg.com",
+        "reuters.com",
+        "medium.com",
+        "shopify.com",
+        "lazada.sg",
+        "shopee.sg",
+        "shopee.com",
+        "amazon.com",
+        "ebay.com",
+        "alibaba.com",
+        "google.com",
+        "maps.google.com",
+        "goo.gl",
     }
     for h in hits:
         url = h.get("url") if isinstance(h, dict) else None
@@ -1226,23 +1479,30 @@ def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> lis
         else:
             netloc_stripped = netloc
         # Skip obvious aggregators/marketplaces/social
-        apex = ".".join(netloc_stripped.split('.')[-2:]) if '.' in netloc_stripped else netloc_stripped
+        apex = (
+            ".".join(netloc_stripped.split(".")[-2:])
+            if "." in netloc_stripped
+            else netloc_stripped
+        )
         if apex in AGGREGATORS:
             continue
         # match core company name in domain only (or first word)
-        domain_label = netloc_stripped.split('.')[0]
-        if (name_nospace in domain_label.replace("-", "") or
-            name_hyphen in netloc_stripped or
-            core[0] in domain_label):
+        domain_label = netloc_stripped.split(".")[0]
+        if (
+            name_nospace in domain_label.replace("-", "")
+            or name_hyphen in netloc_stripped
+            or core[0] in domain_label
+        ):
             filtered_urls.append(url)
+
     # Rank: prefer .sg TLD, then shorter apex domains, then https
     def _rank(u: str) -> tuple:
         p = urlparse(u)
         host = p.netloc.lower()
-        tld_sg = host.endswith('.sg')
+        tld_sg = host.endswith(".sg")
         # prefer apex (fewer labels)
-        labels = host.split('.')
-        return (0 if tld_sg else 1, len(labels), 0 if p.scheme == 'https' else 1, u)
+        labels = host.split(".")
+        return (0 if tld_sg else 1, len(labels), 0 if p.scheme == "https" else 1, u)
 
     if filtered_urls:
         filtered_urls = sorted(set(filtered_urls), key=_rank)
@@ -1255,14 +1515,14 @@ def find_domain(company_name: str, sic_prefix: str = "", uen: str = None) -> lis
 def qualify_pages(pages: list[dict], threshold: int = 4) -> list[dict]:
     print(f"    🔍 Qualifying {len(pages)} pages")
     prompt = PromptTemplate(
-        input_variables=["url","title","content"],
+        input_variables=["url", "title", "content"],
         template=(
             "You are a qualifier agent. Given the following page, score 1–5 whether this is our official website or About Us page.\n"
-            "Return JSON {{\"score\":<int>,\"reason\":\"<reason>\"}}.\n\n"
+            'Return JSON {{"score":<int>,"reason":"<reason>"}}.\n\n'
             "URL: {url}\n"
             "Title: {title}\n"
             "Content: {content}\n"
-        )
+        ),
     )
     chain = prompt | llm | StrOutputParser()
     accepted = []
@@ -1271,10 +1531,10 @@ def qualify_pages(pages: list[dict], threshold: int = 4) -> list[dict]:
         title = p.get("title") or ""
         content = p.get("content") or ""
         try:
-            output = chain.invoke({"url":url, "title":title, "content":content})
+            output = chain.invoke({"url": url, "title": title, "content": content})
             result = json.loads(output)
             score = result.get("score", 0)
-            reason = result.get("reason","")
+            reason = result.get("reason", "")
             if score >= threshold:
                 p["qualifier_reason"] = reason
                 p["score"] = score
@@ -1283,17 +1543,18 @@ def qualify_pages(pages: list[dict], threshold: int = 4) -> list[dict]:
             print(f"       ↳ Qualify error for {url}: {exc}")
     return accepted
 
+
 def extract_website_data(url: str) -> dict:
     print(f"    🌐 extract_website_data('{url}')")
     schema = {
-        "about_text":    "str",
-        "tech_stack":    "list[str]",
+        "about_text": "str",
+        "tech_stack": "list[str]",
         "public_emails": "list[str]",
-        "jobs_count":    "int",
-        "linkedin_url":  "str",
-        "hq_city":       "str",
-        "hq_country":    "str",
-        "phone_number":  "str"
+        "jobs_count": "int",
+        "linkedin_url": "str",
+        "hq_city": "str",
+        "hq_country": "str",
+        "phone_number": "str",
     }
 
     # 1) Crawl starting from the root of the given URL
@@ -1306,7 +1567,7 @@ def extract_website_data(url: str) -> dict:
             "url": f"{root}/*",
             "limit": 20,
             "crawl_depth": 2,
-            "enable_web_search": False
+            "enable_web_search": False,
         }
         crawl_result = tavily_crawl.run(crawl_input)
         raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
@@ -1336,11 +1597,11 @@ def extract_website_data(url: str) -> dict:
         payload = {
             "urls": [url],
             "schema": {"raw_content": "str"},
-            "instructions": "Retrieve the main textual content from this page."
+            "instructions": "Retrieve the main textual content from this page.",
         }
         try:
             raw_data = tavily_extract.run(payload)
-           # print("          ↳ Tavily raw_data:", raw_data)
+        # print("          ↳ Tavily raw_data:", raw_data)
         except Exception as exc:
             print(f"          ↳ TavilyExtract error: {exc}")
             continue
@@ -1351,9 +1612,17 @@ def extract_website_data(url: str) -> dict:
             # top-level
             raw_content = raw_data.get("raw_content")
             # nested under results
-            if raw_content is None and isinstance(raw_data.get("results"), list) and raw_data["results"]:
+            if (
+                raw_content is None
+                and isinstance(raw_data.get("results"), list)
+                and raw_data["results"]
+            ):
                 raw_content = raw_data["results"][0].get("raw_content")
-        if not raw_content or not isinstance(raw_content, str) or not raw_content.strip():
+        if (
+            not raw_content
+            or not isinstance(raw_content, str)
+            or not raw_content.strip()
+        ):
             print("          ↳ No or empty raw_content found, skipping AI extraction.")
             continue
         print(f"          ↳ raw_content length: {len(raw_content)} characters")
@@ -1361,14 +1630,16 @@ def extract_website_data(url: str) -> dict:
         # 3) AI extraction
         try:
             print("          ↳ AI extraction:")
-            ai_output = extract_chain.invoke({
-                "raw_content": raw_content,
-                "schema_keys": list(schema.keys()),
-                "instructions": (
-                    "Extract the About Us text, list of technologies, public business emails, "
-                    "open job listing count, LinkedIn URL, HQ city & country, and phone number."
-                )
-            })
+            ai_output = extract_chain.invoke(
+                {
+                    "raw_content": raw_content,
+                    "schema_keys": list(schema.keys()),
+                    "instructions": (
+                        "Extract the About Us text, list of technologies, public business emails, "
+                        "open job listing count, LinkedIn URL, HQ city & country, and phone number."
+                    ),
+                }
+            )
             # Raw AI output string
             print("          ↳ AI output string:")
             print(ai_output)
@@ -1436,17 +1707,18 @@ def verify_emails(emails: list[str]) -> list[dict]:
             time.sleep(0.75)
             resp = requests.get(
                 "https://api.zerobounce.net/v2/validate",
-                params={
-                    "api_key": ZEROBOUNCE_API_KEY,
-                    "email": e,
-                    "ip_address": ""
-                },
-                timeout=10
+                params={"api_key": ZEROBOUNCE_API_KEY, "email": e, "ip_address": ""},
+                timeout=10,
             )
             data = resp.json()
             status = data.get("status", "unknown")
             confidence = float(data.get("confidence", 0.0))
-            rec = {"email": e, "status": status, "confidence": confidence, "source": "zerobounce"}
+            rec = {
+                "email": e,
+                "status": status,
+                "confidence": confidence,
+                "source": "zerobounce",
+            }
             if conn:
                 _cache_set(conn, e, status, confidence)
                 try:
@@ -1454,21 +1726,27 @@ def verify_emails(emails: list[str]) -> list[dict]:
                 except Exception:
                     pass
             ZB_CACHE[e] = rec
-            print(f"       ✅ ZeroBounce result for {e}: status={status}, confidence={confidence}")
+            print(
+                f"       ✅ ZeroBounce result for {e}: status={status}, confidence={confidence}"
+            )
         except Exception as exc:
             print(f"       ⚠️ ZeroBounce API error for {e}: {exc}")
             status = "unknown"
             confidence = 0.0
-            results.append({
-                "email": e,
-                "status": status,
-                "confidence": confidence,
-                "source": "zerobounce"
-            })
+            results.append(
+                {
+                    "email": e,
+                    "status": status,
+                    "confidence": confidence,
+                    "source": "zerobounce",
+                }
+            )
     return results
 
 
-def _persist_corpus(company_id: Optional[int], corpus: str, page_count: int, source: str = "tavily") -> None:
+def _persist_corpus(
+    company_id: Optional[int], corpus: str, page_count: int, source: str = "tavily"
+) -> None:
     if not company_id or not corpus:
         return
     conn = get_db_connection()
@@ -1492,7 +1770,7 @@ def _persist_corpus(company_id: Optional[int], corpus: str, page_count: int, sou
                     INSERT INTO crawl_corpus (company_id, page_count, source, corpus)
                     VALUES (%s,%s,%s,%s)
                     """,
-                    (company_id, page_count, source, corpus)
+                    (company_id, page_count, source, corpus),
                 )
     finally:
         try:
@@ -1508,15 +1786,15 @@ def _normalize_phone_list(values: list[str]) -> list[str]:
         if not s:
             continue
         # Keep leading + and digits only
-        if s.startswith('+'):
-            num = '+' + ''.join(ch for ch in s if ch.isdigit())
+        if s.startswith("+"):
+            num = "+" + "".join(ch for ch in s if ch.isdigit())
         else:
-            digits = ''.join(ch for ch in s if ch.isdigit())
+            digits = "".join(ch for ch in s if ch.isdigit())
             # Heuristic: 8 digits -> assume Singapore local, prefix +65
             if len(digits) == 8:
-                num = '+65' + digits
+                num = "+65" + digits
             elif len(digits) >= 9:
-                num = '+' + digits
+                num = "+" + digits
             else:
                 num = digits
         if num and num not in out:
@@ -1554,8 +1832,8 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                     data.get("jobs_count"),
                     data.get("linkedin_url"),
                     Json(verification),
-                    embedding
-                )
+                    embedding,
+                ),
             )
             print("       ↳ history saved")
 
@@ -1570,13 +1848,27 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                 (
                     apex,
                     data.get("linkedin_url"),
-                    (data.get("tech_stack") if isinstance(data.get("tech_stack"), list) else [data.get("tech_stack")] if data.get("tech_stack") else None),
-                    (data.get("public_emails") if isinstance(data.get("public_emails"), list) else [data.get("public_emails")] if data.get("public_emails") else None),
+                    (
+                        data.get("tech_stack")
+                        if isinstance(data.get("tech_stack"), list)
+                        else (
+                            [data.get("tech_stack")] if data.get("tech_stack") else None
+                        )
+                    ),
+                    (
+                        data.get("public_emails")
+                        if isinstance(data.get("public_emails"), list)
+                        else (
+                            [data.get("public_emails")]
+                            if data.get("public_emails")
+                            else None
+                        )
+                    ),
                     phones_norm,
                     data.get("hq_city"),
                     data.get("hq_country"),
-                    company_id
-                )
+                    company_id,
+                ),
             )
             print("       ↳ companies updated")
 
@@ -1596,8 +1888,8 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                         ver["email"],
                         email_verified,
                         ver["confidence"],
-                        contact_source
-                    )
+                        contact_source,
+                    ),
                 )
                 # Also write to lead_emails if table exists
                 try:
@@ -1613,8 +1905,12 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                           last_verified_at=now()
                         """,
                         (
-                            ver["email"], company_id, ver.get("status"), ver.get("confidence"), contact_source
-                        )
+                            ver["email"],
+                            company_id,
+                            ver.get("status"),
+                            ver.get("confidence"),
+                            contact_source,
+                        ),
                     )
                 except Exception:
                     pass
@@ -1627,14 +1923,14 @@ def store_enrichment(company_id: int, domain: str, data: dict):
 async def enrich_company(company_id: int, company_name: str):
     # 1) find domain (your current method)
     urls = [u for u in find_domain(company_name) if u]  # filter out None/empty
-    if not urls: 
+    if not urls:
         print("   ↳ No domain found; skipping")
         return
     url = urls[0]
 
     # 2) deterministic crawl first
     try:
-        summary = await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
+        summary = await crawl_site(url, max_pages=CRAWL_MAX_PAGES)
         # Store in summaries table
         conn = psycopg2.connect(dsn=POSTGRES_DSN)
         with conn, conn.cursor() as cur:
@@ -1654,46 +1950,75 @@ async def enrich_company(company_id: int, company_name: str):
                 )
                 # If crawl_site exposes page html, persist first-page synopsis if present
                 pages = (summary or {}).get("pages") or []
-                for p in pages[:CRAWLER_MAX_PAGES]:
+                for p in pages[:CRAWL_MAX_PAGES]:
                     cur.execute(
                         """
                         INSERT INTO crawl_pages (company_id, url, title, raw_html)
                         VALUES (%s,%s,%s,%s)
                         ON CONFLICT DO NOTHING
                         """,
-                        (company_id, p.get("url"), p.get("title"), p.get("html") or p.get("raw_content"))
+                        (
+                            company_id,
+                            p.get("url"),
+                            p.get("title"),
+                            p.get("html") or p.get("raw_content"),
+                        ),
                     )
             except Exception:
                 pass
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO summaries (company_id, url, title, description, content_summary, key_pages, signals, rule_score, rule_band, shortlist, crawl_metadata)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
-            """, (
-                company_id,
-                summary["url"], summary.get("title"), summary.get("description"),
-                summary.get("content_summary"), Json(summary.get("key_pages")),
-                Json(summary.get("signals")), summary.get("rule_score"),
-                summary.get("rule_band"), Json(summary.get("shortlist")),
-                Json(summary.get("crawl_metadata")),
-            ))
+            """,
+                (
+                    company_id,
+                    summary["url"],
+                    summary.get("title"),
+                    summary.get("description"),
+                    summary.get("content_summary"),
+                    Json(summary.get("key_pages")),
+                    Json(summary.get("signals")),
+                    summary.get("rule_score"),
+                    summary.get("rule_band"),
+                    Json(summary.get("shortlist")),
+                    Json(summary.get("crawl_metadata")),
+                ),
+            )
         conn.close()
 
         # Also project into company_enrichment_runs for downstream compatibility
         signals = summary.get("signals", {})
-        about_text = summary.get("content_summary") or " ".join(signals.get("value_props", [])[:6])
+        about_text = summary.get("content_summary") or " ".join(
+            signals.get("value_props", [])[:6]
+        )
         tech_stack = sorted(set(sum(signals.get("tech", {}).values(), [])))[:25]
         public_emails = (signals.get("contact") or {}).get("emails", [])[:10]
         jobs_count = signals.get("open_roles_count", 0)
 
-        print("signals: ", signals, "about_text: ", about_text, "tech_stack: ", tech_stack, "public_emails: ", public_emails, "jobs_count: ", jobs_count)
+        print(
+            "signals: ",
+            signals,
+            "about_text: ",
+            about_text,
+            "tech_stack: ",
+            tech_stack,
+            "public_emails: ",
+            public_emails,
+            "jobs_count: ",
+            jobs_count,
+        )
 
         conn = get_db_connection()
         with conn, conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO company_enrichment_runs (company_id, run_timestamp, about_text, tech_stack, public_emails, jobs_count, linkedin_url)
                 VALUES (%s, now(), %s, %s, %s, %s, %s)
-            """, (company_id, about_text, tech_stack, public_emails, jobs_count, None))
+            """,
+                (company_id, about_text, tech_stack, public_emails, jobs_count, None),
+            )
         conn.close()
 
         # Prepare data dict for store_enrichment (best-effort for all fields)
@@ -1702,14 +2027,26 @@ async def enrich_company(company_id: int, company_name: str):
             # Try from signals, else guess from TLD
             city = None
             country = None
-            text = (signals.get("title") or "") + " " + (signals.get("meta_description") or "")
-            if "singapore" in text.lower() or url.lower().endswith(".sg/") or ".sg" in url.lower():
+            text = (
+                (signals.get("title") or "")
+                + " "
+                + (signals.get("meta_description") or "")
+            )
+            if (
+                "singapore" in text.lower()
+                or url.lower().endswith(".sg/")
+                or ".sg" in url.lower()
+            ):
                 city = country = "Singapore"
             # TODO: Add more heuristics as needed
             return city, country
 
         hq_city, hq_country = guess_city_country(signals, url)
-        website_domain = urlparse(url).netloc.lower() if url.startswith("http") else (url or "").lower()
+        website_domain = (
+            urlparse(url).netloc.lower()
+            if url.startswith("http")
+            else (url or "").lower()
+        )
         email = public_emails[0] if public_emails else None
         phones = (signals.get("contact") or {}).get("phones", [])
         phone_number = phones[0] if phones else None
@@ -1719,7 +2056,9 @@ async def enrich_company(company_id: int, company_name: str):
             "public_emails": public_emails,
             "jobs_count": jobs_count,
             "linkedin_url": None,
-            "phone_number": (signals.get("contact") or {}).get("phones", []),  # all phones
+            "phone_number": (signals.get("contact") or {}).get(
+                "phones", []
+            ),  # all phones
             "hq_city": hq_city,
             "hq_country": hq_country,
             "website_domain": website_domain,
@@ -1729,12 +2068,16 @@ async def enrich_company(company_id: int, company_name: str):
             "pricing": signals.get("pricing", []),
             # You can add more fields here as needed
         }
-        print("DEBUG: Data dict to store_enrichment:", json.dumps(data, indent=2, default=str))
+        print(
+            "DEBUG: Data dict to store_enrichment:",
+            json.dumps(data, indent=2, default=str),
+        )
         store_enrichment(company_id, url, data)
         return  # success; skip LLM/Tavily path
 
     except Exception as exc:
         import traceback
+
         print(f"   ↳ deterministic crawler failed: {exc}. Falling back to Tavily/LLM.")
         traceback.print_exc()
 
