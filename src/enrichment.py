@@ -17,7 +17,11 @@ from langchain_core.tools import tool
 
 # LangChain imports for AI-driven extraction
 from langchain_openai import ChatOpenAI
-from langchain_tavily import TavilyCrawl, TavilyExtract
+from langchain_tavily import (
+    TavilyCrawl,
+    TavilyExtract,
+    TavilySearch as TavilySearchResults,
+)
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 from tavily import TavilyClient
