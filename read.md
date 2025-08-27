@@ -42,10 +42,12 @@ Optional / Recommended
 - TEMPERATURE: default `0.3`
 - CRAWL_MAX_PAGES: default `6` (total site pages after homepage)
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
+- ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
 
 Example `.env` (do not use real keys here)
 ```
 POSTGRES_DSN=postgres://USER:PASSWORD@HOST:5432/DB
+ODOO_POSTGRES_DSN=postgres://odoo:odoo@localhost:25060/demo
 OPENAI_API_KEY=sk-...
 TAVILY_API_KEY=tvly-...
 ZEROBOUNCE_API_KEY=zb-...
@@ -55,6 +57,35 @@ TEMPERATURE=0.3
 CRAWL_MAX_PAGES=6
 EXTRACT_CORPUS_CHAR_LIMIT=35000
 ```
+
+## Odoo Integration
+
+To extend an Odoo instance with enrichment fields, connect directly to its PostgreSQL
+database using a separate DSN. The migration script can open an SSH tunnel when the
+following variables are provided (example droplet):
+
+```
+SSH_HOST=188.166.183.13
+SSH_PORT=22
+SSH_USER=root
+SSH_PASSWORD=My_password
+DB_HOST_IN_DROPLET=172.18.0.2
+DB_PORT=5432
+DB_NAME=demo
+DB_USER=odoo
+DB_PASSWORD=odoo
+LOCAL_PORT=25060
+```
+
+Run the migration; the script will forward `LOCAL_PORT` to the droplet and build the
+DSN automatically if `ODOO_POSTGRES_DSN` isn't set:
+
+```
+python scripts/run_odoo_migration.py
+```
+
+This keeps your application database (`POSTGRES_DSN`) independent from Odoo's
+database connection.
 
 ## Database Schema & Migrations
 The code expects the following tables/columns. Adjust to your schema as needed.
