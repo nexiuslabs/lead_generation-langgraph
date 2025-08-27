@@ -1,5 +1,6 @@
 import os
 import sys
+
 from urllib.parse import urlparse, urlunparse
 
 import psycopg2
@@ -50,7 +51,9 @@ def main():
         print(f"ERROR: Migration file not found: {MIGRATION_FILE}")
         sys.exit(1)
 
+
     print("Using Odoo Postgres DSN:", _mask_dsn(ODOO_POSTGRES_DSN))
+
     conn = psycopg2.connect(dsn=ODOO_POSTGRES_DSN)
     try:
         with conn:
@@ -76,7 +79,9 @@ def main():
                 if not (has_res_partner and has_crm_lead):
                     print("\n❌ Odoo core tables not found in the target database.")
                     print("   Expected tables: res_partner, crm_lead")
+
                     print("   Current DSN:", _mask_dsn(ODOO_POSTGRES_DSN))
+
                     print("\nAction needed:")
                     print(
                         " - Point ODOO_POSTGRES_DSN in your .env to the actual Odoo Postgres database."
