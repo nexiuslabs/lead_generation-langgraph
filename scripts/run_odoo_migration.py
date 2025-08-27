@@ -1,7 +1,9 @@
 import os
 import subprocess
 import sys
+
 import time
+
 from urllib.parse import urlparse, urlunparse
 
 import psycopg2
@@ -55,7 +57,6 @@ def _mask_dsn(dsn: str) -> str:
     except Exception:
         return "<hidden>"
 
-
 def _open_ssh_tunnel():
     """Open an SSH tunnel if credentials are provided.
 
@@ -97,8 +98,10 @@ def main():
         print(f"ERROR: Migration file not found: {MIGRATION_FILE}")
         sys.exit(1)
 
+
     print("Using Odoo Postgres DSN:", _mask_dsn(dsn))
     conn = psycopg2.connect(dsn=dsn)
+
     try:
         with conn:
             with conn.cursor() as cur:
@@ -123,10 +126,12 @@ def main():
                 if not (has_res_partner and has_crm_lead):
                     print("\n❌ Odoo core tables not found in the target database.")
                     print("   Expected tables: res_partner, crm_lead")
+
                     print("   Current DSN:", _mask_dsn(dsn))
                     print("\nAction needed:")
                     print(
                         " - Point ODOO_POSTGRES_DSN or DB_* env vars to the actual Odoo Postgres database."
+
                     )
                     print(
                         " - Ensure the Odoo server has initialized its schema (start Odoo once).\n"
