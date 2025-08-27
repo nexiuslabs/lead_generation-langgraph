@@ -13,8 +13,8 @@ load_dotenv(_SRC_DIR / ".env")
 
 # Database DSN (postgres://user:pass@host:port/db)
 POSTGRES_DSN = os.getenv("POSTGRES_DSN")
-# Single source: both “app” and “odoo” use the same DSN
-ODOO_POSTGRES_DSN = POSTGRES_DSN
+# Odoo can use its own DSN; falls back to POSTGRES_DSN if unset
+ODOO_POSTGRES_DSN = os.getenv("ODOO_POSTGRES_DSN") or POSTGRES_DSN
 APP_POSTGRES_DSN = POSTGRES_DSN
 
 # OpenAI / LangChain config
