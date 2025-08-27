@@ -13,8 +13,19 @@ load_dotenv(_SRC_DIR / ".env")
 
 # Database DSN (postgres://user:pass@host:port/db)
 POSTGRES_DSN = os.getenv("POSTGRES_DSN")
-# Odoo can use its own DSN; falls back to POSTGRES_DSN if unset
-ODOO_POSTGRES_DSN = os.getenv("ODOO_POSTGRES_DSN") or POSTGRES_DSN
+
+# Odoo has its own DSN and does not fall back to POSTGRES_DSN
+ODOO_POSTGRES_DSN = os.getenv("ODOO_POSTGRES_DSN")
+if not ODOO_POSTGRES_DSN:
+    _local_port = os.getenv("LOCAL_PORT")
+    _db_user = os.getenv("DB_USER")
+    _db_password = os.getenv("DB_PASSWORD")
+    _db_name = os.getenv("DB_NAME")
+    if _local_port and _db_user and _db_password and _db_name:
+        ODOO_POSTGRES_DSN = (
+            f"postgresql://{_db_user}:{_db_password}@localhost:{_local_port}/{_db_name}"
+        )
+
 APP_POSTGRES_DSN = POSTGRES_DSN
 
 # OpenAI / LangChain config
