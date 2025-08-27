@@ -936,7 +936,8 @@ async def score_node(state: GraphState) -> GraphState:
         return state
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
+        # 1) Fetch latest scores for the candidate IDs
+        score_rows = await conn.fetch(
             f"""
             SELECT company_id, score, bucket, rationale
             FROM public.{LEAD_SCORES_TABLE}
@@ -944,17 +945,38 @@ async def score_node(state: GraphState) -> GraphState:
             """,
             ids,
         )
-    by_id = {r["company_id"]: dict(r) for r in rows}
+        by_score = {r["company_id"]: dict(r) for r in score_rows}
 
+        # 2) Fetch fresh company fields to display up-to-date values
+        comp_rows = await conn.fetch(
+            """
+            SELECT company_id, name, website_domain, industry_norm, employees_est
+            FROM public.companies
+            WHERE company_id = ANY($1::int[])
+            """,
+            ids,
+        )
+        by_comp = {r["company_id"]: dict(r) for r in comp_rows}
+
+    # 3) Merge fresh company data with scores, preserving candidate order
     scored: List[Dict[str, Any]] = []
     for c in cands:
-        sc = by_id.get(c.get("id"))
-        c_out = {**c}
+        cid = c.get("id")
+        comp = by_comp.get(cid, {})
+        sc = by_score.get(cid)
+        # Build row with refreshed fields; fallback to existing candidate values if missing
+        row: Dict[str, Any] = {
+            "id": cid,
+            "name": comp.get("name") or c.get("name"),
+            "domain": comp.get("website_domain") or c.get("domain"),
+            "industry": comp.get("industry_norm") or c.get("industry"),
+            "employee_count": comp.get("employees_est") if comp.get("employees_est") is not None else c.get("employee_count"),
+        }
         if sc:
-            c_out["lead_score"] = sc.get("score")
-            c_out["lead_bucket"] = sc.get("bucket")
-            c_out["lead_rationale"] = sc.get("rationale")
-        scored.append(c_out)
+            row["lead_score"] = sc.get("score")
+            row["lead_bucket"] = sc.get("bucket")
+            row["lead_rationale"] = sc.get("rationale")
+        scored.append(row)
 
     state["scored"] = scored
     table = _fmt_table(scored)
