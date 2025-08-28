@@ -178,7 +178,11 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
         final = await enrich_company_with_tavily(cid, name, uen)
+        if not final.get("completed"):
+            logger.warning("skipping odoo sync; enrichment incomplete for %s", name)
+            continue
         data = final.get("data") or {}
+        logger.info("↪ upsert_company %s", name)
         odoo_id = await store.upsert_company(
             name,
             uen,
@@ -188,7 +192,10 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
             incorporation_year=data.get("incorporation_year"),
             website_domain=data.get("website_domain"),
         )
+        logger.info("✔ upsert_company %s -> %s", name, odoo_id)
+        logger.info("↪ merge_company_enrichment %s", odoo_id)
         await store.merge_company_enrichment(odoo_id, data)
+        logger.info("✔ merge_company_enrichment %s", odoo_id)
         c.update({"id": cid, "odoo_id": odoo_id})
         ids.append(cid)
         enriched[cid] = {"data": data, "name": name, "odoo_id": odoo_id}
@@ -227,6 +234,7 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         if isinstance(emails, list) and emails:
             primary_email = emails[0]
         if odoo_id is not None:
+            logger.info("↪ create_lead_if_high %s", odoo_id)
             await store.create_lead_if_high(
                 odoo_id,
                 info.get("name", ""),
@@ -235,6 +243,7 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 sc.get("rationale", ""),
                 primary_email,
             )
+            logger.info("✔ create_lead_if_high %s", odoo_id)
         results.append(
             {
                 "company_id": cid,
