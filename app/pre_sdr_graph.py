@@ -252,7 +252,7 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                     email,
                 )
         except Exception as exc:
-            logger.warning("odoo sync failed for company_id=%s: %s", cid, exc)
+            logger.exception("odoo sync failed for company_id=%s", cid)
 
     state["messages"].append(
         AIMessage(f"Enrichment complete for {len(results)} companies.")
@@ -1090,13 +1090,13 @@ async def enrich_node(state: GraphState) -> GraphState:
                                         email,
                                     )
                             except Exception as exc:
-                                logger.warning(
-                                    "odoo sync failed for company_id=%s: %s", cid, exc
+                                logger.exception(
+                                    "odoo sync failed for company_id=%s", cid
                                 )
                 except Exception as _odoo_exc:
-                    logger.warning("odoo sync block failed: %s", _odoo_exc)
+                    logger.exception("odoo sync block failed")
         except Exception as _score_exc:
-            logger.warning("lead scoring failed: %s", _score_exc)
+            logger.exception("lead scoring failed")
     else:
         done = sum(1 for r in results if r.get("completed"))
         total = len(results)

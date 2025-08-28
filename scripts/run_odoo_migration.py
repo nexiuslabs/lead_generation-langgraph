@@ -77,9 +77,10 @@ def _open_ssh_tunnel():
             "-p",
             SSH_PASSWORD,
             "ssh",
+            "-4",
             "-N",
             "-L",
-            f"{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
+            f"127.0.0.1:{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
             f"{SSH_USER}@{SSH_HOST}",
             "-p",
             str(SSH_PORT),
@@ -91,9 +92,10 @@ def _open_ssh_tunnel():
     else:
         cmd = [
             "ssh",
+            "-4",
             "-N",
             "-L",
-            f"{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
+            f"127.0.0.1:{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
             f"{SSH_USER}@{SSH_HOST}",
             "-p",
             str(SSH_PORT),
@@ -111,7 +113,8 @@ def _open_ssh_tunnel():
 def main():
     dsn = ODOO_POSTGRES_DSN
     if not dsn:
-        dsn = f"postgresql://{DB_USER}:{DB_PASSWORD}@localhost:{LOCAL_PORT}/{DB_NAME}"
+        # Use IPv4 loopback explicitly to avoid ::1 preference
+        dsn = f"postgresql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{LOCAL_PORT}/{DB_NAME}"
 
     tunnel = _open_ssh_tunnel()
 
