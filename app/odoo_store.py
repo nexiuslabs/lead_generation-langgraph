@@ -23,6 +23,7 @@ class OdooStore:
         return await asyncpg.connect(self.dsn)
 
     async def upsert_company(self, name: str, uen: str | None = None, **fields) -> int:
+
         logger.info("Upserting company name=%s uen=%s", name, uen)
         conn = await self._acquire()
         try:
@@ -74,6 +75,7 @@ class OdooStore:
                 "Inserted Odoo company id=%s name=%s uen=%s", row["id"], name, uen
             )
             return row["id"]
+
         finally:
             await conn.close()
 
@@ -81,7 +83,11 @@ class OdooStore:
         self, company_id: int, email: str, full_name: str | None = None
     ) -> Optional[int]:
         if not email:
+            logger.info(
+                "skipping contact without email", extra={"partner_id": company_id}
+            )
             return None
+
         logger.info("Adding contact email=%s company_id=%s", email, company_id)
         conn = await self._acquire()
         try:
@@ -118,12 +124,14 @@ class OdooStore:
                 email,
             )
             return row["id"]
+
         finally:
             await conn.close()
 
     async def merge_company_enrichment(
         self, company_id: int, enrichment: Dict[str, Any]
     ):
+
         logger.info("Merging enrichment for company_id=%s", company_id)
         conn = await self._acquire()
         try:
@@ -142,6 +150,7 @@ class OdooStore:
                 company_id,
             )
             logger.info("Merged enrichment for company_id=%s", company_id)
+
         finally:
             await conn.close()
 
@@ -157,14 +166,21 @@ class OdooStore:
     ) -> Optional[int]:
         if score < threshold:
             logger.info(
+
                 "Skipping lead creation company_id=%s score=%.2f < %.2f",
                 company_id,
                 score,
                 threshold,
+
             )
             return None
+        logger.info(
+            "creating lead",
+            extra={"partner_id": company_id, "score": score},
+        )
         conn = await self._acquire()
         try:
+
             row = await conn.fetchrow(
                 """
               INSERT INTO crm_lead (name, partner_id, type,
@@ -188,5 +204,6 @@ class OdooStore:
                 score,
             )
             return row["id"]
+
         finally:
             await conn.close()
