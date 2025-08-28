@@ -185,13 +185,11 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
 
     icp = state.get("icp") or {}
     scoring_initial_state = {
-
         "candidate_ids": ids,
         "lead_features": [],
         "lead_scores": [],
         "icp_payload": {
             "employee_range": {
-
                 "min": icp.get("employees_min"),
                 "max": icp.get("employees_max"),
             },
@@ -256,8 +254,6 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         except Exception as exc:
             logger.warning("odoo sync failed for company_id=%s: %s", cid, exc)
 
-
- 
     state["messages"].append(
         AIMessage(f"Enrichment complete for {len(results)} companies.")
     )
@@ -1026,6 +1022,79 @@ async def enrich_node(state: GraphState) -> GraphState:
                 await lead_scoring_agent.ainvoke(scoring_initial_state)
                 # Immediately render scores into chat for better UX
                 state = await score_node(state)
+
+                # Best-effort Odoo sync for completed companies
+                try:
+                    pool = await get_pg_pool()
+                    async with pool.acquire() as conn:
+                        comp_rows = await conn.fetch(
+                            """
+                            SELECT company_id, name, uen, industry_norm, employees_est,
+                                   revenue_bucket, incorporation_year, website_domain
+                            FROM companies WHERE company_id = ANY($1::int[])
+                            """,
+                            ids,
+                        )
+                        comps = {r["company_id"]: dict(r) for r in comp_rows}
+
+                        email_rows = await conn.fetch(
+                            "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
+                            ids,
+                        )
+                        emails: Dict[int, str] = {}
+                        for row in email_rows:
+                            cid = row["company_id"]
+                            emails.setdefault(cid, row["email"])
+
+                        score_rows = await conn.fetch(
+                            "SELECT company_id, score, rationale FROM lead_scores WHERE company_id = ANY($1::int[])",
+                            ids,
+                        )
+                        scores = {r["company_id"]: dict(r) for r in score_rows}
+
+                    from app.odoo_store import OdooStore
+
+                    try:
+                        store = OdooStore()
+                    except Exception as _odoo_init_exc:
+                        logger.warning("odoo init skipped: %s", _odoo_init_exc)
+                        store = None  # type: ignore
+
+                    if store:
+                        for cid in ids:
+                            comp = comps.get(cid, {})
+                            if not comp:
+                                continue
+                            score = scores.get(cid) or {}
+                            email = emails.get(cid)
+                            try:
+                                odoo_id = await store.upsert_company(
+                                    comp.get("name"),
+                                    comp.get("uen"),
+                                    industry_norm=comp.get("industry_norm"),
+                                    employees_est=comp.get("employees_est"),
+                                    revenue_bucket=comp.get("revenue_bucket"),
+                                    incorporation_year=comp.get("incorporation_year"),
+                                    website_domain=comp.get("website_domain"),
+                                )
+                                if email:
+                                    await store.add_contact(odoo_id, email)
+                                await store.merge_company_enrichment(odoo_id, {})
+                                if "score" in score:
+                                    await store.create_lead_if_high(
+                                        odoo_id,
+                                        comp.get("name"),
+                                        float(score.get("score") or 0.0),
+                                        {},
+                                        str(score.get("rationale") or ""),
+                                        email,
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    "odoo sync failed for company_id=%s: %s", cid, exc
+                                )
+                except Exception as _odoo_exc:
+                    logger.warning("odoo sync block failed: %s", _odoo_exc)
         except Exception as _score_exc:
             logger.warning("lead scoring failed: %s", _score_exc)
     else:
@@ -1072,6 +1141,10 @@ async def score_node(state: GraphState) -> GraphState:
     pool = await get_pg_pool()
     cands = state.get("candidates") or []
     ids = [c.get("id") for c in cands if c.get("id") is not None]
+    # Fallback: derive ids from enrichment results if candidates lack ids
+    if not ids:
+        results = state.get("results") or []
+        ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
 
     if not ids:
         table = _fmt_table([])
@@ -1160,7 +1233,7 @@ def router(state: GraphState) -> str:
     if has_results and enrichment_completed and not has_scored:
         logger.info("router -> score (have enrichment, no scores, all completed)")
         return "score"
-    if has_results and not enrichment_completed:
+    if has_results and not enrichment_completed and not has_scored:
         logger.info("router -> end (enrichment not fully completed)")
         return "end"
 
