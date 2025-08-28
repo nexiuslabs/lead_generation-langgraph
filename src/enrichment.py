@@ -20,6 +20,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
+from openai import OpenAIError
 from psycopg2.extras import Json
 from tavily import TavilyClient
 
@@ -1236,7 +1237,8 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         "about_text",
     ]
     data: Dict[str, Any] = {}
-    any_success = False
+    success_count = 0
+    total_chunks = len(state["chunks"])
     for i, chunk in enumerate(state["chunks"], start=1):
         retries = 0
         while True:
@@ -1257,7 +1259,17 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
                 m = re.search(r"\{.*\}", ai_output, re.S)
                 piece = json.loads(m.group(0)) if m else json.loads(ai_output)
                 data = _merge_extracted_records(data, piece)
-                any_success = True
+                success_count += 1
+                break
+            except OpenAIError as e:
+                status = getattr(e, "status_code", None)
+                if status == 429 and retries < 3:
+                    delay = 2**retries
+                    print(f"   ↳ Chunk {i} rate limited (429). Retrying in {delay}s")
+                    await asyncio.sleep(delay)
+                    retries += 1
+                    continue
+                print(f"   ↳ Chunk {i} OpenAI HTTP error: {e}")
                 break
             except Exception as e:
                 status = getattr(
@@ -1284,8 +1296,12 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
     except Exception as exc:
         print(f"   ↳ deterministic merge skipped: {exc}")
     state["data"] = data
-    if any_success:
+    if success_count:
         state["extraction_success"] = True
+        if success_count < total_chunks:
+            state["extraction_partial"] = True
+    else:
+        state["completed"] = True
     return state
 
 
