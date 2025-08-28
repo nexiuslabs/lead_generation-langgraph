@@ -185,13 +185,11 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
 
     icp = state.get("icp") or {}
     scoring_initial_state = {
-
         "candidate_ids": ids,
         "lead_features": [],
         "lead_scores": [],
         "icp_payload": {
             "employee_range": {
-
                 "min": icp.get("employees_min"),
                 "max": icp.get("employees_max"),
             },
@@ -256,8 +254,6 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         except Exception as exc:
             logger.warning("odoo sync failed for company_id=%s: %s", cid, exc)
 
-
- 
     state["messages"].append(
         AIMessage(f"Enrichment complete for {len(results)} companies.")
     )
@@ -981,17 +977,22 @@ async def enrich_node(state: GraphState) -> GraphState:
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
         final_state = await enrich_company_with_tavily(cid, name, uen)
-        completed = (
-            bool(final_state.get("completed"))
+        enrichment_complete = bool(
+            final_state.get("enrichment_complete")
             if isinstance(final_state, dict)
             else False
         )
-        return {"company_id": cid, "name": name, "uen": uen, "completed": completed}
+        return {
+            "company_id": cid,
+            "name": name,
+            "uen": uen,
+            "completed": enrichment_complete,
+        }
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
     all_done = all(bool(r.get("completed")) for r in results) if results else False
     state["results"] = results
-    state["enrichment_completed"] = all_done
+    state["enrichment_complete"] = all_done
 
     if all_done:
         state["messages"] = add_messages(
@@ -1152,15 +1153,15 @@ def router(state: GraphState) -> str:
     has_candidates = bool(state.get("candidates"))
     has_results = bool(state.get("results"))
     has_scored = bool(state.get("scored"))
-    enrichment_completed = bool(state.get("enrichment_completed"))
+    enrichment_complete = bool(state.get("enrichment_complete"))
 
     if has_candidates and not has_results:
         logger.info("router -> enrich (have candidates, no enrichment)")
         return "enrich"
-    if has_results and enrichment_completed and not has_scored:
+    if has_results and enrichment_complete and not has_scored:
         logger.info("router -> score (have enrichment, no scores, all completed)")
         return "score"
-    if has_results and not enrichment_completed:
+    if has_results and not enrichment_complete:
         logger.info("router -> end (enrichment not fully completed)")
         return "end"
 

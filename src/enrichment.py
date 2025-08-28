@@ -850,10 +850,18 @@ async def enrich_company_with_tavily(
     }
     try:
         final_state = await enrichment_agent.ainvoke(initial_state)
-        return final_state
     except Exception as e:
         print(f"   ↳ Enrichment graph invoke failed: {e}")
-        return initial_state
+        final_state = initial_state
+
+    extraction_ok = bool(final_state.get("extraction_success"))
+    deterministic_only = (
+        bool(final_state.get("deterministic_summary")) and not extraction_ok
+    )
+    final_state["deterministic_only"] = deterministic_only
+    final_state["enrichment_complete"] = extraction_ok or deterministic_only
+
+    return final_state
 
 
 class EnrichmentState(TypedDict, total=False):
