@@ -17,6 +17,7 @@ from app.odoo_store import OdooStore
 from src.database import get_pg_pool
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
+from src.settings import ODOO_POSTGRES_DSN
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -184,11 +185,13 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
 
     icp = state.get("icp") or {}
     scoring_initial_state = {
+
         "candidate_ids": ids,
         "lead_features": [],
         "lead_scores": [],
         "icp_payload": {
             "employee_range": {
+
                 "min": icp.get("employees_min"),
                 "max": icp.get("employees_max"),
             },
@@ -253,6 +256,8 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         except Exception as exc:
             logger.warning("odoo sync failed for company_id=%s: %s", cid, exc)
 
+
+ 
     state["messages"].append(
         AIMessage(f"Enrichment complete for {len(results)} companies.")
     )

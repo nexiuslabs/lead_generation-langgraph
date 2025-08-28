@@ -692,6 +692,7 @@ def update_company_core_fields(company_id: int, data: dict):
                   location_country = %s,
                   last_seen = now()
                 WHERE company_id = %s
+
             """
             params = [
                 data.get("name"),
@@ -715,6 +716,8 @@ def update_company_core_fields(company_id: int, data: dict):
             ]
             assert sql.count("%s") == len(params), "placeholder mismatch"
             cur.execute(sql, params)
+
+
     except Exception as e:
         print(f"    ⚠️ companies core update failed: {e}")
     finally:
