@@ -36,7 +36,6 @@ from src.settings import (
     LUSHA_API_KEY,
     LUSHA_PREFERRED_TITLES,
     PERSIST_CRAWL_CORPUS,
-    PERSIST_CRAWL_PAGES,
     POSTGRES_DSN,
     TAVILY_API_KEY,
     ZEROBOUNCE_API_KEY,
@@ -167,7 +166,9 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
         # Back-compat: some databases have a NOT NULL run_id on this table
         # that references enrichment_runs(run_id). If the column exists and
         # caller didn't provide one, create a new enrichment_runs row and use it.
-        if "run_id" in cols and ("run_id" not in fields or fields.get("run_id") is None):
+        if "run_id" in cols and (
+            "run_id" not in fields or fields.get("run_id") is None
+        ):
             try:
                 with conn.cursor() as cur:
                     # Ensure enrichment_runs table exists (idempotent create)
@@ -198,6 +199,7 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
     except Exception as e:
         # Surface but don't crash callers; they may have follow-up persistence
         print(f"   ↳ insert company_enrichment_runs skipped: {e}")
+
 
 def _get_contact_stats(company_id: int):
     """Return (total_contacts, has_named_contact, founder_present).
@@ -694,13 +696,10 @@ def update_company_core_fields(company_id: int, data: dict):
                 """,
                 (
                     data.get("name"),
-                   
                     data.get("employees_est"),
                     data.get("revenue_bucket"),
-                   
-                   
+                    data.get("incorporation_year"),
                     data.get("website_domain"),
-                   
                     data.get("company_size"),
                     data.get("annual_revenue"),
                     data.get("hq_city"),
@@ -755,28 +754,6 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
                     Json(summary.get("crawl_metadata")),
                 ),
             )
-        if PERSIST_CRAWL_PAGES and pages:
-            try:
-                with conn.cursor() as cur:
-                    for p in pages:
-                        html = p.get("html") or ""
-                        title = ""
-                        try:
-                            soup = BeautifulSoup(html, "html.parser")
-                            title = (
-                                (soup.title.string or "").strip() if soup.title else ""
-                            )
-                        except Exception:
-                            title = ""
-                        cur.execute(
-                            """
-                            INSERT INTO crawl_pages (company_id, url, title, html, fetched_at)
-                            VALUES (%s,%s,%s,%s, now())
-                            """,
-                            (company_id, p.get("url"), title, html),
-                        )
-            except Exception as e:
-                print(f"   ↳ persist crawl_pages failed: {e}")
     conn.close()
 
     # Project into company_enrichment_runs for downstream compatibility
