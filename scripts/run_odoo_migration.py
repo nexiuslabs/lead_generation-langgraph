@@ -1,9 +1,8 @@
 import os
+import shutil
 import subprocess
 import sys
-
 import time
-
 from urllib.parse import urlparse, urlunparse
 
 import psycopg2
@@ -57,6 +56,7 @@ def _mask_dsn(dsn: str) -> str:
     except Exception:
         return "<hidden>"
 
+
 def _open_ssh_tunnel():
     """Open an SSH tunnel if credentials are provided.
 
@@ -64,21 +64,45 @@ def _open_ssh_tunnel():
     """
     if not (SSH_HOST and SSH_USER and DB_HOST_IN_DROPLET):
         return None
-    cmd = [
-        "ssh",
-        "-N",
-        "-L",
-        f"{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
-        f"{SSH_USER}@{SSH_HOST}",
-        "-p",
-        str(SSH_PORT),
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "StrictHostKeyChecking=no",
-    ]
+
     if SSH_PASSWORD:
-        cmd = ["sshpass", "-p", SSH_PASSWORD, *cmd]
+        if shutil.which("sshpass") is None:
+            print(
+                "ERROR: sshpass not found but SSH_PASSWORD is set.\n"
+                "Install sshpass (e.g., 'sudo apt-get install sshpass') or switch to key-based authentication."
+            )
+            sys.exit(1)
+        cmd = [
+            "sshpass",
+            "-p",
+            SSH_PASSWORD,
+            "ssh",
+            "-N",
+            "-L",
+            f"{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
+            f"{SSH_USER}@{SSH_HOST}",
+            "-p",
+            str(SSH_PORT),
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+        ]
+    else:
+        cmd = [
+            "ssh",
+            "-N",
+            "-L",
+            f"{LOCAL_PORT}:{DB_HOST_IN_DROPLET}:{DB_PORT}",
+            f"{SSH_USER}@{SSH_HOST}",
+            "-p",
+            str(SSH_PORT),
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+        ]
+
     proc = subprocess.Popen(cmd)
     time.sleep(1)  # give tunnel a moment
     return proc
@@ -97,7 +121,6 @@ def main():
     if not os.path.exists(MIGRATION_FILE):
         print(f"ERROR: Migration file not found: {MIGRATION_FILE}")
         sys.exit(1)
-
 
     print("Using Odoo Postgres DSN:", _mask_dsn(dsn))
     conn = psycopg2.connect(dsn=dsn)
@@ -131,7 +154,6 @@ def main():
                     print("\nAction needed:")
                     print(
                         " - Point ODOO_POSTGRES_DSN or DB_* env vars to the actual Odoo Postgres database."
-
                     )
                     print(
                         " - Ensure the Odoo server has initialized its schema (start Odoo once).\n"

@@ -1,11 +1,14 @@
 # app/odoo_store.py
 import json
+import logging
 import os
 from typing import Any, Dict, Optional
 
 import asyncpg
 
 from src.settings import ODOO_POSTGRES_DSN
+
+logger = logging.getLogger(__name__)
 
 
 class OdooStore:
@@ -20,9 +23,9 @@ class OdooStore:
         return await asyncpg.connect(self.dsn)
 
     async def upsert_company(self, name: str, uen: str | None = None, **fields) -> int:
+        logger.info("Upserting company name=%s uen=%s", name, uen)
         conn = await self._acquire()
         try:
-            # Try update by UEN; else insert as company
             row = await conn.fetchrow(
                 """
               UPDATE res_partner
@@ -47,6 +50,9 @@ class OdooStore:
                 fields.get("website_domain"),
             )
             if row:
+                logger.info(
+                    "Updated Odoo company id=%s name=%s uen=%s", row["id"], name, uen
+                )
                 return row["id"]
 
             row = await conn.fetchrow(
@@ -64,6 +70,9 @@ class OdooStore:
                 fields.get("incorporation_year"),
                 fields.get("website_domain"),
             )
+            logger.info(
+                "Inserted Odoo company id=%s name=%s uen=%s", row["id"], name, uen
+            )
             return row["id"]
         finally:
             await conn.close()
@@ -73,9 +82,9 @@ class OdooStore:
     ) -> Optional[int]:
         if not email:
             return None
+        logger.info("Adding contact email=%s company_id=%s", email, company_id)
         conn = await self._acquire()
         try:
-            # dedupe by (parent_id, lower(email))
             row = await conn.fetchrow(
                 """
               SELECT id FROM res_partner
@@ -85,6 +94,12 @@ class OdooStore:
                 email,
             )
             if row:
+                logger.info(
+                    "Contact exists id=%s company_id=%s email=%s",
+                    row["id"],
+                    company_id,
+                    email,
+                )
                 return row["id"]
             row = await conn.fetchrow(
                 """
@@ -96,6 +111,12 @@ class OdooStore:
                 email,
                 full_name,
             )
+            logger.info(
+                "Inserted contact id=%s company_id=%s email=%s",
+                row["id"],
+                company_id,
+                email,
+            )
             return row["id"]
         finally:
             await conn.close()
@@ -103,6 +124,7 @@ class OdooStore:
     async def merge_company_enrichment(
         self, company_id: int, enrichment: Dict[str, Any]
     ):
+        logger.info("Merging enrichment for company_id=%s", company_id)
         conn = await self._acquire()
         try:
             await conn.execute(
@@ -119,6 +141,7 @@ class OdooStore:
                 json.dumps(enrichment.get("tech_stack") or []),
                 company_id,
             )
+            logger.info("Merged enrichment for company_id=%s", company_id)
         finally:
             await conn.close()
 
@@ -133,6 +156,12 @@ class OdooStore:
         threshold: float = 0.66,
     ) -> Optional[int]:
         if score < threshold:
+            logger.info(
+                "Skipping lead creation company_id=%s score=%.2f < %.2f",
+                company_id,
+                score,
+                threshold,
+            )
             return None
         conn = await self._acquire()
         try:
@@ -151,6 +180,12 @@ class OdooStore:
                 json.dumps(features),
                 rationale,
                 primary_email,
+            )
+            logger.info(
+                "Created lead id=%s company_id=%s score=%.2f",
+                row["id"],
+                company_id,
+                score,
             )
             return row["id"]
         finally:

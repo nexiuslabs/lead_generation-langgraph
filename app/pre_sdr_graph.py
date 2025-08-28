@@ -13,6 +13,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
+from app.odoo_store import OdooStore
 from src.database import get_pg_pool
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
@@ -160,12 +161,100 @@ def parse_candidates(state: PreSDRState) -> PreSDRState:
 
 @log_node("enrich")
 async def run_enrichment(state: PreSDRState) -> PreSDRState:
-    # PLACEHOLDER: you still call your enrichment + Odoo writes here.
-    await asyncio.sleep(0.01)
-    cands = state.get("candidates") or []
-    state["results"] = [{"name": c["name"], "score": 0.7} for c in cands]
+    candidates = state.get("candidates") or []
+    if not candidates:
+        return state
+
+    pool = await get_pg_pool()
+    store = OdooStore()
+
+    async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
+        name = c["name"]
+        cid = c.get("id") or await _ensure_company_row(pool, name)
+        uen = c.get("uen")
+        await enrich_company_with_tavily(cid, name, uen)
+        return {"company_id": cid, "name": name, "uen": uen}
+
+    results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
+    state["results"] = results
+
+    ids = [r["company_id"] for r in results if r.get("company_id") is not None]
+    if not ids:
+        return state
+
+    icp = state.get("icp") or {}
+    scoring_initial_state = {
+        "candidate_ids": ids,
+        "lead_features": [],
+        "lead_scores": [],
+        "icp_payload": {
+            "employee_range": {
+                "min": icp.get("employees_min"),
+                "max": icp.get("employees_max"),
+            },
+            "revenue_bucket": icp.get("revenue_bucket"),
+            "incorporation_year": {
+                "min": icp.get("year_min"),
+                "max": icp.get("year_max"),
+            },
+        },
+    }
+    scoring_state = await lead_scoring_agent.ainvoke(scoring_initial_state)
+    scores = {s["company_id"]: s for s in scoring_state.get("lead_scores", [])}
+    features = {f["company_id"]: f for f in scoring_state.get("lead_features", [])}
+
+    async with pool.acquire() as conn:
+        comp_rows = await conn.fetch(
+            """
+            SELECT company_id, name, uen, industry_norm, employees_est,
+                   revenue_bucket, incorporation_year, website_domain
+            FROM companies WHERE company_id = ANY($1::int[])
+            """,
+            ids,
+        )
+        comps = {r["company_id"]: dict(r) for r in comp_rows}
+        email_rows = await conn.fetch(
+            "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
+            ids,
+        )
+        emails: Dict[int, str] = {}
+        for row in email_rows:
+            cid = row["company_id"]
+            emails.setdefault(cid, row["email"])
+
+    for cid in ids:
+        comp = comps.get(cid, {})
+        if not comp:
+            continue
+        score = scores.get(cid)
+        email = emails.get(cid)
+        try:
+            odoo_id = await store.upsert_company(
+                comp.get("name"),
+                comp.get("uen"),
+                industry_norm=comp.get("industry_norm"),
+                employees_est=comp.get("employees_est"),
+                revenue_bucket=comp.get("revenue_bucket"),
+                incorporation_year=comp.get("incorporation_year"),
+                website_domain=comp.get("website_domain"),
+            )
+            if email:
+                await store.add_contact(odoo_id, email)
+            await store.merge_company_enrichment(odoo_id, {})
+            if score:
+                await store.create_lead_if_high(
+                    odoo_id,
+                    comp.get("name"),
+                    score.get("score"),
+                    features.get(cid, {}),
+                    score.get("rationale", ""),
+                    email,
+                )
+        except Exception as exc:
+            logger.warning("odoo sync failed for company_id=%s: %s", cid, exc)
+
     state["messages"].append(
-        AIMessage(f"Enrichment complete for {len(cands)} companies.")
+        AIMessage(f"Enrichment complete for {len(results)} companies.")
     )
     return state
 
@@ -345,7 +434,19 @@ def _is_company_like(token: str) -> bool:
     if "." in t:
         return True
     # company suffixes
-    suffixes = [" inc", " inc.", " ltd", " corp", " co", " llc", " pte", " plc", " gmbh", " limited", " company"]
+    suffixes = [
+        " inc",
+        " inc.",
+        " ltd",
+        " corp",
+        " co",
+        " llc",
+        " pte",
+        " plc",
+        " gmbh",
+        " limited",
+        " company",
+    ]
     if any(s in tl for s in suffixes):
         return True
     if len(t) <= 2:
@@ -357,8 +458,24 @@ def _is_company_like(token: str) -> bool:
     if " " in t:
         words = [w for w in re.split(r"\s+", tl) if w]
         geo_words = {
-            "sg", "singapore", "sea", "apac", "emea", "global", "us", "usa", "europe",
-            "uk", "india", "na", "latam", "southeast", "asia", "north", "south", "america",
+            "sg",
+            "singapore",
+            "sea",
+            "apac",
+            "emea",
+            "global",
+            "us",
+            "usa",
+            "europe",
+            "uk",
+            "india",
+            "na",
+            "latam",
+            "southeast",
+            "asia",
+            "north",
+            "south",
+            "america",
         }
         connectors = {"and", "&", "/", "-", "or", "the", "of"}
         if all((w in geo_words) or (w in connectors) for w in words):
@@ -373,7 +490,9 @@ def _is_company_like(token: str) -> bool:
 def _parse_company_list(text: str) -> List[str]:
     raw = re.split(r"[,|\n]+", text or "")
     names = [n.strip() for n in raw if n and n.strip()]
-    names = [n for n in names if n.lower() not in {"start", "confirm", "run enrichment"}]
+    names = [
+        n for n in names if n.lower() not in {"start", "confirm", "run enrichment"}
+    ]
     # Keep only tokens that look like companies/domains
     names = [n for n in names if _is_company_like(n)]
     return names
@@ -389,7 +508,9 @@ class ICPUpdate(BaseModel):
     employees_min: Optional[int] = Field(default=None)
     employees_max: Optional[int] = Field(default=None)
     # New: revenue bucket and incorporation year range
-    revenue_bucket: Optional[str] = Field(default=None, description="small|medium|large")
+    revenue_bucket: Optional[str] = Field(
+        default=None, description="small|medium|large"
+    )
     year_min: Optional[int] = Field(default=None)
     year_max: Optional[int] = Field(default=None)
     geos: List[str] = Field(default_factory=list)
@@ -558,7 +679,9 @@ async def _ensure_company_row(pool, name: str) -> int:
         #    WARNING: This is best-effort and not concurrency-safe, but unblocks local flows.
         try:
             # Determine next id value from max(company_id)
-            row = await conn.fetchrow("SELECT COALESCE(MAX(company_id), 0) + 1 AS nid FROM companies")
+            row = await conn.fetchrow(
+                "SELECT COALESCE(MAX(company_id), 0) + 1 AS nid FROM companies"
+            )
             nid = int(row["nid"]) if row and "nid" in row else None  # type: ignore[index]
             if nid is not None:
                 await conn.execute(
@@ -592,12 +715,18 @@ async def _default_candidates(
         industries_param.append(industry_single.strip().lower())
     inds = icp.get("industries") or []
     if isinstance(inds, list):
-        industries_param.extend([s.strip().lower() for s in inds if isinstance(s, str) and s.strip()])
+        industries_param.extend(
+            [s.strip().lower() for s in inds if isinstance(s, str) and s.strip()]
+        )
     # Dedupe
     industries_param = sorted(set(industries_param))
     emp_min = icp.get("employees_min")
     emp_max = icp.get("employees_max")
-    rev_bucket = (icp.get("revenue_bucket") or "").strip().lower() if isinstance(icp.get("revenue_bucket"), str) else None
+    rev_bucket = (
+        (icp.get("revenue_bucket") or "").strip().lower()
+        if isinstance(icp.get("revenue_bucket"), str)
+        else None
+    )
     y_min = icp.get("year_min")
     y_max = icp.get("year_max")
     geos = icp.get("geos") or []
@@ -847,7 +976,11 @@ async def enrich_node(state: GraphState) -> GraphState:
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
         final_state = await enrich_company_with_tavily(cid, name, uen)
-        completed = bool(final_state.get("completed")) if isinstance(final_state, dict) else False
+        completed = (
+            bool(final_state.get("completed"))
+            if isinstance(final_state, dict)
+            else False
+        )
         return {"company_id": cid, "name": name, "uen": uen, "completed": completed}
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
@@ -862,7 +995,9 @@ async def enrich_node(state: GraphState) -> GraphState:
         )
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
-            ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
+            ids = [
+                r.get("company_id") for r in results if r.get("company_id") is not None
+            ]
             if ids:
                 scoring_initial_state = {
                     "candidate_ids": ids,
@@ -874,7 +1009,9 @@ async def enrich_node(state: GraphState) -> GraphState:
                             "max": (state.get("icp") or {}).get("employees_max"),
                         },
                         # New: pass-through revenue_bucket and incorporation_year
-                        "revenue_bucket": (state.get("icp") or {}).get("revenue_bucket"),
+                        "revenue_bucket": (state.get("icp") or {}).get(
+                            "revenue_bucket"
+                        ),
                         "incorporation_year": {
                             "min": (state.get("icp") or {}).get("year_min"),
                             "max": (state.get("icp") or {}).get("year_max"),
@@ -891,7 +1028,11 @@ async def enrich_node(state: GraphState) -> GraphState:
         total = len(results)
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [AIMessage(content=f"Enrichment finished with issues ({done}/{total} completed). I’ll wait to score until all complete.")],
+            [
+                AIMessage(
+                    content=f"Enrichment finished with issues ({done}/{total} completed). I’ll wait to score until all complete."
+                )
+            ],
         )
     return state
 
@@ -970,7 +1111,11 @@ async def score_node(state: GraphState) -> GraphState:
             "name": comp.get("name") or c.get("name"),
             "domain": comp.get("website_domain") or c.get("domain"),
             "industry": comp.get("industry_norm") or c.get("industry"),
-            "employee_count": comp.get("employees_est") if comp.get("employees_est") is not None else c.get("employee_count"),
+            "employee_count": (
+                comp.get("employees_est")
+                if comp.get("employees_est") is not None
+                else c.get("employee_count")
+            ),
         }
         if sc:
             row["lead_score"] = sc.get("score")
