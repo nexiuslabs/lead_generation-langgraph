@@ -77,6 +77,14 @@ DB_PASSWORD=odoo
 LOCAL_PORT=25060
 ```
 
+If `SSH_PASSWORD` is set, the migration script relies on `sshpass` to feed the
+password to `ssh`. Install it before running:
+
+- Debian/Ubuntu: `sudo apt-get install sshpass`
+- macOS (Homebrew): `brew install hudochenkov/sshpass/sshpass`
+
+Alternatively, omit `SSH_PASSWORD` and use key-based authentication.
+
 Run the migration; the script will forward `LOCAL_PORT` to the droplet and build the
 DSN automatically if `ODOO_POSTGRES_DSN` isn't set:
 
