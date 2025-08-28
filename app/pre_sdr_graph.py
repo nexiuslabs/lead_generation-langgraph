@@ -1114,24 +1114,27 @@ async def enrich_node(state: GraphState) -> GraphState:
 def _fmt_table(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No candidates found."
-    headers = ["Name", "Domain", "Industry", "Employees", "Score", "Bucket"]
+    headers = ["Name", "Domain", "Industry", "Employees", "Score", "Bucket", "Rationale", "Contact"]
     md = [
         "| " + " | ".join(headers) + " |",
         "|" + "|".join(["---"] * len(headers)) + "|",
     ]
     for r in rows:
+        rationale = str(r.get("lead_rationale", ""))
+        if len(rationale) > 140:
+            rationale = rationale[:137] + "…"
         md.append(
             "| "
-            + " | ".join(
-                [
-                    str(r.get("name", "")),
-                    str(r.get("domain", "")),
-                    str(r.get("industry", "")),
-                    str(r.get("employee_count", "")),
-                    str(r.get("lead_score", "")),
-                    str(r.get("lead_bucket", "")),
-                ]
-            )
+            + " | ".join([
+                str(r.get("name", "")),
+                str(r.get("domain", "")),
+                str(r.get("industry", "")),
+                str(r.get("employee_count", "")),
+                str(r.get("lead_score", "")),
+                str(r.get("lead_bucket", "")),
+                rationale,
+                str(r.get("contact_email", "")),
+            ])
             + " |"
         )
     return "\n".join(md)
@@ -1177,6 +1180,17 @@ async def score_node(state: GraphState) -> GraphState:
         )
         by_comp = {r["company_id"]: dict(r) for r in comp_rows}
 
+        # 3) Fetch a contact email when available
+        email_rows = await conn.fetch(
+            "SELECT company_id, email FROM public.lead_emails WHERE company_id = ANY($1::int[])",
+            ids,
+        )
+        by_email = {}
+        for _er in email_rows:
+            _cid = _er["company_id"]
+            if _cid not in by_email:
+                by_email[_cid] = _er.get("email")
+
     # 3) Merge fresh company data with scores, preserving candidate order
     scored: List[Dict[str, Any]] = []
     for c in cands:
@@ -1194,6 +1208,7 @@ async def score_node(state: GraphState) -> GraphState:
                 if comp.get("employees_est") is not None
                 else c.get("employee_count")
             ),
+            "contact_email": (by_email.get(cid) if "by_email" in locals() else None) or c.get("email") or "",
         }
         if sc:
             row["lead_score"] = sc.get("score")
