@@ -162,98 +162,102 @@ def parse_candidates(state: PreSDRState) -> PreSDRState:
 
 @log_node("enrich")
 async def run_enrichment(state: PreSDRState) -> PreSDRState:
-    cands = state.get("candidates") or []
-    if not cands:
-        state["messages"].append(AIMessage("No candidates to enrich."))
+    candidates = state.get("candidates") or []
+    if not candidates:
         return state
 
     pool = await get_pg_pool()
-    store = OdooStore(ODOO_POSTGRES_DSN)
+    store = OdooStore()
 
-    # Enrich each candidate and sync to Odoo
-    ids: List[int] = []
-    enriched: Dict[int, Dict[str, Any]] = {}
-    for c in cands:
-        name = c.get("name") or ""
+    async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
+        name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
-        final = await enrich_company_with_tavily(cid, name, uen)
-        if not final.get("completed"):
-            logger.warning("skipping odoo sync; enrichment incomplete for %s", name)
-            continue
-        data = final.get("data") or {}
-        logger.info("↪ upsert_company %s", name)
-        odoo_id = await store.upsert_company(
-            name,
-            uen,
-            industry_norm=data.get("industry_norm"),
-            employees_est=data.get("employees_est"),
-            revenue_bucket=data.get("revenue_bucket"),
-            incorporation_year=data.get("incorporation_year"),
-            website_domain=data.get("website_domain"),
-        )
-        logger.info("✔ upsert_company %s -> %s", name, odoo_id)
-        logger.info("↪ merge_company_enrichment %s", odoo_id)
-        await store.merge_company_enrichment(odoo_id, data)
-        logger.info("✔ merge_company_enrichment %s", odoo_id)
-        c.update({"id": cid, "odoo_id": odoo_id})
-        ids.append(cid)
-        enriched[cid] = {"data": data, "name": name, "odoo_id": odoo_id}
+        await enrich_company_with_tavily(cid, name, uen)
+        return {"company_id": cid, "name": name, "uen": uen}
 
-    # Lead scoring across all enriched companies
-    scoring_state = {
+    results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
+    state["results"] = results
+
+    ids = [r["company_id"] for r in results if r.get("company_id") is not None]
+    if not ids:
+        return state
+
+    icp = state.get("icp") or {}
+    scoring_initial_state = {
+
         "candidate_ids": ids,
         "lead_features": [],
         "lead_scores": [],
         "icp_payload": {
             "employee_range": {
-                "min": (state.get("icp") or {}).get("employees_min"),
-                "max": (state.get("icp") or {}).get("employees_max"),
+
+                "min": icp.get("employees_min"),
+                "max": icp.get("employees_max"),
             },
-            "revenue_bucket": (state.get("icp") or {}).get("revenue_bucket"),
+            "revenue_bucket": icp.get("revenue_bucket"),
             "incorporation_year": {
-                "min": (state.get("icp") or {}).get("year_min"),
-                "max": (state.get("icp") or {}).get("year_max"),
+                "min": icp.get("year_min"),
+                "max": icp.get("year_max"),
             },
         },
     }
-    scoring_state = await lead_scoring_agent.ainvoke(scoring_state)
-    features_by_id = {
-        f["company_id"]: f for f in scoring_state.get("lead_features") or []
-    }
-    scores = scoring_state.get("lead_scores") or []
+    scoring_state = await lead_scoring_agent.ainvoke(scoring_initial_state)
+    scores = {s["company_id"]: s for s in scoring_state.get("lead_scores", [])}
+    features = {f["company_id"]: f for f in scoring_state.get("lead_features", [])}
 
-    results: List[Dict[str, Any]] = []
-    for sc in scores:
-        cid = sc.get("company_id")
-        info = enriched.get(cid, {})
-        odoo_id = info.get("odoo_id")
-        data = info.get("data", {})
-        primary_email = None
-        emails = data.get("email")
-        if isinstance(emails, list) and emails:
-            primary_email = emails[0]
-        if odoo_id is not None:
-            logger.info("↪ create_lead_if_high %s", odoo_id)
-            await store.create_lead_if_high(
-                odoo_id,
-                info.get("name", ""),
-                sc.get("score", 0.0),
-                features_by_id.get(cid, {}),
-                sc.get("rationale", ""),
-                primary_email,
-            )
-            logger.info("✔ create_lead_if_high %s", odoo_id)
-        results.append(
-            {
-                "company_id": cid,
-                "name": info.get("name"),
-                "score": sc.get("score"),
-                "bucket": sc.get("bucket"),
-            }
+    async with pool.acquire() as conn:
+        comp_rows = await conn.fetch(
+            """
+            SELECT company_id, name, uen, industry_norm, employees_est,
+                   revenue_bucket, incorporation_year, website_domain
+            FROM companies WHERE company_id = ANY($1::int[])
+            """,
+            ids,
         )
+        comps = {r["company_id"]: dict(r) for r in comp_rows}
+        email_rows = await conn.fetch(
+            "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
+            ids,
+        )
+        emails: Dict[int, str] = {}
+        for row in email_rows:
+            cid = row["company_id"]
+            emails.setdefault(cid, row["email"])
 
-    state["results"] = results
+    for cid in ids:
+        comp = comps.get(cid, {})
+        if not comp:
+            continue
+        score = scores.get(cid)
+        email = emails.get(cid)
+        try:
+            odoo_id = await store.upsert_company(
+                comp.get("name"),
+                comp.get("uen"),
+                industry_norm=comp.get("industry_norm"),
+                employees_est=comp.get("employees_est"),
+                revenue_bucket=comp.get("revenue_bucket"),
+                incorporation_year=comp.get("incorporation_year"),
+                website_domain=comp.get("website_domain"),
+            )
+            if email:
+                await store.add_contact(odoo_id, email)
+            await store.merge_company_enrichment(odoo_id, {})
+            if score:
+                await store.create_lead_if_high(
+                    odoo_id,
+                    comp.get("name"),
+                    score.get("score"),
+                    features.get(cid, {}),
+                    score.get("rationale", ""),
+                    email,
+                )
+        except Exception as exc:
+            logger.warning("odoo sync failed for company_id=%s: %s", cid, exc)
+
+
+ 
     state["messages"].append(
         AIMessage(f"Enrichment complete for {len(results)} companies.")
     )

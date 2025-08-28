@@ -668,17 +668,16 @@ def update_company_core_fields(company_id: int, data: dict):
     conn = get_db_connection()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(
-                """
+            sql = """
                 UPDATE companies SET
                   name = COALESCE(%s, name),
-               
+
                   employees_est = %s,
                   revenue_bucket = %s,
                   incorporation_year = %s,
-                 
+
                   website_domain = COALESCE(%s, website_domain),
-                  
+
                   company_size = %s,
                   annual_revenue = %s,
                   hq_city = %s,
@@ -693,28 +692,32 @@ def update_company_core_fields(company_id: int, data: dict):
                   location_country = %s,
                   last_seen = now()
                 WHERE company_id = %s
-                """,
-                (
-                    data.get("name"),
-                    data.get("employees_est"),
-                    data.get("revenue_bucket"),
-                    data.get("incorporation_year"),
-                    data.get("website_domain"),
-                    data.get("company_size"),
-                    data.get("annual_revenue"),
-                    data.get("hq_city"),
-                    data.get("hq_country"),
-                    data.get("linkedin_url"),
-                    data.get("founded_year"),
-                    data.get("ownership_type"),
-                    data.get("funding_status"),
-                    data.get("employee_turnover"),
-                    data.get("web_traffic"),
-                    data.get("location_city"),
-                    data.get("location_country"),
-                    company_id,
-                ),
-            )
+
+            """
+            params = [
+                data.get("name"),
+                data.get("employees_est"),
+                data.get("revenue_bucket"),
+                data.get("incorporation_year"),
+                data.get("website_domain"),
+                data.get("company_size"),
+                data.get("annual_revenue"),
+                data.get("hq_city"),
+                data.get("hq_country"),
+                data.get("linkedin_url"),
+                data.get("founded_year"),
+                data.get("ownership_type"),
+                data.get("funding_status"),
+                data.get("employee_turnover"),
+                data.get("web_traffic"),
+                data.get("location_city"),
+                data.get("location_country"),
+                company_id,
+            ]
+            assert sql.count("%s") == len(params), "placeholder mismatch"
+            cur.execute(sql, params)
+
+
     except Exception as e:
         print(f"    ⚠️ companies core update failed: {e}")
     finally:
