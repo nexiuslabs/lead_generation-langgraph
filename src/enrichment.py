@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 import psycopg2
 import requests
+import tiktoken
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
@@ -75,6 +76,9 @@ prompt_template = PromptTemplate(
     ),
 )
 extract_chain = prompt_template | llm | StrOutputParser()
+
+TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
+TOKEN_CHUNK_LIMIT = 128_000
 
 
 def get_db_connection():
@@ -542,7 +546,10 @@ def _combine_pages(pages: list[dict], char_limit: int) -> str:
 
 
 def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
-    """Build corpus chunks from pages without truncation. Each chunk length <= chunk_char_size."""
+    """Build corpus chunks from pages without truncation.
+
+    Each fetched page is first split into token-sized pieces (<TOKEN_CHUNK_LIMIT)
+    and then grouped into character-limited chunks for extraction."""
     blocks: list[str] = []
     for p in pages:
         url = p.get("url") or ""
@@ -555,7 +562,13 @@ def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
             body = title
         if not body:
             continue
-        blocks.append(f"[URL] {url}\n[TITLE] {title}\n[BODY]\n{body}\n")
+        header = f"[URL] {url}\n[TITLE] {title}\n[BODY]\n"
+        header_tokens = len(TOKEN_ENCODING.encode(header))
+        body_limit = max(TOKEN_CHUNK_LIMIT - header_tokens, 1)
+        body_tokens = TOKEN_ENCODING.encode(body)
+        for i in range(0, len(body_tokens), body_limit):
+            piece = TOKEN_ENCODING.decode(body_tokens[i : i + body_limit])
+            blocks.append(f"{header}{piece}\n")
 
     chunks: list[str] = []
     cur: list[str] = []
@@ -716,7 +729,6 @@ def update_company_core_fields(company_id: int, data: dict):
             ]
             assert sql.count("%s") == len(params), "placeholder mismatch"
             cur.execute(sql, params)
-
 
     except Exception as e:
         print(f"    ⚠️ companies core update failed: {e}")
@@ -1224,27 +1236,44 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         "about_text",
     ]
     data: Dict[str, Any] = {}
+    any_success = False
     for i, chunk in enumerate(state["chunks"], start=1):
-        try:
-            ai_output = extract_chain.invoke(
-                {
-                    "raw_content": f"Company: {company_name}\n\n{chunk}",
-                    "schema_keys": schema_keys,
-                    "instructions": (
-                        "Return a single JSON object with only the above keys. Use null for unknown. "
-                        "For tech_stack, email, and phone_number return arrays of strings. "
-                        "Use integers for employees_est and incorporation_year when possible. "
-                        "website_domain should be the official domain for the company. "
-                        "about_text should be a concise 1-3 sentence summary of the company."
-                    ),
-                }
-            )
-            m = re.search(r"\{.*\}", ai_output, re.S)
-            piece = json.loads(m.group(0)) if m else json.loads(ai_output)
-            data = _merge_extracted_records(data, piece)
-        except Exception as e:
-            print(f"   ↳ Chunk {i} extraction parse failed: {e}")
-            continue
+        retries = 0
+        while True:
+            try:
+                ai_output = await extract_chain.ainvoke(
+                    {
+                        "raw_content": f"Company: {company_name}\n\n{chunk}",
+                        "schema_keys": schema_keys,
+                        "instructions": (
+                            "Return a single JSON object with only the above keys. Use null for unknown. "
+                            "For tech_stack, email, and phone_number return arrays of strings. "
+                            "Use integers for employees_est and incorporation_year when possible. "
+                            "website_domain should be the official domain for the company. "
+                            "about_text should be a concise 1-3 sentence summary of the company.",
+                        ),
+                    }
+                )
+                m = re.search(r"\{.*\}", ai_output, re.S)
+                piece = json.loads(m.group(0)) if m else json.loads(ai_output)
+                data = _merge_extracted_records(data, piece)
+                any_success = True
+                break
+            except Exception as e:
+                status = getattr(
+                    getattr(e, "response", None), "status_code", None
+                ) or getattr(e, "status_code", None)
+                if status == 429 or "429" in str(e):
+                    if retries < 3:
+                        delay = 2**retries
+                        print(
+                            f"   ↳ Chunk {i} rate limited (429). Retrying in {delay}s"
+                        )
+                        await asyncio.sleep(delay)
+                        retries += 1
+                        continue
+                print(f"   ↳ Chunk {i} extraction parse failed: {e}")
+                break
     for k in ["email", "phone_number", "tech_stack"]:
         data[k] = _ensure_list(data.get(k)) or []
     try:
@@ -1255,6 +1284,8 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
     except Exception as exc:
         print(f"   ↳ deterministic merge skipped: {exc}")
     state["data"] = data
+    if any_success:
+        state["extraction_success"] = True
     return state
 
 
@@ -1388,7 +1419,7 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
     data = state.get("data") or {}
     home = state.get("home") or ""
     company_id = state.get("company_id")
-    if not (company_id and data and home):
+    if not (data or state.get("extraction_success")):
         return state
     legacy = {
         "about_text": data.get("about_text") or "",
@@ -1405,13 +1436,14 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
         "value_props": data.get("value_props") or [],
         "pricing": data.get("pricing") or [],
     }
-    try:
-        # Run blocking store in a worker thread to avoid blocking the event loop
-        await asyncio.to_thread(store_enrichment, company_id, home, legacy)
-        print(f"    💾 stored extracted fields for company_id={company_id}")
-        state["completed"] = True
-    except Exception as exc:
-        print(f"   ↳ store_enrichment failed: {exc}")
+    if company_id and home:
+        try:
+            # Run blocking store in a worker thread to avoid blocking the event loop
+            await asyncio.to_thread(store_enrichment, company_id, home, legacy)
+            print(f"    💾 stored extracted fields for company_id={company_id}")
+        except Exception as exc:
+            print(f"   ↳ store_enrichment failed: {exc}")
+    state["completed"] = True
     return state
 
 
