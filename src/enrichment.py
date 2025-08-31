@@ -34,6 +34,8 @@ from src.settings import (
     CRAWLER_USER_AGENT,
     ENABLE_LUSHA_FALLBACK,
     EXTRACT_CORPUS_CHAR_LIMIT,
+    LANGCHAIN_MODEL,
+    TEMPERATURE,
     LUSHA_API_KEY,
     LUSHA_PREFERRED_TITLES,
     PERSIST_CRAWL_CORPUS,
@@ -64,7 +66,16 @@ else:
     )
 
 # Initialize LangChain LLM for AI extraction
-llm = ChatOpenAI(model="gpt-5", temperature=0)
+# Use configured model; some models (e.g., gpt-5) do not accept an explicit
+# temperature override, so omit the parameter in that case to avoid 400 errors.
+def _make_chat_llm(model: str, temperature: float | None) -> ChatOpenAI:
+    kwargs: dict = {"model": model}
+    # Omit temperature for models that only support default behavior
+    if temperature is not None and not model.lower().startswith("gpt-5"):
+        kwargs["temperature"] = temperature
+    return ChatOpenAI(**kwargs)
+
+llm = _make_chat_llm(LANGCHAIN_MODEL, TEMPERATURE)
 prompt_template = PromptTemplate(
     input_variables=["raw_content", "schema_keys", "instructions"],
     template=(
@@ -547,27 +558,51 @@ def _combine_pages(pages: list[dict], char_limit: int) -> str:
 
 
 def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
-    """Build corpus chunks from pages without truncation. Each chunk length <= chunk_char_size."""
+    """Build corpus chunks from pages, ensuring each chunk <= chunk_char_size.
+
+    - Strips HTML to text when needed to reduce token bloat.
+    - Splits any single oversized page into multiple blocks before packing.
+    """
+    # Clamp to a safe upper bound regardless of env configuration
+    safe_size = max(10_000, min(chunk_char_size, 200_000))
     blocks: list[str] = []
     for p in pages:
         url = p.get("url") or ""
         title = _clean_text(p.get("title") or "")
         body = p.get("raw_content") or p.get("content") or p.get("html") or ""
-        
+
+        # Normalize body into plain text
         if isinstance(body, dict):
             body = body.get("text") or ""
+        if isinstance(body, str) and ("</" in body or "<br" in body or "<p" in body):
+            try:
+                body = BeautifulSoup(body, "html.parser").get_text(" ", strip=True)
+            except Exception:
+                pass
         body = _clean_text(body)
         if not body and title:
             body = title
         if not body:
             continue
-        blocks.append(f"[URL] {url}\n[TITLE] {title}\n[BODY]\n{body}\n")
 
+        header = f"[URL] {url}\n[TITLE] {title}\n[BODY]\n"
+        max_body_len = max(1, safe_size - len(header) - 10)
+        if len(body) <= max_body_len:
+            blocks.append(f"{header}{body}\n")
+        else:
+            # Split a single large page into multiple pieces
+            part = 1
+            for i in range(0, len(body), max_body_len):
+                piece = body[i : i + max_body_len]
+                blocks.append(f"{header}(part {part})\n{piece}\n")
+                part += 1
+
+    # Pack blocks into chunks within size limit
     chunks: list[str] = []
     cur: list[str] = []
     cur_len = 0
     for blk in blocks:
-        if cur and (cur_len + len(blk) > chunk_char_size):
+        if cur and (cur_len + len(blk) > safe_size):
             chunks.append("\n\n".join(cur))
             cur = [blk]
             cur_len = len(blk)
@@ -576,6 +611,9 @@ def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
             cur_len += len(blk)
     if cur:
         chunks.append("\n\n".join(cur))
+
+    # Final hard cap just in case
+    chunks = [c[:safe_size] for c in chunks]
     return chunks
 
 
@@ -1280,6 +1318,31 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
             piece = json.loads(m.group(0)) if m else json.loads(ai_output)
             data = _merge_extracted_records(data, piece)
         except Exception as e:
+            # Best-effort recovery if context exceeded: retry with trimmed chunk
+            msg = str(e) if e else ""
+            if "context length" in msg.lower() or "maximum context length" in msg.lower():
+                try:
+                    trimmed = chunk[: int(len(chunk) * 0.6)]
+                    ai_output = extract_chain.invoke(
+                        {
+                            "raw_content": f"Company: {company_name}\n\n{trimmed}",
+                            "schema_keys": schema_keys,
+                            "instructions": (
+                                "Return a single JSON object with only the above keys. Use null for unknown. "
+                                "For tech_stack, email, and phone_number return arrays of strings. "
+                                "Use integers for employees_est and incorporation_year when possible. "
+                                "website_domain should be the official domain for the company. "
+                                "about_text should be a concise 1-3 sentence summary of the company."
+                            ),
+                        }
+                    )
+                    m = re.search(r"\{.*\}", ai_output, re.S)
+                    piece = json.loads(m.group(0)) if m else json.loads(ai_output)
+                    data = _merge_extracted_records(data, piece)
+                    logger.info(f"   ↳ Chunk {i} retried with trimmed content")
+                    continue
+                except Exception:
+                    pass
             logger.warning(f"   ↳ Chunk {i} extraction parse failed", exc_info=True)
             continue
     for k in ["email", "phone_number", "tech_stack"]:

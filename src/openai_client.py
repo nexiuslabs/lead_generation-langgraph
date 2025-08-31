@@ -8,12 +8,18 @@ from src.settings import OPENAI_API_KEY, LANGCHAIN_MODEL, TEMPERATURE
 os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
 
 # Initialize with no callback manager to avoid LangSmith errors
-chat_client = ChatOpenAI(
-    model=LANGCHAIN_MODEL,
-    temperature=TEMPERATURE,
-    callback_manager=None,
-    verbose=False
-)
+def _make_chat_client(model: str, temperature: float | None) -> ChatOpenAI:
+    kwargs = {
+        "model": model,
+        "callback_manager": None,
+        "verbose": False,
+    }
+    # Some models (e.g., gpt-5) only support default temperature; omit override
+    if temperature is not None and not model.lower().startswith("gpt-5"):
+        kwargs["temperature"] = temperature
+    return ChatOpenAI(**kwargs)
+
+chat_client = _make_chat_client(LANGCHAIN_MODEL, TEMPERATURE)
 
 async def generate_rationale(prompt: str) -> str:
     messages = [
