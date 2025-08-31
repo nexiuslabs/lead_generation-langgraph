@@ -170,6 +170,11 @@ Note: Arrays are handled as JSONB in this pipeline. If your schema uses `text[]`
 - Persist to `summaries`, project into `company_enrichment_runs`, update `companies`
 - ZeroBounce email verification (if key provided)
 
+### Domain Discovery Heuristics
+- Exact-match search: tries `"<Company Name>" "official website"` then `site:.sg` before fallbacks.
+- Brand/.sg filter: keeps only `.sg` domains or exact brand apex matches (e.g., `acme.com`).
+- Marketplace/aggregator rejection: discards results from marketplaces, directories, or socials (e.g., `linkedin.com`, `shopee.sg`, `amazon.com`), unless the apex exactly equals the brand (e.g., Amazon).
+
 ## Running
 - Ensure DB and `.env` are set
 - source .venv/bin/activate

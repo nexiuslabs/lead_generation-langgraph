@@ -134,6 +134,7 @@ class OdooStore:
                 """
               UPDATE res_partner
                  SET name=$1,
+                     complete_name=$1,
                      x_uen=COALESCE($2::varchar,x_uen),
                      x_industry_norm=$3,
                      x_employees_est=$4,
@@ -161,11 +162,12 @@ class OdooStore:
 
             row = await conn.fetchrow(
                 """
-              INSERT INTO res_partner (name, is_company, x_uen, x_industry_norm,
+              INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, x_uen, x_industry_norm,
                                        x_employees_est, x_revenue_bucket, x_incorporation_year, x_website_domain, create_date)
-              VALUES ($1, TRUE, $2, $3, $4, $5, $6, $7, now())
+              VALUES ($1, $1, 'contact', TRUE, TRUE, $2, $3, $4, $5, $6, $7, $8, now())
               RETURNING id
             """,
+                name,
                 name,
                 uen,
                 fields.get("industry_norm"),
@@ -212,8 +214,17 @@ class OdooStore:
                 return row["id"]
             row = await conn.fetchrow(
                 """
-              INSERT INTO res_partner (parent_id, is_company, name, email, create_date)
-              VALUES ($1, FALSE, COALESCE($3, split_part($2,'@',1)), $2, now())
+              INSERT INTO res_partner (parent_id, type, is_company, active, name, complete_name, email, create_date)
+              VALUES (
+                $1,
+                'contact',
+                FALSE,
+                TRUE,
+                COALESCE($3, split_part($2,'@',1)),
+                COALESCE($3, split_part($2,'@',1)),
+                $2,
+                now()
+              )
               RETURNING id
             """,
                 company_id,
@@ -286,11 +297,25 @@ class OdooStore:
 
             row = await conn.fetchrow(
                 """
-              INSERT INTO crm_lead (name, partner_id, type,
-                                    x_pre_sdr_score, x_pre_sdr_bucket, x_pre_sdr_features, x_pre_sdr_rationale,
-                                    email_from, create_date)
-              VALUES ($1,$2,'lead',$3, CASE WHEN $3>=0.66 THEN 'High' WHEN $3>=0.33 THEN 'Medium' ELSE 'Low' END,
-                      $4::jsonb, $5, $6, now())
+              INSERT INTO crm_lead (
+                name, partner_id, type, active, user_id, stage_id,
+                x_pre_sdr_score, x_pre_sdr_bucket, x_pre_sdr_features, x_pre_sdr_rationale,
+                email_from, create_date
+              )
+              VALUES (
+                $1,
+                $2,
+                'opportunity',
+                TRUE,
+                2,
+                1,
+                $3,
+                CASE WHEN $3>=0.66 THEN 'High' WHEN $3>=0.33 THEN 'Medium' ELSE 'Low' END,
+                $4::jsonb,
+                $5,
+                $6,
+                now()
+              )
               RETURNING id
             """,
                 title,

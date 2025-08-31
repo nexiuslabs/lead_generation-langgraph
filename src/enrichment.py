@@ -1495,23 +1495,34 @@ def find_domain(company_name: str) -> list[str]:
 
     core = _normalize_company_name(company_name)
     normalized_query = " ".join(core)
+    name_nospace = "".join(core)
+    name_hyphen = "-".join(core)
+
+    # 1) Exact-match search first, with fallbacks
     try:
-        query = f"{normalized_query} official website".strip()
-        response = tavily_client.search(query)
+        queries = [
+            f'"{company_name}" "official website"',
+            f'"{company_name}" site:.sg',
+            f"{normalized_query} official website",
+            f"{company_name} official website",
+        ]
+        response = None
+        for q in queries:
+            try:
+                response = tavily_client.search(q)
+            except Exception:
+                response = None
+            if isinstance(response, dict) and response.get("results"):
+                break
         if not isinstance(response, dict) or not response.get("results"):
-            query = f"{company_name} official website"
-            response = tavily_client.search(query)
-            if not isinstance(response, dict) or not response.get("results"):
-                print("       ↳ No results from Tavily search.")
-                return []
+            print("       ↳ No results from Tavily search.")
+            return []
     except Exception as exc:
         print(f"       ↳ Search error: {exc}")
         return []
 
     # Filter URLs to those containing the core company name (first two words)
-    name_nospace = "".join(core)
-    name_hyphen = "-".join(core)
-    filtered_urls = []
+    filtered_urls: list[str] = []
     AGGREGATORS = {
         "linkedin.com",
         "facebook.com",
@@ -1540,6 +1551,11 @@ def find_domain(company_name: str) -> list[str]:
         "google.com",
         "maps.google.com",
         "goo.gl",
+        "g2.com",
+        "capterra.com",
+        "tripadvisor.com",
+        "expedia.com",
+        "yelp.com",
     }
     for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
@@ -1558,37 +1574,65 @@ def find_domain(company_name: str) -> list[str]:
             else netloc_stripped
         )
         apex_label = apex.split(".")[0]
-        # Skip obvious aggregators/marketplaces/social unless the company name matches the apex domain
-        if apex in AGGREGATORS and apex_label != name_nospace:
-            continue
-        # match core company name in domain or fallback to page metadata
         domain_label = netloc_stripped.split(".")[0]
+
+        is_aggregator = apex in AGGREGATORS
+        is_sg = netloc_stripped.endswith(".sg") or apex.endswith(".sg")
+        is_brand_exact = (
+            apex_label == name_nospace
+            or domain_label.replace("-", "") == name_nospace
+        )
+
+        # page text signals
         title = (h.get("title") or "").lower()
         snippet = (h.get("content") or h.get("snippet") or "").lower()
         text = f"{title} {snippet}"
         label_match = (
             name_nospace in domain_label.replace("-", "")
             or name_hyphen in netloc_stripped
-            or core[0] in domain_label
+            or (core and core[0] in domain_label)
         )
         text_match = all(part in text for part in core)
-        if label_match or text_match:
-            filtered_urls.append(url)
+
+        # Enforce heuristics:
+        # - Reject marketplaces/aggregators (unless the brand name equals the aggregator apex e.g., Amazon)
+        if is_aggregator and not is_brand_exact:
+            continue
+        # - Keep only .sg domains or exact brand apex/domain
+        if not (is_sg or is_brand_exact):
+            continue
+        # - Also require name evidence in label or text for safety
+        if not (label_match or text_match or is_brand_exact):
+            continue
+
+        filtered_urls.append(url)
 
     # Rank: prefer .sg TLD, then shorter apex domains, then https
     def _rank(u: str) -> tuple:
         p = urlparse(u)
         host = p.netloc.lower()
-        tld_sg = host.endswith(".sg")
-        # prefer apex (fewer labels)
-        labels = host.split(".")
-        return (0 if tld_sg else 1, len(labels), 0 if p.scheme == "https" else 1, u)
+        host_stripped = host[4:] if host.startswith("www.") else host
+        labels = host_stripped.split(".")
+        apex = ".".join(labels[-2:]) if len(labels) >= 2 else host_stripped
+        apex_label = apex.split(".")[0]
+        domain_label = host_stripped.split(".")[0]
+        is_brand_exact_r = (
+            apex_label == name_nospace or domain_label.replace("-", "") == name_nospace
+        )
+        tld_sg = host_stripped.endswith(".sg") or apex.endswith(".sg")
+        return (
+            0 if is_brand_exact_r else 1,
+            0 if tld_sg else 1,
+            len(labels),
+            0 if p.scheme == "https" else 1,
+            u,
+        )
 
     if filtered_urls:
         filtered_urls = sorted(set(filtered_urls), key=_rank)
         print(f"       ↳ Filtered URLs: {filtered_urls}")
         return filtered_urls
-    print("       ↳ No matching URLs found.")
+    print("       ↳ No matching URLs found after heuristics.")
     return []
 
 
