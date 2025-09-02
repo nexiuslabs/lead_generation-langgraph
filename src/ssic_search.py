@@ -52,10 +52,10 @@ def _norm_terms(terms: Iterable[str]) -> Tuple[List[str], List[str]]:
 def search_ssic_terms(
     terms: Sequence[str], limit: int = 20
 ) -> List[Tuple[str, str, float]]:
-    """Search ``ssic_ref`` for the provided terms.
+    """Search ``ssic_ref_latest`` for the provided terms.
 
     Matching uses a combination of trigram similarity and full‑text search
-    ranking.  The latest ``ssic_ref.version`` is preferred.
+    ranking.  The view automatically targets the latest ``ssic_ref`` version.
     """
 
     texts, codes = _norm_terms(terms)
@@ -70,10 +70,9 @@ def search_ssic_terms(
             if codes:
                 cur.execute(
                     """
-                    SELECT ssic_code, ssic_title, 1.0 AS score
-                    FROM ssic_ref
-                    WHERE version = (SELECT MAX(version) FROM ssic_ref)
-                      AND ssic_code = ANY(%s)
+                    SELECT code, title, 1.0 AS score
+                    FROM ssic_ref_latest
+                    WHERE code = ANY(%s)
                     """,
                     (codes,),
                 )
@@ -83,20 +82,19 @@ def search_ssic_terms(
             for term in texts:
                 cur.execute(
                     """
-                    SELECT ssic_code,
-                           ssic_title,
+                    SELECT code,
+                           title,
                            GREATEST(
-                               similarity(ssic_title, %s),
+                               similarity(title, %s),
                                ts_rank_cd(
-                                   to_tsvector('english', ssic_title),
+                                   to_tsvector('english', title),
                                    websearch_to_tsquery('english', %s)
                                )
                            ) AS score
-                    FROM ssic_ref
-                    WHERE version = (SELECT MAX(version) FROM ssic_ref)
-                      AND (
-                          ssic_title % %s OR
-                          to_tsvector('english', ssic_title) @@ websearch_to_tsquery('english', %s)
+                    FROM ssic_ref_latest
+                    WHERE (
+                          title % %s OR
+                          to_tsvector('english', title) @@ websearch_to_tsquery('english', %s)
                       )
                     ORDER BY score DESC
                     LIMIT %s
