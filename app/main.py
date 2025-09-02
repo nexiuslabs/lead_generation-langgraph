@@ -196,7 +196,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
             src_desc = pick(
                 "primary_ssic_description", "ssic_description", "industry_description"
             )
-            src_code = pick("primary_ssic_code", "ssic_code", "industry_code") or "NULL"
+            src_code = pick("primary_ssic_code", "industry_code") or "NULL"
             src_web = (
                 pick("website", "website_url", "website_domain", "url", "homepage")
                 or "NULL"
@@ -230,10 +230,13 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
                   {src_name} AS entity_name,
                   {src_desc} AS primary_ssic_description,
                   {src_code} AS primary_ssic_code,
+                  ref.code AS ssic_code,
                   {src_web}  AS website,
                   {src_year} AS incorporation_year,
                   {src_stat} AS entity_status_de
-                FROM staging_acra_companies
+                FROM staging_acra_companies sc
+                LEFT JOIN ssic_ref_latest ref
+                  ON CAST({src_code} AS TEXT) = ref.code
                 WHERE LOWER({src_desc}) = ANY(%s)
                    OR LOWER({src_desc}) ILIKE ANY(%s)
                 LIMIT 1000
@@ -246,6 +249,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
                 uen,
                 entity_name,
                 ssic_desc,
+                primary_ssic_code,
                 ssic_code,
                 website,
                 inc_year,
@@ -351,7 +355,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
 def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
     """Fetch staging rows by SSIC code and upsert into companies.
 
-    Industry terms are resolved to SSIC codes via ``ssic_ref``. Matching rows
+    Industry terms are resolved to SSIC codes via ``ssic_ref_latest``. Matching rows
     are pulled from ``staging_acra_companies`` by ``primary_ssic_code`` and
     inserted or updated into ``companies``.
     """
@@ -385,10 +389,7 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                 )
                 or "NULL"
             )
-            src_code = (
-                pick("primary_ssic_code", "ssic_code", "industry_code", "ssic")
-                or "NULL"
-            )
+            src_code = pick("primary_ssic_code", "industry_code") or "NULL"
             src_web = (
                 pick("website", "website_url", "website_domain", "url", "homepage")
                 or "NULL"
@@ -420,8 +421,8 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
             ]
             cur.execute(
                 """
-                SELECT DISTINCT CAST(ssic_code AS TEXT), LOWER(description)
-                FROM ssic_ref
+                SELECT DISTINCT code AS ssic_code, LOWER(description)
+                FROM ssic_ref_latest
                 WHERE LOWER(description) = ANY(%s)
                    OR LOWER(title) = ANY(%s)
                 """,
@@ -441,10 +442,13 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                   {src_name} AS entity_name,
                   {src_desc} AS primary_ssic_description,
                   {src_code} AS primary_ssic_code,
+                  ref.code AS ssic_code,
                   {src_web}  AS website,
                   {src_year} AS incorporation_year,
                   {src_stat} AS entity_status_de
-                FROM staging_acra_companies
+                FROM staging_acra_companies sc
+                LEFT JOIN ssic_ref_latest ref
+                  ON CAST({src_code} AS TEXT) = ref.code
                 WHERE CAST({src_code} AS TEXT) = ANY(%s)
                 LIMIT 1000
             """
@@ -456,6 +460,7 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                 uen,
                 entity_name,
                 ssic_desc,
+                primary_ssic_code,
                 ssic_code,
                 website,
                 inc_year,
