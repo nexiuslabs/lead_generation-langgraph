@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import logging
 import os
 import re
 import sys
@@ -35,6 +36,9 @@ except Exception as e:
     POSTGRES_DSN = None  # will validate later
 
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 SSIC_VERSION_DEFAULT = os.getenv("SSIC_VERSION", "SSIC 2025A")
 
 
@@ -55,7 +59,9 @@ def sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
-def _excel_read_with_header_detection(path: Path, sheet: Optional[str] = None) -> pd.DataFrame:
+def _excel_read_with_header_detection(
+    path: Path, sheet: Optional[str] = None
+) -> pd.DataFrame:
     """Read Excel and detect the real header row when the first rows are titles."""
     sheet_arg = None
     if sheet is not None:
@@ -74,9 +80,14 @@ def _excel_read_with_header_detection(path: Path, sheet: Optional[str] = None) -
             vals = [str(v).strip().lower() for v in row]
             if not any(vals):
                 continue
-            has_code = any(("code" in v and "postal" not in v) or ("ssic" in v and "code" in v) for v in vals)
+            has_code = any(
+                ("code" in v and "postal" not in v) or ("ssic" in v and "code" in v)
+                for v in vals
+            )
             has_title = any("title" in v or "activity" in v for v in vals)
-            has_def = any("definition" in v or "description" in v or "detail" in v for v in vals)
+            has_def = any(
+                "definition" in v or "description" in v or "detail" in v for v in vals
+            )
             if has_code and (has_title or has_def):
                 # Build columns from this row
                 cols = []
@@ -117,7 +128,12 @@ def read_any(path: Path, sheet: Optional[str] = None) -> pd.DataFrame:
     return _excel_read_with_header_detection(path, sheet)
 
 
-def run(path: str, dsn: str, ssic_version: str = SSIC_VERSION_DEFAULT, sheet: Optional[str] = None) -> int:
+def run(
+    path: str,
+    dsn: str,
+    ssic_version: str = SSIC_VERSION_DEFAULT,
+    sheet: Optional[str] = None,
+) -> int:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
@@ -129,6 +145,7 @@ def run(path: str, dsn: str, ssic_version: str = SSIC_VERSION_DEFAULT, sheet: Op
 
     # Canonicalize headers to be resilient to spaces, punctuation, and casing
     orig_cols = [str(c) for c in df.columns]
+
     def _canon(s: str) -> str:
         return re.sub(r"[^a-z0-9]+", "_", s.strip().lower()).strip("_")
 
@@ -178,10 +195,18 @@ def run(path: str, dsn: str, ssic_version: str = SSIC_VERSION_DEFAULT, sheet: Op
         return canon_map[title_like[0]] if title_like else None
 
     def _pick_desc_col() -> Optional[str]:
-        for k in ("description", "details", "definition", "detailed_definition", "detailed_definitions"):
+        for k in (
+            "description",
+            "details",
+            "definition",
+            "detailed_definition",
+            "detailed_definitions",
+        ):
             if k in canon_map:
                 return canon_map[k]
-        desc_like = [c for c in canon_cols if "desc" in c or "defin" in c or "detail" in c]
+        desc_like = [
+            c for c in canon_cols if "desc" in c or "defin" in c or "detail" in c
+        ]
         return canon_map[desc_like[0]] if desc_like else None
 
     code_col = _pick_code_col()
@@ -213,31 +238,46 @@ def run(path: str, dsn: str, ssic_version: str = SSIC_VERSION_DEFAULT, sheet: Op
     try:
         with conn:
             with conn.cursor() as cur:
-                # Keep prior versions; only clear rows for same version+hash to prevent duping on reruns
-                cur.execute(
-                    "DELETE FROM ssic_ref WHERE version=%s AND source_file_hash=%s",
-                    (ssic_version, file_hash),
+                logger.info(
+                    "Loading %d SSIC rows for version %s", len(rows), ssic_version
                 )
+                cur.execute("DROP TABLE IF EXISTS ssic_ref_new")
+                cur.execute("CREATE TABLE ssic_ref_new (LIKE ssic_ref INCLUDING ALL)")
                 cur.executemany(
                     """
-                    INSERT INTO ssic_ref (code, title, description, version, source_file_hash)
+                    INSERT INTO ssic_ref_new (code, title, description, version, source_file_hash)
                     VALUES (%s,%s,%s,%s,%s)
-                    ON CONFLICT (code) DO UPDATE
-                       SET title=EXCLUDED.title,
-                           description=EXCLUDED.description,
-                           version=EXCLUDED.version,
-                           source_file_hash=EXCLUDED.source_file_hash
                     """,
                     rows,
                 )
-        print(f"Upserted {len(rows)} SSIC rows. version={ssic_version} hash={file_hash[:12]}…")
+                cur.execute("ALTER TABLE ssic_ref RENAME TO ssic_ref_old")
+                cur.execute("ALTER TABLE ssic_ref_new RENAME TO ssic_ref")
+                cur.execute("DROP TABLE ssic_ref_old")
+                cur.execute(
+                    """
+                    CREATE OR REPLACE VIEW ssic_ref_latest AS
+                    SELECT * FROM ssic_ref
+                    WHERE version = (SELECT MAX(version) FROM ssic_ref)
+                    """
+                )
+        logger.info(
+            "Loaded %d SSIC rows. version=%s hash=%s",
+            len(rows),
+            ssic_version,
+            file_hash[:12],
+        )
         return len(rows)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("SSIC load failed; previous ssic_ref retained")
+        return 0
     finally:
         conn.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load SSIC reference data into ssic_ref.")
+    parser = argparse.ArgumentParser(
+        description="Load SSIC reference data into ssic_ref."
+    )
     # Make path optional; fall back to SSIC_FILE env var or common defaults
     parser.add_argument(
         "path",
