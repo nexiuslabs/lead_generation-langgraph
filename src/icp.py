@@ -1,13 +1,15 @@
 # icp.py
 import logging
-from typing import Any, Dict, List, TypedDict, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
+
 from src.database import get_conn
 
 log = logging.getLogger(__name__)
 
 # ---------- State types ----------
+
 
 class NormState(TypedDict, total=False):
     raw_records: List[Dict[str, Any]]
@@ -21,6 +23,7 @@ class ICPState(TypedDict, total=False):
 
 
 # ---------- Helpers ----------
+
 
 def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
     """Fetch raw rows from staging_acra_companies with best-effort column mapping.
@@ -47,10 +50,32 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
 
                 src_uen = pick("uen", "uen_no", "uen_number") or "NULL"
                 src_name = pick("entity_name", "name", "company_name") or "NULL"
-                src_desc = pick("primary_ssic_description", "ssic_description", "industry_description") or "NULL"
-                src_code = pick("primary_ssic_code", "ssic_code", "industry_code", "ssic") or "NULL"
-                src_year = pick("incorporation_year", "founded_year", "registration_incorporation_date") or "NULL"
-                src_status = pick("entity_status_description", "entity_status", "status", "entity_status_de") or "NULL"
+                src_desc = (
+                    pick(
+                        "primary_ssic_description",
+                        "ssic_description",
+                        "industry_description",
+                    )
+                    or "NULL"
+                )
+                src_code = pick("primary_ssic_code", "industry_code") or "NULL"
+                src_year = (
+                    pick(
+                        "incorporation_year",
+                        "founded_year",
+                        "registration_incorporation_date",
+                    )
+                    or "NULL"
+                )
+                src_status = (
+                    pick(
+                        "entity_status_description",
+                        "entity_status",
+                        "status",
+                        "entity_status_de",
+                    )
+                    or "NULL"
+                )
 
                 sql = f"""
                     SELECT
@@ -58,9 +83,12 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
                       {src_name}  AS entity_name,
                       {src_desc}  AS primary_ssic_description,
                       {src_code}  AS primary_ssic_code,
+                      ref.code    AS ssic_code,
                       {src_year}  AS raw_year,
                       {src_status} AS entity_status_description
-                    FROM staging_acra_companies
+                    FROM staging_acra_companies sc
+                    LEFT JOIN ssic_ref ref
+                      ON CAST({src_code} AS TEXT) = ref.code
                     ORDER BY 1
                     LIMIT %s
                 """
@@ -77,6 +105,7 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
                     name AS entity_name,
                     industry_norm AS primary_ssic_description,
                     industry_code AS primary_ssic_code,
+                    industry_code AS ssic_code,
                     incorporation_year AS raw_year,
                     sg_registered
                 FROM companies
@@ -109,6 +138,7 @@ def _parse_year(val: Any) -> Optional[int]:
 
 def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     """Minimal normalization pass with flexible source keys."""
+
     def _norm_str(x: Optional[str]) -> Optional[str]:
         if x is None:
             return None
@@ -124,7 +154,11 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     ind_code = str(ind_code) if ind_code is not None else None
     raw_year = r.get("incorporation_year")
     if raw_year is None:
-        raw_year = r.get("founded_year") or r.get("raw_year") or r.get("registration_incorporation_date")
+        raw_year = (
+            r.get("founded_year")
+            or r.get("raw_year")
+            or r.get("registration_incorporation_date")
+        )
     year = _parse_year(raw_year)
     # Founded year mirrors incorporation if available
     founded = year
@@ -165,8 +199,16 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
     with get_conn() as conn:
         cols = _table_columns(conn, "companies")
         # Resolve target column names for schema variants
-        col_industry = "industry_code" if "industry_code" in cols else ("industory_code" if "industory_code" in cols else None)
-        col_founded = "founded_year" if "founded_year" in cols else ("incorporation_year" if "incorporation_year" in cols else None)
+        col_industry = (
+            "industry_code"
+            if "industry_code" in cols
+            else ("industory_code" if "industory_code" in cols else None)
+        )
+        col_founded = (
+            "founded_year"
+            if "founded_year" in cols
+            else ("incorporation_year" if "incorporation_year" in cols else None)
+        )
         col_sg = "sg_registered" if "sg_registered" in cols else None
 
         for r in rows:
@@ -197,7 +239,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
             if col_founded and r.get("founded_year") is not None:
                 insert_cols.append(col_founded)
                 params.append(r.get("founded_year"))
-            elif "incorporation_year" in cols and r.get("incorporation_year") is not None:
+            elif (
+                "incorporation_year" in cols and r.get("incorporation_year") is not None
+            ):
                 insert_cols.append("incorporation_year")
                 params.append(r.get("incorporation_year"))
             if col_sg and r.get("sg_registered") is not None:
@@ -205,7 +249,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
                 params.append(r.get("sg_registered"))
 
             # Always set last_seen on update; insert via NOW()
-            insert_cols_sql = ", ".join([*insert_cols, "last_seen"]) if insert_cols else "last_seen"
+            insert_cols_sql = (
+                ", ".join([*insert_cols, "last_seen"]) if insert_cols else "last_seen"
+            )
             placeholders = ",".join(["%s"] * len(params) + ["NOW()"])
 
             # Determine conflict target: prefer company_id, else uen if available
@@ -216,7 +262,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
                 conflict_col = "uen"
 
             # Build update assignments for upsert
-            set_cols = [c for c in insert_cols if c not in (conflict_col or "")] + ["last_seen"]
+            set_cols = [c for c in insert_cols if c not in (conflict_col or "")] + [
+                "last_seen"
+            ]
             set_sql = ", ".join([f"{c} = EXCLUDED.{c}" for c in set_cols])
 
             sql = f"INSERT INTO companies ({insert_cols_sql}) VALUES ({placeholders})"
@@ -232,7 +280,11 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
 
 def _select_icp_candidates(payload: Dict[str, Any]) -> List[int]:
     """Build a simple WHERE from payload and fetch matching company_ids."""
-    industries = [s.strip().lower() for s in payload.get("industries", []) if isinstance(s, str) and s.strip()]
+    industries = [
+        s.strip().lower()
+        for s in payload.get("industries", [])
+        if isinstance(s, str) and s.strip()
+    ]
     emp = payload.get("employee_range", {}) or {}
     inc = payload.get("incorporation_year", {}) or {}
 
@@ -268,6 +320,7 @@ def _select_icp_candidates(payload: Dict[str, Any]) -> List[int]:
 
 
 # ---------- LangGraph nodes ----------
+
 
 async def fetch_raw_records(state: NormState) -> NormState:
     rows = _fetch_staging_rows(limit=100)

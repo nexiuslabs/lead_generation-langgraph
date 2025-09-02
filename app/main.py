@@ -196,7 +196,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
             src_desc = pick(
                 "primary_ssic_description", "ssic_description", "industry_description"
             )
-            src_code = pick("primary_ssic_code", "ssic_code", "industry_code") or "NULL"
+            src_code = pick("primary_ssic_code", "industry_code") or "NULL"
             src_web = (
                 pick("website", "website_url", "website_domain", "url", "homepage")
                 or "NULL"
@@ -230,10 +230,11 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
                   {src_name} AS entity_name,
                   {src_desc} AS primary_ssic_description,
                   {src_code} AS primary_ssic_code,
+                  CAST({src_code} AS TEXT) AS ssic_code,
                   {src_web}  AS website,
                   {src_year} AS incorporation_year,
                   {src_stat} AS entity_status_de
-                FROM staging_acra_companies
+                FROM staging_acra_companies sc
                 WHERE LOWER({src_desc}) = ANY(%s)
                    OR LOWER({src_desc}) ILIKE ANY(%s)
                 LIMIT 1000
@@ -246,6 +247,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: list[str]) -> i
                 uen,
                 entity_name,
                 ssic_desc,
+                primary_ssic_code,
                 ssic_code,
                 website,
                 inc_year,
@@ -385,10 +387,7 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                 )
                 or "NULL"
             )
-            src_code = (
-                pick("primary_ssic_code", "ssic_code", "industry_code", "ssic")
-                or "NULL"
-            )
+            src_code = pick("primary_ssic_code", "industry_code") or "NULL"
             src_web = (
                 pick("website", "website_url", "website_domain", "url", "homepage")
                 or "NULL"
@@ -418,14 +417,17 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
             norm_inds = [
                 (t or "").strip().lower() for t in industries if (t or "").strip()
             ]
+            like_patterns = [f"%{t}%" for t in norm_inds]
             cur.execute(
                 """
-                SELECT DISTINCT CAST(ssic_code AS TEXT), LOWER(description)
+                SELECT DISTINCT code AS ssic_code, LOWER(description)
                 FROM ssic_ref
                 WHERE LOWER(description) = ANY(%s)
                    OR LOWER(title) = ANY(%s)
+                   OR LOWER(description) LIKE ANY(%s)
+                   OR LOWER(title) LIKE ANY(%s)
                 """,
-                (norm_inds, norm_inds),
+                (norm_inds, norm_inds, like_patterns, like_patterns),
             )
             code_rows = cur.fetchall()
             code_map = {
@@ -441,10 +443,11 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                   {src_name} AS entity_name,
                   {src_desc} AS primary_ssic_description,
                   {src_code} AS primary_ssic_code,
+                  CAST({src_code} AS TEXT) AS ssic_code,
                   {src_web}  AS website,
                   {src_year} AS incorporation_year,
                   {src_stat} AS entity_status_de
-                FROM staging_acra_companies
+                FROM staging_acra_companies sc
                 WHERE CAST({src_code} AS TEXT) = ANY(%s)
                 LIMIT 1000
             """
@@ -456,6 +459,7 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                 uen,
                 entity_name,
                 ssic_desc,
+                primary_ssic_code,
                 ssic_code,
                 website,
                 inc_year,
