@@ -300,10 +300,12 @@ def _upsert_companies_from_staging_by_industries_old(industries: List[str]) -> i
                       {src_name} AS entity_name,
                       {src_desc} AS primary_ssic_description,
                       {src_code} AS primary_ssic_code,
+
                       CAST({src_code} AS TEXT) AS ssic_code,
                       {src_year_expr} AS incorporation_year,
                       {src_stat} AS entity_status_de
                     FROM staging_acra_companies sc
+
                     WHERE CAST({src_code} AS TEXT) = ANY(%s::text[])
                 """
                 select_params = (code_list,)
@@ -324,6 +326,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: List[str]) -> i
                       {src_year_expr} AS incorporation_year,
                       {src_stat} AS entity_status_de
                     FROM staging_acra_companies sc
+
                     WHERE LOWER({src_desc}) = ANY(%s::text[])
                        OR {src_desc} ILIKE ANY(%s::text[])
                 """
@@ -471,7 +474,7 @@ def _upsert_companies_from_staging_by_industries_old(industries: List[str]) -> i
 def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
     """Fetch staging rows by SSIC code and upsert into companies.
 
-    Industry terms are mapped to SSIC codes via ``ssic_ref``; matching
+    Industry terms are mapped to SSIC codes via ``ssic_ref_latest``; matching
     staging rows (by ``primary_ssic_code``) are then inserted or updated in
     ``companies``.
     """
@@ -563,6 +566,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                   {src_year} AS incorporation_year,
                   {src_stat} AS entity_status_de
                 FROM staging_acra_companies sc
+
                 WHERE CAST({src_code} AS TEXT) = ANY(%s)
                 LIMIT 1000
             """

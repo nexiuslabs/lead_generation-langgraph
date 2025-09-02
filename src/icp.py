@@ -88,6 +88,7 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
                       {src_status} AS entity_status_description
                     FROM staging_acra_companies sc
                     LEFT JOIN ssic_ref ref
+
                       ON CAST({src_code} AS TEXT) = ref.code
                     ORDER BY 1
                     LIMIT %s
