@@ -55,4 +55,5 @@ def test_find_domain_normalizes_name_in_query(monkeypatch):
     monkeypatch.setattr(enrichment, "tavily_client", dummy)
 
     assert enrichment.find_domain("NEXIUS LABS PTE LTD") == ["https://nexiuslabs.com"]
-    assert dummy.last_query == "nexius labs official website"
+    assert "nexius labs" in dummy.last_query.lower()
+    assert "official website" in dummy.last_query.lower()

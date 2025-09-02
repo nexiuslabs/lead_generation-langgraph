@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from app.odoo_store import OdooStore
 from src.database import get_pg_pool
 from src.enrichment import enrich_company_with_tavily
+from src.industry_resolver import resolve_industry_terms
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
 
@@ -710,6 +711,7 @@ async def _default_candidates(
     icp = icp or {}
     # Normalize industries; accept multiple. Use exact match on industry_norm (case-insensitive).
     industries_param: List[str] = []
+    codes_param: List[str] = []
     # Back-compat: allow single 'industry' or list 'industries'
     industry_single = icp.get("industry")
     if isinstance(industry_single, str) and industry_single.strip():
@@ -719,8 +721,12 @@ async def _default_candidates(
         industries_param.extend(
             [s.strip().lower() for s in inds if isinstance(s, str) and s.strip()]
         )
+    codes = icp.get("industry_codes") or []
+    if isinstance(codes, list):
+        codes_param.extend([str(c).strip() for c in codes if str(c).strip()])
     # Dedupe
     industries_param = sorted(set(industries_param))
+    codes_param = sorted(set(codes_param))
     emp_min = icp.get("employees_min")
     emp_max = icp.get("employees_max")
     rev_bucket = (
@@ -749,7 +755,10 @@ async def _default_candidates(
     clauses: List[str] = []
     params: List[Any] = []
 
-    if industries_param:
+    if codes_param:
+        clauses.append(f"c.industry_code = ANY(${len(params)+1})")
+        params.append(codes_param)
+    elif industries_param:
         # Exact equality against normalized industry names
         clauses.append(f"LOWER(c.industry_norm) = ANY(${len(params)+1})")
         params.append(industries_param)
@@ -811,7 +820,10 @@ async def _default_candidates(
         # Pass 2: relax employees + geo filters, but NEVER drop industry if provided
         r_clauses: List[str] = []
         r_params: List[Any] = []
-        if industries_param:
+        if codes_param:
+            r_clauses.append(f"c.industry_code = ANY(${len(r_params)+1})")
+            r_params.append(codes_param)
+        elif industries_param:
             r_clauses.append(f"LOWER(c.industry_norm) = ANY(${len(r_params)+1})")
             r_params.append(industries_param)
         r_where = ("WHERE " + " AND ".join(r_clauses)) if r_clauses else ""
@@ -880,6 +892,42 @@ async def icp_node(state: GraphState) -> GraphState:
         icp["signals_done"] = True
 
     new_msgs: List[BaseMessage] = []
+
+    # Offer ranked SSIC codes and sample companies when industries are provided
+    if update.industries:
+        try:
+            term_matches = resolve_industry_terms(update.industries)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("resolve_industry_terms error: %s", exc)
+            term_matches = []
+
+        if term_matches:
+            selected_codes: List[str] = []
+            lines: List[str] = []
+            for tm in term_matches:
+                if not tm.get("matches"):
+                    lines.append(f"*{tm['term']}*: no SSIC data found")
+                    continue
+                lines.append(f"**{tm['term']}**")
+                for m in tm["matches"]:
+                    sample = ", ".join(m.get("companies") or []) or "no examples"
+                    lines.append(f"- {m['code']} {m['description']} (e.g., {sample})")
+                    selected_codes.append(m["code"])
+            if selected_codes:
+                icp["industry_codes"] = selected_codes
+            lines.append("Run enrichment for these when ready.")
+            new_msgs.append(
+                AIMessage(
+                    content="\n".join(lines),
+                    additional_kwargs={"ssic_codes": selected_codes},
+                )
+            )
+        else:
+            new_msgs.append(
+                AIMessage(
+                    content="No SSIC data found for the provided industries.",
+                )
+            )
 
     # If user pasted companies, preserve previous behavior
     if update.pasted_companies:
@@ -1114,7 +1162,16 @@ async def enrich_node(state: GraphState) -> GraphState:
 def _fmt_table(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No candidates found."
-    headers = ["Name", "Domain", "Industry", "Employees", "Score", "Bucket", "Rationale", "Contact"]
+    headers = [
+        "Name",
+        "Domain",
+        "Industry",
+        "Employees",
+        "Score",
+        "Bucket",
+        "Rationale",
+        "Contact",
+    ]
     md = [
         "| " + " | ".join(headers) + " |",
         "|" + "|".join(["---"] * len(headers)) + "|",
@@ -1125,16 +1182,18 @@ def _fmt_table(rows: List[Dict[str, Any]]) -> str:
             rationale = rationale[:137] + "…"
         md.append(
             "| "
-            + " | ".join([
-                str(r.get("name", "")),
-                str(r.get("domain", "")),
-                str(r.get("industry", "")),
-                str(r.get("employee_count", "")),
-                str(r.get("lead_score", "")),
-                str(r.get("lead_bucket", "")),
-                rationale,
-                str(r.get("contact_email", "")),
-            ])
+            + " | ".join(
+                [
+                    str(r.get("name", "")),
+                    str(r.get("domain", "")),
+                    str(r.get("industry", "")),
+                    str(r.get("employee_count", "")),
+                    str(r.get("lead_score", "")),
+                    str(r.get("lead_bucket", "")),
+                    rationale,
+                    str(r.get("contact_email", "")),
+                ]
+            )
             + " |"
         )
     return "\n".join(md)
@@ -1208,7 +1267,9 @@ async def score_node(state: GraphState) -> GraphState:
                 if comp.get("employees_est") is not None
                 else c.get("employee_count")
             ),
-            "contact_email": (by_email.get(cid) if "by_email" in locals() else None) or c.get("email") or "",
+            "contact_email": (by_email.get(cid) if "by_email" in locals() else None)
+            or c.get("email")
+            or "",
         }
         if sc:
             row["lead_score"] = sc.get("score")
