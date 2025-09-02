@@ -77,6 +77,14 @@ DB_PASSWORD=odoo
 LOCAL_PORT=25060
 ```
 
+If `SSH_PASSWORD` is set, the migration script relies on `sshpass` to feed the
+password to `ssh`. Install it before running:
+
+- Debian/Ubuntu: `sudo apt-get install sshpass`
+- macOS (Homebrew): `brew install hudochenkov/sshpass/sshpass`
+
+Alternatively, omit `SSH_PASSWORD` and use key-based authentication.
+
 Run the migration; the script will forward `LOCAL_PORT` to the droplet and build the
 DSN automatically if `ODOO_POSTGRES_DSN` isn't set:
 
@@ -161,6 +169,11 @@ Note: Arrays are handled as JSONB in this pipeline. If your schema uses `text[]`
 - Deterministic crawler merges signals (emails, phones, tech, pricing pages, etc.)
 - Persist to `summaries`, project into `company_enrichment_runs`, update `companies`
 - ZeroBounce email verification (if key provided)
+
+### Domain Discovery Heuristics
+- Exact-match search: tries `"<Company Name>" "official website"` then `site:.sg` before fallbacks.
+- Brand/.sg filter: keeps only `.sg` domains or exact brand apex matches (e.g., `acme.com`).
+- Marketplace/aggregator rejection: discards results from marketplaces, directories, or socials (e.g., `linkedin.com`, `shopee.sg`, `amazon.com`), unless the apex exactly equals the brand (e.g., Amazon).
 
 ## Running
 - Ensure DB and `.env` are set

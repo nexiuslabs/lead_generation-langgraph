@@ -10,6 +10,7 @@ import csv
 from io import StringIO
 import logging
 import re
+import os
 
 logger = logging.getLogger("input_norm")
 if not logger.handlers:
@@ -18,6 +19,14 @@ if not logger.handlers:
     h.setFormatter(fmt)
     logger.addHandler(h)
 logger.setLevel("INFO")
+
+# Ensure LangGraph checkpoint directory exists to prevent FileNotFoundError
+# e.g., '.langgraph_api/.langgraph_checkpoint.*.pckl.tmp'
+CHECKPOINT_DIR = os.environ.get("LANGGRAPH_CHECKPOINT_DIR", ".langgraph_api")
+try:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+except Exception as e:
+    logger.warning("Failed to ensure checkpoint dir %s: %s", CHECKPOINT_DIR, e)
 
 app = FastAPI(title="Pre-SDR LangGraph Server")
 

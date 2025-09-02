@@ -22,8 +22,9 @@ if not ODOO_POSTGRES_DSN:
     _db_password = os.getenv("DB_PASSWORD")
     _db_name = os.getenv("DB_NAME")
     if _local_port and _db_user and _db_password and _db_name:
+        # Use IPv4 loopback explicitly to avoid systems preferring ::1
         ODOO_POSTGRES_DSN = (
-            f"postgresql://{_db_user}:{_db_password}@localhost:{_local_port}/{_db_name}"
+            f"postgresql://{_db_user}:{_db_password}@127.0.0.1:{_local_port}/{_db_name}"
         )
 
 APP_POSTGRES_DSN = POSTGRES_DSN

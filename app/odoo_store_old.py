@@ -134,16 +134,15 @@ class OdooStore:
                 """
               UPDATE res_partner
                  SET name=$1,
-                     complete_name=$1,
-                     x_uen=COALESCE($2::varchar,x_uen),
+                     x_uen=COALESCE($2,x_uen),
                      x_industry_norm=$3,
                      x_employees_est=$4,
                      x_revenue_bucket=$5,
                      x_incorporation_year=$6,
                      x_website_domain=COALESCE($7,x_website_domain),
                      write_date=now()
-               WHERE ($2::varchar IS NOT NULL AND x_uen=$2::varchar)
-                 AND is_company = TRUE
+               WHERE ($2 IS NOT NULL AND x_uen=$2)
+                 AND company_type='company'
                RETURNING id
             """,
                 name,
@@ -162,12 +161,11 @@ class OdooStore:
 
             row = await conn.fetchrow(
                 """
-              INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, x_uen, x_industry_norm,
+              INSERT INTO res_partner (name, company_type, x_uen, x_industry_norm,
                                        x_employees_est, x_revenue_bucket, x_incorporation_year, x_website_domain, create_date)
-              VALUES ($1, $1, 'contact', TRUE, TRUE, $2, $3, $4, $5, $6, $7, $8, now())
+              VALUES ($1,'company',$2,$3,$4,$5,$6,$7, now())
               RETURNING id
             """,
-                name,
                 name,
                 uen,
                 fields.get("industry_norm"),
@@ -214,17 +212,8 @@ class OdooStore:
                 return row["id"]
             row = await conn.fetchrow(
                 """
-              INSERT INTO res_partner (parent_id, type, is_company, active, name, complete_name, email, create_date)
-              VALUES (
-                $1,
-                'contact',
-                FALSE,
-                TRUE,
-                COALESCE($3, split_part($2,'@',1)),
-                COALESCE($3, split_part($2,'@',1)),
-                $2,
-                now()
-              )
+              INSERT INTO res_partner (parent_id, company_type, name, email, create_date)
+              VALUES ($1, 'person', COALESCE($3, split_part($2,'@',1)), $2, now())
               RETURNING id
             """,
                 company_id,
@@ -256,7 +245,7 @@ class OdooStore:
                      x_jobs_count = COALESCE($2, x_jobs_count),
                      x_tech_stack = COALESCE(x_tech_stack,'[]'::jsonb) || to_jsonb(COALESCE($3,'[]'::jsonb)),
                      write_date=now()
-               WHERE id=$4 AND is_company = TRUE
+               WHERE id=$4 AND company_type='company'
             """,
                 json.dumps(enrichment),
                 enrichment.get("jobs_count"),
@@ -276,7 +265,7 @@ class OdooStore:
         features: Dict[str, Any],
         rationale: str,
         primary_email: str | None,
-        threshold: float = 0,
+        threshold: float = 0.66,
     ) -> Optional[int]:
         if score < threshold:
             logger.info(
@@ -297,25 +286,11 @@ class OdooStore:
 
             row = await conn.fetchrow(
                 """
-              INSERT INTO crm_lead (
-                name, partner_id, type, active, user_id, stage_id,
-                x_pre_sdr_score, x_pre_sdr_bucket, x_pre_sdr_features, x_pre_sdr_rationale,
-                email_from, create_date
-              )
-              VALUES (
-                $1,
-                $2,
-                'opportunity',
-                TRUE,
-                2,
-                1,
-                $3,
-                CASE WHEN $3>=0.66 THEN 'High' WHEN $3>=0.33 THEN 'Medium' ELSE 'Low' END,
-                $4::jsonb,
-                $5,
-                $6,
-                now()
-              )
+              INSERT INTO crm_lead (name, partner_id, type,
+                                    x_pre_sdr_score, x_pre_sdr_bucket, x_pre_sdr_features, x_pre_sdr_rationale,
+                                    email_from, create_date)
+              VALUES ($1,$2,'lead',$3, CASE WHEN $3>=0.66 THEN 'High' WHEN $3>=0.33 THEN 'Medium' ELSE 'Low' END,
+                      $4::jsonb, $5, $6, now())
               RETURNING id
             """,
                 title,
