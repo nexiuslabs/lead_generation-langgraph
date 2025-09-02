@@ -85,16 +85,16 @@ def search_ssic_terms(
                     SELECT code,
                            title,
                            GREATEST(
-                               similarity(title, %s),
+                               similarity(title || ' ' || COALESCE(description,''), %s),
                                ts_rank_cd(
-                                   to_tsvector('english', title),
+                                   to_tsvector('english', title || ' ' || COALESCE(description,'')),
                                    websearch_to_tsquery('english', %s)
                                )
                            ) AS score
                     FROM ssic_ref_latest
                     WHERE (
-                          title % %s OR
-                          to_tsvector('english', title) @@ websearch_to_tsquery('english', %s)
+                          similarity(title || ' ' || COALESCE(description,''), %s) >= 0.1 OR
+                          to_tsvector('english', title || ' ' || COALESCE(description,'')) @@ websearch_to_tsquery('english', %s)
                       )
                     ORDER BY score DESC
                     LIMIT %s
