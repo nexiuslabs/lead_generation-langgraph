@@ -1,13 +1,17 @@
-# icp.py
-import logging
-from typing import Any, Dict, List, TypedDict, Optional
+"""Industry classification and candidate selection utilities."""
 
-from langgraph.graph import StateGraph, END
+import logging
+import re
+from typing import Any, Dict, List, Optional, Set, TypedDict
+
+from langgraph.graph import END, StateGraph
+
 from src.database import get_conn
 
 log = logging.getLogger(__name__)
 
 # ---------- State types ----------
+
 
 class NormState(TypedDict, total=False):
     raw_records: List[Dict[str, Any]]
@@ -21,6 +25,7 @@ class ICPState(TypedDict, total=False):
 
 
 # ---------- Helpers ----------
+
 
 def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
     """Fetch raw rows from staging_acra_companies with best-effort column mapping.
@@ -47,10 +52,35 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
 
                 src_uen = pick("uen", "uen_no", "uen_number") or "NULL"
                 src_name = pick("entity_name", "name", "company_name") or "NULL"
-                src_desc = pick("primary_ssic_description", "ssic_description", "industry_description") or "NULL"
-                src_code = pick("primary_ssic_code", "ssic_code", "industry_code", "ssic") or "NULL"
-                src_year = pick("incorporation_year", "founded_year", "registration_incorporation_date") or "NULL"
-                src_status = pick("entity_status_description", "entity_status", "status", "entity_status_de") or "NULL"
+                src_desc = (
+                    pick(
+                        "primary_ssic_description",
+                        "ssic_description",
+                        "industry_description",
+                    )
+                    or "NULL"
+                )
+                src_code = (
+                    pick("primary_ssic_code", "ssic_code", "industry_code", "ssic")
+                    or "NULL"
+                )
+                src_year = (
+                    pick(
+                        "incorporation_year",
+                        "founded_year",
+                        "registration_incorporation_date",
+                    )
+                    or "NULL"
+                )
+                src_status = (
+                    pick(
+                        "entity_status_description",
+                        "entity_status",
+                        "status",
+                        "entity_status_de",
+                    )
+                    or "NULL"
+                )
 
                 sql = f"""
                     SELECT
@@ -109,6 +139,7 @@ def _parse_year(val: Any) -> Optional[int]:
 
 def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     """Minimal normalization pass with flexible source keys."""
+
     def _norm_str(x: Optional[str]) -> Optional[str]:
         if x is None:
             return None
@@ -124,7 +155,11 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     ind_code = str(ind_code) if ind_code is not None else None
     raw_year = r.get("incorporation_year")
     if raw_year is None:
-        raw_year = r.get("founded_year") or r.get("raw_year") or r.get("registration_incorporation_date")
+        raw_year = (
+            r.get("founded_year")
+            or r.get("raw_year")
+            or r.get("registration_incorporation_date")
+        )
     year = _parse_year(raw_year)
     # Founded year mirrors incorporation if available
     founded = year
@@ -157,6 +192,33 @@ def _table_columns(conn, table: str) -> set[str]:
         return {r[0] for r in cur.fetchall()}
 
 
+def _norm_ssic(s: str | None) -> str | None:
+    """Normalize SSIC to 5-digit string (e.g., '62010')."""
+    if not s:
+        return None
+    d = re.sub(r"\D", "", str(s))
+    if not d:
+        return None
+    return d.zfill(5)[:5]
+
+
+def _pick_col(cur, table: str, *candidates: str) -> str | None:
+    """Find first existing column name in `table` from the candidate list."""
+    cur.execute(
+        """
+      SELECT lower(column_name)
+      FROM information_schema.columns
+      WHERE table_name=%s
+    """,
+        (table,),
+    )
+    cols = {r[0] for r in cur.fetchall()}
+    for c in candidates:
+        if c.lower() in cols:
+            return c
+    return None
+
+
 def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
     """Upsert normalized rows into companies table (dynamic columns, robust conflicts)."""
     if not rows:
@@ -165,8 +227,16 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
     with get_conn() as conn:
         cols = _table_columns(conn, "companies")
         # Resolve target column names for schema variants
-        col_industry = "industry_code" if "industry_code" in cols else ("industory_code" if "industory_code" in cols else None)
-        col_founded = "founded_year" if "founded_year" in cols else ("incorporation_year" if "incorporation_year" in cols else None)
+        col_industry = (
+            "industry_code"
+            if "industry_code" in cols
+            else ("industory_code" if "industory_code" in cols else None)
+        )
+        col_founded = (
+            "founded_year"
+            if "founded_year" in cols
+            else ("incorporation_year" if "incorporation_year" in cols else None)
+        )
         col_sg = "sg_registered" if "sg_registered" in cols else None
 
         for r in rows:
@@ -197,7 +267,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
             if col_founded and r.get("founded_year") is not None:
                 insert_cols.append(col_founded)
                 params.append(r.get("founded_year"))
-            elif "incorporation_year" in cols and r.get("incorporation_year") is not None:
+            elif (
+                "incorporation_year" in cols and r.get("incorporation_year") is not None
+            ):
                 insert_cols.append("incorporation_year")
                 params.append(r.get("incorporation_year"))
             if col_sg and r.get("sg_registered") is not None:
@@ -205,7 +277,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
                 params.append(r.get("sg_registered"))
 
             # Always set last_seen on update; insert via NOW()
-            insert_cols_sql = ", ".join([*insert_cols, "last_seen"]) if insert_cols else "last_seen"
+            insert_cols_sql = (
+                ", ".join([*insert_cols, "last_seen"]) if insert_cols else "last_seen"
+            )
             placeholders = ",".join(["%s"] * len(params) + ["NOW()"])
 
             # Determine conflict target: prefer company_id, else uen if available
@@ -216,7 +290,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
                 conflict_col = "uen"
 
             # Build update assignments for upsert
-            set_cols = [c for c in insert_cols if c not in (conflict_col or "")] + ["last_seen"]
+            set_cols = [c for c in insert_cols if c not in (conflict_col or "")] + [
+                "last_seen"
+            ]
             set_sql = ", ".join([f"{c} = EXCLUDED.{c}" for c in set_cols])
 
             sql = f"INSERT INTO companies ({insert_cols_sql}) VALUES ({placeholders})"
@@ -232,7 +308,11 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
 
 def _select_icp_candidates(payload: Dict[str, Any]) -> List[int]:
     """Build a simple WHERE from payload and fetch matching company_ids."""
-    industries = [s.strip().lower() for s in payload.get("industries", []) if isinstance(s, str) and s.strip()]
+    industries = [
+        s.strip().lower()
+        for s in payload.get("industries", [])
+        if isinstance(s, str) and s.strip()
+    ]
     emp = payload.get("employee_range", {}) or {}
     inc = payload.get("incorporation_year", {}) or {}
 
@@ -267,7 +347,101 @@ def _select_icp_candidates(payload: Dict[str, Any]) -> List[int]:
         return [row[0] for row in cur.fetchall()]
 
 
+def _find_ssic_codes_by_terms(terms: list[str]) -> list[tuple[str, str, float]]:
+    """Return [(code, title, score)] from ssic_ref matching free-text `terms`."""
+    if not terms:
+        return []
+    q = " ".join(t.strip() for t in terms if t and t.strip())
+    if not q:
+        return []
+    with get_conn() as conn, conn.cursor() as cur:
+        # Full-text first
+        cur.execute(
+            """
+          WITH q AS (SELECT websearch_to_tsquery('english', %s) AS ts)
+          SELECT code, title, ts_rank(fts, (SELECT ts FROM q)) AS score
+          FROM ssic_ref
+          WHERE fts @@ (SELECT ts FROM q)
+          ORDER BY score DESC
+          LIMIT 30
+        """,
+            (q,),
+        )
+        rows = [(r[0], r[1], float(r[2])) for r in cur.fetchall()]
+        # Trigram fallback
+        if not rows:
+            cur.execute(
+                """
+              SELECT code, title,
+                     GREATEST(similarity(title, %s),
+                              similarity(coalesce(description,''), %s)) AS score
+              FROM ssic_ref
+              WHERE title % %s OR coalesce(description,'') % %s
+              ORDER BY score DESC
+              LIMIT 30
+            """,
+                (q, q, q, q),
+            )
+            rows = [(r[0], r[1], float(r[2])) for r in cur.fetchall()]
+    return rows
+
+
+def _select_acra_by_ssic_codes(codes: Set[str], limit: int = 1000) -> list[dict]:
+    """Pull rows from staging_acra_companies for the given SSIC codes."""
+    if not codes:
+        return []
+    codes = {_norm_ssic(c) for c in codes if c}
+    codes.discard(None)
+    if not codes:
+        return []
+    with get_conn() as conn, conn.cursor() as cur:
+        code_col = _pick_col(
+            cur,
+            "staging_acra_companies",
+            "primary_ssic_code",
+            "ssic_code",
+            "primary_ssic",
+            "ssic",
+        )
+        name_col = _pick_col(
+            cur,
+            "staging_acra_companies",
+            "entity_name",
+            "company_name",
+            "name",
+        )
+        uen_col = _pick_col(
+            cur, "staging_acra_companies", "uen", "uen_no", "uen_number"
+        )
+        status_col = _pick_col(
+            cur,
+            "staging_acra_companies",
+            "entity_status_description",
+            "entity_status",
+            "status",
+        )
+        assert (
+            code_col and name_col and uen_col
+        ), "staging_acra_companies columns missing"
+
+        sql = f"""
+          SELECT
+            {uen_col}::text AS uen,
+            {name_col}::text AS entity_name,
+            {code_col}::text AS primary_ssic_code,
+            COALESCE({status_col}::text, '') AS entity_status_description
+          FROM staging_acra_companies
+          WHERE regexp_replace({code_col}::text, '\\D', '', 'g') = ANY(%s)
+          ORDER BY {name_col}
+          LIMIT %s
+        """
+        cur.execute(sql, (list(codes), limit))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
 # ---------- LangGraph nodes ----------
+
 
 async def fetch_raw_records(state: NormState) -> NormState:
     rows = _fetch_staging_rows(limit=100)
@@ -310,4 +484,33 @@ _icp_graph.set_entry_point("refresh")
 _icp_graph.add_edge("refresh", END)
 icp_refresh_agent = _icp_graph.compile()
 
-__all__ = ["normalize_agent", "icp_refresh_agent"]
+
+class ICPBySSICState(TypedDict, total=False):
+    terms: List[str]
+    matched_ssic: List[Dict[str, Any]]
+    acra_candidates: List[Dict[str, Any]]
+
+
+async def icp_match_ssic(state: ICPBySSICState) -> ICPBySSICState:
+    terms = state.get("terms") or []
+    ssic = _find_ssic_codes_by_terms(terms)
+    state["matched_ssic"] = [{"code": c, "title": t, "score": s} for c, t, s in ssic]
+    return state
+
+
+async def icp_fetch_acra_by_ssic(state: ICPBySSICState) -> ICPBySSICState:
+    codes = {m["code"] for m in (state.get("matched_ssic") or [])}
+    rows = _select_acra_by_ssic_codes(codes, limit=1000)
+    state["acra_candidates"] = rows
+    return state
+
+
+_icp_ssic_graph = StateGraph(ICPBySSICState)
+_icp_ssic_graph.add_node("icp_match_ssic", icp_match_ssic)
+_icp_ssic_graph.add_node("icp_fetch_acra_by_ssic", icp_fetch_acra_by_ssic)
+_icp_ssic_graph.set_entry_point("icp_match_ssic")
+_icp_ssic_graph.add_edge("icp_match_ssic", "icp_fetch_acra_by_ssic")
+_icp_ssic_graph.add_edge("icp_fetch_acra_by_ssic", END)
+icp_by_ssic_agent = _icp_ssic_graph.compile()
+
+__all__ = ["normalize_agent", "icp_refresh_agent", "icp_by_ssic_agent"]
