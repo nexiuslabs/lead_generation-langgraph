@@ -1,6 +1,6 @@
 import asyncio
 import os
-from src.icp import normalize_agent, icp_refresh_agent
+from src.icp import normalize_agent, icp_refresh_agent, _find_ssic_codes_by_terms
 from src.settings import ICP_RULE_NAME
 from src.openai_client import generate_rationale
 from src.lead_scoring import lead_scoring_agent
@@ -41,27 +41,29 @@ def fetch_candidate_ids_by_industry_codes(industry_codes):
     return [r[0] for r in rows]
 
 def fetch_industry_codes_by_names(industries):
-    """Resolve SSIC industry codes from human-readable industry names.
-    First checks staging_acra_companies by description, then falls back to companies.industry_norm.
-    Returns a sorted list of distinct code strings.
+    """Resolve SSIC codes from free-text industry names via ssic_ref; fallback to companies.
+
+    - Primary: use `ssic_ref` FTS/trigram (via `_find_ssic_codes_by_terms`).
+    - Fallback: if none found, check `companies` by `industry_norm` to collect `industry_code`.
     """
     if not industries:
         return []
-    # Normalize and dedupe inputs
     normed = sorted({(s or '').strip().lower() for s in industries if isinstance(s, str) and s.strip()})
     if not normed:
         return []
-    codes = set()
+    codes = {c for (c, _title, _score) in _find_ssic_codes_by_terms(normed)}
+    if codes:
+        return sorted(codes)
+    # Fallback to companies table
     conn = psycopg2.connect(dsn=POSTGRES_DSN)
     try:
-        # Prefer authoritative mapping from staging
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT CAST(primary_ssic_code AS TEXT)
-                FROM public.staging_acra_companies
-                WHERE LOWER(primary_ssic_description) = ANY(%s)
-                  AND primary_ssic_code IS NOT NULL
+                SELECT DISTINCT industry_code
+                FROM companies
+                WHERE industry_norm = ANY(%s)
+                  AND industry_code IS NOT NULL
                 """,
                 (normed,)
             )
@@ -69,22 +71,6 @@ def fetch_industry_codes_by_names(industries):
             for (code,) in rows:
                 if code:
                     codes.add(str(code))
-        # Fallback: resolve via companies table if staging yields nothing
-        if not codes:
-            with conn, conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT DISTINCT industry_code
-                    FROM companies
-                    WHERE industry_norm = ANY(%s)
-                      AND industry_code IS NOT NULL
-                    """,
-                    (normed,)
-                )
-                rows = cur.fetchall()
-                for (code,) in rows:
-                    if code:
-                        codes.add(str(code))
         return sorted(codes)
     finally:
         conn.close()

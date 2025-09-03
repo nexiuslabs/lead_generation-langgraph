@@ -5,6 +5,7 @@ from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
 from app.pre_sdr_graph import build_graph, GraphState  # new dynamic builder
 from src.database import get_conn
+from src.icp import _find_ssic_codes_by_terms
 import logging
 import re
 
@@ -219,16 +220,14 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                 src_desc, src_code, src_name, src_uen, src_year, src_stat,
             )
 
-            # Step 1: Resolve SSIC codes from industry description matches (exact or partial)
-            codes_sql = f"""
-                SELECT DISTINCT CAST({src_code} AS TEXT) AS code
-                FROM staging_acra_companies
-                WHERE LOWER({src_desc}) = ANY(%s::text[])
-                   OR {src_desc} ILIKE ANY(%s::text[])
-            """
-            cur.execute(codes_sql, (lower_terms, like_patterns))
-            code_rows = cur.fetchall()
-            code_list = [r[0] for r in code_rows if r and r[0] is not None]
+            # Step 1: Resolve SSIC codes via ssic_ref using free-text industry terms
+            ssic_matches = _find_ssic_codes_by_terms(lower_terms)
+            code_list = [c for (c, _title, _score) in ssic_matches]
+            if code_list:
+                codes_preview = ", ".join([str(c) for c in code_list[:50]])
+                if len(code_list) > 50:
+                    codes_preview += f", ... (+{len(code_list)-50} more)"
+                logger.info("ssic_ref resolved %d SSIC codes from industries=%s: %s", len(code_list), lower_terms, codes_preview)
 
             if code_list:
                 # Log resolved SSIC codes for traceability (preview up to 50)
@@ -247,7 +246,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                       {src_year_expr} AS incorporation_year,
                       {src_stat} AS entity_status_de
                     FROM staging_acra_companies
-                    WHERE CAST({src_code} AS TEXT) = ANY(%s::text[])
+                    WHERE regexp_replace({src_code}::text, '\\D', '', 'g') = ANY(%s::text[])
                 """
                 select_params = (code_list,)
                 source_mode = 'ssic'
@@ -274,7 +273,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
 
             # Pre-count for visibility
             if source_mode == 'ssic':
-                count_sql = f"SELECT COUNT(*) FROM staging_acra_companies WHERE CAST({src_code} AS TEXT) = ANY(%s::text[])"
+                count_sql = f"SELECT COUNT(*) FROM staging_acra_companies WHERE regexp_replace({src_code}::text, '\\D', '', 'g') = ANY(%s::text[])"
                 count_params = (code_list,)
             else:
                 count_sql = f"SELECT COUNT(*) FROM staging_acra_companies WHERE LOWER({src_desc}) = ANY(%s::text[]) OR {src_desc} ILIKE ANY(%s::text[])"
@@ -290,6 +289,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
             batch_size = 500
             logger.info("Upserting staging companies by %s in batches of %d", source_mode, batch_size)
             processed = 0
+            names_preview_list: List[str] = []  # collect first ~50 names that matched codes
             while True:
                 rows = cur_sel.fetchmany(batch_size)
                 if not rows:
@@ -304,6 +304,11 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                         inc_year,
                         status_de,
                     ) in rows:
+                        # capture names for preview if SSIC-based selection
+                        if source_mode == 'ssic' and len(names_preview_list) < 50:
+                            nm = (entity_name or "").strip()
+                            if nm:
+                                names_preview_list.append(nm)
                         name = (entity_name or "").strip() or None
                         desc_lower = (ssic_desc or "").strip().lower()
                         match_term = None
@@ -371,6 +376,9 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                             cur_up.execute("UPDATE companies SET last_seen = NOW() WHERE company_id = %s", (new_id,))
                             affected += 1
                 processed += len(rows)
+            if source_mode == 'ssic' and names_preview_list:
+                extra = f", ... (+{total_matches - len(names_preview_list)} more)" if total_matches > len(names_preview_list) else ""
+                logger.info("staging_acra_companies matched %d rows by SSIC code; names: %s%s", total_matches, ", ".join(names_preview_list), extra)
             logger.info("Finished upserting by %s (%d rows processed, %d affected)", source_mode, processed, affected)
         return affected
     except Exception as e:

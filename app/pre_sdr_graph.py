@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.odoo_store import OdooStore
 from src.database import get_pg_pool
+from src.icp import _find_ssic_codes_by_terms
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
@@ -823,6 +824,21 @@ async def _default_candidates(
             if not industries_param:
                 any_sql = f"{base_select} {order_by} LIMIT $1"
                 rows = await _run_query([limit], any_sql)
+            else:
+                # Pass 3b: map industries -> SSIC codes via ssic_ref, then fetch by industry_code
+                try:
+                    codes = [c for (c, _t, _s) in _find_ssic_codes_by_terms(industries_param)]
+                    if codes:
+                        code_sql = f"""
+                            {base_select}
+                            WHERE regexp_replace(c.industry_code::text, '\\D', '', 'g') = ANY($1::text[])
+                            {order_by}
+                            LIMIT $2
+                        """
+                        rows = await _run_query([codes, limit], code_sql)
+                except Exception:
+                    # Do not block on fallback errors
+                    pass
 
     out: List[Dict[str, Any]] = []
     for r in rows:

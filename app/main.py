@@ -6,6 +6,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.pre_sdr_graph import build_graph
 from src.database import get_pg_pool, get_conn
+from src.icp import _find_ssic_codes_by_terms
 import csv
 from io import StringIO
 import logging
@@ -152,13 +153,13 @@ def _collect_industry_terms(messages: list[BaseMessage] | None) -> list[str]:
 
 
 def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
-    """Fetch rows from staging_acra_companies matching the provided industries and upsert into companies.
+    """Resolve SSIC codes via ssic_ref, fetch staging companies by code, and upsert into companies.
 
-    Matching is based on LOWER(primary_ssic_description) equality to any provided term.
-    Upsert strategy:
-      - Try to locate an existing companies row by UEN, or by (lower(name) OR website_domain)
-      - If found: UPDATE set core fields and last_seen
-      - Else: INSERT a new row (omit company_id so default/sequence can assign)
+    Flow:
+      1) Resolve codes from `ssic_ref` using industry terms (title/description via FTS/trigram).
+      2) If codes found: pull rows from staging where normalized primary SSIC code is in that set.
+      3) Else fallback: match staging by LOWER(primary_ssic_description) (with ILIKE partials).
+      4) Upsert results into companies.
     Returns number of affected rows (inserted + updated best-effort).
     """
     if not industries:
@@ -183,7 +184,7 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
             src_uen = pick('uen','uen_no','uen_number') or 'NULL'
             src_name = pick('entity_name','name','company_name') or 'NULL'
             src_desc = pick('primary_ssic_description','ssic_description','industry_description')
-            src_code = pick('primary_ssic_code','ssic_code','industry_code') or 'NULL'
+            src_code = pick('primary_ssic_code','ssic_code','industry_code','ssic') or 'NULL'
             src_web  = pick('website','website_url','website_domain','url','homepage') or 'NULL'
             src_year = pick('incorporation_year','year_incorporated','inc_year','founded_year') or 'NULL'
             src_stat = pick('entity_status_de','entity_status','status','entity_status_description') or 'NULL'
@@ -191,23 +192,60 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
             if not src_desc:
                 return 0
 
-            like_patterns = [f"%{t}%" for t in industries]
-            select_sql = f"""
-                SELECT
-                  {src_uen} AS uen,
-                  {src_name} AS entity_name,
-                  {src_desc} AS primary_ssic_description,
-                  {src_code} AS primary_ssic_code,
-                  {src_web}  AS website,
-                  {src_year} AS incorporation_year,
-                  {src_stat} AS entity_status_de
-                FROM staging_acra_companies
-                WHERE LOWER({src_desc}) = ANY(%s)
-                   OR LOWER({src_desc}) ILIKE ANY(%s)
-                LIMIT 1000
-            """
-            cur.execute(select_sql, (industries, like_patterns))
+            # Resolve SSIC codes from ssic_ref (FTS/trigram)
+            lower_terms = [((t or '').strip().lower()) for t in industries if (t or '').strip()]
+            like_patterns = [f"%{t}%" for t in lower_terms]
+            codes_rows = _find_ssic_codes_by_terms(lower_terms)
+            code_list = [c for (c, _title, _score) in codes_rows]
+            if code_list:
+                codes_preview = ", ".join(code_list[:50])
+                if len(code_list) > 50:
+                    codes_preview += f", ... (+{len(code_list)-50} more)"
+                logger.info("ssic_ref resolved %d SSIC codes from industries=%s: %s", len(code_list), lower_terms, codes_preview)
+
+            if code_list:
+                select_sql = f"""
+                    SELECT
+                      {src_uen} AS uen,
+                      {src_name} AS entity_name,
+                      {src_desc} AS primary_ssic_description,
+                      {src_code} AS primary_ssic_code,
+                      {src_web}  AS website,
+                      {src_year} AS incorporation_year,
+                      {src_stat} AS entity_status_de
+                    FROM staging_acra_companies
+                    WHERE regexp_replace({src_code}::text, '\\D', '', 'g') = ANY(%s::text[])
+                    LIMIT 1000
+                """
+                cur.execute(select_sql, (code_list,))
+            else:
+                select_sql = f"""
+                    SELECT
+                      {src_uen} AS uen,
+                      {src_name} AS entity_name,
+                      {src_desc} AS primary_ssic_description,
+                      {src_code} AS primary_ssic_code,
+                      {src_web}  AS website,
+                      {src_year} AS incorporation_year,
+                      {src_stat} AS entity_status_de
+                    FROM staging_acra_companies
+                    WHERE LOWER({src_desc}) = ANY(%s)
+                       OR LOWER({src_desc}) ILIKE ANY(%s)
+                    LIMIT 1000
+                """
+                cur.execute(select_sql, (lower_terms, like_patterns))
             rows = cur.fetchall()
+            if code_list and rows:
+                # Log matched names for visibility (preview up to 50)
+                try:
+                    name_idx = 1  # entity_name is second selected column
+                    names = [(r[name_idx] or "").strip() for r in rows]
+                    names = [n for n in names if n]
+                    names_preview = ", ".join(names[:50])
+                    extra = f", ... (+{len(names)-50} more)" if len(names) > 50 else ""
+                    logger.info("staging_acra_companies matched %d rows by SSIC code; names: %s%s", len(names), names_preview, extra)
+                except Exception:
+                    pass
             if not rows:
                 return 0
             for (

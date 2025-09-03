@@ -976,7 +976,11 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         except Exception as e:
             logger.warning("   ↳ Lusha domain fallback failed", exc_info=True)
     if not domains:
+        # Graceful termination: no domain available, nothing to crawl/extract.
+        # Mark as completed so upstream pipeline can proceed to scoring/next steps.
         state["error"] = "no_domain"
+        state["completed"] = True
+        logger.info("   ↳ No domain found; marking enrichment as completed (no crawl)")
         return state
     home = domains[0]
     if not home.startswith("http"):
