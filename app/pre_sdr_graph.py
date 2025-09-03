@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.odoo_store import OdooStore
 from src.database import get_pg_pool
-from src.icp import _find_ssic_codes_by_terms
+from src.icp import _find_ssic_codes_by_terms, _select_acra_by_ssic_codes
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
@@ -934,23 +934,122 @@ async def candidates_node(state: GraphState) -> GraphState:
         state["candidates"] = cand
 
     n = len(state["candidates"]) if state.get("candidates") else 0
-    state["messages"] = add_messages(
-        state.get("messages") or [],
-        [AIMessage(content=f"Got {n} companies. Started Enrichment. Please wait...")],
-    )
+
+    # Consolidated message: Got N companies + SSIC + ACRA sample + start note
+    icp = state.get("icp") or {}
+    terms = [
+        s.strip().lower()
+        for s in (icp.get("industries") or [])
+        if isinstance(s, str) and s.strip()
+    ]
+    lines: list[str] = []
+    lines.append(f"Got {n} companies. ")
+    try:
+        if terms:
+            ssic_matches = _find_ssic_codes_by_terms(terms)
+            if ssic_matches:
+                top_code, top_title, _ = ssic_matches[0]
+                lines.append(
+                    f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)"
+                )
+            else:
+                lines.append("Matched 0 SSIC codes")
+            # ACRA sample
+            try:
+                codes = {c for (c, _t, _s) in ssic_matches}
+                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 50)
+            except Exception:
+                rows = []
+            m = len(rows)
+            if m:
+                lines.append(f"- Found {m} ACRA candidates. Sample:")
+                for r in rows[:2]:
+                    uen = (r.get("uen") or "").strip()
+                    nm = (r.get("entity_name") or "").strip()
+                    code = (r.get("primary_ssic_code") or "").strip()
+                    status = (r.get("entity_status_description") or "").strip()
+                    lines.append(
+                        f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
+                    )
+            else:
+                lines.append("- Found 0 ACRA candidates.")
+    except Exception:
+        pass
+    lines.append("Started Enrichment. Please wait...")
+    msg = "\n".join([ln for ln in lines if ln])
+
+    state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=msg)])
     return state
 
 
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
-    state["messages"] = add_messages(
-        state.get("messages") or [],
-        [
-            AIMessage(
-                content="✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**."
-            )
-        ],
-    )
+
+    # Ensure we have candidates to work with post-confirm
+    if not state.get("candidates"):
+        try:
+            pool = await get_pg_pool()
+            cand = await _default_candidates(pool, state.get("icp") or {}, limit=20)
+            state["candidates"] = cand
+        except Exception:
+            state["candidates"] = []
+
+    n = len(state.get("candidates") or [])
+
+    # Resolve SSIC by industries (if provided)
+    icp = state.get("icp") or {}
+    terms = [
+        s.strip().lower()
+        for s in (icp.get("industries") or [])
+        if isinstance(s, str) and s.strip()
+    ]
+    ssic_matches = []
+    msg_lines: list[str] = []
+
+    # Start with candidate count
+    msg_lines.append(f"Got {n} companies. ")
+
+    try:
+        if terms:
+            ssic_matches = _find_ssic_codes_by_terms(terms)
+            if ssic_matches:
+                top_code, top_title, _ = ssic_matches[0]
+                msg_lines.append(
+                    f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)"
+                )
+            else:
+                msg_lines.append("Matched 0 SSIC codes")
+
+            # Fetch ACRA sample
+            try:
+                codes = {c for (c, _t, _s) in ssic_matches}
+                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 50)
+            except Exception:
+                rows = []
+            m = len(rows)
+            if m:
+                msg_lines.append(f"- Found {m} ACRA candidates. Sample:")
+                for r in rows[:2]:
+                    uen = (r.get("uen") or "").strip()
+                    nm = (r.get("entity_name") or "").strip()
+                    code = (r.get("primary_ssic_code") or "").strip()
+                    status = (r.get("entity_status_description") or "").strip()
+                    msg_lines.append(
+                        f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
+                    )
+            else:
+                msg_lines.append("- Found 0 ACRA candidates.")
+    except Exception:
+        # Don’t block on SSIC/ACRA preview errors
+        pass
+
+    msg_lines.append("Started Enrichment. Please wait...")
+    text = "\n".join([ln for ln in msg_lines if ln])
+
+    # Signal that we've shown the SSIC/ACRA preview
+    state["ssic_probe_done"] = True
+
+    state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=text)])
     return state
 
 
