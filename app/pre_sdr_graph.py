@@ -1137,8 +1137,6 @@ def _fmt_table(rows: List[Dict[str, Any]]) -> str:
     ]
     for r in rows:
         rationale = str(r.get("lead_rationale", ""))
-        if len(rationale) > 140:
-            rationale = rationale[:137] + "…"
         md.append(
             "| "
             + " | ".join([
