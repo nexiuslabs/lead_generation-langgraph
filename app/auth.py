@@ -158,3 +158,33 @@ async def require_identity(request: Request) -> dict:
     request.state.tenant_id = claims.get("tenant_id")
     request.state.roles = claims.get("roles", [])
     return claims
+
+
+async def require_optional_identity(request: Request) -> dict:
+    """Return identity from bearer token when present; otherwise allow dev-style headers.
+
+    - Does not require a tenant_id claim.
+    - If no Authorization header, constructs identity from `X-User-Email` or `DEV_USER_EMAIL`.
+    - Intended for onboarding endpoints to avoid 401 loops when frontend has not
+      attached the token yet, while still verifying when a token is present.
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        claims = verify_jwt(auth[7:])
+        request.state.tenant_id = claims.get("tenant_id")
+        request.state.roles = claims.get("roles", [])
+        return claims
+
+    # No bearer presented; synthesize minimal identity from headers/env
+    email = request.headers.get("X-User-Email") or os.getenv("DEV_USER_EMAIL", "dev@local")
+    roles_hdr = request.headers.get("X-User-Roles", "")
+    roles = [r.strip() for r in roles_hdr.split(",") if r.strip()] or ["admin"]
+    tenant_raw = request.headers.get("X-Tenant-ID") or os.getenv("DEFAULT_TENANT_ID")
+    try:
+        tenant_id = int(tenant_raw) if tenant_raw is not None else None
+    except ValueError:
+        tenant_id = None
+    claims = {"sub": email, "email": email, "tenant_id": tenant_id, "roles": roles, "optional": True}
+    request.state.tenant_id = tenant_id
+    request.state.roles = roles
+    return claims

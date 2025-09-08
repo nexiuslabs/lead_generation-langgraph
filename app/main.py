@@ -5,8 +5,9 @@ from langserve import add_routes
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
+from app.odoo_connection_info import get_odoo_connection_info
 from src.database import get_pg_pool, get_conn
-from app.auth import require_auth, require_identity
+from app.auth import require_auth, require_identity, require_optional_identity
 from src.icp import _find_ssic_codes_by_terms
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
@@ -504,19 +505,62 @@ async def debug_tenant(claims: dict = Depends(require_auth)):
     }
 
 
+@app.get("/session/odoo_info")
+async def session_odoo_info(claims: dict = Depends(require_optional_identity)):
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    return info
+
+
 @app.post("/onboarding/first_login")
 async def onboarding_first_login(
-    background: BackgroundTasks, claims: dict = Depends(require_identity)
+    background: BackgroundTasks, claims: dict = Depends(require_optional_identity)
 ):
     email = claims.get("email") or claims.get("preferred_username")
-    tenant_id_claim = claims.get("tenant_id")
+    # Ignore tenant_id from token to avoid reliance on claim
+    tenant_id_claim = None
 
     # If we already have an onboarding record for this tenant in progress or ready,
-    # avoid enqueueing duplicate background tasks.
+    # avoid enqueueing duplicate background tasks. Resolve candidate tenant ID from
+    # DSN→odoo_connections mapping first, then fall back to existing user mapping by email.
     try:
-        if tenant_id_claim is not None:
-            current = get_onboarding_status(int(tenant_id_claim))
+        candidate_tid = None
+        # DSN-based mapping: if ODOO_POSTGRES_DSN points at a specific DB, find the active mapping
+        from src.settings import ODOO_POSTGRES_DSN
+        try:
+            inferred_db = None
+            if ODOO_POSTGRES_DSN:
+                from urllib.parse import urlparse
+                u = urlparse(ODOO_POSTGRES_DSN)
+                inferred_db = (u.path or "/").lstrip("/") or None
+            if inferred_db:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT tenant_id FROM odoo_connections WHERE db_name=%s AND active=TRUE LIMIT 1", (inferred_db,))
+                    row = cur.fetchone()
+                    if row:
+                        candidate_tid = int(row[0])
+        except Exception:
+            candidate_tid = candidate_tid  # keep any value already found
+
+        # Fallback to email → tenant_users mapping
+        if candidate_tid is None:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+                row = cur.fetchone()
+                if row:
+                    candidate_tid = int(row[0])
+
+        if candidate_tid is not None:
+            current = get_onboarding_status(int(candidate_tid))
             if current and current.get("status") in {"provisioning", "syncing", "ready"}:
+                logger.info(
+                    "onboarding:first_login dedup tenant_id=%s inferred_db=%s email=%s status=%s",
+                    candidate_tid,
+                    locals().get("inferred_db"),
+                    email,
+                    current.get("status"),
+                )
                 return {"status": current.get("status"), "tenant_id": current.get("tenant_id"), "error": current.get("error")}
     except Exception:
         # Non-blocking; proceed to kickoff if status lookup fails
@@ -530,10 +574,39 @@ async def onboarding_first_login(
 
 
 @app.get("/onboarding/status")
-async def onboarding_status(claims: dict = Depends(require_identity)):
-    tid = claims.get("tenant_id")
-    if not tid:
-        tid = getattr(getattr(app, "state", object()), "tenant_id", None)
+async def onboarding_status(claims: dict = Depends(require_optional_identity)):
+    # Resolve tenant id primarily via DSN→odoo_connections; fallback to claim or email mapping
+    tid = None
+    try:
+        from src.settings import ODOO_POSTGRES_DSN
+        inferred_db = None
+        if ODOO_POSTGRES_DSN:
+            from urllib.parse import urlparse
+            u = urlparse(ODOO_POSTGRES_DSN)
+            inferred_db = (u.path or "/").lstrip("/") or None
+        if inferred_db:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM odoo_connections WHERE db_name=%s AND active=TRUE LIMIT 1", (inferred_db,))
+                row = cur.fetchone()
+                if row:
+                    tid = int(row[0])
+    except Exception:
+        tid = None
+
+    if tid is None:
+        tid = claims.get("tenant_id") or getattr(getattr(app, "state", object()), "tenant_id", None)
+
+    if tid is None:
+        email = claims.get("email") or claims.get("preferred_username")
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+                row = cur.fetchone()
+                if row:
+                    tid = int(row[0])
+        except Exception:
+            tid = tid
+
     try:
         return get_onboarding_status(int(tid))
     except Exception as e:
