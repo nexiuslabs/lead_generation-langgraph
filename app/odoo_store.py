@@ -39,12 +39,22 @@ class OdooStore:
                             # Fallback: allow storing full DSN in db_name column
                             resolved_dsn = row[0]
             except Exception as e:
-                logger.warning("Per-tenant Odoo DSN resolution failed: %s", e)
+                logger.exception("Per-tenant Odoo DSN resolution failed")
         self.dsn = resolved_dsn or ODOO_POSTGRES_DSN
         if not self.dsn:
             raise ValueError(
                 "Odoo DSN not provided; set ODOO_POSTGRES_DSN or map via odoo_connections."
             )
+        # Log target host:port and db for observability (mask user/pass)
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(self.dsn)
+            host = u.hostname or "?"
+            port = u.port or 5432
+            db = (u.path or "/").lstrip("/") or "?"
+            logger.info("odoo:target host=%s port=%s db=%s", host, port, db)
+        except Exception:
+            pass
         # Lazy SSH tunnel (password or key) via env if configured
         self._ensure_tunnel_once()
 
@@ -84,7 +94,7 @@ class OdooStore:
         # Build ssh command; prefer password auth via sshpass when provided
         if ssh_password:
             if shutil.which("sshpass") is None:
-                logger.warning(
+                logger.error(
                     "sshpass not found but SSH_PASSWORD is set; cannot auto-open tunnel."
                 )
                 # Do not mark as opened; leave it false so future attempts can retry
@@ -124,6 +134,14 @@ class OdooStore:
             ]
 
         try:
+            logger.info(
+                "Opening SSH tunnel local 127.0.0.1:%s -> %s:%s via %s@%s",
+                local_port,
+                db_host_in_droplet,
+                db_port,
+                ssh_user,
+                ssh_host,
+            )
             OdooStore._tunnel_proc = subprocess.Popen(cmd)
             # Wait briefly for the local port to become available
             for _ in range(20):  # ~5s total
@@ -135,17 +153,27 @@ class OdooStore:
                 # Port did not open in time; check if process already exited
                 rc = OdooStore._tunnel_proc.poll()
                 if rc is not None:
-                    logger.warning("SSH tunnel process exited early with code %s; port %s not open", rc, local_port)
+                    logger.error("SSH tunnel process exited early with code %s; port %s not open", rc, local_port)
                 else:
-                    logger.warning("SSH tunnel did not open port %s within timeout", local_port)
+                    logger.error("SSH tunnel did not open port %s within timeout", local_port)
                 OdooStore._tunnel_opened = False
         except Exception as exc:
-            logger.warning("SSH tunnel start failed: %s", exc)
+            logger.exception("SSH tunnel start failed")
             OdooStore._tunnel_opened = False
 
     async def _acquire(self):
         # Re-check/ensure tunnel in case previous attempt failed or was terminated
         self._ensure_tunnel_once()
+        # Best-effort visibility if local port is not open
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(self.dsn)
+            host = u.hostname or "127.0.0.1"
+            port = u.port or 5432
+            if not self._port_open(host, port):
+                logger.warning("Odoo DSN target %s:%s not reachable before connect()", host, port)
+        except Exception:
+            pass
         return await asyncpg.connect(self.dsn)
 
     async def upsert_company(self, name: str, uen: str | None = None, **fields) -> int:

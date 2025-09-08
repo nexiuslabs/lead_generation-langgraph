@@ -16,13 +16,21 @@ import logging
 import re
 import os
 
-logger = logging.getLogger("input_norm")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
-    h.setFormatter(fmt)
-    logger.addHandler(h)
-logger.setLevel("INFO")
+fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
+
+def _ensure_logger(name: str, level: str = "INFO"):
+    lg = logging.getLogger(name)
+    if not lg.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(fmt)
+        lg.addHandler(h)
+    lg.setLevel(level)
+    return lg
+
+# Configure important app loggers so they are visible in Uvicorn output
+logger = _ensure_logger("input_norm")
+_ensure_logger("onboarding")
+_ensure_logger("app.odoo_store")
 
 # Ensure LangGraph checkpoint directory exists to prevent FileNotFoundError
 # e.g., '.langgraph_api/.langgraph_checkpoint.*.pckl.tmp'
@@ -34,13 +42,24 @@ except Exception as e:
 
 app = FastAPI(title="Pre-SDR LangGraph Server")
 
+# CORS allowlist (env-extensible)
+extra_origins = []
+try:
+    raw = os.getenv("EXTRA_CORS_ORIGINS", "")
+    if raw:
+        extra_origins = [o.strip() for o in raw.split(",") if o.strip()]
+except Exception:
+    extra_origins = []
+
+allow_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+] + extra_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-    ],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -427,6 +446,7 @@ async def verify_odoo(claims: dict = Depends(require_auth)):
             row = cur.fetchone()
             exists = bool(row and row[0])
     except Exception as e:
+        logger.exception("Odoo verify DB lookup failed tenant_id=%s", tid)
         return {"tenant_id": tid, "exists": False, "ready": False, "error": str(e)}
 
     smoke = False
@@ -437,8 +457,51 @@ async def verify_odoo(claims: dict = Depends(require_auth)):
         smoke = True
     except Exception as e:
         error = str(e)
+        logger.exception("Odoo: mapping exists=%s, smoke test failed tenant_id=%s", exists, tid)
 
     return {"tenant_id": tid, "exists": exists, "smoke": smoke, "ready": bool(exists and smoke), "error": error}
+
+
+@app.get("/debug/tenant")
+async def debug_tenant(claims: dict = Depends(require_auth)):
+    """Return current user identity, tenant mapping, and Odoo connectivity status."""
+    email = claims.get("email") or claims.get("preferred_username")
+    tid = claims.get("tenant_id")
+    roles = claims.get("roles", [])
+
+    db_name = None
+    mapping_exists = False
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
+            row = cur.fetchone()
+            if row:
+                mapping_exists = True
+                db_name = row[0]
+    except Exception as e:
+        return {
+            "email": email,
+            "tenant_id": tid,
+            "roles": roles,
+            "odoo": {"exists": False, "ready": False, "error": f"mapping fetch failed: {e}"},
+        }
+
+    # Try connectivity
+    ready = False
+    error = None
+    try:
+        store = OdooStore(tenant_id=int(tid))
+        await store.connectivity_smoke_test()
+        ready = True
+    except Exception as e:
+        error = str(e)
+
+    return {
+        "email": email,
+        "tenant_id": tid,
+        "roles": roles,
+        "odoo": {"exists": mapping_exists, "db_name": db_name, "ready": ready, "error": error},
+    }
 
 
 @app.post("/onboarding/first_login")
@@ -447,6 +510,17 @@ async def onboarding_first_login(
 ):
     email = claims.get("email") or claims.get("preferred_username")
     tenant_id_claim = claims.get("tenant_id")
+
+    # If we already have an onboarding record for this tenant in progress or ready,
+    # avoid enqueueing duplicate background tasks.
+    try:
+        if tenant_id_claim is not None:
+            current = get_onboarding_status(int(tenant_id_claim))
+            if current and current.get("status") in {"provisioning", "syncing", "ready"}:
+                return {"status": current.get("status"), "tenant_id": current.get("tenant_id"), "error": current.get("error")}
+    except Exception:
+        # Non-blocking; proceed to kickoff if status lookup fails
+        pass
 
     async def _run():
         await handle_first_login(email, tenant_id_claim)
@@ -460,7 +534,12 @@ async def onboarding_status(claims: dict = Depends(require_auth)):
     tid = claims.get("tenant_id")
     if not tid:
         tid = getattr(getattr(app, "state", object()), "tenant_id", None)
-    return get_onboarding_status(int(tid))
+    try:
+        return get_onboarding_status(int(tid))
+    except Exception as e:
+        logger.exception("Onboarding status failed tenant_id=%s", tid)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"tenant_id": tid, "status": "error", "error": str(e)})
 
 
 # --- Role-based access helpers and ICP endpoints ---
@@ -518,17 +597,6 @@ async def upsert_icp_rule(item: dict, _: dict = Depends(require_auth), __: bool 
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
-# --- Lightweight tenant middleware (optional header-based) ---
-@app.middleware("http")
-async def tenant_middleware(request: Request, call_next):
-    # In dev only, allow X-Tenant-ID header for local testing when SSO is not configured
-    allow_dev = (os.getenv("DEV_ALLOW_TENANT_HEADER", "false").lower() in ("1","true","yes","on"))
-    if allow_dev and not getattr(request.state, "tenant_id", None):
-        tenant_id = request.headers.get("X-Tenant-ID") or None
-        request.state.tenant_id = tenant_id
-    return await call_next(request)
 
 
 # --- Export endpoints (JSON/CSV) ---
@@ -593,20 +661,12 @@ async def auth_guard(request: Request, call_next):
     open_paths = {"/health", "/docs", "/openapi.json"}
     if request.url.path in open_paths:
         return await call_next(request)
-    # Dev bypass: allow X-Tenant-ID without JWT when enabled
+    # Dev bypass: in development, allow X-Tenant-ID without JWT
     dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")
     if dev_bypass:
-        # Respect explicit header, else DEFAULT_TENANT_ID
         tenant_id = request.headers.get("X-Tenant-ID") or os.getenv("DEFAULT_TENANT_ID")
         if tenant_id:
             request.state.tenant_id = tenant_id
-            return await call_next(request)
-    # Validate JWT for other requests
-    try:
-        await require_auth(request)
-    except Exception as e:
-        from fastapi.responses import JSONResponse
-        status = getattr(e, "status_code", 401)
-        detail = getattr(e, "detail", str(e))
-        return JSONResponse(status_code=status, content={"detail": detail})
+        return await call_next(request)
+    # In production, do not double-enforce here; route dependencies perform auth
     return await call_next(request)
