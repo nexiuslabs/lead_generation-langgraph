@@ -6,7 +6,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
 from src.database import get_pg_pool, get_conn
-from app.auth import require_auth
+from app.auth import require_auth, require_identity
 from src.icp import _find_ssic_codes_by_terms
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
@@ -506,7 +506,7 @@ async def debug_tenant(claims: dict = Depends(require_auth)):
 
 @app.post("/onboarding/first_login")
 async def onboarding_first_login(
-    background: BackgroundTasks, claims: dict = Depends(require_auth)
+    background: BackgroundTasks, claims: dict = Depends(require_identity)
 ):
     email = claims.get("email") or claims.get("preferred_username")
     tenant_id_claim = claims.get("tenant_id")
@@ -530,7 +530,7 @@ async def onboarding_first_login(
 
 
 @app.get("/onboarding/status")
-async def onboarding_status(claims: dict = Depends(require_auth)):
+async def onboarding_status(claims: dict = Depends(require_identity)):
     tid = claims.get("tenant_id")
     if not tid:
         tid = getattr(getattr(app, "state", object()), "tenant_id", None)
