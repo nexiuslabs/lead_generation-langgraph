@@ -1,12 +1,15 @@
 # app/main.py
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langserve import add_routes
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from app.pre_sdr_graph import build_graph
+from app.onboarding import handle_first_login, get_onboarding_status
 from src.database import get_pg_pool, get_conn
+from app.auth import require_auth
 from src.icp import _find_ssic_codes_by_terms
+from app.odoo_store import OdooStore
+from src.settings import OPENAI_API_KEY
 import csv
 from io import StringIO
 import logging
@@ -43,7 +46,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-graph = build_graph()
+# Lazily enable /agent routes only when LLM is configured to avoid import-time errors
+graph = None
 
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
@@ -383,10 +387,133 @@ def normalize_input(payload: dict) -> dict:
 
     return state
 
-ui_adapter = RunnableLambda(normalize_input) | graph
+try:
+    if OPENAI_API_KEY:
+        # Import here to prevent ChatOpenAI initialization when no key is configured
+        from app.pre_sdr_graph import build_graph  # type: ignore
 
-# expose adapted runnable so /agent accepts role-based payloads
-add_routes(app, ui_adapter, path="/agent")
+        graph = build_graph()
+        ui_adapter = RunnableLambda(normalize_input) | graph
+        add_routes(app, ui_adapter, path="/agent")
+        logger.info("/agent routes enabled (LLM configured)")
+    else:
+        logger.info("OPENAI_API_KEY not set; skipping /agent routes")
+except Exception as e:
+    # Never block API/docs if LangGraph wiring fails; just log and continue
+    logger.warning("Skipping /agent routes due to initialization error: %s", e)
+
+@app.get("/info")
+async def info(_: dict = Depends(require_auth)):
+    return {"ok": True}
+
+@app.get("/whoami")
+async def whoami(claims: dict = Depends(require_auth)):
+    return {
+        "sub": claims.get("sub"),
+        "email": claims.get("email"),
+        "tenant_id": claims.get("tenant_id"),
+        "roles": claims.get("roles", []),
+    }
+
+@app.get("/onboarding/verify_odoo")
+async def verify_odoo(claims: dict = Depends(require_auth)):
+    tid = claims.get("tenant_id")
+    exists = False
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT active FROM odoo_connections WHERE tenant_id=%s", (tid,)
+            )
+            row = cur.fetchone()
+            exists = bool(row and row[0])
+    except Exception as e:
+        return {"tenant_id": tid, "exists": False, "ready": False, "error": str(e)}
+
+    smoke = False
+    error = None
+    try:
+        store = OdooStore(tenant_id=int(tid))
+        await store.connectivity_smoke_test()
+        smoke = True
+    except Exception as e:
+        error = str(e)
+
+    return {"tenant_id": tid, "exists": exists, "smoke": smoke, "ready": bool(exists and smoke), "error": error}
+
+
+@app.post("/onboarding/first_login")
+async def onboarding_first_login(
+    background: BackgroundTasks, claims: dict = Depends(require_auth)
+):
+    email = claims.get("email") or claims.get("preferred_username")
+    tenant_id_claim = claims.get("tenant_id")
+
+    async def _run():
+        await handle_first_login(email, tenant_id_claim)
+
+    background.add_task(_run)
+    return {"status": "provisioning"}
+
+
+@app.get("/onboarding/status")
+async def onboarding_status(claims: dict = Depends(require_auth)):
+    tid = claims.get("tenant_id")
+    if not tid:
+        tid = getattr(getattr(app, "state", object()), "tenant_id", None)
+    return get_onboarding_status(int(tid))
+
+
+# --- Role-based access helpers and ICP endpoints ---
+def require_roles(allowed: set[str]):
+    async def _dep(request: Request):
+        roles = getattr(request.state, "roles", []) or []
+        if not any(r in allowed for r in roles):
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return True
+    return _dep
+
+
+@app.get("/icp/rules")
+async def list_icp_rules(_: dict = Depends(require_auth), request: Request = None):
+    # List ICP rules for current tenant (viewer allowed)
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        tid = getattr(request.state, "tenant_id", None)
+        if tid:
+            try:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+            except Exception:
+                pass
+        rows = await conn.fetch(
+            "SELECT rule_id, tenant_id, name, payload, created_at FROM icp_rules ORDER BY created_at DESC LIMIT 50"
+        )
+    return [dict(r) for r in rows]
+
+
+@app.post("/icp/rules")
+async def upsert_icp_rule(item: dict, _: dict = Depends(require_auth), __: bool = Depends(require_roles({"ops", "admin"})), request: Request = None):
+    # Upsert ICP rule for tenant (ops/admin only)
+    name = (item or {}).get("name") or "Default ICP"
+    payload = (item or {}).get("payload") or {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be an object")
+    tid = getattr(request.state, "tenant_id", None)
+    if not tid:
+        raise HTTPException(status_code=400, detail="missing tenant context")
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (tid,))
+        except Exception:
+            pass
+        cur.execute(
+            """
+            INSERT INTO icp_rules(tenant_id, name, payload)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (rule_id) DO NOTHING
+            """,
+            (tid, name, payload),
+        )
+    return {"ok": True}
 
 @app.get("/health")
 def health():
@@ -396,17 +523,25 @@ def health():
 # --- Lightweight tenant middleware (optional header-based) ---
 @app.middleware("http")
 async def tenant_middleware(request: Request, call_next):
-    # Extract tenant_id from header (e.g., set by SSO/edge); no validation here
-    tenant_id = request.headers.get("X-Tenant-ID") or None
-    request.state.tenant_id = tenant_id
+    # In dev only, allow X-Tenant-ID header for local testing when SSO is not configured
+    allow_dev = (os.getenv("DEV_ALLOW_TENANT_HEADER", "false").lower() in ("1","true","yes","on"))
+    if allow_dev and not getattr(request.state, "tenant_id", None):
+        tenant_id = request.headers.get("X-Tenant-ID") or None
+        request.state.tenant_id = tenant_id
     return await call_next(request)
 
 
 # --- Export endpoints (JSON/CSV) ---
 @app.get("/export/latest_scores.json")
-async def export_latest_scores_json(limit: int = 200):
+async def export_latest_scores_json(limit: int = 200, request: Request = None, _: dict = Depends(require_auth)):
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
+        # Set per-request tenant GUC for RLS
+        try:
+            if request and getattr(request.state, "tenant_id", None):
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", request.state.tenant_id)
+        except Exception:
+            pass
         rows = await conn.fetch(
             """
             SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
@@ -422,9 +557,14 @@ async def export_latest_scores_json(limit: int = 200):
 
 
 @app.get("/export/latest_scores.csv")
-async def export_latest_scores_csv(limit: int = 200):
+async def export_latest_scores_csv(limit: int = 200, request: Request = None, _: dict = Depends(require_auth)):
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
+        try:
+            if request and getattr(request.state, "tenant_id", None):
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", request.state.tenant_id)
+        except Exception:
+            pass
         rows = await conn.fetch(
             """
             SELECT c.company_id, c.name, c.industry_norm, c.employees_est,
@@ -444,3 +584,29 @@ async def export_latest_scores_csv(limit: int = 200):
     for r in rows:
         writer.writerow(dict(r))
     return Response(content=buf.getvalue(), media_type="text/csv")
+@app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    # Always let CORS preflight through
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+    # Allow unauthenticated for health and docs
+    open_paths = {"/health", "/docs", "/openapi.json"}
+    if request.url.path in open_paths:
+        return await call_next(request)
+    # Dev bypass: allow X-Tenant-ID without JWT when enabled
+    dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")
+    if dev_bypass:
+        # Respect explicit header, else DEFAULT_TENANT_ID
+        tenant_id = request.headers.get("X-Tenant-ID") or os.getenv("DEFAULT_TENANT_ID")
+        if tenant_id:
+            request.state.tenant_id = tenant_id
+            return await call_next(request)
+    # Validate JWT for other requests
+    try:
+        await require_auth(request)
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        status = getattr(e, "status_code", 401)
+        detail = getattr(e, "detail", str(e))
+        return JSONResponse(status_code=status, content={"detail": detail})
+    return await call_next(request)

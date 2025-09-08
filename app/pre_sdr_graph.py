@@ -168,7 +168,14 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         return state
 
     pool = await get_pg_pool()
-    store = OdooStore()
+    # Resolve tenant for Odoo; default to env for non-HTTP graph runs
+    _tid = None
+    try:
+        _tid_env = os.getenv("DEFAULT_TENANT_ID")
+        _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+    except Exception:
+        _tid = None
+    store = OdooStore(tenant_id=_tid)
 
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]
@@ -1170,7 +1177,13 @@ async def enrich_node(state: GraphState) -> GraphState:
                     from app.odoo_store import OdooStore
 
                     try:
-                        store = OdooStore()
+                        _tid = None
+                        try:
+                            _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                            _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                        except Exception:
+                            _tid = None
+                        store = OdooStore(tenant_id=_tid)
                     except Exception as _odoo_init_exc:
                         logger.warning("odoo init skipped: %s", _odoo_init_exc)
                         store = None  # type: ignore

@@ -1,5 +1,6 @@
 # tools.py
 import asyncio
+import os
 import json
 import re
 import time
@@ -51,6 +52,13 @@ logger.info("🛠️  Initializing enrichment pipeline…")
 
 # Simple in-memory cache for ZeroBounce to avoid duplicate calls per-run
 ZB_CACHE: dict[str, dict] = {}
+
+def _default_tenant_id() -> int | None:
+    try:
+        v = os.getenv("DEFAULT_TENANT_ID")
+        return int(v) if v and v.isdigit() else None
+    except Exception:
+        return None
 
 # Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
 if TAVILY_API_KEY:
@@ -824,16 +832,20 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
 
     conn = get_db_connection()
     with conn:
+        fields = {
+            "company_id": company_id,
+            "about_text": about_text,
+            "tech_stack": tech_stack,
+            "public_emails": public_emails,
+            "jobs_count": jobs_count,
+            "linkedin_url": None,
+        }
+        tid = _default_tenant_id()
+        if tid is not None:
+            fields["tenant_id"] = tid
         _insert_company_enrichment_run(
             conn,
-            {
-                "company_id": company_id,
-                "about_text": about_text,
-                "tech_stack": tech_stack,
-                "public_emails": public_emails,
-                "jobs_count": jobs_count,
-                "linkedin_url": None,
-            },
+            fields,
         )
     conn.close()
 
@@ -2044,18 +2056,22 @@ def store_enrichment(company_id: int, domain: str, data: dict):
     phones_norm = _normalize_phone_list(data.get("phone_number") or [])
 
     with conn:
+        fields2 = {
+            "company_id": company_id,
+            "about_text": data.get("about_text"),
+            "tech_stack": (data.get("tech_stack") or []),
+            "public_emails": (data.get("public_emails") or []),
+            "jobs_count": data.get("jobs_count"),
+            "linkedin_url": data.get("linkedin_url"),
+            "verification_results": Json(verification),
+            "embedding": embedding,
+        }
+        tid2 = _default_tenant_id()
+        if tid2 is not None:
+            fields2["tenant_id"] = tid2
         _insert_company_enrichment_run(
             conn,
-            {
-                "company_id": company_id,
-                "about_text": data.get("about_text"),
-                "tech_stack": (data.get("tech_stack") or []),
-                "public_emails": (data.get("public_emails") or []),
-                "jobs_count": data.get("jobs_count"),
-                "linkedin_url": data.get("linkedin_url"),
-                "verification_results": Json(verification),
-                "embedding": embedding,
-            },
+            fields2,
         )
         print("       ↳ history saved")
         with conn.cursor() as cur:
@@ -2177,16 +2193,20 @@ async def enrich_company(company_id: int, company_name: str):
 
         conn = get_db_connection()
         with conn:
+            fields3 = {
+                "company_id": company_id,
+                "about_text": about_text,
+                "tech_stack": tech_stack,
+                "public_emails": public_emails,
+                "jobs_count": jobs_count,
+                "linkedin_url": None,
+            }
+            tid3 = _default_tenant_id()
+            if tid3 is not None:
+                fields3["tenant_id"] = tid3
             _insert_company_enrichment_run(
                 conn,
-                {
-                    "company_id": company_id,
-                    "about_text": about_text,
-                    "tech_stack": tech_stack,
-                    "public_emails": public_emails,
-                    "jobs_count": jobs_count,
-                    "linkedin_url": None,
-                },
+                fields3,
             )
         conn.close()
 

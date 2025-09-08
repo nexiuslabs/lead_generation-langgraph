@@ -11,6 +11,7 @@ asyncpg
 psycopg2
 scikit-learn
 httpx
+PyJWT
 beautifulsoup4
 fastapi
 uvicorn

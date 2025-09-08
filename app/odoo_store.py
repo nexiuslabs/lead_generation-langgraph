@@ -16,11 +16,34 @@ logger = logging.getLogger(__name__)
 
 
 class OdooStore:
-    def __init__(self, dsn: str | None = None):
-        self.dsn = dsn or ODOO_POSTGRES_DSN
+    def __init__(self, tenant_id: int | None = None, dsn: str | None = None):
+        # Prefer explicit DSN if provided
+        resolved_dsn = dsn
+        if not resolved_dsn and tenant_id is not None:
+            try:
+                # Resolve per-tenant DSN from app DB mapping (odoo_connections)
+                import psycopg2  # local import to avoid cyclics
+                from src.settings import POSTGRES_DSN as APP_DSN
+
+                with psycopg2.connect(dsn=APP_DSN) as c, c.cursor() as cur:
+                    cur.execute(
+                        "SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active",
+                        (tenant_id,),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        base_tpl = os.getenv("ODOO_BASE_DSN_TEMPLATE", "")
+                        if base_tpl:
+                            resolved_dsn = base_tpl.format(db_name=row[0])
+                        else:
+                            # Fallback: allow storing full DSN in db_name column
+                            resolved_dsn = row[0]
+            except Exception as e:
+                logger.warning("Per-tenant Odoo DSN resolution failed: %s", e)
+        self.dsn = resolved_dsn or ODOO_POSTGRES_DSN
         if not self.dsn:
             raise ValueError(
-                "Odoo DSN not provided; set ODOO_POSTGRES_DSN or pass dsn."
+                "Odoo DSN not provided; set ODOO_POSTGRES_DSN or map via odoo_connections."
             )
         # Lazy SSH tunnel (password or key) via env if configured
         self._ensure_tunnel_once()
@@ -241,6 +264,37 @@ class OdooStore:
 
         finally:
             await conn.close()
+
+    async def connectivity_smoke_test(self) -> None:
+        conn = await self._acquire()
+        try:
+            # Basic connectivity check
+            await conn.execute("SELECT 1")
+            # Optionally check res_partner exists
+            try:
+                await conn.fetchrow(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name='res_partner'"
+                )
+            except Exception:
+                pass
+        finally:
+            await conn.close()
+
+    async def seed_baseline_entities(self, tenant_id: int, email: str | None = None) -> None:
+        """Create minimal baseline entities in Odoo for a new tenant context.
+
+        - Create a company (res_partner, is_company=TRUE) if a placeholder does not exist
+        - Optionally add a contact row with the user's email under that company
+        """
+        # Use a deterministic tenant-scoped company name
+        company_name = f"Tenant {tenant_id} Company"
+        cid = await self.upsert_company(name=company_name, uen=None)
+        if email:
+            try:
+                await self.add_contact(company_id=cid, email=email, full_name=None)
+            except Exception:
+                # Best-effort; do not fail onboarding if contact insert fails
+                pass
 
     async def merge_company_enrichment(
         self, company_id: int, enrichment: Dict[str, Any]
