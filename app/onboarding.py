@@ -1,7 +1,9 @@
 import os
+import json
 import logging
 from typing import Optional, Tuple
 import asyncpg  # noqa: F401  # reserved for potential future async DB ops
+import requests
 from src.database import get_conn
 from app.odoo_store import OdooStore
 
@@ -86,9 +88,14 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
                 (tenant_id_claim,),
             )
             if not cur.fetchone():
+                try:
+                    from psycopg2.extras import Json  # type: ignore
+                    payload = Json({"industries": ["software"], "employee_range": {"min": 10, "max": 200}})
+                except Exception:
+                    payload = json.dumps({"industries": ["software"], "employee_range": {"min": 10, "max": 200}})
                 cur.execute(
                     "INSERT INTO icp_rules(tenant_id, name, payload) VALUES (%s, %s, %s)",
-                    (tenant_id_claim, "Default ICP", {"industries": ["software"], "employee_range": {"min": 10, "max": 200}}),
+                    (tenant_id_claim, "Default ICP", payload),
                 )
             return tenant_id_claim
 
@@ -100,12 +107,27 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
         r = cur.fetchone()
         if r:
             tid = r[0]
+            # If tenant row is missing for this tid (orphaned mapping), create it idempotently
+            cur.execute("SELECT 1 FROM tenants WHERE tenant_id=%s", (tid,))
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO tenants(tenant_id, name, status) VALUES (%s, %s, 'active') ON CONFLICT (tenant_id) DO NOTHING",
+                    (tid, email.split("@")[0]),
+                )
         else:
             cur.execute(
                 "INSERT INTO tenants(name, status) VALUES(%s,'active') RETURNING tenant_id",
                 (email.split("@")[0],),
             )
             tid = cur.fetchone()[0]
+        # Ensure tenants row exists for tid (idempotent upsert) in case of prior inconsistent data
+        try:
+            cur.execute(
+                "INSERT INTO tenants(tenant_id, name, status) VALUES (%s, %s, 'active') ON CONFLICT (tenant_id) DO NOTHING",
+                (tid, email.split("@")[0]),
+            )
+        except Exception:
+            pass
         # Link user and seed defaults
         cur.execute(
             """
@@ -117,9 +139,14 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
         )
         cur.execute("SELECT 1 FROM icp_rules WHERE tenant_id=%s LIMIT 1", (tid,))
         if not cur.fetchone():
+            try:
+                from psycopg2.extras import Json  # type: ignore
+                payload = Json({"industries": ["software"], "employee_range": {"min": 10, "max": 200}})
+            except Exception:
+                payload = json.dumps({"industries": ["software"], "employee_range": {"min": 10, "max": 200}})
             cur.execute(
                 "INSERT INTO icp_rules(tenant_id, name, payload) VALUES (%s, %s, %s)",
-                (tid, "Default ICP", {"industries": ["software"], "employee_range": {"min": 10, "max": 200}}),
+                (tid, "Default ICP", payload),
             )
         return tid
 
@@ -263,6 +290,9 @@ async def handle_first_login(email: str, tenant_id_claim: Optional[int]) -> dict
     try:
         _ensure_tables()
         logger.info("onboarding:first_login start email=%s tenant_id_claim=%s", email, tenant_id_claim)
+        # Odoo-first: ensure DB exists before creating tenant rows
+        _ensure_odoo_db_first_by_email(email)
+        # Create/find tenant rows in app DB
         tid = _ensure_tenant_and_user(email, tenant_id_claim)
         logger.info("onboarding:first_login resolved_tenant_id=%s email=%s", tid, email)
         _insert_or_update_status(tid, ONBOARDING_STARTING)
@@ -337,10 +367,18 @@ def get_onboarding_status(tenant_id: int) -> dict:
 
 
 # --- Odoo DB + OIDC helpers (best effort; optional based on env) ---
+def _requests_verify() -> bool | str:
+    v = (os.getenv('ODOO_TLS_VERIFY', 'true') or 'true').strip().lower()
+    enabled = v in ('1', 'true', 'yes', 'on')
+    ca = os.getenv('ODOO_CA_BUNDLE', '').strip()
+    if enabled and ca:
+        return ca
+    return enabled
+
+
 def _odoo_db_list(server: str) -> list:
-    import requests
     payload = {"jsonrpc": "2.0", "method": "call", "params": {"service": "db", "method": "list", "args": []}}
-    r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=20)
+    r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=20, verify=_requests_verify())
     r.raise_for_status()
     return (r.json() or {}).get("result", [])
 
@@ -349,7 +387,7 @@ def _odoo_db_create(server: str, master_pwd: str, db_name: str, admin_login: str
     import requests
     args = [master_pwd, db_name, False, os.getenv("ODOO_LANG", "en_US"), admin_password, admin_login, os.getenv("ODOO_COUNTRY", "SG"), "", admin_login]
     payload = {"jsonrpc": "2.0", "method": "call", "params": {"service": "db", "method": "create_database", "args": args}}
-    r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=180)
+    r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=180, verify=_requests_verify())
     r.raise_for_status()
 
 
@@ -400,3 +438,33 @@ def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email:
             _odoo_admin_user_create(server, db_name, admin_login, admin_password, email)
     except Exception as e:
         logger.warning("ensure_odoo_db_and_admin failed: %s", e)
+
+
+def _ensure_odoo_db_first_by_email(email: str) -> Optional[str]:
+    """Ensure an Odoo database exists for the user's email domain BEFORE tenant creation.
+
+    - Derives db_name as odoo_<first label of domain>.
+    - If ODOO_SERVER_URL/ODOO_MASTER_PASSWORD not set, returns None (skip).
+    - If DB exists: return db_name.
+    - Else create DB + admin user (login=email) and return db_name.
+    """
+    server = os.getenv('ODOO_SERVER_URL')
+    master = os.getenv('ODOO_MASTER_PASSWORD')
+    if not server or not master:
+        return None
+    try:
+        desired = _derive_db_name_from_email(email)
+        dbs = _odoo_db_list(server)
+        if desired in dbs:
+            logger.info("odoo:first ensure exists db=%s email=%s", desired, email)
+            return desired
+        # Create DB and bootstrap admin user
+        import secrets
+        admin_pass = secrets.token_urlsafe(int(os.getenv('ODOO_TENANT_ADMIN_PASSWORD_LENGTH', '24')))
+        _odoo_db_create(server, master, desired, email, admin_pass)
+        _odoo_admin_user_create(server, desired, email, admin_pass, email)
+        logger.info("odoo:first created db=%s email=%s", desired, email)
+        return desired
+    except Exception as e:
+        logger.warning("odoo:first ensure failed email=%s error=%s", email, e)
+        return None
