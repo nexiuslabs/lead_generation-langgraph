@@ -1,6 +1,10 @@
 {
   "dependencies": ["."],
+  "env": ".env",
   "graphs": {
     "agent": "./app/lg_entry.py:make_graph"
+  },
+  "http": {
+    "app": "./app/main.py:app"
   }
 }

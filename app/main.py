@@ -1,7 +1,6 @@
 # app/main.py
 from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
-from langserve import add_routes
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
@@ -414,9 +413,11 @@ def normalize_input(payload: dict) -> dict:
 
     return state
 
+ENABLE_LANGSERVE_IN_APP = os.getenv("ENABLE_LANGSERVE_IN_APP", "false").lower() in ("1", "true", "yes", "on")
 try:
-    if OPENAI_API_KEY:
-        # Import here to prevent ChatOpenAI initialization when no key is configured
+    if ENABLE_LANGSERVE_IN_APP and OPENAI_API_KEY:
+        # Import inside conditional to avoid loading langserve when mounted into LangGraph Server
+        from langserve import add_routes  # type: ignore
         from app.pre_sdr_graph import build_graph  # type: ignore
 
         graph = build_graph()
@@ -424,9 +425,9 @@ try:
         add_routes(app, ui_adapter, path="/agent")
         logger.info("/agent routes enabled (LLM configured)")
     else:
-        logger.info("OPENAI_API_KEY not set; skipping /agent routes")
+        logger.info("Skipping /agent routes (ENABLE_LANGSERVE_IN_APP is false or OPENAI_API_KEY missing)")
 except Exception as e:
-    # Never block API/docs if LangGraph wiring fails; just log and continue
+    # Never block API/docs if LangServe wiring fails; just log and continue
     logger.warning("Skipping /agent routes due to initialization error: %s", e)
 
 @app.get("/info")
