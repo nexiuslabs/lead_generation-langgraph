@@ -1,5 +1,5 @@
 # app/main.py
-from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from langserve import add_routes
 from langchain_core.runnables import RunnableLambda
@@ -68,6 +68,13 @@ app.add_middleware(
 
 # Lazily enable /agent routes only when LLM is configured to avoid import-time errors
 graph = None
+
+# Mount auth cookie routes
+try:
+    from app.auth_routes import router as auth_router
+    app.include_router(auth_router)
+except Exception as _e:
+    logger.warning("Auth routes not mounted: %s", _e)
 
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
@@ -424,7 +431,16 @@ except Exception as e:
 
 @app.get("/info")
 async def info(_: dict = Depends(require_auth)):
-    return {"ok": True}
+    # Expose capability hints and current auth mode (no secrets)
+    checkpoint_enabled = True if CHECKPOINT_DIR else False
+    dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")
+    issuer = (os.getenv("NEXIUS_ISSUER") or "").strip() or None
+    audience = (os.getenv("NEXIUS_AUDIENCE") or "").strip() or None
+    return {
+        "ok": True,
+        "checkpoint_enabled": checkpoint_enabled,
+        "auth": {"dev_bypass": dev_bypass, "issuer": issuer, "audience": audience},
+    }
 
 @app.get("/whoami")
 async def whoami(claims: dict = Depends(require_auth)):
@@ -576,6 +592,8 @@ async def onboarding_first_login(
 @app.get("/onboarding/status")
 async def onboarding_status(claims: dict = Depends(require_optional_identity)):
     # Resolve tenant id primarily via DSN→odoo_connections; fallback to claim or email mapping
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    logger.info("onboarding_status: enter email=%s claim_tid=%s", email, claims.get("tenant_id"))
     tid = None
     try:
         from src.settings import ODOO_POSTGRES_DSN
@@ -597,7 +615,6 @@ async def onboarding_status(claims: dict = Depends(require_optional_identity)):
         tid = claims.get("tenant_id") or getattr(getattr(app, "state", object()), "tenant_id", None)
 
     if tid is None:
-        email = claims.get("email") or claims.get("preferred_username")
         try:
             with get_conn() as conn, conn.cursor() as cur:
                 cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
@@ -607,12 +624,29 @@ async def onboarding_status(claims: dict = Depends(require_optional_identity)):
         except Exception:
             tid = tid
 
+    # Guard: if tenant_id is still unknown, return a provisioning placeholder instead of 500
+    if tid is None:
+        logger.info("onboarding_status: no tenant yet for email=%s → returning provisioning placeholder", email)
+        return {"tenant_id": None, "status": "provisioning", "error": None}
+
     try:
-        return get_onboarding_status(int(tid))
+        res = get_onboarding_status(int(tid))
+        logger.info("onboarding_status: tenant_id=%s status=%s", tid, res.get("status"))
+        return res
     except Exception as e:
         logger.exception("Onboarding status failed tenant_id=%s", tid)
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=500, content={"tenant_id": tid, "status": "error", "error": str(e)})
+
+
+@app.get("/tenants/{tenant_id}")
+async def tenant_status(tenant_id: int, _: dict = Depends(require_optional_identity)):
+    """PRD alias for onboarding status by explicit tenant id."""
+    try:
+        return get_onboarding_status(int(tenant_id))
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"tenant_id": tenant_id, "status": "error", "error": str(e)})
 
 
 # --- Role-based access helpers and ICP endpoints ---
@@ -734,12 +768,17 @@ async def auth_guard(request: Request, call_next):
     open_paths = {"/health", "/docs", "/openapi.json"}
     if request.url.path in open_paths:
         return await call_next(request)
-    # Dev bypass: in development, allow X-Tenant-ID without JWT
-    dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")
-    if dev_bypass:
-        tenant_id = request.headers.get("X-Tenant-ID") or os.getenv("DEFAULT_TENANT_ID")
-        if tenant_id:
-            request.state.tenant_id = tenant_id
-        return await call_next(request)
     # In production, do not double-enforce here; route dependencies perform auth
     return await call_next(request)
+
+# --- Admin/ops: rotate per-tenant Odoo API key ---
+@app.post("/tenants/{tenant_id}/odoo/api-key/rotate")
+async def rotate_odoo_key(tenant_id: int = Path(...), _: dict = Depends(require_auth)):
+    import secrets
+    new_secret = secrets.token_urlsafe(32)
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE odoo_connections SET secret=%s WHERE tenant_id=%s", (new_secret, tenant_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rotate failed: {e}")
+    return Response(status_code=204)
