@@ -166,6 +166,22 @@ def _derive_db_name_from_email(email: str) -> str:
         return "odoo_tenant"
 
 
+def _truthy(name: str, default: str = "false") -> bool:
+    val = (os.getenv(name, default) or default).strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _has_active_mapping(tenant_id: int) -> bool:
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM odoo_connections WHERE tenant_id=%s AND active", (tenant_id,)
+            )
+            return bool(cur.fetchone())
+    except Exception:
+        return False
+
+
 async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     """Ensure there is an active odoo_connections row for this tenant.
 
@@ -252,7 +268,7 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     # No mapping yet; try server-level automation using suggested db_name from email
     server = os.getenv('ODOO_SERVER_URL')
     master = os.getenv('ODOO_MASTER_PASSWORD')
-    if server and master and email:
+    if _truthy('ODOO_ENABLE_HTTP_PROVISION', 'false') and server and master and email:
         try:
             desired = _derive_db_name_from_email(email)
             # If DB exists on server, just upsert mapping; else create and map
@@ -290,8 +306,9 @@ async def handle_first_login(email: str, tenant_id_claim: Optional[int]) -> dict
     try:
         _ensure_tables()
         logger.info("onboarding:first_login start email=%s tenant_id_claim=%s", email, tenant_id_claim)
-        # Odoo-first: ensure DB exists before creating tenant rows
-        _ensure_odoo_db_first_by_email(email)
+        # Optional: Odoo-first HTTP ensure (disabled by default)
+        if _truthy('ODOO_ENABLE_HTTP_PROVISION', 'false'):
+            _ensure_odoo_db_first_by_email(email)
         # Create/find tenant rows in app DB
         tid = _ensure_tenant_and_user(email, tenant_id_claim)
         logger.info("onboarding:first_login resolved_tenant_id=%s email=%s", tid, email)
@@ -300,59 +317,64 @@ async def handle_first_login(email: str, tenant_id_claim: Optional[int]) -> dict
         logger.exception("onboarding:first_login early failure email=%s", email)
         return {"tenant_id": None, "status": ONBOARDING_ERROR, "error": str(e)}
     try:
+        # Determine if mapping already existed before this run
+        mapping_exists_before = _has_active_mapping(tid)
         # Ensure mapping and smoke test / infer db
         _insert_or_update_status(tid, ONBOARDING_CREATING_ODOO)
         await _ensure_odoo_mapping(tid, email=email)
 
         # Optional: automatically create Odoo DB (HTTP DB manager) and bootstrap admin
-        try:
-            from urllib.parse import urlparse
-            server = os.getenv('ODOO_SERVER_URL')
-            master = os.getenv('ODOO_MASTER_PASSWORD')
-            if server and master:
-                # derive db_name
-                db_name = None
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
-                    row = cur.fetchone()
-                    db_name = (row[0] if row else None)
-                if db_name:
-                    # Use first-login email as admin login
-                    _ensure_odoo_db_and_admin(server, master, db_name, email)
-        except Exception as e:
-            logger.warning("odoo db auto-create skipped: %s", e)
+        if not mapping_exists_before and _truthy('ODOO_ENABLE_HTTP_PROVISION', 'false'):
+            try:
+                server = os.getenv('ODOO_SERVER_URL')
+                master = os.getenv('ODOO_MASTER_PASSWORD')
+                if server and master:
+                    # derive db_name
+                    db_name = None
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
+                        row = cur.fetchone()
+                        db_name = (row[0] if row else None)
+                    if db_name:
+                        # Use first-login email as admin login
+                        _ensure_odoo_db_and_admin(server, master, db_name, email)
+            except Exception as e:
+                logger.warning("odoo db auto-create skipped: %s", e)
 
         # Configure OIDC provider in Odoo (optional)
-        _insert_or_update_status(tid, ONBOARDING_CONFIGURING_OIDC)
-        try:
-            server = os.getenv('ODOO_SERVER_URL')
-            issuer = os.getenv('NEXIUS_ISSUER')
-            cid = os.getenv('NEXIUS_CLIENT_ID')
-            secret = os.getenv('NEXIUS_CLIENT_SECRET')
-            if server and issuer and cid and secret:
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
-                    row = cur.fetchone()
-                    db_name = (row[0] if row else None)
-                if db_name:
-                    # Log in with tenant admin (same email) and configure provider
-                    admin_login = email
-                    admin_password = os.getenv('ODOO_TENANT_ADMIN_PASSWORD_FALLBACK', '')
-                    if admin_password:
-                        _odoo_configure_oidc(server, db_name, admin_login, admin_password, issuer, cid, secret)
-        except Exception as e:
-            logger.warning("odoo oidc auto-config skipped: %s", e)
+        if not mapping_exists_before and _truthy('ODOO_ENABLE_OIDC_AUTOCONFIG', 'false'):
+            _insert_or_update_status(tid, ONBOARDING_CONFIGURING_OIDC)
+            try:
+                server = os.getenv('ODOO_SERVER_URL')
+                issuer = os.getenv('NEXIUS_ISSUER')
+                cid = os.getenv('NEXIUS_CLIENT_ID')
+                secret = os.getenv('NEXIUS_CLIENT_SECRET')
+                if server and issuer and cid and secret:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
+                        row = cur.fetchone()
+                        db_name = (row[0] if row else None)
+                    if db_name:
+                        # Log in with tenant admin (same email) and configure provider
+                        admin_login = email
+                        admin_password = os.getenv('ODOO_TENANT_ADMIN_PASSWORD_FALLBACK', '')
+                        if admin_password:
+                            _odoo_configure_oidc(server, db_name, admin_login, admin_password, issuer, cid, secret)
+            except Exception as e:
+                logger.warning("odoo oidc auto-config skipped: %s", e)
 
-        # Move to seeding while we seed minimal baseline
-        _insert_or_update_status(tid, ONBOARDING_SEEDING)
-        try:
-            store = OdooStore(tenant_id=tid)
-            await store.seed_baseline_entities(tenant_id=tid, email=email)
-        except Exception as _seed_err:
-            # Non-fatal; continue to ready but include error detail in status
-            logger.exception("Onboarding baseline seed failed tenant_id=%s", tid)
-            _insert_or_update_status(tid, ONBOARDING_SEEDING, str(_seed_err))
+        # Move to seeding only if this was a newly provisioned mapping
+        if not mapping_exists_before:
+            _insert_or_update_status(tid, ONBOARDING_SEEDING)
+            try:
+                store = OdooStore(tenant_id=tid)
+                await store.seed_baseline_entities(tenant_id=tid, email=email)
+            except Exception as _seed_err:
+                # Non-fatal; continue to ready but include error detail in status
+                logger.exception("Onboarding baseline seed failed tenant_id=%s", tid)
+                _insert_or_update_status(tid, ONBOARDING_SEEDING, str(_seed_err))
         _insert_or_update_status(tid, ONBOARDING_READY)
+        logger.info("onboarding:first_login status=ready tenant_id=%s email=%s", tid, email)
     except Exception as e:
         logger.exception("Onboarding failed tenant_id=%s", tid)
         _insert_or_update_status(tid, ONBOARDING_ERROR, str(e))

@@ -452,31 +452,42 @@ async def whoami(claims: dict = Depends(require_auth)):
     }
 
 @app.get("/onboarding/verify_odoo")
-async def verify_odoo(claims: dict = Depends(require_auth)):
-    tid = claims.get("tenant_id")
+async def verify_odoo(claims: dict = Depends(require_identity)):
+    """Verify Odoo mapping + connectivity for the current session.
+
+    Aligns with PRD/DevPlan: does not require a tenant_id claim; resolves
+    tenant via DSN→odoo_connections, claim, or email mapping. Uses
+    odoo_connection_info for smoke test.
+    """
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+
+    # Use shared resolver + smoke test
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+
+    # Determine whether an active mapping exists
     exists = False
-    try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT active FROM odoo_connections WHERE tenant_id=%s", (tid,)
-            )
-            row = cur.fetchone()
-            exists = bool(row and row[0])
-    except Exception as e:
-        logger.exception("Odoo verify DB lookup failed tenant_id=%s", tid)
-        return {"tenant_id": tid, "exists": False, "ready": False, "error": str(e)}
+    if tid is not None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT active FROM odoo_connections WHERE tenant_id=%s", (tid,))
+                row = cur.fetchone()
+                exists = bool(row and row[0])
+        except Exception as e:
+            logger.exception("Odoo verify DB lookup failed tenant_id=%s", tid)
+            return {"tenant_id": tid, "exists": False, "ready": False, "error": str(e)}
 
-    smoke = False
-    error = None
-    try:
-        store = OdooStore(tenant_id=int(tid))
-        await store.connectivity_smoke_test()
-        smoke = True
-    except Exception as e:
-        error = str(e)
-        logger.exception("Odoo: mapping exists=%s, smoke test failed tenant_id=%s", exists, tid)
+    smoke = bool((info.get("odoo") or {}).get("ready"))
+    error = (info.get("odoo") or {}).get("error")
 
-    return {"tenant_id": tid, "exists": exists, "smoke": smoke, "ready": bool(exists and smoke), "error": error}
+    return {
+        "tenant_id": tid,
+        "exists": exists,
+        "smoke": smoke,
+        "ready": bool(exists and smoke),
+        "error": error,
+    }
 
 
 @app.get("/debug/tenant")
@@ -631,6 +642,12 @@ async def onboarding_status(claims: dict = Depends(require_optional_identity)):
 
     try:
         res = get_onboarding_status(int(tid))
+        # Back-compat: normalize legacy 'complete' to 'ready' for UI gate
+        try:
+            if (res or {}).get("status") == "complete":
+                res["status"] = "ready"
+        except Exception:
+            pass
         logger.info("onboarding_status: tenant_id=%s status=%s", tid, res.get("status"))
         return res
     except Exception as e:
@@ -643,7 +660,14 @@ async def onboarding_status(claims: dict = Depends(require_optional_identity)):
 async def tenant_status(tenant_id: int, _: dict = Depends(require_optional_identity)):
     """PRD alias for onboarding status by explicit tenant id."""
     try:
-        return get_onboarding_status(int(tenant_id))
+        res = get_onboarding_status(int(tenant_id))
+        # Back-compat normalization
+        try:
+            if (res or {}).get("status") == "complete":
+                res["status"] = "ready"
+        except Exception:
+            pass
+        return res
     except Exception as e:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=500, content={"tenant_id": tenant_id, "status": "error", "error": str(e)})
