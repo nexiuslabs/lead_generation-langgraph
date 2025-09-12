@@ -205,14 +205,27 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
             pass
     store = None
     try:
+        logger.info("odoo resolve: tenant_id=%s (env DEFAULT_TENANT_ID=%s)", _tid, os.getenv("DEFAULT_TENANT_ID"))
+    except Exception:
+        pass
+    try:
         store = OdooStore(tenant_id=_tid)
     except Exception as _init_exc:
-        # Fallback: derive DSN from active mapping + template
+        # Fallback: derive DSN for current tenant first; only use first active when tenant is unknown
         try:
+            db_name = None
             with get_conn() as _c, _c.cursor() as _cur:
-                _cur.execute("SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1")
-                _row = _cur.fetchone()
-                db_name = _row[0] if _row and _row[0] else None
+                if _tid is not None:
+                    _cur.execute(
+                        "SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active=TRUE LIMIT 1",
+                        (_tid,),
+                    )
+                    _row = _cur.fetchone()
+                    db_name = _row[0] if _row and _row[0] else None
+                if db_name is None and _tid is None:
+                    _cur.execute("SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                    _row = _cur.fetchone()
+                    db_name = _row[0] if _row and _row[0] else None
             if db_name:
                 tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE", "") or "").strip()
                 if tpl:
@@ -220,7 +233,11 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 else:
                     dsn = db_name if str(db_name).startswith("postgresql://") else None
                 if dsn:
-                    logger.info("odoo init: fallback DSN via mapping db=%s", db_name)
+                    logger.info(
+                        "odoo init: fallback DSN via mapping db=%s%s",
+                        db_name,
+                        f" (tenant_id={_tid})" if _tid is not None else "",
+                    )
                     store = OdooStore(dsn=dsn)
         except Exception as _fb_exc:
             logger.warning("odoo init fallback error: %s", _fb_exc)
@@ -1241,14 +1258,25 @@ async def enrich_node(state: GraphState) -> GraphState:
                     from app.odoo_store import OdooStore
 
                     try:
+                        try:
+                            logger.info("odoo resolve: tenant_id=%s (env DEFAULT_TENANT_ID=%s)", _tid, os.getenv("DEFAULT_TENANT_ID"))
+                        except Exception:
+                            pass
                         # Resolve tenant for OdooStore in this order:
                         # 1) DEFAULT_TENANT_ID (for non-HTTP runs)
                         # 2) Map DSN path -> odoo_connections.tenant_id
                         # 3) First active mapping in odoo_connections
-                        _tid = None
+                        # Prefer tenant_id from state (multi-user safe)
+                        _tid_val = state.get("tenant_id") if isinstance(state, dict) else None
                         try:
-                            _tid_env = os.getenv("DEFAULT_TENANT_ID")
-                            _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                            _tid = int(_tid_val) if _tid_val is not None else None
+                        except Exception:
+                            _tid = None
+                        # Env fallback for dev/single-user
+                        try:
+                            if _tid is None:
+                                _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                                _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
                         except Exception:
                             _tid = None
 
@@ -1288,10 +1316,21 @@ async def enrich_node(state: GraphState) -> GraphState:
                         except Exception as _odoo_init_exc:
                             # Fallback DSN from mapping + template
                             try:
+                                db_name = None
                                 with get_conn() as _c, _c.cursor() as _cur:
-                                    _cur.execute("SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1")
-                                    _row = _cur.fetchone()
-                                    db_name = _row[0] if _row and _row[0] else None
+                                    if _tid is not None:
+                                        _cur.execute(
+                                            "SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active=TRUE LIMIT 1",
+                                            (_tid,),
+                                        )
+                                        _row = _cur.fetchone()
+                                        db_name = _row[0] if _row and _row[0] else None
+                                    if db_name is None and _tid is None:
+                                        _cur.execute(
+                                            "SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1"
+                                        )
+                                        _row = _cur.fetchone()
+                                        db_name = _row[0] if _row and _row[0] else None
                                 if db_name:
                                     tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE", "") or "").strip()
                                     if tpl:
@@ -1299,7 +1338,11 @@ async def enrich_node(state: GraphState) -> GraphState:
                                     else:
                                         dsn = db_name if str(db_name).startswith("postgresql://") else None
                                     if dsn:
-                                        logger.info("odoo init: fallback DSN via mapping db=%s", db_name)
+                                        logger.info(
+                                            "odoo init: fallback DSN via mapping db=%s (tenant_id=%s)",
+                                            db_name,
+                                            _tid,
+                                        )
                                         store = OdooStore(dsn=dsn)
                             except Exception as _fb_exc:
                                 logger.warning("odoo init fallback error: %s", _fb_exc)

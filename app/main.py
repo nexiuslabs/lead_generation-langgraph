@@ -482,13 +482,19 @@ async def verify_odoo(claims: dict = Depends(require_identity)):
     smoke = bool((info.get("odoo") or {}).get("ready"))
     error = (info.get("odoo") or {}).get("error")
 
-    return {
+    out = {
         "tenant_id": tid,
         "exists": exists,
         "smoke": smoke,
         "ready": bool(exists and smoke),
         "error": error,
     }
+    try:
+        if out.get("tenant_id") is not None and out.get("ready"):
+            os.environ["DEFAULT_TENANT_ID"] = str(out.get("tenant_id"))
+    except Exception:
+        pass
+    return out
 
 
 @app.get("/debug/tenant")
@@ -538,6 +544,11 @@ async def session_odoo_info(claims: dict = Depends(require_optional_identity)):
     email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
     claim_tid = claims.get("tenant_id")
     info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    try:
+        if info.get("tenant_id") is not None and (info.get("odoo") or {}).get("ready"):
+            os.environ["DEFAULT_TENANT_ID"] = str(info.get("tenant_id"))
+    except Exception:
+        pass
     return info
 
 

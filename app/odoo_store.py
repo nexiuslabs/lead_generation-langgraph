@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 import asyncpg
 
 from src.settings import ODOO_POSTGRES_DSN
+from src.database import get_conn
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +22,8 @@ class OdooStore:
         resolved_dsn = dsn
         if not resolved_dsn and tenant_id is not None:
             try:
-                # Resolve per-tenant DSN from app DB mapping (odoo_connections)
-                import psycopg2  # local import to avoid cyclics
-                from src.settings import POSTGRES_DSN as APP_DSN
-
-                with psycopg2.connect(dsn=APP_DSN) as c, c.cursor() as cur:
+                # Resolve per-tenant DSN from app DB mapping (odoo_connections) using pooled connection
+                with get_conn() as c, c.cursor() as cur:
                     cur.execute(
                         "SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active",
                         (tenant_id,),
