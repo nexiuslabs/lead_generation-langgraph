@@ -37,18 +37,33 @@ def get_conn():
     Usage:
         with get_conn() as conn, conn.cursor() as cur:
             ...
-    Ensures we reuse a small shared pool instead of opening new connections
-    per request.
+
+    Behavior:
+    - Commits if the block exits without exception.
+    - Rolls back on exception, then re-raises.
+    - Returns the connection to a small shared pool to avoid exhausting slots.
     """
     pool = _get_sync_pool()
     conn = pool.getconn()
     try:
-        yield conn
-    finally:
         try:
-            # Best-effort rollback any open transaction before returning to pool
-            if not conn.closed:
-                conn.rollback()
+            yield conn
+            try:
+                if not conn.closed:
+                    conn.commit()
+            except Exception:
+                # If commit fails, best-effort rollback before returning to pool
+                try:
+                    if not conn.closed:
+                        conn.rollback()
+                except Exception:
+                    pass
         except Exception:
-            pass
+            try:
+                if not conn.closed:
+                    conn.rollback()
+            except Exception:
+                pass
+            raise
+    finally:
         pool.putconn(conn, close=False)

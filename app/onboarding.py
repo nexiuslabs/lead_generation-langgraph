@@ -60,6 +60,7 @@ def _get_status(tenant_id: int) -> Tuple[str, Optional[str]]:
 
 def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
     with get_conn() as conn, conn.cursor() as cur:
+        tenant_label = _derive_tenant_label(email)
         # Always honor the tenant_id claim when provided
         if tenant_id_claim is not None:
             # Ensure tenants row exists with this exact id
@@ -71,7 +72,7 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
             if not r:
                 cur.execute(
                     "INSERT INTO tenants(tenant_id, name, status) VALUES (%s, %s, 'active')",
-                    (tenant_id_claim, email.split("@")[0]),
+                    (tenant_id_claim, tenant_label),
                 )
             # Link user to claimed tenant (viewer by default)
             cur.execute(
@@ -112,19 +113,19 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO tenants(tenant_id, name, status) VALUES (%s, %s, 'active') ON CONFLICT (tenant_id) DO NOTHING",
-                    (tid, email.split("@")[0]),
+                    (tid, tenant_label),
                 )
         else:
             cur.execute(
                 "INSERT INTO tenants(name, status) VALUES(%s,'active') RETURNING tenant_id",
-                (email.split("@")[0],),
+                (tenant_label,),
             )
             tid = cur.fetchone()[0]
         # Ensure tenants row exists for tid (idempotent upsert) in case of prior inconsistent data
         try:
             cur.execute(
                 "INSERT INTO tenants(tenant_id, name, status) VALUES (%s, %s, 'active') ON CONFLICT (tenant_id) DO NOTHING",
-                (tid, email.split("@")[0]),
+                (tid, tenant_label),
             )
         except Exception:
             pass
@@ -151,19 +152,22 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
         return tid
 
 
-def _derive_db_name_from_email(email: str) -> str:
+def _derive_tenant_label(email: str) -> str:
     try:
-        local, domain = (email or "").split("@", 1)
-        # Strip TLD and non-alnum, keep first label
-        parts = [p for p in domain.split('.') if p]
+        _local, domain = (email or "").split("@", 1)
+        parts = [p for p in (domain or "").split(".") if p]
         base = parts[0] if parts else (domain or "tenant")
         import re
-        base = re.sub(r"[^a-zA-Z0-9_]", "", base.lower())
-        if not base:
-            base = "tenant"
-        return f"odoo_{base}"
+        base = base.replace('-', '_').lower()
+        base = re.sub(r"[^a-z0-9_]", "", base)
+        return base or "tenant"
     except Exception:
-        return "odoo_tenant"
+        return "tenant"
+
+
+def _derive_db_name_from_email(email: str) -> str:
+    # Odoo DB equals the tenant label
+    return _derive_tenant_label(email)
 
 
 def _truthy(name: str, default: str = "false") -> bool:
@@ -234,13 +238,37 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
         if row and row[0]:
             existing_db = row[0]
 
+    # Compute preferred tenant base_url like https://{tenant}.agent.nexiusagent.com
+    tenant_label = _derive_tenant_label(email or "") if email else None
+    base_template = (os.getenv('ODOO_BASE_URL_TEMPLATE') or '').strip()
+    base_domain = (os.getenv('ODOO_BASE_DOMAIN') or '').strip()
+    scheme = (os.getenv('ODOO_BASE_SCHEME') or 'https').strip()
+    preferred_base_url: Optional[str] = None
+    try:
+        if tenant_label:
+            if base_template:
+                preferred_base_url = base_template.format(tenant=tenant_label)
+            elif base_domain:
+                preferred_base_url = f"{scheme}://{tenant_label}.{base_domain}"
+            else:
+                # Fallback: derive base domain from ODOO_SERVER_URL
+                srv = (os.getenv('ODOO_SERVER_URL') or '').strip()
+                if srv:
+                    from urllib.parse import urlparse
+                    u = urlparse(srv)
+                    host = (u.netloc or u.path or '').strip().lstrip('/')
+                    if host:
+                        preferred_base_url = f"{scheme}://{tenant_label}.{host}"
+    except Exception:
+        preferred_base_url = None
+
     if existing_db:
         logger.info(
             "onboarding:odoo_mapping use_existing tenant_id=%s db_name=%s",
             tenant_id,
             existing_db,
         )
-        upsert_mapping(existing_db)
+        upsert_mapping(existing_db, base_url=preferred_base_url)
         store = OdooStore(tenant_id=tenant_id)
         try:
             await store.connectivity_smoke_test()
@@ -268,19 +296,20 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     # No mapping yet; try server-level automation using suggested db_name from email
     server = os.getenv('ODOO_SERVER_URL')
     master = os.getenv('ODOO_MASTER_PASSWORD')
-    if _truthy('ODOO_ENABLE_HTTP_PROVISION', 'false') and server and master and email:
+    # Attempt HTTP provisioning whenever server+master are configured (do not gate on the flag in dev)
+    if server and master and email:
         try:
             desired = _derive_db_name_from_email(email)
             # If DB exists on server, just upsert mapping; else create and map
             if desired in _odoo_db_list(server):
-                upsert_mapping(desired, base_url=server)
+                upsert_mapping(desired, base_url=preferred_base_url or server)
             else:
                 # Create DB and basic admin user using email as login
                 import secrets
                 admin_pass = secrets.token_urlsafe(24)
                 _odoo_db_create(server, master, desired, email, admin_pass)
                 _odoo_admin_user_create(server, desired, email, admin_pass, email)
-                upsert_mapping(desired, base_url=server)
+                upsert_mapping(desired, base_url=preferred_base_url or server)
             store = OdooStore(tenant_id=tenant_id)
             await store.connectivity_smoke_test()
             return
@@ -298,7 +327,7 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     # No way to infer mapping
     raise RuntimeError(
         f"No odoo_connections mapping for tenant_id={tenant_id} and unable to infer db_name. "
-        f"Insert into odoo_connections(tenant_id, db_name, active) or set ODOO_POSTGRES_DSN."
+        f"Provide ODOO_POSTGRES_DSN, or configure ODOO_SERVER_URL/ODOO_MASTER_PASSWORD so auto-provision can run."
     )
 
 
@@ -465,7 +494,7 @@ def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email:
 def _ensure_odoo_db_first_by_email(email: str) -> Optional[str]:
     """Ensure an Odoo database exists for the user's email domain BEFORE tenant creation.
 
-    - Derives db_name as odoo_<first label of domain>.
+    - Derives db_name as <first label of domain>.
     - If ODOO_SERVER_URL/ODOO_MASTER_PASSWORD not set, returns None (skip).
     - If DB exists: return db_name.
     - Else create DB + admin user (login=email) and return db_name.
