@@ -14,7 +14,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from app.odoo_store import OdooStore
-from src.database import get_pg_pool
+from src.database import get_pg_pool, get_conn
 from src.icp import _find_ssic_codes_by_terms, _select_acra_by_ssic_codes
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
