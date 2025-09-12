@@ -168,14 +168,64 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         return state
 
     pool = await get_pg_pool()
-    # Resolve tenant for Odoo; default to env for non-HTTP graph runs
+    # Resolve tenant for Odoo with robust fallbacks (env → DSN→mapping → first active)
     _tid = None
     try:
         _tid_env = os.getenv("DEFAULT_TENANT_ID")
         _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
     except Exception:
         _tid = None
-    store = OdooStore(tenant_id=_tid)
+    if _tid is None:
+        try:
+            from src.settings import ODOO_POSTGRES_DSN
+            inferred_db = None
+            if ODOO_POSTGRES_DSN:
+                from urllib.parse import urlparse
+                u = urlparse(ODOO_POSTGRES_DSN)
+                inferred_db = (u.path or "/").lstrip("/") or None
+            if inferred_db:
+                with get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                        (inferred_db, ODOO_POSTGRES_DSN),
+                    )
+                    _row = _cur.fetchone()
+                    if _row:
+                        _tid = int(_row[0])
+        except Exception:
+            pass
+    if _tid is None:
+        try:
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                _row = _cur.fetchone()
+                if _row:
+                    _tid = int(_row[0])
+        except Exception:
+            pass
+    store = None
+    try:
+        store = OdooStore(tenant_id=_tid)
+    except Exception as _init_exc:
+        # Fallback: derive DSN from active mapping + template
+        try:
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute("SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                _row = _cur.fetchone()
+                db_name = _row[0] if _row and _row[0] else None
+            if db_name:
+                tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE", "") or "").strip()
+                if tpl:
+                    dsn = tpl.format(db_name=db_name)
+                else:
+                    dsn = db_name if str(db_name).startswith("postgresql://") else None
+                if dsn:
+                    logger.info("odoo init: fallback DSN via mapping db=%s", db_name)
+                    store = OdooStore(dsn=dsn)
+        except Exception as _fb_exc:
+            logger.warning("odoo init fallback error: %s", _fb_exc)
+        if store is None:
+            logger.warning("odoo init skipped: %s", _init_exc)
 
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]
@@ -248,17 +298,31 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 website_domain=comp.get("website_domain"),
             )
             if email:
-                await store.add_contact(odoo_id, email)
-            await store.merge_company_enrichment(odoo_id, {})
+                try:
+                    await store.add_contact(odoo_id, email)
+                    logger.info("odoo export: contact added email=%s for partner_id=%s", email, odoo_id)
+                except Exception as _contact_exc:
+                    logger.warning("odoo export: add_contact failed email=%s err=%s", email, _contact_exc)
+            try:
+                logger.info("odoo export: upsert company partner_id=%s name=%s", odoo_id, comp.get("name"))
+            except Exception:
+                pass
+            try:
+                await store.merge_company_enrichment(odoo_id, {})
+            except Exception:
+                pass
             if score:
-                await store.create_lead_if_high(
-                    odoo_id,
-                    comp.get("name"),
-                    score.get("score"),
-                    features.get(cid, {}),
-                    score.get("rationale", ""),
-                    email,
-                )
+                try:
+                    await store.create_lead_if_high(
+                        odoo_id,
+                        comp.get("name"),
+                        score.get("score"),
+                        features.get(cid, {}),
+                        score.get("rationale", ""),
+                        email,
+                    )
+                except Exception as _lead_exc:
+                    logger.warning("odoo export: create_lead failed partner_id=%s err=%s", odoo_id, _lead_exc)
         except Exception as exc:
             logger.exception("odoo sync failed for company_id=%s", cid)
 
@@ -1177,16 +1241,76 @@ async def enrich_node(state: GraphState) -> GraphState:
                     from app.odoo_store import OdooStore
 
                     try:
+                        # Resolve tenant for OdooStore in this order:
+                        # 1) DEFAULT_TENANT_ID (for non-HTTP runs)
+                        # 2) Map DSN path -> odoo_connections.tenant_id
+                        # 3) First active mapping in odoo_connections
                         _tid = None
                         try:
                             _tid_env = os.getenv("DEFAULT_TENANT_ID")
                             _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
                         except Exception:
                             _tid = None
-                        store = OdooStore(tenant_id=_tid)
-                    except Exception as _odoo_init_exc:
-                        logger.warning("odoo init skipped: %s", _odoo_init_exc)
-                        store = None  # type: ignore
+
+                        if _tid is None:
+                            try:
+                                from src.settings import ODOO_POSTGRES_DSN
+                                inferred_db = None
+                                if ODOO_POSTGRES_DSN:
+                                    from urllib.parse import urlparse
+                                    u = urlparse(ODOO_POSTGRES_DSN)
+                                    inferred_db = (u.path or "/").lstrip("/") or None
+                                if inferred_db:
+                                    with get_conn() as _c, _c.cursor() as _cur:
+                                        _cur.execute(
+                                            "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                                            (inferred_db, ODOO_POSTGRES_DSN),
+                                        )
+                                        _row = _cur.fetchone()
+                                        if _row:
+                                            _tid = int(_row[0])
+                            except Exception:
+                                pass
+
+                        if _tid is None:
+                            try:
+                                with get_conn() as _c, _c.cursor() as _cur:
+                                    _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                    _row = _cur.fetchone()
+                                    if _row:
+                                        _tid = int(_row[0])
+                            except Exception:
+                                pass
+
+                        store = None
+                        try:
+                            store = OdooStore(tenant_id=_tid)
+                        except Exception as _odoo_init_exc:
+                            # Fallback DSN from mapping + template
+                            try:
+                                with get_conn() as _c, _c.cursor() as _cur:
+                                    _cur.execute("SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                    _row = _cur.fetchone()
+                                    db_name = _row[0] if _row and _row[0] else None
+                                if db_name:
+                                    tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE", "") or "").strip()
+                                    if tpl:
+                                        dsn = tpl.format(db_name=db_name)
+                                    else:
+                                        dsn = db_name if str(db_name).startswith("postgresql://") else None
+                                    if dsn:
+                                        logger.info("odoo init: fallback DSN via mapping db=%s", db_name)
+                                        store = OdooStore(dsn=dsn)
+                            except Exception as _fb_exc:
+                                logger.warning("odoo init fallback error: %s", _fb_exc)
+                            if store is None:
+                                logger.warning("odoo init skipped: %s", _odoo_init_exc)
+
+                    except Exception as _tid_init_block_exc:
+                        # Catch-all for any unexpected errors during tenant resolution
+                        # and initial OdooStore creation so the outer block can continue.
+                        logger.warning("odoo init block error: %s", _tid_init_block_exc)
+                        store = None
 
                     if store:
                         for cid in ids:
@@ -1205,18 +1329,48 @@ async def enrich_node(state: GraphState) -> GraphState:
                                     incorporation_year=comp.get("incorporation_year"),
                                     website_domain=comp.get("website_domain"),
                                 )
-                                if email:
-                                    await store.add_contact(odoo_id, email)
-                                await store.merge_company_enrichment(odoo_id, {})
-                                if "score" in score:
-                                    await store.create_lead_if_high(
+                                try:
+                                    logger.info(
+                                        "odoo export: upsert company partner_id=%s name=%s",
                                         odoo_id,
                                         comp.get("name"),
-                                        float(score.get("score") or 0.0),
-                                        {},
-                                        str(score.get("rationale") or ""),
-                                        email,
                                     )
+                                except Exception:
+                                    pass
+                                if email:
+                                    try:
+                                        await store.add_contact(odoo_id, email)
+                                        logger.info(
+                                            "odoo export: contact added email=%s partner_id=%s",
+                                            email,
+                                            odoo_id,
+                                        )
+                                    except Exception as _c_exc:
+                                        logger.warning(
+                                            "odoo export: add_contact failed email=%s err=%s",
+                                            email,
+                                            _c_exc,
+                                        )
+                                try:
+                                    await store.merge_company_enrichment(odoo_id, {})
+                                except Exception:
+                                    pass
+                                if "score" in score:
+                                    try:
+                                        await store.create_lead_if_high(
+                                            odoo_id,
+                                            comp.get("name"),
+                                            float(score.get("score") or 0.0),
+                                            {},
+                                            str(score.get("rationale") or ""),
+                                            email,
+                                        )
+                                    except Exception as _lead_exc:
+                                        logger.warning(
+                                            "odoo export: create_lead failed partner_id=%s err=%s",
+                                            odoo_id,
+                                            _lead_exc,
+                                        )
                             except Exception as exc:
                                 logger.exception(
                                     "odoo sync failed for company_id=%s", cid

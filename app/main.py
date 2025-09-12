@@ -784,6 +784,107 @@ async def export_latest_scores_csv(limit: int = 200, request: Request = None, _:
     for r in rows:
         writer.writerow(dict(r))
     return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.post("/export/odoo/sync")
+async def export_odoo_sync(body: dict | None = None, request: Request = None, claims: dict = Depends(require_identity)):
+    """Export scored companies to Odoo for the current tenant.
+
+    Body (optional): { "min_score": float, "limit": int }
+    - Selects top scored rows for the tenant and upserts company + primary contact; creates a lead when score ≥ min_score.
+    """
+    min_score = 0.0
+    limit = 100
+    try:
+        if isinstance(body, dict):
+            if isinstance(body.get("min_score"), (int, float)):
+                min_score = float(body["min_score"])  # type: ignore[index]
+            if isinstance(body.get("limit"), int):
+                limit = int(body["limit"])  # type: ignore[index]
+    except Exception:
+        pass
+
+    # Resolve tenant context even if token lacks tenant_id
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        # Set per-request tenant for RLS
+        try:
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+        except Exception:
+            pass
+        rows = await conn.fetch(
+            """
+            SELECT s.company_id, s.score, s.rationale,
+                   c.name, c.uen, c.industry_norm, c.employees_est, c.revenue_bucket,
+                   c.incorporation_year, c.website_domain,
+                   (SELECT e.email FROM lead_emails e WHERE e.company_id=s.company_id LIMIT 1) AS primary_email
+            FROM lead_scores s
+            JOIN companies c ON c.company_id = s.company_id
+            ORDER BY s.score DESC NULLS LAST
+            LIMIT $1
+            """,
+            limit,
+        )
+    # Use tenant-scoped Odoo mapping
+    store = OdooStore(tenant_id=int(tid)) if tid is not None else OdooStore()
+    exported = 0
+    errors: list[dict] = []
+    for r in rows:
+        try:
+            odoo_id = await store.upsert_company(
+                r["name"],
+                r["uen"],
+                industry_norm=r["industry_norm"],
+                employees_est=r["employees_est"],
+                revenue_bucket=r["revenue_bucket"],
+                incorporation_year=r["incorporation_year"],
+                website_domain=r["website_domain"],
+            )
+            try:
+                import logging as _lg
+                _lg.getLogger("onboarding").info("export: upsert company partner_id=%s name=%s", odoo_id, r["name"])
+            except Exception:
+                pass
+            if r["primary_email"]:
+                try:
+                    await store.add_contact(odoo_id, r["primary_email"])
+                    try:
+                        import logging as _lg
+                        _lg.getLogger("onboarding").info("export: add_contact email=%s partner_id=%s", r["primary_email"], odoo_id)
+                    except Exception:
+                        pass
+                except Exception as _c_exc:
+                    errors.append({"company_id": r["company_id"], "error": f"contact: {_c_exc}"})
+            await store.merge_company_enrichment(odoo_id, {})
+            sc = float(r["score"] or 0)
+            try:
+                await store.create_lead_if_high(
+                    odoo_id,
+                    r["name"],
+                    sc,
+                    {},
+                    r["rationale"] or "",
+                    r["primary_email"],
+                    threshold=min_score,
+                )
+                try:
+                    import logging as _lg
+                    _lg.getLogger("onboarding").info("export: lead check partner_id=%s score=%.2f threshold=%.2f", odoo_id, sc, min_score)
+                except Exception:
+                    pass
+            except Exception as _l_exc:
+                errors.append({"company_id": r["company_id"], "error": f"lead: {_l_exc}"})
+            exported += 1
+        except Exception as e:
+            errors.append({"company_id": r["company_id"], "error": str(e)})
+    return {"exported": exported, "count": len(rows), "min_score": min_score, "errors": errors}
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
     # Always let CORS preflight through
