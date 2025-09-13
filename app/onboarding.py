@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from typing import Optional, Tuple
 import asyncpg  # noqa: F401  # reserved for potential future async DB ops
 import requests
@@ -307,8 +308,24 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
                 # Create DB and basic admin user using email as login
                 import secrets
                 admin_pass = secrets.token_urlsafe(24)
+                logger.info("odoo:create start db=%s email=%s server=%s", desired, email, server)
                 _odoo_db_create(server, master, desired, email, admin_pass)
-                _odoo_admin_user_create(server, desired, email, admin_pass, email)
+                # Wait for the new DB to appear and be ready for XML-RPC auth
+                ready = _odoo_wait_db(server, desired, timeout_s=90, interval_s=2.0)
+                if not ready:
+                    raise RuntimeError(f"odoo db '{desired}' did not appear within timeout after create_database")
+                # Retry admin user creation a few times (registry may still be warming up)
+                last_exc: Exception | None = None
+                for _ in range(5):
+                    try:
+                        _odoo_admin_user_create(server, desired, email, admin_pass, email)
+                        last_exc = None
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        time.sleep(2.0)
+                if last_exc is not None:
+                    raise last_exc
                 upsert_mapping(desired, base_url=preferred_base_url or server)
             store = OdooStore(tenant_id=tenant_id)
             await store.connectivity_smoke_test()
@@ -327,7 +344,8 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     # No way to infer mapping
     raise RuntimeError(
         f"No odoo_connections mapping for tenant_id={tenant_id} and unable to infer db_name. "
-        f"Provide ODOO_POSTGRES_DSN, or configure ODOO_SERVER_URL/ODOO_MASTER_PASSWORD so auto-provision can run."
+        f"Set ODOO_POSTGRES_DSN or ODOO_BASE_DSN_TEMPLATE for Postgres connectivity, "
+        f"or configure ODOO_SERVER_URL and ODOO_MASTER_PASSWORD so auto-provision can run."
     )
 
 
@@ -431,7 +449,10 @@ def _odoo_db_list(server: str) -> list:
     payload = {"jsonrpc": "2.0", "method": "call", "params": {"service": "db", "method": "list", "args": []}}
     r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=20, verify=_requests_verify())
     r.raise_for_status()
-    return (r.json() or {}).get("result", [])
+    data = r.json() or {}
+    if "error" in data:
+        raise RuntimeError(f"odoo db.list failed: {data['error']}")
+    return data.get("result", [])
 
 
 def _odoo_db_create(server: str, master_pwd: str, db_name: str, admin_login: str, admin_password: str):
@@ -440,6 +461,25 @@ def _odoo_db_create(server: str, master_pwd: str, db_name: str, admin_login: str
     payload = {"jsonrpc": "2.0", "method": "call", "params": {"service": "db", "method": "create_database", "args": args}}
     r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=180, verify=_requests_verify())
     r.raise_for_status()
+    data = r.json() or {}
+    if "error" in data:
+        raise RuntimeError(f"odoo create_database failed: {data['error']}")
+
+
+def _odoo_wait_db(server: str, db_name: str, timeout_s: int = 60, interval_s: float = 1.5) -> bool:
+    """Wait until the Odoo DB shows up in the db manager list.
+
+    Returns True when the DB appears within timeout; False otherwise.
+    """
+    deadline = time.time() + max(1, timeout_s)
+    while time.time() < deadline:
+        try:
+            if db_name in _odoo_db_list(server):
+                return True
+        except Exception:
+            pass
+        time.sleep(max(0.5, interval_s))
+    return False
 
 
 def _odoo_admin_user_create(server: str, db_name: str, admin_login: str, admin_password: str, tenant_admin_email: str):

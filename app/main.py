@@ -592,7 +592,8 @@ async def onboarding_first_login(
 
         if candidate_tid is not None:
             current = get_onboarding_status(int(candidate_tid))
-            if current and current.get("status") in {"provisioning", "syncing", "ready"}:
+            # Dedup for all known in-progress/ready states
+            if current and current.get("status") in {"provisioning", "syncing", "ready", "starting", "creating_odoo", "configuring_oidc", "seeding"}:
                 logger.info(
                     "onboarding:first_login dedup tenant_id=%s inferred_db=%s email=%s status=%s",
                     candidate_tid,
