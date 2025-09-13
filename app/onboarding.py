@@ -457,13 +457,55 @@ def _odoo_db_list(server: str) -> list:
 
 def _odoo_db_create(server: str, master_pwd: str, db_name: str, admin_login: str, admin_password: str):
     import requests
-    args = [master_pwd, db_name, False, os.getenv("ODOO_LANG", "en_US"), admin_password, admin_login, os.getenv("ODOO_COUNTRY", "SG"), "", admin_login]
-    payload = {"jsonrpc": "2.0", "method": "call", "params": {"service": "db", "method": "create_database", "args": args}}
-    r = requests.post(server.rstrip('/') + "/jsonrpc", json=payload, timeout=180, verify=_requests_verify())
-    r.raise_for_status()
-    data = r.json() or {}
-    if "error" in data:
-        raise RuntimeError(f"odoo create_database failed: {data['error']}")
+    lang = os.getenv("ODOO_LANG", "en_US")
+    country = os.getenv("ODOO_COUNTRY", "SG")
+    # Try shortest/newer signatures first (common in recent Odoo), then legacy 9-arg
+    attempts = [
+        # 6-arg: master, db, demo, lang, admin_password, admin_login
+        [master_pwd, db_name, False, lang, admin_password, admin_login],
+        # 7-arg: + country_code (some versions accept country as positional)
+        [master_pwd, db_name, False, lang, admin_password, admin_login, country],
+        # 9-arg legacy: + country_code, phone, admin_login (again)
+        [master_pwd, db_name, False, lang, admin_password, admin_login, country, "", admin_login],
+    ]
+    last_err = None
+    for args in attempts:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {"service": "db", "method": "create_database", "args": args},
+        }
+        try:
+            r = requests.post(
+                server.rstrip("/") + "/jsonrpc",
+                json=payload,
+                timeout=180,
+                verify=_requests_verify(),
+            )
+            r.raise_for_status()
+            data = r.json() or {}
+            if "error" in data:
+                # On signature mismatch, try next variant; otherwise fail
+                err_msg = (
+                    (data.get("error", {}).get("data", {}) or {}).get("message")
+                    or data.get("error", {}).get("message")
+                    or str(data.get("error"))
+                )
+                last_err = err_msg
+                low = (err_msg or "").lower()
+                if (
+                    "too many positional arguments" in low
+                    or ("missing" in low and "argument" in low)
+                ):
+                    continue
+                raise RuntimeError(f"odoo create_database failed: {data['error']}")
+            # Success
+            return
+        except Exception as e:
+            last_err = str(e)
+            continue
+    # If all attempts failed, raise the last error
+    raise RuntimeError(f"odoo create_database failed: {last_err}")
 
 
 def _odoo_wait_db(server: str, db_name: str, timeout_s: int = 60, interval_s: float = 1.5) -> bool:
