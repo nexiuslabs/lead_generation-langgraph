@@ -658,10 +658,19 @@ def _odoo_admin_user_create(server: str, db_name: str, admin_login: str, admin_p
             'name': 'Tenant Admin',
             'login': tenant_admin_email,
             'email': tenant_admin_email,
+            'password': admin_password,
         }
         if group_system_id:
             vals['groups_id'] = [(6, 0, [group_system_id])]
-        models.execute_kw(db_name, uid, admin_password, 'res.users', 'create', [vals])
+        models.execute_kw(
+            db_name,
+            uid,
+            admin_password,
+            'res.users',
+            'create',
+            [vals],
+            {'context': {'no_reset_password': True}},
+        )
 
 
 def _odoo_set_admin_credentials(
