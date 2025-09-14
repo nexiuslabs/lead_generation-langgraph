@@ -187,7 +187,7 @@ def _has_active_mapping(tenant_id: int) -> bool:
         return False
 
 
-async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
+async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admin_password_override: Optional[str] = None):
     """Ensure there is an active odoo_connections row for this tenant.
 
     Behavior:
@@ -307,7 +307,7 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
             else:
                 # Create DB and basic admin user using email as login
                 import secrets
-                admin_pass = secrets.token_urlsafe(24)
+                admin_pass = admin_password_override or secrets.token_urlsafe(24)
                 logger.info("odoo:create start db=%s email=%s server=%s", desired, email, server)
                 _odoo_db_create(server, master, desired, email, admin_pass)
                 # Wait for the new DB to appear and be ready for XML-RPC auth
@@ -325,10 +325,15 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
                         last_exc = e
                         time.sleep(2.0)
                 if last_exc is not None:
-                    raise last_exc
+                    logger.warning("odoo:create admin user failed for db=%s email=%s error=%s", desired, email, last_exc)
+                # Upsert mapping regardless so platform can connect via Postgres DSN
                 upsert_mapping(desired, base_url=preferred_base_url or server)
-            store = OdooStore(tenant_id=tenant_id)
-            await store.connectivity_smoke_test()
+            # Best-effort connectivity check; do not fail provisioning if DSN is unreachable (e.g., tunnel closed)
+            try:
+                store = OdooStore(tenant_id=tenant_id)
+                await store.connectivity_smoke_test()
+            except Exception as e:
+                logger.warning("onboarding:odoo_connectivity_post_create_failed tenant_id=%s db=%s error=%s", tenant_id, desired if email else "?", e)
             return
         except Exception as e:
             logger.warning("odoo mapping via server failed tenant_id=%s email=%s error=%s", tenant_id, email, e)
@@ -337,8 +342,11 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     if inferred_db:
         logger.info("onboarding:odoo_mapping create_inferred tenant_id=%s db_name=%s", tenant_id, inferred_db)
         upsert_mapping(inferred_db, base_url=None)
-        store = OdooStore(tenant_id=tenant_id)
-        await store.connectivity_smoke_test()
+        try:
+            store = OdooStore(tenant_id=tenant_id)
+            await store.connectivity_smoke_test()
+        except Exception as e:
+            logger.warning("onboarding:odoo_connectivity_inferred_failed tenant_id=%s db=%s error=%s", tenant_id, inferred_db, e)
         return
 
     # No way to infer mapping
@@ -349,7 +357,7 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None):
     )
 
 
-async def handle_first_login(email: str, tenant_id_claim: Optional[int]) -> dict:
+async def handle_first_login(email: str, tenant_id_claim: Optional[int], user_password: Optional[str] = None) -> dict:
     try:
         _ensure_tables()
         logger.info("onboarding:first_login start email=%s tenant_id_claim=%s", email, tenant_id_claim)
@@ -368,7 +376,7 @@ async def handle_first_login(email: str, tenant_id_claim: Optional[int]) -> dict
         mapping_exists_before = _has_active_mapping(tid)
         # Ensure mapping and smoke test / infer db
         _insert_or_update_status(tid, ONBOARDING_CREATING_ODOO)
-        await _ensure_odoo_mapping(tid, email=email)
+        await _ensure_odoo_mapping(tid, email=email, admin_password_override=user_password)
 
         # Optional: automatically create Odoo DB (HTTP DB manager) and bootstrap admin
         if not mapping_exists_before and _truthy('ODOO_ENABLE_HTTP_PROVISION', 'false'):
@@ -528,14 +536,73 @@ def _odoo_admin_user_create(server: str, db_name: str, admin_login: str, admin_p
     import xmlrpc.client
     common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
     uid = common.authenticate(db_name, admin_login, admin_password, {})
+    if not uid:
+        raise RuntimeError("odoo xmlrpc authentication failed for admin user")
     models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
-    group_system_id = models.execute_kw(db_name, uid, admin_password, 'ir.model.data', 'xmlid_to_res_id', ['base.group_system'])
+
+    def _resolve_group_system_id() -> int | None:
+        # Try several methods to resolve 'base.group_system' across Odoo versions
+        try:
+            gid = models.execute_kw(
+                db_name, uid, admin_password,
+                'ir.model.data', 'xmlid_to_res_model_res_id', ['base.group_system']
+            )
+            # Some versions return (model, id)
+            if isinstance(gid, (list, tuple)) and len(gid) == 2:
+                return int(gid[1])
+            if isinstance(gid, int):
+                return int(gid)
+        except Exception:
+            pass
+        try:
+            pair = models.execute_kw(
+                db_name, uid, admin_password,
+                'ir.model.data', 'get_object_reference', ['base', 'group_system']
+            )
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                return int(pair[1])
+        except Exception:
+            pass
+        try:
+            # Fallback search by XML-ID stored in ir_model_data
+            recs = models.execute_kw(
+                db_name, uid, admin_password,
+                'ir.model.data', 'search_read', [[['module', '=', 'base'], ['name', '=', 'group_system']]],
+                {'fields': ['res_id'], 'limit': 1}
+            )
+            if recs and recs[0].get('res_id'):
+                return int(recs[0]['res_id'])
+        except Exception:
+            pass
+        # Last resort: search group by implied system name
+        try:
+            gids = models.execute_kw(
+                db_name, uid, admin_password,
+                'res.groups', 'search', [[['technical_name', '=', 'group_system']]],
+                {'limit': 1}
+            )
+            if gids:
+                return int(gids[0])
+        except Exception:
+            pass
+        return None
+
+    group_system_id = _resolve_group_system_id()
+
     # Ensure a separate admin user if needed
-    users = models.execute_kw(db_name, uid, admin_password, 'res.users', 'search', [[['login', '=', tenant_admin_email]]])
+    users = models.execute_kw(
+        db_name, uid, admin_password,
+        'res.users', 'search', [[['login', '=', tenant_admin_email]]]
+    )
     if not users:
-        models.execute_kw(db_name, uid, admin_password, 'res.users', 'create', [{
-            'name': 'Tenant Admin', 'login': tenant_admin_email, 'email': tenant_admin_email, 'groups_id': [(6, 0, [group_system_id])]
-        }])
+        vals = {
+            'name': 'Tenant Admin',
+            'login': tenant_admin_email,
+            'email': tenant_admin_email,
+        }
+        if group_system_id:
+            vals['groups_id'] = [(6, 0, [group_system_id])]
+        models.execute_kw(db_name, uid, admin_password, 'res.users', 'create', [vals])
 
 
 def _odoo_configure_oidc(server: str, db_name: str, admin_login: str, admin_password: str, issuer: str, cid: str, secret: str):

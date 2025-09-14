@@ -607,7 +607,8 @@ async def onboarding_first_login(
         pass
 
     async def _run():
-        await handle_first_login(email, tenant_id_claim)
+        # No password available here; only register flow can pass one
+        await handle_first_login(email, tenant_id_claim, user_password=None)
 
     background.add_task(_run)
     return {"status": "provisioning"}

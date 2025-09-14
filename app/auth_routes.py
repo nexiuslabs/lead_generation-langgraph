@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Response, Request, HTTPException
+from fastapi import APIRouter, Response, Request, HTTPException, BackgroundTasks
 import os
 import time
 import httpx
 
 from app.auth import verify_jwt
+from app.onboarding import handle_first_login
 
 router = APIRouter(prefix="/auth", tags=["auth"]) 
 
@@ -173,7 +174,7 @@ async def _admin_token() -> str:
 
 
 @router.post("/register")
-async def register(body: dict, response: Response):
+async def register(body: dict, response: Response, background: BackgroundTasks):
     email = (body.get("email") or "").strip()
     password = body.get("password") or ""
     first = (body.get("first_name") or "").strip() or None
@@ -228,6 +229,12 @@ async def register(body: dict, response: Response):
         raise HTTPException(status_code=500, detail="No token after register")
     claims = verify_jwt(access)
     _set_session(response, access, refresh)
+    # Kick off onboarding immediately so Odoo admin uses the signup password
+    try:
+        background.add_task(handle_first_login, email, None, body.get("password"))
+    except Exception:
+        # Non-fatal if background scheduling fails; UI will still call /onboarding/first_login
+        pass
     return {"tenant_id": claims.get("tenant_id"), "roles": claims.get("roles", []), "email": claims.get("email")}
 
 
