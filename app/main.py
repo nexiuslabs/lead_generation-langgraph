@@ -600,6 +600,52 @@ async def onboarding_repair_admin(body: dict, _: dict = Depends(require_auth)):
     return {"ok": True, "db_name": db_name}
 
 
+@app.post("/onboarding/verify_admin_login")
+async def onboarding_verify_admin_login(body: dict, _: dict = Depends(require_auth)):
+    """Verify that the provided email/password can authenticate to the tenant's Odoo DB.
+
+    Body: { tenant_id?: int, email: str, password: str }
+    Resolves tenant_id from body or from odoo_connections via email mapping when omitted.
+    """
+    email = (body or {}).get("email") or ""
+    password = (body or {}).get("password") or ""
+    tenant_id = (body or {}).get("tenant_id")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password required")
+    # Resolve tenant_id if not provided
+    if tenant_id is None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+                r = cur.fetchone()
+                if r:
+                    tenant_id = int(r[0])
+        except Exception:
+            tenant_id = tenant_id
+    if tenant_id is None:
+        raise HTTPException(status_code=404, detail="tenant_id not found for email")
+    # Resolve db_name for tenant
+    db_name = None
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tenant_id,))
+        r = cur.fetchone()
+        db_name = r[0] if r and r[0] else None
+    if not db_name:
+        raise HTTPException(status_code=404, detail="No db_name for tenant")
+    server = (os.getenv("ODOO_SERVER_URL") or "").rstrip("/")
+    if not server:
+        raise HTTPException(status_code=500, detail="Missing ODOO_SERVER_URL")
+    # XML-RPC authenticate
+    try:
+        import xmlrpc.client
+        common = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/common")
+        uid = common.authenticate(db_name, email, password, {})
+        ok = bool(uid)
+        return {"ok": ok, "tenant_id": tenant_id, "db_name": db_name, "uid": uid or None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"XML-RPC auth failed: {e}")
+
+
 @app.post("/onboarding/first_login")
 async def onboarding_first_login(
     background: BackgroundTasks, claims: dict = Depends(require_optional_identity)

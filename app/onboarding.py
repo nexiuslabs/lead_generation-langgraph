@@ -329,7 +329,25 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                 # Set admin credentials explicitly to the signup email/password when available
                 try:
                     if admin_password_override:
-                        _odoo_set_admin_credentials(server, desired, email, admin_password_override)
+                        # Try authenticating with the credentials used by create_database first
+                        ok = _odoo_set_admin_credentials(
+                            server,
+                            desired,
+                            email,
+                            admin_password_override,
+                            auth_login=email,
+                            auth_password=admin_pass,
+                        )
+                        if not ok:
+                            # Some Odoo versions ignore the admin_login param and set 'admin'
+                            _odoo_set_admin_credentials(
+                                server,
+                                desired,
+                                email,
+                                admin_password_override,
+                                auth_login='admin',
+                                auth_password=admin_pass,
+                            )
                     else:
                         # Retry admin user bootstrap a few times (registry may still be warming up)
                         last_exc: Exception | None = None
@@ -647,7 +665,15 @@ def _odoo_admin_user_create(server: str, db_name: str, admin_login: str, admin_p
         models.execute_kw(db_name, uid, admin_password, 'res.users', 'create', [vals])
 
 
-def _odoo_set_admin_credentials(server: str, db_name: str, admin_email: str, new_password: str) -> bool:
+def _odoo_set_admin_credentials(
+    server: str,
+    db_name: str,
+    admin_email: str,
+    new_password: str,
+    *,
+    auth_login: Optional[str] = None,
+    auth_password: Optional[str] = None,
+) -> bool:
     """Set the tenant admin login/password via XML-RPC using template admin credentials.
 
     This ensures the Odoo admin login matches the signup email/password, even when the
@@ -657,36 +683,93 @@ def _odoo_set_admin_credentials(server: str, db_name: str, admin_email: str, new
     import xmlrpc.client
     template_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
     template_pw = os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD')
-    if not template_pw:
-        # No template admin configured; skip silently
+    # Prefer explicit auth creds; fallback to template admin env
+    auth_login = auth_login or template_login
+    auth_password = auth_password or template_pw
+    if not auth_login or not auth_password:
+        # No usable credentials to perform XML-RPC write
         return False
+
+    def _verify_login(email: str, pwd: str) -> bool:
+        try:
+            c = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
+            return bool(c.authenticate(db_name, email, pwd, {}))
+        except Exception:
+            return False
+
     common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
-    uid = common.authenticate(db_name, template_login, template_pw, {})
+    uid = common.authenticate(db_name, auth_login, auth_password, {})
     if not uid:
-        raise RuntimeError("odoo template admin authentication failed (check dbfilter/password)")
+        raise RuntimeError("odoo xmlrpc authentication failed for credential used to set admin password (check dbfilter/password)")
     models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
     # Identify admin user record (by template login or id=2 fallback)
     ids = models.execute_kw(
-        db_name, uid, template_pw,
+        db_name, uid, auth_password,
         'res.users', 'search', [[['login', '=', template_login]]], {'limit': 1}
     )
     if not ids:
         ids = [2]
     # Apply login + password (Odoo hashes the password)
     models.execute_kw(
-        db_name, uid, template_pw, 'res.users', 'write', [ids, {'login': admin_email, 'password': new_password}]
+        db_name, uid, auth_password, 'res.users', 'write', [ids, {'login': admin_email, 'active': True, 'password': new_password}]
     )
     try:
-        recs = models.execute_kw(db_name, uid, template_pw, 'res.users', 'read', [ids, ['partner_id']])
+        recs = models.execute_kw(db_name, uid, auth_password, 'res.users', 'read', [ids, ['partner_id']])
         if recs and recs[0].get('partner_id'):
             pid = recs[0]['partner_id'][0]
             try:
-                models.execute_kw(db_name, uid, template_pw, 'res.partner', 'write', [[pid], {'email': admin_email}])
+                models.execute_kw(db_name, uid, auth_password, 'res.partner', 'write', [[pid], {'email': admin_email}])
             except Exception:
                 pass
     except Exception:
         pass
-    return True
+    # Verify login works
+    if _verify_login(admin_email, new_password):
+        return True
+
+    # Fallback: DB-level update with correct hash so Odoo can authenticate
+    try:
+        target_dsn = _odoo_admin_dsn_for(db_name)
+        if not target_dsn:
+            return False
+        import psycopg2
+        with closing(psycopg2.connect(target_dsn)) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                # Check if password_crypt exists (Odoo 16+)
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='res_users' AND column_name='password_crypt' LIMIT 1
+                    """
+                )
+                has_crypt = bool(cur.fetchone())
+                pwd_hash = _odoo_admin_hash(new_password)
+                # Resolve admin user id (prefer id from xmlrpc search, fallback to 2)
+                admin_id = ids[0] if ids else 2
+                # Ensure login and password stored in the correct column
+                if has_crypt:
+                    cur.execute(
+                        "UPDATE res_users SET login=%s, password_crypt=%s, active=TRUE WHERE id=%s",
+                        (admin_email, pwd_hash, admin_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE res_users SET login=%s, password=%s, active=TRUE WHERE id=%s",
+                        (admin_email, pwd_hash, admin_id),
+                    )
+                # Best-effort partner email sync
+                try:
+                    cur.execute("SELECT partner_id FROM res_users WHERE id=%s", (admin_id,))
+                    r = cur.fetchone()
+                    if r and r[0]:
+                        cur.execute("UPDATE res_partner SET email=%s WHERE id=%s", (admin_email, int(r[0])))
+                except Exception:
+                    pass
+        # Verify again via XML-RPC
+        return _verify_login(admin_email, new_password)
+    except Exception:
+        return False
 
 
 def _odoo_configure_oidc(server: str, db_name: str, admin_login: str, admin_password: str, issuer: str, cid: str, secret: str):
@@ -906,11 +989,29 @@ def _odoo_provision_from_template(db_name: str, admin_email: str, admin_password
                         partner_id = int(r2[0])
             except Exception:
                 pass
+            # Determine which password column exists
+            has_crypt = False
+            try:
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='res_users' AND column_name='password_crypt' LIMIT 1
+                    """
+                )
+                has_crypt = bool(cur.fetchone())
+            except Exception:
+                has_crypt = False
             # Update login + password
-            cur.execute(
-                "UPDATE res_users SET login=%s, password=%s WHERE id=%s",
-                (admin_email, pwd_hash, admin_id),
-            )
+            if has_crypt:
+                cur.execute(
+                    "UPDATE res_users SET login=%s, password_crypt=%s, active=TRUE WHERE id=%s",
+                    (admin_email, pwd_hash, admin_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE res_users SET login=%s, password=%s, active=TRUE WHERE id=%s",
+                    (admin_email, pwd_hash, admin_id),
+                )
             try:
                 if partner_id:
                     cur.execute(
