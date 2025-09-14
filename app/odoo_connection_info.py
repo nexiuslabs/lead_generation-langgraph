@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 
 from src.database import get_conn
 from app.odoo_store import OdooStore
+import os
 
 logger = logging.getLogger("onboarding")
 
@@ -72,6 +73,7 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
 
     ready = False
     error = None
+    login_url = None
     if tid is not None:
         try:
             store = OdooStore(tenant_id=int(tid))
@@ -79,6 +81,13 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
             ready = True
         except Exception as e:
             error = str(e)
+    try:
+        if db_name:
+            server = (os.getenv("ODOO_SERVER_URL") or "").rstrip("/")
+            if server:
+                login_url = f"{server}/web/login?db={db_name}"
+    except Exception:
+        login_url = None
 
     logger.info(
         "session:odoo_info email=%s tenant_id=%s db_name=%s ready=%s",
@@ -95,6 +104,6 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
             "db_name": db_name,
             "ready": ready,
             "error": error,
+            "login_url": login_url,
         },
     }
-

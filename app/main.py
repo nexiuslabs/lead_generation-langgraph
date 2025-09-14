@@ -10,6 +10,7 @@ from app.auth import require_auth, require_identity, require_optional_identity
 from src.icp import _find_ssic_codes_by_terms
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
+import os
 import csv
 from io import StringIO
 import logging
@@ -550,6 +551,53 @@ async def session_odoo_info(claims: dict = Depends(require_optional_identity)):
     except Exception:
         pass
     return info
+
+
+@app.post("/onboarding/repair_admin")
+async def onboarding_repair_admin(body: dict, _: dict = Depends(require_auth)):
+    """Reset the admin login/password for a tenant's Odoo DB via XML-RPC.
+
+    Body: { tenant_id: int, email: str, password: str }
+    Requires: ODOO_SERVER_URL, ODOO_TEMPLATE_ADMIN_LOGIN, ODOO_TEMPLATE_ADMIN_PASSWORD
+    """
+    tenant_id = (body or {}).get("tenant_id")
+    email = (body or {}).get("email")
+    password = (body or {}).get("password")
+    if not tenant_id or not email or not password:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="tenant_id, email, password required")
+    server = (os.getenv("ODOO_SERVER_URL") or "").rstrip("/")
+    admin_login = os.getenv("ODOO_TEMPLATE_ADMIN_LOGIN", "admin")
+    admin_pw = os.getenv("ODOO_TEMPLATE_ADMIN_PASSWORD")
+    if not server or not admin_pw:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="Missing ODOO server or template admin credentials")
+    # Resolve db_name for tenant
+    db_name = None
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tenant_id,))
+        r = cur.fetchone()
+        db_name = r[0] if r and r[0] else None
+    if not db_name:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="No db_name for tenant")
+    # XML-RPC update
+    import xmlrpc.client
+    common = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/common")
+    uid = common.authenticate(db_name, admin_login, admin_pw, {})
+    if not uid:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Template admin auth failed (check dbfilter/password)")
+    models = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/object")
+    ids = models.execute_kw(db_name, uid, admin_pw, 'res.users', 'search', [[['login', '=', admin_login]]], {'limit': 1}) or [2]
+    models.execute_kw(db_name, uid, admin_pw, 'res.users', 'write', [ids, {'login': email, 'password': password}])
+    try:
+        recs = models.execute_kw(db_name, uid, admin_pw, 'res.users', 'read', [ids, ['partner_id']])
+        if recs and recs[0].get('partner_id'):
+            models.execute_kw(db_name, uid, admin_pw, 'res.partner', 'write', [[recs[0]['partner_id'][0]], {'email': email}])
+    except Exception:
+        pass
+    return {"ok": True, "db_name": db_name}
 
 
 @app.post("/onboarding/first_login")

@@ -2,6 +2,9 @@ import os
 import json
 import logging
 import time
+import base64
+import hashlib
+from contextlib import closing
 from typing import Optional, Tuple
 import asyncpg  # noqa: F401  # reserved for potential future async DB ops
 import requests
@@ -337,6 +340,20 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
             return
         except Exception as e:
             logger.warning("odoo mapping via server failed tenant_id=%s email=%s error=%s", tenant_id, email, e)
+            # Fallback: If web DB-manager is disabled (list_db=false) or RPC signature differs, try template-based provisioning
+            try:
+                desired = _derive_db_name_from_email(email)
+                admin_pass = admin_password_override or _random_password()
+                if _odoo_provision_from_template(desired, email, admin_pass):
+                    upsert_mapping(desired, base_url=preferred_base_url or server)
+                    try:
+                        store = OdooStore(tenant_id=tenant_id)
+                        await store.connectivity_smoke_test()
+                    except Exception as e2:
+                        logger.warning("onboarding:odoo_connectivity_post_template_failed tenant_id=%s db=%s error=%s", tenant_id, desired, e2)
+                    return
+            except Exception as e2:
+                logger.warning("odoo template provision failed tenant_id=%s email=%s error=%s", tenant_id, email, e2)
 
     # Fallback: create mapping from inferred DSN path
     if inferred_db:
@@ -668,3 +685,171 @@ def _ensure_odoo_db_first_by_email(email: str) -> Optional[str]:
     except Exception as e:
         logger.warning("odoo:first ensure failed email=%s error=%s", email, e)
         return None
+# --- Template-based provisioning fallback (works when list_db=false) ---
+
+def _random_password(length: int = 24) -> str:
+    import secrets
+    return secrets.token_urlsafe(length)
+
+
+def _odoo_admin_hash(password: str, rounds: int = 29000) -> str:
+    """Create a pbkdf2_sha512 hash compatible with Odoo's passlib default.
+
+    Format: pbkdf2_sha512$<rounds>$<salt_b64>$<hash_b64>
+    """
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac('sha512', password.encode('utf-8'), salt, rounds)
+    return f"pbkdf2_sha512${rounds}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+
+def _odoo_admin_dsn_for(db_name: str) -> Optional[str]:
+    tpl = (os.getenv('ODOO_BASE_DSN_TEMPLATE') or '').strip()
+    if tpl:
+        return tpl.format(db_name=db_name)
+    dsn = (os.getenv('ODOO_POSTGRES_DSN') or '').strip()
+    if not dsn:
+        return None
+    # Replace path with db_name
+    try:
+        from urllib.parse import urlparse, urlunparse
+        u = urlparse(dsn)
+        u = u._replace(path='/' + db_name)
+        return urlunparse(u)
+    except Exception:
+        return None
+
+
+def _pg_exec(dsn: str, sql: str, params: tuple | None = None) -> None:
+    import psycopg2
+    with closing(psycopg2.connect(dsn)) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+
+
+def _wait_pg_connect(dsn: str, timeout_s: int = 60) -> bool:
+    import psycopg2
+    deadline = time.time() + max(1, timeout_s)
+    while time.time() < deadline:
+        try:
+            with closing(psycopg2.connect(dsn)) as conn:
+                return True
+        except Exception:
+            time.sleep(1.0)
+    return False
+
+
+def _sanitize_db_name(name: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9_\-]", "", name.lower())
+
+
+def _odoo_provision_from_template(db_name: str, admin_email: str, admin_password: str) -> bool:
+    """Provision an Odoo DB by copying a template DB and setting admin credentials.
+
+    Requires env ODOO_TEMPLATE_DB and DSN template/DSN to connect to Postgres.
+    """
+    template = (os.getenv('ODOO_TEMPLATE_DB') or '').strip()
+    if not template:
+        raise RuntimeError('Missing ODOO_TEMPLATE_DB for template-based provisioning')
+
+    db_name = _sanitize_db_name(db_name)
+    # Ensure SSH tunnel to Postgres is open (best-effort)
+    try:
+        admin_dsn_postgres = _odoo_admin_dsn_for('postgres')
+        if not admin_dsn_postgres:
+            raise RuntimeError('Cannot build Odoo admin DSN for postgres DB')
+        # Open tunnel
+        _ = OdooStore(dsn=admin_dsn_postgres)
+    except Exception:
+        pass
+
+    admin_dsn_postgres = _odoo_admin_dsn_for('postgres')
+    if not admin_dsn_postgres:
+        raise RuntimeError('Cannot build Odoo admin DSN for postgres DB')
+
+    # Create DB from template
+    logger.info('odoo:template create db=%s from=%s', db_name, template)
+    try:
+        _pg_exec(admin_dsn_postgres, f'CREATE DATABASE "{db_name}" TEMPLATE "{template}"')
+    except Exception as e:
+        msg = str(e)
+        if 'already exists' in msg.lower():
+            logger.info('odoo:template db already exists, continuing db=%s', db_name)
+        else:
+            raise
+
+    # Wait until new DB accepts connections
+    target_dsn = _odoo_admin_dsn_for(db_name)
+    if not target_dsn:
+        raise RuntimeError('Cannot build DSN for new Odoo DB')
+    if not _wait_pg_connect(target_dsn, timeout_s=60):
+        raise RuntimeError(f'New DB {db_name} did not accept connections in time')
+
+    # Prefer setting credentials via XML-RPC so Odoo applies the right hash
+    try:
+        server = os.getenv('ODOO_SERVER_URL')
+        template_admin_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
+        template_admin_password = os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD')
+        if server and template_admin_password:
+            import xmlrpc.client
+            common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
+            uid = common.authenticate(db_name, template_admin_login, template_admin_password, {})
+            if uid:
+                models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
+                # Find admin user (login='admin' or id=2)
+                ids = models.execute_kw(db_name, uid, template_admin_password, 'res.users', 'search', [[['login', '=', template_admin_login]]], {'limit': 1})
+                if not ids:
+                    ids = [2]
+                # Set login + password (Odoo will hash it)
+                models.execute_kw(db_name, uid, template_admin_password, 'res.users', 'write', [ids, {'login': admin_email, 'password': admin_password}])
+                # Update partner email as well
+                recs = models.execute_kw(db_name, uid, template_admin_password, 'res.users', 'read', [ids, ['partner_id']])
+                if recs and recs[0].get('partner_id'):
+                    pid = recs[0]['partner_id'][0]
+                    try:
+                        models.execute_kw(db_name, uid, template_admin_password, 'res.partner', 'write', [[pid], {'email': admin_email}])
+                    except Exception:
+                        pass
+                logger.info('odoo:template set admin via xmlrpc db=%s user=%s', db_name, admin_email)
+                return True
+    except Exception as e:
+        logger.warning('odoo:template xmlrpc admin set failed db=%s error=%s', db_name, e)
+
+    # Fallback: Update admin user credentials directly in DB (hash locally)
+    logger.info('odoo:template set admin credentials (DB) db=%s email=%s', db_name, admin_email)
+    pwd_hash = _odoo_admin_hash(admin_password)
+    import psycopg2
+    with closing(psycopg2.connect(target_dsn)) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # Find admin user id
+            admin_id = 2
+            partner_id = None
+            try:
+                cur.execute("SELECT id, partner_id FROM res_users WHERE login='admin' ORDER BY id ASC LIMIT 1")
+                r = cur.fetchone()
+                if r:
+                    admin_id = int(r[0]) if r[0] else admin_id
+                    partner_id = int(r[1]) if r[1] else None
+                else:
+                    cur.execute("SELECT partner_id FROM res_users WHERE id=2")
+                    r2 = cur.fetchone()
+                    if r2 and r2[0]:
+                        partner_id = int(r2[0])
+            except Exception:
+                pass
+            # Update login + password
+            cur.execute(
+                "UPDATE res_users SET login=%s, password=%s WHERE id=%s",
+                (admin_email, pwd_hash, admin_id),
+            )
+            try:
+                if partner_id:
+                    cur.execute(
+                        "UPDATE res_partner SET email=%s WHERE id=%s",
+                        (admin_email, partner_id),
+                    )
+            except Exception:
+                pass
+    return True

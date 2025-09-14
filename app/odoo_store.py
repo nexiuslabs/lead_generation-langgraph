@@ -179,52 +179,76 @@ class OdooStore:
         logger.info("Upserting company name=%s uen=%s", name, uen)
         conn = await self._acquire()
         try:
-            row = await conn.fetchrow(
-                """
-              UPDATE res_partner
-                 SET name=$1,
-                     complete_name=$1,
-                     x_uen=COALESCE($2::varchar,x_uen),
-                     x_industry_norm=$3,
-                     x_employees_est=$4,
-                     x_revenue_bucket=$5,
-                     x_incorporation_year=$6,
-                     x_website_domain=COALESCE($7,x_website_domain),
-                     write_date=now()
-               WHERE ($2::varchar IS NOT NULL AND x_uen=$2::varchar)
-                 AND is_company = TRUE
-               RETURNING id
-            """,
-                name,
-                uen,
-                fields.get("industry_norm"),
-                fields.get("employees_est"),
-                fields.get("revenue_bucket"),
-                fields.get("incorporation_year"),
-                fields.get("website_domain"),
-            )
+            try:
+                row = await conn.fetchrow(
+                    """
+                  UPDATE res_partner
+                     SET name=$1,
+                         complete_name=$1,
+                         x_uen=COALESCE($2::varchar,x_uen),
+                         x_industry_norm=$3,
+                         x_employees_est=$4,
+                         x_revenue_bucket=$5,
+                         x_incorporation_year=$6,
+                         x_website_domain=COALESCE($7,x_website_domain),
+                         write_date=now()
+                   WHERE ($2::varchar IS NOT NULL AND x_uen=$2::varchar)
+                     AND is_company = TRUE
+                   RETURNING id
+                """,
+                    name,
+                    uen,
+                    fields.get("industry_norm"),
+                    fields.get("employees_est"),
+                    fields.get("revenue_bucket"),
+                    fields.get("incorporation_year"),
+                    fields.get("website_domain"),
+                )
+            except Exception:
+                # Fallback for templates lacking custom x_* columns
+                row = await conn.fetchrow(
+                    """
+                  UPDATE res_partner
+                     SET name=$1,
+                         complete_name=$1,
+                         write_date=now()
+                   WHERE is_company = TRUE AND lower(name)=lower($1)
+                   RETURNING id
+                """,
+                    name,
+                )
             if row:
                 logger.info(
                     "Updated Odoo company id=%s name=%s uen=%s", row["id"], name, uen
                 )
                 return row["id"]
 
-            row = await conn.fetchrow(
-                """
-              INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, x_uen, x_industry_norm,
-                                       x_employees_est, x_revenue_bucket, x_incorporation_year, x_website_domain, create_date)
-              VALUES ($1, $1, 'contact', TRUE, TRUE, $2, $3, $4, $5, $6, $7, $8, now())
-              RETURNING id
-            """,
-                name,
-                name,
-                uen,
-                fields.get("industry_norm"),
-                fields.get("employees_est"),
-                fields.get("revenue_bucket"),
-                fields.get("incorporation_year"),
-                fields.get("website_domain"),
-            )
+            try:
+                row = await conn.fetchrow(
+                    """
+                  INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, x_uen, x_industry_norm,
+                                           x_employees_est, x_revenue_bucket, x_incorporation_year, x_website_domain, create_date)
+                  VALUES ($1, $1, 'contact', TRUE, TRUE, $2, $3, $4, $5, $6, $7, $8, now())
+                  RETURNING id
+                """,
+                    name,
+                    name,
+                    uen,
+                    fields.get("industry_norm"),
+                    fields.get("employees_est"),
+                    fields.get("revenue_bucket"),
+                    fields.get("incorporation_year"),
+                    fields.get("website_domain"),
+                )
+            except Exception:
+                row = await conn.fetchrow(
+                    """
+                  INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, create_date)
+                  VALUES ($1, $1, 'contact', TRUE, TRUE, $1, now())
+                  RETURNING id
+                """,
+                    name,
+                )
             logger.info(
                 "Inserted Odoo company id=%s name=%s uen=%s", row["id"], name, uen
             )
