@@ -7,7 +7,6 @@ from app.onboarding import handle_first_login, get_onboarding_status
 from app.odoo_connection_info import get_odoo_connection_info
 from src.database import get_pg_pool, get_conn
 from app.auth import require_auth, require_identity, require_optional_identity
-from src.icp import _find_ssic_codes_by_terms
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
 import os
@@ -789,6 +788,23 @@ def require_roles(allowed: set[str]):
             raise HTTPException(status_code=403, detail="Insufficient role")
         return True
     return _dep
+
+
+@app.post("/api/icp/by-ssic")
+async def api_icp_by_ssic(payload: dict):
+    import src.icp as icp_module
+
+    terms = (payload or {}).get("terms")
+    if not isinstance(terms, list):
+        terms = []
+    norm_terms = [t.strip().lower() for t in terms if isinstance(t, str) and t.strip()]
+    matched = icp_module._find_ssic_codes_by_terms(norm_terms)
+    codes = [code for code, _title, _score in matched]
+    acra = icp_module._select_acra_by_ssic_codes(codes)
+    return {
+        "matched_ssic": [{"code": c, "title": t, "score": s} for c, t, s in matched],
+        "acra_candidates": acra,
+    }
 
 
 @app.get("/icp/rules")

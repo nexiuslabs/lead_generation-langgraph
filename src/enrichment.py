@@ -1614,12 +1614,12 @@ def find_domain(company_name: str) -> list[str]:
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
 
-    # 1) Exact-match search first, with fallbacks
+    # 1) Use normalized name first, fall back to quoted variants
     try:
         queries = [
+            f"{normalized_query} official website",
             f'"{company_name}" "official website"',
             f'"{company_name}" site:.sg',
-            f"{normalized_query} official website",
             f"{company_name} official website",
         ]
         response = None
