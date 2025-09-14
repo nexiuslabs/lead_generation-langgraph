@@ -362,6 +362,12 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                             logger.warning("odoo:create admin user failed for db=%s email=%s error=%s", desired, email, last_exc)
                 except Exception as _cred_exc:
                     logger.warning("odoo:create admin credential set failed db=%s email=%s error=%s", desired, email, _cred_exc)
+                # Post-create setup: install modules and run migration
+                try:
+                    _odoo_install_modules(server, desired, email, admin_password_override or admin_pass, ['crm', 'contacts'])
+                    _odoo_run_migration(desired)
+                except Exception as _setup_exc:
+                    logger.warning("odoo post-create setup failed db=%s error=%s", desired, _setup_exc)
                 # Upsert mapping regardless so platform can connect via Postgres DSN
                 upsert_mapping(desired, base_url=preferred_base_url or server)
             # Best-effort connectivity check; do not fail provisioning if DSN is unreachable (e.g., tunnel closed)
@@ -803,6 +809,69 @@ def _odoo_configure_oidc(server: str, db_name: str, admin_login: str, admin_pass
         models.execute_kw(db_name, uid, admin_password, 'auth.oauth.provider', 'create', [vals])
 
 
+def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_password: str, modules: list[str]):
+    import xmlrpc.client
+    common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
+    uid = common.authenticate(db_name, admin_login, admin_password, {})
+    if not uid:
+        raise RuntimeError("odoo xmlrpc authentication failed for module install")
+    models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
+    for mod in modules:
+        try:
+            ids = models.execute_kw(
+                db_name, uid, admin_password, 'ir.module.module', 'search', [[['name', '=', mod]]]
+            )
+            if ids:
+                try:
+                    models.execute_kw(
+                        db_name,
+                        uid,
+                        admin_password,
+                        'ir.module.module',
+                        'button_immediate_install',
+                        [ids],
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def _odoo_run_migration(db_name: str):
+    try:
+        from src.settings import ODOO_POSTGRES_DSN
+    except Exception:
+        ODOO_POSTGRES_DSN = None
+    base_tpl = (os.getenv('ODOO_BASE_DSN_TEMPLATE') or '').strip()
+    dsn = None
+    if base_tpl:
+        try:
+            dsn = base_tpl.format(db_name=db_name)
+        except Exception:
+            dsn = None
+    if not dsn and ODOO_POSTGRES_DSN:
+        try:
+            from urllib.parse import urlparse, urlunparse
+            u = urlparse(ODOO_POSTGRES_DSN)
+            u = u._replace(path='/' + db_name)
+            dsn = urlunparse(u)
+        except Exception:
+            dsn = ODOO_POSTGRES_DSN
+    if not dsn:
+        return
+    file_path = os.path.join(os.path.dirname(__file__), 'migrations', '001_presdr_odoo.sql')
+    if not os.path.exists(file_path):
+        return
+    try:
+        import psycopg2
+        with psycopg2.connect(dsn=dsn) as conn:
+            with conn.cursor() as cur:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    cur.execute(f.read())
+    except Exception as e:
+        logger.warning("odoo:migration failed db=%s error=%s", db_name, e)
+
+
 def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email: str):
     try:
         if db_name not in _odoo_db_list(server):
@@ -811,6 +880,11 @@ def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email:
             admin_password = secrets.token_urlsafe(int(os.getenv('ODOO_TENANT_ADMIN_PASSWORD_LENGTH', '24')))
             _odoo_db_create(server, master_pwd, db_name, admin_login, admin_password)
             _odoo_admin_user_create(server, db_name, admin_login, admin_password, email)
+            try:
+                _odoo_install_modules(server, db_name, admin_login, admin_password, ['crm', 'contacts'])
+                _odoo_run_migration(db_name)
+            except Exception as _setup_exc:
+                logger.warning("odoo post-create setup failed db=%s error=%s", db_name, _setup_exc)
     except Exception as e:
         logger.warning("ensure_odoo_db_and_admin failed: %s", e)
 
