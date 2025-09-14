@@ -276,6 +276,15 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
         store = OdooStore(tenant_id=tenant_id)
         try:
             await store.connectivity_smoke_test()
+            # If signup password was provided, align Odoo admin credentials now (existing DB case)
+            if admin_password_override and email:
+                try:
+                    server = (os.getenv('ODOO_SERVER_URL') or '').strip()
+                    if server:
+                        _odoo_set_admin_credentials(server, existing_db, email, admin_password_override)
+                        logger.info("onboarding:odoo_admin aligned for existing db tenant_id=%s", tenant_id)
+                except Exception as _align_exc:
+                    logger.warning("onboarding:odoo_admin align failed tenant_id=%s db=%s error=%s", tenant_id, existing_db, _align_exc)
             return
         except Exception as e:
             logger.warning(
@@ -317,18 +326,25 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                 ready = _odoo_wait_db(server, desired, timeout_s=90, interval_s=2.0)
                 if not ready:
                     raise RuntimeError(f"odoo db '{desired}' did not appear within timeout after create_database")
-                # Retry admin user creation a few times (registry may still be warming up)
-                last_exc: Exception | None = None
-                for _ in range(5):
-                    try:
-                        _odoo_admin_user_create(server, desired, email, admin_pass, email)
-                        last_exc = None
-                        break
-                    except Exception as e:
-                        last_exc = e
-                        time.sleep(2.0)
-                if last_exc is not None:
-                    logger.warning("odoo:create admin user failed for db=%s email=%s error=%s", desired, email, last_exc)
+                # Set admin credentials explicitly to the signup email/password when available
+                try:
+                    if admin_password_override:
+                        _odoo_set_admin_credentials(server, desired, email, admin_password_override)
+                    else:
+                        # Retry admin user bootstrap a few times (registry may still be warming up)
+                        last_exc: Exception | None = None
+                        for _ in range(5):
+                            try:
+                                _odoo_admin_user_create(server, desired, email, admin_pass, email)
+                                last_exc = None
+                                break
+                            except Exception as e:
+                                last_exc = e
+                                time.sleep(2.0)
+                        if last_exc is not None:
+                            logger.warning("odoo:create admin user failed for db=%s email=%s error=%s", desired, email, last_exc)
+                except Exception as _cred_exc:
+                    logger.warning("odoo:create admin credential set failed db=%s email=%s error=%s", desired, email, _cred_exc)
                 # Upsert mapping regardless so platform can connect via Postgres DSN
                 upsert_mapping(desired, base_url=preferred_base_url or server)
             # Best-effort connectivity check; do not fail provisioning if DSN is unreachable (e.g., tunnel closed)
@@ -362,6 +378,15 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
         try:
             store = OdooStore(tenant_id=tenant_id)
             await store.connectivity_smoke_test()
+            # Align admin credentials if we have a signup password and server
+            if admin_password_override and email:
+                try:
+                    server = (os.getenv('ODOO_SERVER_URL') or '').strip()
+                    if server:
+                        _odoo_set_admin_credentials(server, inferred_db, email, admin_password_override)
+                        logger.info("onboarding:odoo_admin aligned for inferred db tenant_id=%s", tenant_id)
+                except Exception as _align_exc:
+                    logger.warning("onboarding:odoo_admin align failed tenant_id=%s db=%s error=%s", tenant_id, inferred_db, _align_exc)
         except Exception as e:
             logger.warning("onboarding:odoo_connectivity_inferred_failed tenant_id=%s db=%s error=%s", tenant_id, inferred_db, e)
         return
@@ -620,6 +645,48 @@ def _odoo_admin_user_create(server: str, db_name: str, admin_login: str, admin_p
         if group_system_id:
             vals['groups_id'] = [(6, 0, [group_system_id])]
         models.execute_kw(db_name, uid, admin_password, 'res.users', 'create', [vals])
+
+
+def _odoo_set_admin_credentials(server: str, db_name: str, admin_email: str, new_password: str) -> bool:
+    """Set the tenant admin login/password via XML-RPC using template admin credentials.
+
+    This ensures the Odoo admin login matches the signup email/password, even when the
+    database already existed or the create_database signature didn’t set the login.
+    Returns True on success, False if preconditions are missing.
+    """
+    import xmlrpc.client
+    template_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
+    template_pw = os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD')
+    if not template_pw:
+        # No template admin configured; skip silently
+        return False
+    common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
+    uid = common.authenticate(db_name, template_login, template_pw, {})
+    if not uid:
+        raise RuntimeError("odoo template admin authentication failed (check dbfilter/password)")
+    models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
+    # Identify admin user record (by template login or id=2 fallback)
+    ids = models.execute_kw(
+        db_name, uid, template_pw,
+        'res.users', 'search', [[['login', '=', template_login]]], {'limit': 1}
+    )
+    if not ids:
+        ids = [2]
+    # Apply login + password (Odoo hashes the password)
+    models.execute_kw(
+        db_name, uid, template_pw, 'res.users', 'write', [ids, {'login': admin_email, 'password': new_password}]
+    )
+    try:
+        recs = models.execute_kw(db_name, uid, template_pw, 'res.users', 'read', [ids, ['partner_id']])
+        if recs and recs[0].get('partner_id'):
+            pid = recs[0]['partner_id'][0]
+            try:
+                models.execute_kw(db_name, uid, template_pw, 'res.partner', 'write', [[pid], {'email': admin_email}])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return True
 
 
 def _odoo_configure_oidc(server: str, db_name: str, admin_login: str, admin_password: str, issuer: str, cid: str, secret: str):

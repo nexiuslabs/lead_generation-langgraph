@@ -69,7 +69,18 @@ def _current_odoo_db_name(tenant_id: int) -> Optional[str]:
 
 async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict[str, Any]:
     tid = _resolve_tenant_id(email, claim_tid)
-    db_name = _current_odoo_db_name(tid) if tid is not None else None
+    db_name = None
+    base_url = None
+    if tid is not None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT db_name, base_url FROM odoo_connections WHERE tenant_id=%s", (tid,))
+                row = cur.fetchone()
+                if row:
+                    db_name = row[0]
+                    base_url = row[1]
+        except Exception:
+            db_name = _current_odoo_db_name(tid)
 
     ready = False
     error = None
@@ -81,8 +92,12 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
             ready = True
         except Exception as e:
             error = str(e)
+    # Build a login URL that works with subdomain dbfilter or db param fallback
     try:
-        if db_name:
+        if base_url:
+            # base_url is expected to be tenant-specific, e.g. https://<db>.example.com
+            login_url = f"{base_url.rstrip('/')}/web/login"
+        elif db_name:
             server = (os.getenv("ODOO_SERVER_URL") or "").rstrip("/")
             if server:
                 login_url = f"{server}/web/login?db={db_name}"
@@ -102,6 +117,7 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
         "tenant_id": tid,
         "odoo": {
             "db_name": db_name,
+            "base_url": base_url,
             "ready": ready,
             "error": error,
             "login_url": login_url,
