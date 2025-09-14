@@ -2,12 +2,11 @@ import os
 import json
 import logging
 import time
-import base64
-import hashlib
 from contextlib import closing
 from typing import Optional, Tuple
 import asyncpg  # noqa: F401  # reserved for potential future async DB ops
 import requests
+from passlib.hash import pbkdf2_sha512
 from src.database import get_conn
 from app.odoo_store import OdooStore
 
@@ -843,13 +842,8 @@ def _random_password(length: int = 24) -> str:
 
 
 def _odoo_admin_hash(password: str, rounds: int = 29000) -> str:
-    """Create a pbkdf2_sha512 hash compatible with Odoo's passlib default.
-
-    Format: pbkdf2_sha512$<rounds>$<salt_b64>$<hash_b64>
-    """
-    salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac('sha512', password.encode('utf-8'), salt, rounds)
-    return f"pbkdf2_sha512${rounds}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+    """Generate a pbkdf2_sha512 hash using passlib."""
+    return pbkdf2_sha512.hash(password, rounds=rounds)
 
 
 def _odoo_admin_dsn_for(db_name: str) -> Optional[str]:
