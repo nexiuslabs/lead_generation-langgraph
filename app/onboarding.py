@@ -363,6 +363,7 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                 except Exception as _cred_exc:
                     logger.warning("odoo:create admin credential set failed db=%s email=%s error=%s", desired, email, _cred_exc)
                 # Post-create setup: install modules and run migration
+
                 admin_pw = admin_password_override or admin_pass
                 try:
                     _odoo_install_modules(server, desired, email, admin_pw, ['crm', 'contacts'])
@@ -372,6 +373,7 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                     _odoo_run_migration(desired)
                 except Exception as _mig_exc:
                     logger.warning("odoo migration failed db=%s error=%s", desired, _mig_exc)
+
                 # Upsert mapping regardless so platform can connect via Postgres DSN
                 upsert_mapping(desired, base_url=preferred_base_url or server)
             # Best-effort connectivity check; do not fail provisioning if DSN is unreachable (e.g., tunnel closed)
@@ -817,6 +819,7 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
     import xmlrpc.client
     common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
     uid = common.authenticate(db_name, admin_login, admin_password, {})
+
     password = admin_password
     if not uid:
         tmpl_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
@@ -825,6 +828,7 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
         if uid:
             admin_login = tmpl_login
             password = tmpl_pw
+
     if not uid:
         raise RuntimeError("odoo xmlrpc authentication failed for module install")
     models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
@@ -832,6 +836,7 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
         try:
             ids = models.execute_kw(
                 db_name, uid, password, 'ir.module.module', 'search', [[['name', '=', mod]]]
+
             )
             if ids:
                 try:
@@ -894,12 +899,14 @@ def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email:
             _odoo_admin_user_create(server, db_name, admin_login, admin_password, email)
             try:
                 _odoo_install_modules(server, db_name, admin_login, admin_password, ['crm', 'contacts'])
+
             except Exception as _mod_exc:
                 logger.warning("odoo module install failed db=%s error=%s", db_name, _mod_exc)
             try:
                 _odoo_run_migration(db_name)
             except Exception as _mig_exc:
                 logger.warning("odoo migration failed db=%s error=%s", db_name, _mig_exc)
+
     except Exception as e:
         logger.warning("ensure_odoo_db_and_admin failed: %s", e)
 
