@@ -876,39 +876,83 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
     if failed:
         raise RuntimeError(f"Failed to install modules: {', '.join(failed)}")
 
-def _odoo_run_migration(db_name: str):
+def _odoo_run_migration(db_name: str, dsn: str | None = None) -> None:
+    """Run the Odoo SQL migration against the target database.
+
+    Parameters
+    ----------
+    db_name: str
+        The target Odoo database name.
+    dsn: Optional[str]
+        When provided, use this DSN directly. Otherwise attempt to resolve the
+        DSN from environment variables or existing ``odoo_connections``
+        mappings. If the DSN cannot be determined, a ``RuntimeError`` is raised.
+    """
+
     try:
         from src.settings import ODOO_POSTGRES_DSN
     except Exception:
         ODOO_POSTGRES_DSN = None
-    base_tpl = (os.getenv('ODOO_BASE_DSN_TEMPLATE') or '').strip()
-    dsn = None
-    if base_tpl:
-        try:
-            dsn = base_tpl.format(db_name=db_name)
-        except Exception:
-            dsn = None
-    if not dsn and ODOO_POSTGRES_DSN:
+
+    # Prefer explicit DSN parameter
+    resolved_dsn = dsn
+
+    if not resolved_dsn:
+        base_tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE") or "").strip()
+        if base_tpl:
+            try:
+                resolved_dsn = base_tpl.format(db_name=db_name)
+            except Exception:
+                resolved_dsn = None
+
+    if not resolved_dsn and ODOO_POSTGRES_DSN:
         try:
             from urllib.parse import urlparse, urlunparse
+
             u = urlparse(ODOO_POSTGRES_DSN)
-            u = u._replace(path='/' + db_name)
-            dsn = urlunparse(u)
+            u = u._replace(path="/" + db_name)
+            resolved_dsn = urlunparse(u)
         except Exception:
-            dsn = ODOO_POSTGRES_DSN
-    if not dsn:
-        return
-    file_path = os.path.join(os.path.dirname(__file__), 'migrations', '001_presdr_odoo.sql')
+            resolved_dsn = ODOO_POSTGRES_DSN
+
+    if not resolved_dsn:
+        # Attempt to resolve via existing mapping/OdooStore
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tenant_id FROM odoo_connections WHERE db_name=%s AND active",
+                    (db_name,),
+                )
+                row = cur.fetchone()
+            if row and row[0] is not None:
+                try:
+                    store = OdooStore(tenant_id=row[0])
+                    resolved_dsn = store.dsn
+                except Exception:
+                    resolved_dsn = None
+        except Exception:
+            resolved_dsn = None
+
+    if not resolved_dsn:
+        raise RuntimeError(f"Could not resolve Odoo DSN for db '{db_name}'")
+
+    file_path = os.path.join(
+        os.path.dirname(__file__), "migrations", "001_presdr_odoo.sql"
+    )
     if not os.path.exists(file_path):
+        logger.warning("odoo:migration file missing: %s", file_path)
         return
     try:
         import psycopg2
-        with psycopg2.connect(dsn=dsn) as conn:
+
+        with psycopg2.connect(dsn=resolved_dsn) as conn:
             with conn.cursor() as cur:
-                with open(file_path, 'r', encoding='utf-8') as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     cur.execute(f.read())
+        logger.info("odoo:migration succeeded db=%s", db_name)
     except Exception as e:
         logger.warning("odoo:migration failed db=%s error=%s", db_name, e)
+        raise
 
 
 def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email: str):
