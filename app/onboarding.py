@@ -451,21 +451,24 @@ async def handle_first_login(email: str, tenant_id_claim: Optional[int], user_pa
 
         # Optional: automatically create Odoo DB (HTTP DB manager) and bootstrap admin
         if not mapping_exists_before and _truthy('ODOO_ENABLE_HTTP_PROVISION', 'false'):
-            try:
-                server = os.getenv('ODOO_SERVER_URL')
-                master = os.getenv('ODOO_MASTER_PASSWORD')
-                if server and master:
-                    # derive db_name
-                    db_name = None
-                    with get_conn() as conn, conn.cursor() as cur:
-                        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
-                        row = cur.fetchone()
-                        db_name = (row[0] if row else None)
-                    if db_name:
-                        # Use first-login email as admin login
+            server = os.getenv('ODOO_SERVER_URL')
+            master = os.getenv('ODOO_MASTER_PASSWORD')
+            if server and master:
+                # derive db_name
+                db_name = None
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
+                    row = cur.fetchone()
+                    db_name = (row[0] if row else None)
+                if db_name:
+                    # Use first-login email as admin login
+                    try:
                         _ensure_odoo_db_and_admin(server, master, db_name, email)
-            except Exception as e:
-                logger.warning("odoo db auto-create skipped: %s", e)
+                    except Exception as e:
+                        msg = f"odoo db auto-create failed: {e}"
+                        logger.warning(msg)
+                        _insert_or_update_status(tid, ONBOARDING_ERROR, msg)
+                        raise RuntimeError(msg) from e
 
         # Configure OIDC provider in Odoo (optional)
         if not mapping_exists_before and _truthy('ODOO_ENABLE_OIDC_AUTOCONFIG', 'false'):
@@ -956,25 +959,20 @@ def _odoo_run_migration(db_name: str, dsn: str | None = None) -> None:
 
 
 def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email: str):
-    try:
-        if db_name not in _odoo_db_list(server):
-            admin_login = email
-            import secrets
-            admin_password = secrets.token_urlsafe(int(os.getenv('ODOO_TENANT_ADMIN_PASSWORD_LENGTH', '24')))
-            _odoo_db_create(server, master_pwd, db_name, admin_login, admin_password)
-            _odoo_admin_user_create(server, db_name, admin_login, admin_password, email)
-            try:
-                _odoo_install_modules(server, db_name, admin_login, admin_password, ['crm', 'contacts'])
-
-            except Exception as _mod_exc:
-                logger.warning("odoo module install failed db=%s error=%s", db_name, _mod_exc)
-            try:
-                _odoo_run_migration(db_name)
-            except Exception as _mig_exc:
-                logger.warning("odoo migration failed db=%s error=%s", db_name, _mig_exc)
-
-    except Exception as e:
-        logger.warning("ensure_odoo_db_and_admin failed: %s", e)
+    if db_name not in _odoo_db_list(server):
+        admin_login = email
+        import secrets
+        admin_password = secrets.token_urlsafe(
+            int(os.getenv("ODOO_TENANT_ADMIN_PASSWORD_LENGTH", "24"))
+        )
+        _odoo_db_create(server, master_pwd, db_name, admin_login, admin_password)
+        _odoo_admin_user_create(
+            server, db_name, admin_login, admin_password, email
+        )
+        _odoo_install_modules(
+            server, db_name, admin_login, admin_password, ["crm", "contacts"]
+        )
+        _odoo_run_migration(db_name)
 
 
 def _ensure_odoo_db_first_by_email(email: str) -> Optional[str]:
