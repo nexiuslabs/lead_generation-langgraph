@@ -275,6 +275,11 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
         store = OdooStore(tenant_id=tenant_id)
         try:
             await store.connectivity_smoke_test()
+            # Optional: ensure core modules + migration when enabled
+            try:
+                _maybe_ensure_core_modules_and_migration(existing_db, email, admin_password_override)
+            except Exception:
+                pass
             # If signup password was provided, align Odoo admin credentials now (existing DB case)
             if admin_password_override and email:
                 try:
@@ -302,6 +307,11 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                 upsert_mapping(inferred_db)
                 store = OdooStore(tenant_id=tenant_id)
                 await store.connectivity_smoke_test()
+                # Optional: ensure core modules + migration when enabled
+                try:
+                    _maybe_ensure_core_modules_and_migration(inferred_db, email, admin_password_override)
+                except Exception:
+                    pass
                 return
             raise
 
@@ -391,6 +401,11 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                 admin_pass = admin_password_override or _random_password()
                 if _odoo_provision_from_template(desired, email, admin_pass):
                     upsert_mapping(desired, base_url=preferred_base_url or server)
+                    # Best-effort: ensure core modules + migration when feature flag enabled
+                    try:
+                        _maybe_ensure_core_modules_and_migration(desired, email, admin_pass)
+                    except Exception:
+                        pass
                     try:
                         store = OdooStore(tenant_id=tenant_id)
                         await store.connectivity_smoke_test()
@@ -416,6 +431,11 @@ async def _ensure_odoo_mapping(tenant_id: int, email: Optional[str] = None, admi
                         logger.info("onboarding:odoo_admin aligned for inferred db tenant_id=%s", tenant_id)
                 except Exception as _align_exc:
                     logger.warning("onboarding:odoo_admin align failed tenant_id=%s db=%s error=%s", tenant_id, inferred_db, _align_exc)
+            # Optional: ensure core modules + migration when enabled
+            try:
+                _maybe_ensure_core_modules_and_migration(inferred_db, email, admin_password_override)
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("onboarding:odoo_connectivity_inferred_failed tenant_id=%s db=%s error=%s", tenant_id, inferred_db, e)
         return
@@ -535,6 +555,65 @@ def _odoo_db_list(server: str) -> list:
     if "error" in data:
         raise RuntimeError(f"odoo db.list failed: {data['error']}")
     return data.get("result", [])
+
+
+def _odoo_wait_registry(
+    server: str,
+    db_name: str,
+    login_pw_list: list[tuple[str | None, str | None]],
+    timeout_s: int = 120,
+    interval_s: float = 3.0,
+) -> tuple[str, str] | None:
+    """Wait until Odoo registry is ready for XML-RPC operations.
+
+    Tries the provided (login, password) candidates in order on each poll.
+    Returns the first (login, password) that successfully authenticates and can
+    access a basic model via object proxy. Returns None on timeout.
+    """
+    import xmlrpc.client
+    try:
+        candidate_logins = [login for (login, _pw) in (login_pw_list or []) if login]
+    except Exception:
+        candidate_logins = []
+    try:
+        logger.info(
+            "odoo:registry wait start db=%s candidates=%s timeout=%s interval=%s",
+            db_name,
+            candidate_logins,
+            timeout_s,
+            interval_s,
+        )
+    except Exception:
+        pass
+    deadline = time.time() + max(1, timeout_s)
+    common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
+    while time.time() < deadline:
+        for login, pw in login_pw_list:
+            if not login or not pw:
+                continue
+            try:
+                uid = common.authenticate(db_name, login, pw, {})
+                if uid:
+                    # Try a trivial read to ensure registry/models are ready
+                    models = xmlrpc.client.ServerProxy(
+                        f"{server.rstrip('/')}/xmlrpc/2/object"
+                    )
+                    try:
+                        _ = models.execute_kw(
+                            db_name, uid, pw, 'res.users', 'search', [[]], {'limit': 1}
+                        )
+                        try:
+                            logger.info("odoo:registry ready db=%s login=%s", db_name, login)
+                        except Exception:
+                            pass
+                        return (str(login), str(pw))
+                    except Exception:
+                        # Registry not ready yet
+                        pass
+            except Exception:
+                pass
+        time.sleep(max(0.5, interval_s))
+    return None
 
 
 def _odoo_db_create(server: str, master_pwd: str, db_name: str, admin_login: str, admin_password: str):
@@ -821,19 +900,32 @@ def _odoo_configure_oidc(server: str, db_name: str, admin_login: str, admin_pass
 def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_password: str, modules: list[str]):
     import xmlrpc.client
     common = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/common")
-    uid = common.authenticate(db_name, admin_login, admin_password, {})
+    try:
+        logger.info("odoo:module install start db=%s modules=%s", db_name, modules)
+    except Exception:
+        pass
+    # Try multiple auth combinations: (provided), (template), final ('admin'/'admin')
+    attempts: list[tuple[str, str]] = []
+    attempts.append((admin_login, admin_password))
+    tmpl_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
+    tmpl_pw = os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD', admin_password)
+    attempts.append((tmpl_login, tmpl_pw))
+    attempts.append(('admin', 'admin'))
 
-    password = admin_password
-    if not uid:
-        tmpl_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
-        tmpl_pw = os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD', admin_password)
-        uid = common.authenticate(db_name, tmpl_login, tmpl_pw, {})
+    uid = None
+    password = None
+    for login, pw in attempts:
+        try:
+            uid = common.authenticate(db_name, login, pw, {})
+        except Exception:
+            uid = None
         if uid:
-            admin_login = tmpl_login
-            password = tmpl_pw
+            admin_login = login
+            password = pw
+            break
 
-    if not uid:
-        raise RuntimeError("odoo xmlrpc authentication failed for module install")
+    if not uid or not password:
+        raise RuntimeError("odoo xmlrpc authentication failed for module install (all attempts)")
     models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
     try:
         models.execute_kw(db_name, uid, password, 'ir.module.module', 'update_list', [])
@@ -866,6 +958,10 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
                     [ids, ['state']],
                 )[0].get('state')
                 if state == 'installed':
+                    try:
+                        logger.info("odoo:module installed db=%s module=%s", db_name, mod)
+                    except Exception:
+                        pass
                     success = True
                     break
                 raise RuntimeError(f"Module {mod} state {state}")
@@ -878,6 +974,10 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
             failed.append(mod)
     if failed:
         raise RuntimeError(f"Failed to install modules: {', '.join(failed)}")
+    try:
+        logger.info("odoo:module install done db=%s modules=%s", db_name, modules)
+    except Exception:
+        pass
 
 def _odoo_run_migration(db_name: str, dsn: str | None = None) -> None:
     """Run the Odoo SQL migration against the target database.
@@ -948,6 +1048,10 @@ def _odoo_run_migration(db_name: str, dsn: str | None = None) -> None:
     try:
         import psycopg2
 
+        try:
+            logger.info("odoo:migration start db=%s file=%s", db_name, file_path)
+        except Exception:
+            pass
         with psycopg2.connect(dsn=resolved_dsn) as conn:
             with conn.cursor() as cur:
                 with open(file_path, "r", encoding="utf-8") as f:
@@ -958,21 +1062,70 @@ def _odoo_run_migration(db_name: str, dsn: str | None = None) -> None:
         raise
 
 
+def _maybe_ensure_core_modules_and_migration(
+    db_name: str, email: Optional[str], admin_password_override: Optional[str]
+) -> None:
+    """Best-effort ensure of core modules + migration for an existing/inferred DB.
+
+    Controlled by env flag ODOO_ENSURE_CORE_MODULES (default: false). Does nothing
+    if the server URL is not configured or the flag is disabled.
+    """
+    if not _truthy('ODOO_ENSURE_CORE_MODULES', 'false'):
+        return
+    server = (os.getenv('ODOO_SERVER_URL') or '').strip()
+    if not server:
+        return
+    # Build candidate credentials: (signup), (template), ('admin','admin')
+    candidates: list[tuple[str | None, str | None]] = []
+    if email and admin_password_override:
+        candidates.append((email, admin_password_override))
+    tmpl_login = os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin')
+    tmpl_pw = os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD')
+    if tmpl_pw:
+        candidates.append((tmpl_login, tmpl_pw))
+    candidates.append(('admin', 'admin'))
+    try:
+        _odoo_wait_registry(server, db_name, candidates, timeout_s=120, interval_s=3.0)
+    except Exception:
+        pass
+    # Try install + migration (best-effort)
+    try:
+        # Use the first candidate with a non-empty password as the starting point
+        login = (email or tmpl_login)
+        pw = (admin_password_override or tmpl_pw or 'admin')
+        _odoo_install_modules(server, db_name, login, pw, ['crm', 'contacts'])
+    except Exception as _mod_e:
+        logger.warning("odoo ensure core: module install failed db=%s error=%s", db_name, _mod_e)
+    try:
+        _odoo_run_migration(db_name)
+    except Exception as _mig_e:
+        logger.warning("odoo ensure core: migration failed db=%s error=%s", db_name, _mig_e)
+
+
 def _ensure_odoo_db_and_admin(server: str, master_pwd: str, db_name: str, email: str):
     if db_name not in _odoo_db_list(server):
         admin_login = email
         import secrets
-        admin_password = secrets.token_urlsafe(
-            int(os.getenv("ODOO_TENANT_ADMIN_PASSWORD_LENGTH", "24"))
-        )
+        admin_password = secrets.token_urlsafe(int(os.getenv('ODOO_TENANT_ADMIN_PASSWORD_LENGTH', '24')))
         _odoo_db_create(server, master_pwd, db_name, admin_login, admin_password)
-        _odoo_admin_user_create(
-            server, db_name, admin_login, admin_password, email
-        )
-        _odoo_install_modules(
-            server, db_name, admin_login, admin_password, ["crm", "contacts"]
-        )
-        _odoo_run_migration(db_name)
+        _odoo_admin_user_create(server, db_name, admin_login, admin_password, email)
+        # Wait for registry readiness and then install modules + run migration
+        try:
+            _odoo_wait_registry(server, db_name, [
+                (email, admin_password),
+                (os.getenv('ODOO_TEMPLATE_ADMIN_LOGIN', 'admin'), os.getenv('ODOO_TEMPLATE_ADMIN_PASSWORD', admin_password)),
+                ('admin', 'admin'),
+            ])
+        except Exception:
+            pass
+        try:
+            _odoo_install_modules(server, db_name, admin_login, admin_password, ['crm', 'contacts'])
+        except Exception as _mod_exc:
+            logger.warning("odoo module install failed db=%s error=%s", db_name, _mod_exc)
+        try:
+            _odoo_run_migration(db_name)
+        except Exception as _mig_exc:
+            logger.warning("odoo migration failed db=%s error=%s", db_name, _mig_exc)
 
 
 def _ensure_odoo_db_first_by_email(email: str) -> Optional[str]:
