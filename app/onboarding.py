@@ -832,27 +832,49 @@ def _odoo_install_modules(server: str, db_name: str, admin_login: str, admin_pas
     if not uid:
         raise RuntimeError("odoo xmlrpc authentication failed for module install")
     models = xmlrpc.client.ServerProxy(f"{server.rstrip('/')}/xmlrpc/2/object")
+    try:
+        models.execute_kw(db_name, uid, password, 'ir.module.module', 'update_list', [])
+    except Exception as e:
+        logger.warning("Failed to update module list: %s", e)
+    failed: list[str] = []
     for mod in modules:
-        try:
-            ids = models.execute_kw(
-                db_name, uid, password, 'ir.module.module', 'search', [[['name', '=', mod]]]
-
-            )
-            if ids:
-                try:
-                    models.execute_kw(
-                        db_name,
-                        uid,
-                        password,
-                        'ir.module.module',
-                        'button_immediate_install',
-                        [ids],
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+        success = False
+        for attempt in range(3):
+            try:
+                ids = models.execute_kw(
+                    db_name, uid, password, 'ir.module.module', 'search', [[['name', '=', mod]]]
+                )
+                if not ids:
+                    raise RuntimeError(f"Module {mod} not found")
+                models.execute_kw(
+                    db_name,
+                    uid,
+                    password,
+                    'ir.module.module',
+                    'button_immediate_install',
+                    [ids],
+                )
+                state = models.execute_kw(
+                    db_name,
+                    uid,
+                    password,
+                    'ir.module.module',
+                    'read',
+                    [ids, ['state']],
+                )[0].get('state')
+                if state == 'installed':
+                    success = True
+                    break
+                raise RuntimeError(f"Module {mod} state {state}")
+            except Exception as e:
+                logger.warning(
+                    "Failed installing module %s (attempt %d/3): %s", mod, attempt + 1, e
+                )
+                time.sleep(2)
+        if not success:
+            failed.append(mod)
+    if failed:
+        raise RuntimeError(f"Failed to install modules: {', '.join(failed)}")
 
 def _odoo_run_migration(db_name: str):
     try:
