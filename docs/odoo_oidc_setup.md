@@ -34,3 +34,8 @@ Notes
 - The Pre-SDR API never exposes Odoo credentials to the browser; server-side uses per-tenant DSN from `odoo_connections`.
 - If you prefer, store a full Postgres DSN in `odoo_connections.db_name`. Otherwise, set `ODOO_BASE_DSN_TEMPLATE` and store only db_name.
 
+Provisioning Notes
+- Server-driven provisioning prefers two paths:
+  - HTTP DB manager (when enabled): creates the database via JSON-RPC, sets admin credentials, installs base modules, and can auto-configure OIDC.
+  - Template-clone fallback (supported): when the DB manager is disabled (`list_db=false`) or not reachable, the backend clones a configured `ODOO_TEMPLATE_DB` at the Postgres layer and then sets admin credentials via XML-RPC or directly in the DB. This is the supported fallback instead of invoking `odoo-bin`.
+- We do not rely on `odoo-bin` CLI for provisioning. The template-clone approach is simpler to operate across environments and works over a secure Postgres connection (optionally via SSH tunnel) using `ODOO_BASE_DSN_TEMPLATE` or `ODOO_POSTGRES_DSN`.

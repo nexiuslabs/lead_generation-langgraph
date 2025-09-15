@@ -78,6 +78,13 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
                     (tenant_id_claim, tenant_label),
                 )
             # Link user to claimed tenant (viewer by default)
+            try:
+                cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tenant_id_claim),))
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             cur.execute(
                 """
       INSERT INTO tenant_users(tenant_id, user_id, roles)
@@ -132,6 +139,14 @@ def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
             )
         except Exception:
             pass
+        # Set per-request tenant GUC to satisfy RLS WITH CHECK policies on inserts
+        try:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         # Link user and seed defaults
         cur.execute(
             """
