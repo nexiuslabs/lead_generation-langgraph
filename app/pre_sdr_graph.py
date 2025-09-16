@@ -1175,6 +1175,89 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     pool = await get_pg_pool()
 
+    # Helper: resolve current tenant id (best-effort), used to scope backlog rows
+    async def _resolve_tenant_id() -> Optional[int]:
+        # Prefer state-provided tenant id
+        try:
+            _tid_val = state.get("tenant_id") if isinstance(state, dict) else None
+            if _tid_val is not None:
+                return int(_tid_val)
+        except Exception:
+            pass
+        # Fallback: env DEFAULT_TENANT_ID
+        try:
+            _tid_env = os.getenv("DEFAULT_TENANT_ID")
+            if _tid_env and _tid_env.isdigit():
+                return int(_tid_env)
+        except Exception:
+            pass
+        # Fallback: infer from ODOO_POSTGRES_DSN via odoo_connections
+        try:
+            inferred_db = None
+            if ODOO_POSTGRES_DSN:
+                from urllib.parse import urlparse
+                u = urlparse(ODOO_POSTGRES_DSN)
+                inferred_db = (u.path or "/").lstrip("/") or None
+            if inferred_db:
+                with get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                        (inferred_db, ODOO_POSTGRES_DSN),
+                    )
+                    _row = _cur.fetchone()
+                    if _row:
+                        return int(_row[0])
+        except Exception:
+            pass
+        # Last resort: first active tenant
+        try:
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                _row = _cur.fetchone()
+                if _row:
+                    return int(_row[0])
+        except Exception:
+            pass
+        return None
+
+    async def _ensure_backlog_table():
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS enrichment_backlog (
+                    tenant_id INT NOT NULL,
+                    company_id INT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (tenant_id, company_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_enrichment_backlog_tenant_status
+                    ON enrichment_backlog(tenant_id, status, created_at);
+                """
+            )
+
+    async def _enqueue_backlog(leftover_ids: List[int]):
+        if not leftover_ids:
+            return
+        tid = await _resolve_tenant_id()
+        if tid is None:
+            return
+        await _ensure_backlog_table()
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO enrichment_backlog(tenant_id, company_id, status)
+                    SELECT $1::int, x, 'pending' FROM UNNEST($2::int[] ) AS t(x)
+                    ON CONFLICT (tenant_id, company_id) DO NOTHING
+                    """,
+                    tid,
+                    leftover_ids,
+                )
+            except Exception:
+                # best-effort; don't block chat if backlog insert fails
+                pass
+
     # Limit immediate enrichment to a small batch (default 10) and defer the rest to nightly
     try:
         import os
@@ -1184,6 +1267,7 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     total_candidates = len(candidates)
     deferred_count = 0
+    leftover_ids: List[int] = []
     if total_candidates > enrich_now_limit:
         # Ensure company rows exist for all candidates so nightly can pick them up later
         ensured_ids: list[int] = []
@@ -1200,11 +1284,17 @@ async def enrich_node(state: GraphState) -> GraphState:
 
         # Choose the first N candidates to process now (preserve current order)
         selected_ids = set(ensured_ids[:enrich_now_limit]) if ensured_ids else set()
+        leftover_ids = ensured_ids[enrich_now_limit:]
         if selected_ids:
             candidates = [c for c in candidates if (c.get("id") in selected_ids) or (not c.get("id") and False)] or candidates[:enrich_now_limit]
         else:
             candidates = candidates[:enrich_now_limit]
         deferred_count = max(0, total_candidates - len(candidates))
+        # Enqueue leftovers into persistent backlog for deterministic nightly processing
+        try:
+            await _enqueue_backlog(leftover_ids)
+        except Exception:
+            pass
 
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]

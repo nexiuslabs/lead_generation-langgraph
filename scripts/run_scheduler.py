@@ -1,6 +1,12 @@
 import os
+import sys
 import asyncio
 import logging
+
+# Ensure project root is on sys.path so `src` and other top-level modules import
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 
 async def main_async():
