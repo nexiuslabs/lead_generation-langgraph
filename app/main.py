@@ -15,6 +15,7 @@ from io import StringIO
 import logging
 import re
 import os
+from datetime import datetime
 
 fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
 
@@ -1040,3 +1041,108 @@ async def rotate_odoo_key(tenant_id: int = Path(...), _: dict = Depends(require_
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"rotate failed: {e}")
     return Response(status_code=204)
+
+
+# --- Shortlist status and ad-hoc scheduler trigger ---
+@app.get("/shortlist/status")
+async def shortlist_status(request: Request = None, claims: dict = Depends(require_optional_identity)):
+    """Return shortlist freshness and size for the current tenant.
+
+    Response: { last_refreshed_at: ISO8601|null, total_scored: int, tenant_id?: int }
+    """
+    # Resolve tenant from identity and Odoo mapping (same approach as export)
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        # Apply RLS tenant context if known
+        try:
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+        except Exception:
+            pass
+
+        # Count scored rows (RLS will scope if enabled)
+        try:
+            total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores"))
+        except Exception:
+            total_scored = 0
+
+        # last_refreshed_at heuristics: prefer enrichment/company run timestamps if present,
+        # fallback to company last_seen joined to lead_scores, else None.
+        last_ts: datetime | None = None
+
+        # Try company_enrichment_runs.run_timestamp
+        try:
+            ts = await conn.fetchval("SELECT MAX(run_timestamp) FROM company_enrichment_runs")
+            if isinstance(ts, datetime):
+                last_ts = ts
+        except Exception:
+            last_ts = last_ts
+
+        # Try enrichment_runs.started_at (subject to RLS)
+        if last_ts is None:
+            try:
+                ts = await conn.fetchval("SELECT MAX(started_at) FROM enrichment_runs")
+                if isinstance(ts, datetime):
+                    last_ts = ts
+            except Exception:
+                last_ts = last_ts
+
+        # Fallback: companies.last_seen for rows that have scores
+        if last_ts is None:
+            try:
+                ts = await conn.fetchval(
+                    """
+                    SELECT MAX(c.last_seen)
+                    FROM companies c
+                    JOIN lead_scores s ON s.company_id = c.company_id
+                    """
+                )
+                if isinstance(ts, datetime):
+                    last_ts = ts
+            except Exception:
+                last_ts = last_ts
+
+    out = {
+        "tenant_id": tid,
+        "total_scored": total_scored,
+        "last_refreshed_at": (last_ts.isoformat() if isinstance(last_ts, datetime) else None),
+    }
+    return out
+
+
+@app.post("/scheduler/run_now")
+async def scheduler_run_now(background: BackgroundTasks, claims: dict = Depends(require_auth)):
+    """Trigger a background run for the current tenant (ad-hoc).
+
+    Returns immediately with {status: "scheduled", tenant_id}.
+    """
+    # Resolve tenant from identity and Odoo mapping
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+    if tid is None:
+        raise HTTPException(status_code=400, detail="Unable to resolve tenant for current session")
+
+    try:
+        # Import runner lazily to avoid import-time overhead unless used
+        from scripts.run_nightly import run_tenant  # type: ignore
+
+        async def _run():
+            try:
+                await run_tenant(int(tid))
+            except Exception as exc:
+                logging.getLogger("nightly").exception("ad-hoc run failed tenant_id=%s: %s", tid, exc)
+
+        background.add_task(_run)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule failed: {e}")
+
+    return {"status": "scheduled", "tenant_id": tid}

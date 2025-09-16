@@ -235,9 +235,10 @@ async def main():
             finally:
                 conn.close()
 
-            # Threshold (optional) from env
+            # Threshold (optional) from env — align with PRD7 SCORE_MIN_EXPORT, fallback to LEAD_THRESHOLD
             try:
-                threshold = float(os.getenv("LEAD_THRESHOLD", "0.0"))
+                env_thr = os.getenv("SCORE_MIN_EXPORT", os.getenv("LEAD_THRESHOLD", "0.0"))
+                threshold = float(env_thr)
             except Exception:
                 threshold = 0.0
 

@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import os
+from collections import defaultdict
 from bs4 import BeautifulSoup
 
 DEFAULT_UA = "ICPFinder-Bot/1.0 (+https://nexiuslabs.com)"
@@ -91,6 +93,8 @@ TECH_PATTERNS = {
 
 
 async def _fetch(client: httpx.AsyncClient, url: str) -> Tuple[str, str]:
+    # Optional global per-domain limiter across concurrent tasks
+    await _maybe_wait_domain(url)
     r = await client.get(
         url,
         headers={"User-Agent": DEFAULT_UA, "Accept-Language": "en"},
@@ -99,6 +103,51 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> Tuple[str, str]:
     )
     r.raise_for_status()
     return url, r.text
+
+
+# ----------------------
+# Optional domain limiter
+# ----------------------
+
+class DomainLimiter:
+    def __init__(self, min_interval_s: float = 0.0):
+        self.min_interval = max(0.0, float(min_interval_s))
+        self._last: dict[str, float] = defaultdict(lambda: 0.0)
+        self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    async def wait(self, url: str):
+        if self.min_interval <= 1e-9:
+            return
+        host = urlparse(url).hostname or "_"
+        lock = self._locks[host]
+        async with lock:
+            now = time.time()
+            delta = now - self._last[host]
+            if delta < self.min_interval:
+                await asyncio.sleep(self.min_interval - delta)
+            self._last[host] = time.time()
+
+
+_limiter = None
+
+
+def _domain_limiter() -> DomainLimiter:
+    global _limiter
+    if _limiter is None:
+        try:
+            v = float(os.getenv("CRAWLER_DOMAIN_MIN_INTERVAL_S", "0.0") or "0.0")
+        except Exception:
+            v = 0.0
+        _limiter = DomainLimiter(v)
+    return _limiter
+
+
+async def _maybe_wait_domain(url: str):
+    try:
+        await _domain_limiter().wait(url)
+    except Exception:
+        # Never block crawl on limiter errors
+        return
 
 
 def _discover_links(html: str, base_url: str) -> List[str]:
@@ -298,11 +347,12 @@ async def crawl_site(url: str, max_pages: int = MAX_PAGES) -> Dict[str, Any]:
                     allowed.append(u)
             except Exception:
                 continue
-        # Respect basic rate limiting: fetch sequentially with a small delay
+        # Respect basic rate limiting between internal page fetches as a floor
         pages: List[Tuple[str, str]] = []
         for u in allowed:
             try:
-                await asyncio.sleep(0.4)
+                # keep a small intra-site delay even if global limiter is disabled
+                await asyncio.sleep(0.2)
                 pages.append(await _fetch(client, u))
             except Exception:
                 continue
