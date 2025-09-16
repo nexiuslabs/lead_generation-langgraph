@@ -192,6 +192,13 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
         ):
             try:
                 with conn.cursor() as cur:
+                    # Ensure tenant context is set for RLS-aware inserts
+                    try:
+                        tid_guc = _default_tenant_id()
+                        if tid_guc is not None:
+                            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid_guc),))
+                    except Exception:
+                        pass
                     # Ensure enrichment_runs table exists (idempotent create)
                     cur.execute(
                         """
@@ -201,9 +208,31 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
                         );
                         """
                     )
-                    cur.execute(
-                        "INSERT INTO enrichment_runs DEFAULT VALUES RETURNING run_id"
-                    )
+                    # Ensure tenant_id column exists if RLS/migrations are applied
+                    try:
+                        cur.execute("ALTER TABLE enrichment_runs ADD COLUMN IF NOT EXISTS tenant_id INT")
+                    except Exception:
+                        pass
+                    # Insert a run row; include tenant_id when column exists
+                    has_tenant_col = False
+                    try:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.columns WHERE table_name='enrichment_runs' AND column_name='tenant_id'"
+                        )
+                        has_tenant_col = cur.fetchone() is not None
+                    except Exception:
+                        has_tenant_col = False
+
+                    tid_val = _default_tenant_id()
+                    if has_tenant_col and tid_val is not None:
+                        cur.execute(
+                            "INSERT INTO enrichment_runs(tenant_id) VALUES (%s) RETURNING run_id",
+                            (tid_val,),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO enrichment_runs DEFAULT VALUES RETURNING run_id"
+                        )
                     rid = cur.fetchone()[0]
                     fields["run_id"] = rid
             except Exception:

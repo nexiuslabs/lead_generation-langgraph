@@ -1108,52 +1108,12 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
             except Exception:
                 last_ts = last_ts
 
-        # Backlog count (no RLS on this table)
-        backlog_pending = 0
-        try:
-            if tid is not None:
-                q = "SELECT COUNT(*) FROM enrichment_backlog WHERE tenant_id=$1 AND status='pending'"
-                backlog_pending = int(await conn.fetchval(q, int(tid)))
-        except Exception:
-            backlog_pending = 0
-
     out = {
         "tenant_id": tid,
         "total_scored": total_scored,
         "last_refreshed_at": (last_ts.isoformat() if isinstance(last_ts, datetime) else None),
-        "backlog_pending": backlog_pending,
     }
     return out
-
-
-@app.get("/backlog/count")
-async def backlog_count(claims: dict = Depends(require_optional_identity)):
-    """Return pending backlog count for the current tenant.
-
-    Response: { tenant_id: int|null, pending: int }
-    """
-    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
-    claim_tid = claims.get("tenant_id")
-    from app.odoo_connection_info import get_odoo_connection_info
-    # Resolve tenant via mapping (same logic used by export/shortlist/status)
-    try:
-        info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
-        tid = info.get("tenant_id")
-    except Exception:
-        tid = None
-
-    pending = 0
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        try:
-            # Enrichment backlog is tenant-partitioned; no RLS on this table
-            if tid is not None:
-                q = "SELECT COUNT(*) FROM enrichment_backlog WHERE tenant_id=$1 AND status='pending'"
-                pending = int(await conn.fetchval(q, int(tid)))
-        except Exception:
-            pending = 0
-
-    return {"tenant_id": tid, "pending": pending}
 
 
 @app.post("/scheduler/run_now")

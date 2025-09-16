@@ -32,7 +32,7 @@ def _int_env(name: str, default: int) -> int:
 
 TENANT_CONC = _int_env("SCHED_TENANT_CONCURRENCY", 3)
 COMPANY_CONC = _int_env("SCHED_COMPANY_CONCURRENCY", 8)
-DAILY_CAP = _int_env("SCHED_DAILY_CAP_PER_TENANT", _int_env("SHORTLIST_DAILY_CAP", 100))
+DAILY_CAP = _int_env("SCHED_DAILY_CAP_PER_TENANT", _int_env("SHORTLIST_DAILY_CAP", 10))
 BATCH_SIZE = _int_env("SCHED_COMPANY_BATCH_SIZE", 1)
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -59,59 +59,7 @@ def list_active_tenants() -> List[int]:
         return [int(r[0]) for r in cur.fetchall()]
 
 
-def ensure_backlog_table():
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS enrichment_backlog (
-                tenant_id INT NOT NULL,
-                company_id INT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (tenant_id, company_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_enrichment_backlog_tenant_status
-                ON enrichment_backlog(tenant_id, status, created_at);
-            """
-        )
-
-
-def fetch_backlog_company_ids(tenant_id: int, limit: int | None = None) -> List[int]:
-    ensure_backlog_table()
-    with get_conn() as conn, conn.cursor() as cur:
-        if limit and limit > 0:
-            cur.execute(
-                """
-                SELECT company_id
-                FROM enrichment_backlog
-                WHERE tenant_id=%s AND status='pending'
-                ORDER BY created_at ASC
-                LIMIT %s
-                """,
-                (tenant_id, limit),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT company_id
-                FROM enrichment_backlog
-                WHERE tenant_id=%s AND status='pending'
-                ORDER BY created_at ASC
-                """,
-                (tenant_id,),
-            )
-        return [int(r[0]) for r in cur.fetchall()]
-
-
-def clear_backlog_entries(tenant_id: int, company_ids: List[int]):
-    if not company_ids:
-        return
-    ensure_backlog_table()
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM enrichment_backlog WHERE tenant_id=%s AND company_id = ANY(%s)",
-            (tenant_id, company_ids),
-        )
+ 
 
 def select_target_set(candidates: List[int], limit: int) -> List[int]:
     if not candidates:
@@ -184,15 +132,6 @@ async def run_tenant(tenant_id: int):
         }
     )
     candidates = icp_state.get("candidate_ids", [])
-
-    # Prefer draining persistent backlog first for deterministic carryover
-    try:
-        backlog_ids = await asyncio.to_thread(fetch_backlog_company_ids, tenant_id, None)
-        if backlog_ids:
-            LOG.info("tenant=%s backlog pending=%d (draining first)", tenant_id, len(backlog_ids))
-            candidates = backlog_ids
-    except Exception as _e:
-        LOG.info("tenant=%s backlog check skipped: %s", tenant_id, _e)
 
     # Fallback: derive industry codes and select by industry_code if none
     if not candidates and icp_payload.get("industries"):
@@ -351,11 +290,6 @@ async def run_tenant(tenant_id: int):
             LOG.exception("tenant=%s batch=%d Odoo export step failed", tenant_id, batch_idx)
 
         processed += len(targets)
-        # Clear drained backlog entries if this batch came from backlog
-        try:
-            await asyncio.to_thread(clear_backlog_entries, tenant_id, targets)
-        except Exception:
-            pass
         processed_ids.update(targets)
         if not AUTO_CONTINUE:
             break
