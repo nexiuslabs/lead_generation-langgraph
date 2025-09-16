@@ -1133,11 +1133,18 @@ async def scheduler_run_now(background: BackgroundTasks, claims: dict = Depends(
 
     try:
         # Import runner lazily to avoid import-time overhead unless used
-        from scripts.run_nightly import run_tenant  # type: ignore
+        from scripts.run_nightly import run_tenant_partial  # type: ignore
 
         async def _run():
             try:
-                await run_tenant(int(tid))
+                import os
+                # Process up to 10 now; leave remainder for nightly scheduler
+                limit = 10
+                try:
+                    limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
+                except Exception:
+                    limit = 10
+                await run_tenant_partial(int(tid), max_now=limit)
             except Exception as exc:
                 logging.getLogger("nightly").exception("ad-hoc run failed tenant_id=%s: %s", tid, exc)
 

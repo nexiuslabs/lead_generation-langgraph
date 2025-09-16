@@ -1175,6 +1175,37 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     pool = await get_pg_pool()
 
+    # Limit immediate enrichment to a small batch (default 10) and defer the rest to nightly
+    try:
+        import os
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+
+    total_candidates = len(candidates)
+    deferred_count = 0
+    if total_candidates > enrich_now_limit:
+        # Ensure company rows exist for all candidates so nightly can pick them up later
+        ensured_ids: list[int] = []
+        for c in candidates:
+            try:
+                nm = c.get("name") if isinstance(c, dict) else None
+                if not nm:
+                    continue
+                cid = c.get("id") or await _ensure_company_row(pool, nm)
+                ensured_ids.append(int(cid))
+            except Exception:
+                # Best-effort; if ensure fails for some, still proceed with available ones
+                pass
+
+        # Choose the first N candidates to process now (preserve current order)
+        selected_ids = set(ensured_ids[:enrich_now_limit]) if ensured_ids else set()
+        if selected_ids:
+            candidates = [c for c in candidates if (c.get("id") in selected_ids) or (not c.get("id") and False)] or candidates[:enrich_now_limit]
+        else:
+            candidates = candidates[:enrich_now_limit]
+        deferred_count = max(0, total_candidates - len(candidates))
+
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
@@ -1193,9 +1224,13 @@ async def enrich_node(state: GraphState) -> GraphState:
     state["enrichment_completed"] = all_done
 
     if all_done:
+        # Compose completion message; mention deferred count when applicable
+        done_msg = f"Enrichment complete for {len(results)} companies."
+        if deferred_count > 0:
+            done_msg += f" The remaining {deferred_count} will be processed by the nightly scheduler."
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [AIMessage(content=f"Enrichment complete for {len(results)} companies.")],
+            [AIMessage(content=done_msg)],
         )
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:

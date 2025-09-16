@@ -16,6 +16,24 @@ logger = logging.getLogger(__name__)
 class LushaError(RuntimeError):
     pass
 
+def _sanitize_company_text(text: Optional[str]) -> Optional[str]:
+    """Sanitize company name text to Lusha-allowed characters.
+
+    Lusha error message: "Text can only contain alphanumeric characters, spaces,
+    and basic punctuation (.,&-_())".
+    We strip any other characters (e.g., '@', '/', '\\', quotes).
+    """
+    if text is None:
+        return None
+    try:
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,&-_()")
+        cleaned = "".join(ch if ch in allowed else " " for ch in str(text))
+        # Collapse repeated whitespace and trim
+        cleaned = " ".join(cleaned.split()).strip()
+        return cleaned or None
+    except Exception:
+        return text
+
 class AsyncLushaClient:
     BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")
 
@@ -77,7 +95,7 @@ class AsyncLushaClient:
             params["domain"] = domain
         if name:
             # API expects 'company' (not 'companyName')
-            params["company"] = name
+            params["company"] = _sanitize_company_text(name) or name
         if company_id:
             params["companyId"] = company_id
         data = await self._request("GET", "/v2/company", params=params)
@@ -93,7 +111,9 @@ class AsyncLushaClient:
         body: Dict[str, Any] = {}
         filters: Dict[str, Any] = {}
         if name:
-            filters["companyNames"] = [name]
+            s = _sanitize_company_text(name)
+            if s:
+                filters["companyNames"] = [s]
         if country:
             filters["locations"] = [{"country": country}]
         if domain:
@@ -145,10 +165,12 @@ class AsyncLushaClient:
             seen: set[str] = set()
             nv: List[str] = []
             for n in name_variants:
-                if n and n not in seen:
+                sn = _sanitize_company_text(n)
+                if sn and sn not in seen:
                     seen.add(n)
-                    nv.append(n)
-            companies_inc["names"] = nv
+                    nv.append(sn)
+            if nv:
+                companies_inc["names"] = nv
         # Execute
         data = await self._request("POST", "/prospecting/contact/search", json=body)
         # Persist requestId for enrich
@@ -234,17 +256,20 @@ class AsyncLushaClient:
                 logger.info("Lusha companies/names failed for %r: %s", text, e)
             return None
 
-        # Try original
-        d = await _from_filters(company_name)
+        # Try sanitized original
+        sanitized = _sanitize_company_text(company_name) or company_name
+        d = await _from_filters(sanitized)
         if d:
             return d
         # Try dotted/undotted variants
         if "Pte Ltd" in company_name:
-            d = await _from_filters(company_name.replace("Pte Ltd", "Pte. Ltd"))
+            v = _sanitize_company_text(company_name.replace("Pte Ltd", "Pte. Ltd")) or company_name.replace("Pte Ltd", "Pte. Ltd")
+            d = await _from_filters(v)
             if d:
                 return d
         if "Pte. Ltd" in company_name:
-            d = await _from_filters(company_name.replace("Pte. Ltd", "Pte Ltd"))
+            v = _sanitize_company_text(company_name.replace("Pte. Ltd", "Pte Ltd")) or company_name.replace("Pte. Ltd", "Pte Ltd")
+            d = await _from_filters(v)
             if d:
                 return d
         # Try normalized (strip common suffixes)
@@ -254,7 +279,7 @@ class AsyncLushaClient:
             if ul.endswith(sfx):
                 norm = ul[: -len(sfx)].strip()
                 break
-        norm_t = norm.title()
+        norm_t = (_sanitize_company_text(norm.title()) or norm.title())
         if norm_t and norm_t != company_name:
             d = await _from_filters(norm_t)
             if d:
@@ -368,7 +393,7 @@ class LushaClient:
             params["domain"] = domain
         if name:
             # API expects 'company' (not 'companyName')
-            params["company"] = name
+            params["company"] = _sanitize_company_text(name) or name
         if company_id:
             params["companyId"] = company_id
         data = self._get("/v2/company", params=params)
@@ -384,7 +409,9 @@ class LushaClient:
         body: Dict[str, Any] = {}
         filters: Dict[str, Any] = {}
         if name:
-            filters["companyNames"] = [name]
+            s = _sanitize_company_text(name)
+            if s:
+                filters["companyNames"] = [s]
         if country:
             filters["locations"] = [{"country": country}]
         if domain:
@@ -436,10 +463,12 @@ class LushaClient:
             seen: set[str] = set()
             nv: List[str] = []
             for n in name_variants:
-                if n and n not in seen:
+                sn = _sanitize_company_text(n)
+                if sn and sn not in seen:
                     seen.add(n)
-                    nv.append(n)
-            companies_inc["names"] = nv
+                    nv.append(sn)
+            if nv:
+                companies_inc["names"] = nv
         # Execute
         try:
             logger.info(
@@ -588,17 +617,20 @@ class LushaClient:
                 logger.info("Lusha companies/names failed for %r: %s", text, e)
             return None
 
-        # Try original
-        d = _from_filters(company_name)
+        # Try sanitized original
+        sanitized = _sanitize_company_text(company_name) or company_name
+        d = _from_filters(sanitized)
         if d:
             return d
         # Try dotted/undotted variants
         if "Pte Ltd" in company_name:
-            d = _from_filters(company_name.replace("Pte Ltd", "Pte. Ltd"))
+            v = _sanitize_company_text(company_name.replace("Pte Ltd", "Pte. Ltd")) or company_name.replace("Pte Ltd", "Pte. Ltd")
+            d = _from_filters(v)
             if d:
                 return d
         if "Pte. Ltd" in company_name:
-            d = _from_filters(company_name.replace("Pte. Ltd", "Pte Ltd"))
+            v = _sanitize_company_text(company_name.replace("Pte. Ltd", "Pte Ltd")) or company_name.replace("Pte. Ltd", "Pte Ltd")
+            d = _from_filters(v)
             if d:
                 return d
         # Try normalized (strip common suffixes)
@@ -608,7 +640,7 @@ class LushaClient:
             if ul.endswith(sfx):
                 norm = ul[: -len(sfx)].strip()
                 break
-        norm_t = norm.title()
+        norm_t = (_sanitize_company_text(norm.title()) or norm.title())
         if norm_t and norm_t != company_name:
             d = _from_filters(norm_t)
             if d:

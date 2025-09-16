@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 
-def main():
+async def main_async():
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from apscheduler.triggers.cron import CronTrigger
@@ -32,27 +32,31 @@ def main():
             logging.exception("nightly run failed: %s", exc)
 
     sched = AsyncIOScheduler(timezone=tz)
-    job = sched.add_job(
+    cron_job = sched.add_job(
         job,
         CronTrigger(minute=minute, hour=hour, day=dom, month=month, day_of_week=dow),
     )
-    # Log schedule details and next run time
+    # Start the scheduler inside a running event loop
+    sched.start()
     try:
+        # After start(), next_run_time is available
         logging.info(
             "scheduler: cron=%s %s/%s next_run=%s",
             cron,
             tz.key if hasattr(tz, "key") else str(tz),
             tz,
-            getattr(job, "next_run_time", None),
+            getattr(cron_job, "next_run_time", None),
         )
     except Exception:
         pass
-    sched.start()
-    try:
-        asyncio.get_event_loop().run_forever()
-    except KeyboardInterrupt:
-        pass
+
+    # Keep the loop alive forever
+    stop = asyncio.Event()
+    await stop.wait()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
