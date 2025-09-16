@@ -75,6 +75,15 @@ try:
 except Exception as _e:
     logger.warning("Auth routes not mounted: %s", _e)
 
+# Optional: mount split-origin graph proxy if configured
+try:
+    if (os.getenv("ENABLE_GRAPH_PROXY") or "").strip().lower() in ("1", "true", "yes", "on"):
+        from app.graph_proxy import router as graph_router
+        app.include_router(graph_router)
+        logger.info("/graph proxy routes enabled")
+except Exception as _e:
+    logger.warning("Graph proxy not mounted: %s", _e)
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"

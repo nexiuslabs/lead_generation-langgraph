@@ -521,7 +521,10 @@ async def handle_first_login(email: str, tenant_id_claim: Optional[int], user_pa
                     if db_name:
                         # Log in with tenant admin (same email) and configure provider
                         admin_login = email
-                        admin_password = os.getenv('ODOO_TENANT_ADMIN_PASSWORD_FALLBACK', '')
+                        # Prefer the user-supplied password (from registration flow) to align with
+                        # the credentials used when creating/administering the tenant Odoo DB.
+                        # Fallback to env-based tenant admin password for backwards compatibility.
+                        admin_password = (user_password or os.getenv('ODOO_TENANT_ADMIN_PASSWORD_FALLBACK', ''))
                         if admin_password:
                             _odoo_configure_oidc(server, db_name, admin_login, admin_password, issuer, cid, secret)
             except Exception as e:

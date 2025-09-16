@@ -4,6 +4,9 @@
   "graphs": {
     "agent": "./app/lg_entry.py:make_graph"
   },
+  "auth": {
+    "path": "./app/lg_auth.py:auth"
+  },
   "http": {
     "app": "./app/main.py:app"
   }

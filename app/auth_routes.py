@@ -141,6 +141,24 @@ async def logout(response: Response):
     return Response(status_code=204)
 
 
+@router.post("/exchange")
+async def exchange(body: dict, response: Response):
+    """Exchange an ID/access token (obtained client-side via SSO) for server cookies.
+
+    Body: { id_token?: string, access_token?: string, refresh_token?: string }
+    Verifies the token and sets `nx_access` / `nx_refresh` cookies to enable cookie-mode requests.
+    """
+    id_token = (body or {}).get("id_token")
+    access_token = (body or {}).get("access_token")
+    refresh = (body or {}).get("refresh_token")
+    token = id_token or access_token
+    if not token:
+        raise HTTPException(status_code=400, detail="id_token or access_token required")
+    claims = verify_jwt(token)
+    _set_session(response, token, refresh)
+    return {"ok": True, "email": claims.get("email"), "tenant_id": claims.get("tenant_id")}
+
+
 # --- Optional: Admin-backed Registration via Keycloak Admin API ---
 def _issuer_parts():
     issuer = (os.getenv("NEXIUS_ISSUER") or "").rstrip("/")
