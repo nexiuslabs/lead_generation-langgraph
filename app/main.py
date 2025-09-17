@@ -1153,3 +1153,40 @@ async def scheduler_run_now(background: BackgroundTasks, claims: dict = Depends(
         raise HTTPException(status_code=500, detail=f"schedule failed: {e}")
 
     return {"status": "scheduled", "tenant_id": tid}
+
+
+# --- Admin: kickoff full nightly run (optionally for a single tenant) ---
+@app.post("/admin/runs/nightly")
+async def admin_run_nightly(background: BackgroundTasks, request: Request, claims: dict = Depends(require_auth)):
+    roles = claims.get("roles", []) or []
+    if "admin" not in roles:
+        raise HTTPException(status_code=403, detail="admin role required")
+    # Optional tenant_id query param
+    try:
+        tenant_id = request.query_params.get("tenant_id")
+        tenant_id = int(tenant_id) if tenant_id is not None else None
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid tenant_id")
+
+    try:
+        from scripts.run_nightly import run_all, run_tenant  # type: ignore
+
+        async def _run_all():
+            try:
+                await run_all()
+            except Exception as exc:
+                logging.getLogger("nightly").exception("admin run_all failed: %s", exc)
+
+        async def _run_one(tid: int):
+            try:
+                await run_tenant(tid)
+            except Exception as exc:
+                logging.getLogger("nightly").exception("admin run_tenant failed tenant_id=%s: %s", tid, exc)
+
+        if tenant_id is None:
+            background.add_task(_run_all)
+        else:
+            background.add_task(_run_one, tenant_id)
+        return {"status": "scheduled", "tenant_id": tenant_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule failed: {e}")

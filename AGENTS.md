@@ -38,3 +38,16 @@ Troubleshooting
 - Postgres connect errors: verify POSTGRES_DSN and DB reachable.
 - Tavily/Lusha/ZeroBounce: missing keys → fallbacks/pathways skip gracefully; check settings flags.
 
+Scheduler & Cron
+- Use the async scheduler entry: `python lead_generation-main/scripts/run_scheduler.py`
+- Configure start time via `SCHED_START_CRON` (default `0 1 * * *` for 01:00 SGT)
+- Limits & caps:
+  - `SCHED_DAILY_CAP_PER_TENANT` (default 20 in .env)
+  - `SCHED_COMPANY_BATCH_SIZE` (per-batch company count; default 1)
+  - Vendor caps (coarse): `TAVILY_MAX_QUERIES`, `LUSHA_MAX_CONTACT_LOOKUPS`
+  - ZeroBounce: `ZEROBOUNCE_MAX_VERIFICATIONS`, `ZEROBOUNCE_BATCH_SIZE`
+
+Admin Kickoff Endpoint
+- POST `/admin/runs/nightly` (requires admin role)
+  - Run all tenants: `curl -X POST http://localhost:2024/admin/runs/nightly -b 'nx_access=...'`
+  - Run a single tenant: `curl -X POST 'http://localhost:2024/admin/runs/nightly?tenant_id=123' -b 'nx_access=...'`

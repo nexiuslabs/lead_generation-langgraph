@@ -23,6 +23,8 @@ from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 from tavily import TavilyClient
+from src.obs import bump_vendor as _obs_bump
+from src.retry import with_retry, RetryableError, CircuitBreaker
 
 from src.crawler import crawl_site
 from src.lusha_client import AsyncLushaClient, LushaError
@@ -69,6 +71,58 @@ else:
     tavily_client = None  # type: ignore[assignment]
     tavily_crawl = None  # type: ignore[assignment]
     tavily_extract = None  # type: ignore[assignment]
+
+# ---- Run context and vendor counters/caps ----
+_RUN_CTX: dict[str, int | None] = {"run_id": None, "tenant_id": None}
+_VENDOR_COUNTERS: dict[str, int] = {
+    "tavily_queries": 0,
+    "tavily_crawl_calls": 0,
+    "tavily_extract_calls": 0,
+    "lusha_lookups": 0,
+    "apify_linkedin_calls": 0,
+}
+_VENDOR_CAPS: dict[str, int | None] = {"tavily_units": None, "contact_lookups": None}
+_CB = CircuitBreaker()
+
+def set_run_context(run_id: int, tenant_id: int):
+    _RUN_CTX["run_id"] = int(run_id)
+    _RUN_CTX["tenant_id"] = int(tenant_id)
+
+def set_vendor_caps(tavily_units: int | None = None, contact_lookups: int | None = None):
+    _VENDOR_CAPS["tavily_units"] = tavily_units
+    _VENDOR_CAPS["contact_lookups"] = contact_lookups
+
+def get_vendor_counters() -> dict[str, int]:
+    return dict(_VENDOR_COUNTERS)
+
+def reset_vendor_counters():
+    for k in _VENDOR_COUNTERS.keys():
+        _VENDOR_COUNTERS[k] = 0
+
+def _units_used(key: str) -> int:
+    if key == "tavily_units":
+        # Tightened definition: treat Tavily units as (search queries + extract calls).
+        # Crawl discovery is not charged as an extra unit here since extract calls
+        # usually dominate cost. Adjust if your billing model differs.
+        return _VENDOR_COUNTERS["tavily_queries"] + _VENDOR_COUNTERS["tavily_extract_calls"]
+    if key == "contact_lookups":
+        return _VENDOR_COUNTERS["lusha_lookups"] + _VENDOR_COUNTERS["apify_linkedin_calls"]
+    return 0
+
+def _dec_cap(key: str, need: int = 1) -> bool:
+    cap = _VENDOR_CAPS.get(key)
+    if cap is None:
+        return True
+    return (_units_used(key) + need) <= cap
+
+def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0):
+    rid = _RUN_CTX.get("run_id")
+    tid = _RUN_CTX.get("tenant_id")
+    if rid and tid:
+        try:
+            _obs_bump(int(rid), int(tid), vendor, calls=calls, errors=errors)
+        except Exception:
+            pass
     logger.warning(
         "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
     )
@@ -1003,17 +1057,31 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
             logger.info("   ↳ No domain via search; trying Lusha fallback…")
-            async with AsyncLushaClient() as lc:
-                lusha_domain = await lc.find_company_domain(name)
-                if lusha_domain:
-                    normalized = (
-                        lusha_domain
-                        if lusha_domain.startswith("http")
-                        else f"https://{lusha_domain}"
-                    )
-                    domains = [normalized]
-                    state["lusha_used"] = True
-                    logger.info(f"   ↳ Lusha provided domain: {normalized}")
+            tid = int(_RUN_CTX.get("tenant_id") or 0)
+            lusha_domain = None
+            if not (tid and not _CB.allow(tid, "lusha")):
+                async with AsyncLushaClient() as lc:
+                    async def _call():
+                        return await lc.find_company_domain(name)
+                    try:
+                        lusha_domain = await with_retry(_call, retry_on=(Exception,))
+                        _VENDOR_COUNTERS["lusha_lookups"] += 1
+                        _obs_vendor("lusha", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "lusha")
+                    except Exception:
+                        if tid:
+                            _CB.on_error(tid, "lusha")
+                        lusha_domain = None
+            if lusha_domain:
+                normalized = (
+                    lusha_domain
+                    if lusha_domain.startswith("http")
+                    else f"https://{lusha_domain}"
+                )
+                domains = [normalized]
+                state["lusha_used"] = True
+                logger.info(f"   ↳ Lusha provided domain: {normalized}")
         except Exception as e:
             logger.warning("   ↳ Lusha domain fallback failed", exc_info=True)
     if not domains:
@@ -1038,10 +1106,22 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
     filtered_urls: List[str] = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
     if not filtered_urls and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
-            async with AsyncLushaClient() as lc:
-                lusha_domain = await lc.find_company_domain(
-                    state.get("company_name") or ""
-                )
+            tid = int(_RUN_CTX.get("tenant_id") or 0)
+            lusha_domain = None
+            if not (tid and not _CB.allow(tid, "lusha")):
+                async with AsyncLushaClient() as lc:
+                    async def _call():
+                        return await lc.find_company_domain(state.get("company_name") or "")
+                    try:
+                        lusha_domain = await with_retry(_call, retry_on=(Exception,))
+                        _VENDOR_COUNTERS["lusha_lookups"] += 1
+                        _obs_vendor("lusha", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "lusha")
+                    except Exception:
+                        if tid:
+                            _CB.on_error(tid, "lusha")
+                        lusha_domain = None
             if lusha_domain:
                 candidate_home = (
                     lusha_domain
@@ -1092,7 +1172,7 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                 for _p in ("about", "aboutus"):
                     page_urls.append(f"{_root}/{_p}")
 
-        if tavily_crawl is not None:
+        if tavily_crawl is not None and _dec_cap("tavily_units", 1):
             for root in roots[:3]:
                 try:
                     crawl_input = {
@@ -1103,6 +1183,8 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         "enable_web_search": False,
                     }
                     crawl_result = tavily_crawl.run(crawl_input)
+                    _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
+                    _obs_vendor("tavily", calls=1)
                     raw_urls = (
                         crawl_result.get("results") or crawl_result.get("urls") or []
                     )
@@ -1424,7 +1506,7 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
             or missing_names
             or missing_founder
         )
-        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger:
+        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger and _dec_cap("contact_lookups", 1):
             website_hint = data.get("website_domain") or state.get("home") or ""
             try:
                 if website_hint.startswith("http"):
@@ -1434,22 +1516,48 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
             except Exception:
                 company_domain = None
             lusha_contacts: List[Dict[str, Any]] = []
-            async with AsyncLushaClient() as lc:
-                lusha_contacts = await lc.search_and_enrich_contacts(
-                    company_name=state.get("company_name") or "",
-                    company_domain=company_domain,
-                    country=data.get("hq_country"),
-                    titles=LUSHA_PREFERRED_TITLES,
-                    limit=15,
-                )
-                if not lusha_contacts:
-                    lusha_contacts = await lc.search_and_enrich_contacts(
-                        company_name=state.get("company_name") or "",
-                        company_domain=company_domain,
-                        country=data.get("hq_country"),
-                        titles=None,
-                        limit=15,
-                    )
+            tid = int(_RUN_CTX.get("tenant_id") or 0)
+            if tid and not _CB.allow(tid, "lusha"):
+                lusha_contacts = []
+            else:
+                async with AsyncLushaClient() as lc:
+                    async def _call1():
+                        return await lc.search_and_enrich_contacts(
+                            company_name=state.get("company_name") or "",
+                            company_domain=company_domain,
+                            country=data.get("hq_country"),
+                            titles=LUSHA_PREFERRED_TITLES,
+                            limit=15,
+                        )
+                    try:
+                        lusha_contacts = await with_retry(_call1, retry_on=(Exception,))
+                        _VENDOR_COUNTERS["lusha_lookups"] += 1
+                        _obs_vendor("lusha", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "lusha")
+                    except Exception:
+                        if tid:
+                            _CB.on_error(tid, "lusha")
+                        lusha_contacts = []
+                    if not lusha_contacts:
+                        async def _call2():
+                            return await lc.search_and_enrich_contacts(
+                                company_name=state.get("company_name") or "",
+                                company_domain=company_domain,
+                                country=data.get("hq_country"),
+                                titles=None,
+                                limit=15,
+                            )
+                        try:
+                            lusha_contacts = await with_retry(_call2, retry_on=(Exception,))
+                            _VENDOR_COUNTERS["lusha_lookups"] += 1
+                            _obs_vendor("lusha", calls=1)
+                            if tid:
+                                _CB.on_success(tid, "lusha")
+                        except Exception:
+                            if tid:
+                                _CB.on_error(tid, "lusha")
+                            lusha_contacts = []
             added_emails: List[str] = []
             added_phones: List[str] = []
             for c in lusha_contacts or []:
@@ -1653,8 +1761,12 @@ def find_domain(company_name: str) -> list[str]:
         ]
         response = None
         for q in queries:
+            if not _dec_cap("tavily_units", 1):
+                break
             try:
                 response = tavily_client.search(q)
+                _VENDOR_COUNTERS["tavily_queries"] += 1
+                _obs_vendor("tavily", calls=1)
             except Exception:
                 response = None
             if isinstance(response, dict) and response.get("results"):
@@ -1838,8 +1950,13 @@ def extract_website_data(url: str) -> dict:
             "crawl_depth": 2,
             "enable_web_search": False,
         }
-        crawl_result = tavily_crawl.run(crawl_input)
-        raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+        if tavily_crawl is not None and _dec_cap("tavily_units", 1):
+            crawl_result = tavily_crawl.run(crawl_input)
+            _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
+            _obs_vendor("tavily", calls=1)
+            raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+        else:
+            raw_urls = []
     except Exception as exc:
         print(f"       ↳ Crawl error: {exc}")
         raw_urls = []
@@ -1869,7 +1986,31 @@ def extract_website_data(url: str) -> dict:
             "instructions": "Retrieve the main textual content from this page.",
         }
         try:
-            raw_data = tavily_extract.run(payload)
+            if tavily_extract is not None and _dec_cap("tavily_units", 1):
+                tid = int(_RUN_CTX.get("tenant_id") or 0)
+                if tid and not _CB.allow(tid, "tavily"):
+                    raise RuntimeError("tavily_circuit_open")
+                import time as _t, random as _rnd
+                attempts = 0
+                raw_data = None
+                while attempts < 3:
+                    try:
+                        raw_data = tavily_extract.run(payload)
+                        _VENDOR_COUNTERS["tavily_extract_calls"] += 1
+                        _obs_vendor("tavily", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "tavily")
+                        break
+                    except Exception:
+                        attempts += 1
+                        if tid:
+                            _CB.on_error(tid, "tavily")
+                        if attempts >= 3:
+                            raise
+                        delay = 0.25 * (2 ** (attempts - 1)) * (0.8 + 0.4 * _rnd.random())
+                        _t.sleep(delay)
+            else:
+                raise RuntimeError("tavily_units_cap_reached")
         # print("          ↳ Tavily raw_data:", raw_data)
         except Exception as exc:
             print(f"          ↳ TavilyExtract error: {exc}")

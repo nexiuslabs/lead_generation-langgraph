@@ -195,6 +195,20 @@ Logs & Output
 - Candidate IDs, enrichment steps, and lead scores are printed to console
 - Use `output_candidate_records()` for quick JSON snapshots of `companies`
 
+## Scheduler & Cron
+- Start the async scheduler: `python lead_generation-main/scripts/run_scheduler.py`
+- Control start time via `SCHED_START_CRON` (default `0 1 * * *` for 01:00 SGT)
+- Limits & caps:
+  - `SCHED_DAILY_CAP_PER_TENANT` (default 20)
+  - `SCHED_COMPANY_BATCH_SIZE` (per-batch company count)
+  - Tavily cap (coarse): `TAVILY_MAX_QUERIES` (units ≈ search + crawl + extract calls)
+  - Contacts cap (coarse): `LUSHA_MAX_CONTACT_LOOKUPS`
+  - ZeroBounce caps: `ZEROBOUNCE_MAX_VERIFICATIONS`, `ZEROBOUNCE_BATCH_SIZE`
+- Admin kickoff HTTP:
+  - Run all tenants: `POST /admin/runs/nightly`
+  - One tenant: `POST /admin/runs/nightly?tenant_id=<id>`
+  - Requires admin role; cookie-based auth (`nx_access`)
+
 ## Security & Secrets
 - `.gitignore` excludes `.env` and secrets. Never commit keys.
 - If a secret is accidentally committed, rewrite history (e.g., `git filter-repo --invert-paths --path src/.env`) and rotate keys.
