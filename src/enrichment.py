@@ -115,7 +115,14 @@ def _dec_cap(key: str, need: int = 1) -> bool:
         return True
     return (_units_used(key) + need) <= cap
 
+_warned_no_tavily = False
+
 def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0):
+    """Record vendor usage and emit relevant one-time warnings.
+
+    Only warn about missing Tavily key when actually calling Tavily and key is not set,
+    and do so at most once per process to avoid log spam.
+    """
     rid = _RUN_CTX.get("run_id")
     tid = _RUN_CTX.get("tenant_id")
     if rid and tid:
@@ -123,9 +130,12 @@ def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0):
             _obs_bump(int(rid), int(tid), vendor, calls=calls, errors=errors)
         except Exception:
             pass
-    logger.warning(
-        "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
-    )
+    global _warned_no_tavily
+    if (vendor.startswith("tavily")) and not TAVILY_API_KEY and not _warned_no_tavily:
+        logger.warning(
+            "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
+        )
+        _warned_no_tavily = True
 
 # Initialize LangChain LLM for AI extraction
 # Use configured model; some models (e.g., gpt-5) do not accept an explicit

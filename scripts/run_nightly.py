@@ -5,6 +5,8 @@ import logging
 from typing import List, Optional, Dict, Any
 
 from src.icp import icp_refresh_agent, normalize_agent
+# Ensure env is loaded (src.settings loads .env in multiple locations)
+from src import settings as _settings  # noqa: F401
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
 from src.database import get_conn
@@ -78,7 +80,7 @@ def _load_icp_payload_from_db(tenant_id: int, rule_name: Optional[str]) -> Optio
         with get_conn() as conn, conn.cursor() as cur:
             # Ensure tenant RLS context (best-effort)
             try:
-                cur.execute("SELECT set_config('request.tenant_id', %s, true)", (tenant_id,))
+                cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tenant_id),))
             except Exception:
                 pass
             if rule_name:
@@ -87,7 +89,7 @@ def _load_icp_payload_from_db(tenant_id: int, rule_name: Optional[str]) -> Optio
                         """
                         SELECT payload
                         FROM icp_rules
-                        WHERE tenant_id=%s AND name=%s
+                        WHERE tenant_id=%s AND LOWER(name)=LOWER(%s)
                         ORDER BY created_at DESC
                         LIMIT 1
                         """,
@@ -158,12 +160,31 @@ def select_target_set(candidates: List[int], limit: int) -> List[int]:
 
 
 async def enrich_many(company_ids: List[int]):
+    """Enrich a list of company_ids, passing actual company names to avoid vendor 400s.
+
+    Falls back to empty string if name is missing (should be rare after normalization).
+    """
     sem = asyncio.Semaphore(COMPANY_CONC)
 
+    # Prefetch names for the batch
+    names: dict[int, str] = {}
+    try:
+        if company_ids:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT company_id, name FROM companies WHERE company_id = ANY(%s)",
+                    (company_ids,),
+                )
+                for cid, nm in cur.fetchall():
+                    names[int(cid)] = (nm or "").strip() if nm else ""
+    except Exception:
+        pass
+
     async def _one(cid: int):
+        cname = names.get(cid, "")
         async with sem:
             try:
-                await enrich_company_with_tavily(cid, None)
+                await enrich_company_with_tavily(cid, cname)
             except Exception as e:
                 LOG.warning("enrich failed company_id=%s err=%s", cid, e)
 
@@ -194,29 +215,21 @@ async def run_tenant(tenant_id: int):
     except Exception as _e:
         LOG.info("tenant=%s normalization skipped: %s", tenant_id, _e)
 
-    # Build ICP payload from env
-    def _payload_from_env() -> dict:
-        inds_env = (os.getenv("ICP_INDUSTRIES", "") or "").strip()
-        industries = [s.strip() for s in inds_env.split(",") if s.strip()] or ["Technology"]
-        def _int(name: str, default: int) -> int:
-            try:
-                return int(os.getenv(name, str(default)))
-            except Exception:
-                return default
-        return {
-            "industries": industries,
-            "employee_range": {"min": _int("ICP_EMPLOYEES_MIN", 2), "max": _int("ICP_EMPLOYEES_MAX", 100)},
-            "incorporation_year": {"min": _int("ICP_YEAR_MIN", 2000), "max": _int("ICP_YEAR_MAX", 2025)},
-        }
-
-    # Prefer DB-stored ICP per tenant; fallback to env payload
+    # Load ICP strictly from DB (icp_rules). If none, skip this tenant gracefully.
     rule_name = os.getenv("ICP_RULE_NAME", "default")
-    icp_payload = _load_icp_payload_from_db(tenant_id, rule_name) or _payload_from_env()
+    icp_payload = _load_icp_payload_from_db(tenant_id, rule_name)
+    if not icp_payload:
+        LOG.info(
+            "tenant=%s no ICP found in icp_rules (rule_name=%s); skipping tenant run",
+            tenant_id,
+            rule_name,
+        )
+        obs.finalize_run(run_id, status="skipped")
+        return
     try:
-        src = "db(icp_rules)" if icp_payload is not None and _load_icp_payload_from_db(tenant_id, rule_name) else "env"
-        LOG.info("tenant=%s using ICP source=%s payload=%s", tenant_id, src, icp_payload)
+        LOG.info("tenant=%s using ICP source=db payload=%s", tenant_id, icp_payload)
     except Exception:
-        LOG.info("tenant=%s using ICP payload (source unknown)", tenant_id)
+        LOG.info("tenant=%s using ICP from db (payload logged separately)", tenant_id)
 
     # 1) Refresh ICP candidates via graph (or resume from previous manifest)
     resume_run_id_env = os.getenv("RESUME_FROM_RUN_ID")
@@ -245,7 +258,7 @@ async def run_tenant(tenant_id: int):
             )
         candidates = icp_state.get("candidate_ids", [])
 
-    # Fallback: derive industry codes and select by industry_code if none
+    # Fallback: derive industry codes using DB-provided industries only
     if not candidates and icp_payload.get("industries"):
         try:
             inds_norm = sorted({(s or "").strip().lower() for s in icp_payload["industries"] if isinstance(s, str) and s.strip()})
@@ -523,29 +536,20 @@ async def run_tenant_partial(tenant_id: int, max_now: int = 10) -> int:
     except Exception as _e:
         LOG.info("tenant=%s normalization skipped: %s", tenant_id, _e)
 
-    # Build ICP payload same as run_tenant
-    def _payload_from_env() -> dict:
-        inds_env = (os.getenv("ICP_INDUSTRIES", "") or "").strip()
-        industries = [s.strip() for s in inds_env.split(",") if s.strip()] or ["Technology"]
-        def _int(name: str, default: int) -> int:
-            try:
-                return int(os.getenv(name, str(default)))
-            except Exception:
-                return default
-        return {
-            "industries": industries,
-            "employee_range": {"min": _int("ICP_EMPLOYEES_MIN", 2), "max": _int("ICP_EMPLOYEES_MAX", 100)},
-            "incorporation_year": {"min": _int("ICP_YEAR_MIN", 2000), "max": _int("ICP_YEAR_MAX", 2025)},
-        }
-
-    # Prefer DB-stored ICP per tenant; fallback to env payload
+    # Load ICP strictly from DB; skip if not present
     rule_name = os.getenv("ICP_RULE_NAME", "default")
-    icp_payload = _load_icp_payload_from_db(tenant_id, rule_name) or _payload_from_env()
+    icp_payload = _load_icp_payload_from_db(tenant_id, rule_name)
+    if not icp_payload:
+        LOG.info(
+            "tenant=%s partial-run no ICP in icp_rules (rule_name=%s); skipping",
+            tenant_id,
+            rule_name,
+        )
+        return 0
     try:
-        src = "db(icp_rules)" if icp_payload is not None and _load_icp_payload_from_db(tenant_id, rule_name) else "env"
-        LOG.info("tenant=%s partial-run ICP source=%s payload=%s", tenant_id, src, icp_payload)
+        LOG.info("tenant=%s partial-run ICP source=db payload=%s", tenant_id, icp_payload)
     except Exception:
-        LOG.info("tenant=%s partial-run using ICP payload (source unknown)", tenant_id)
+        LOG.info("tenant=%s partial-run using ICP from db (payload logged separately)", tenant_id)
 
     # Refresh ICP candidates
     icp_state = await icp_refresh_agent.ainvoke(
