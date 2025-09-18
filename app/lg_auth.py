@@ -11,9 +11,25 @@ Behavior
 from __future__ import annotations
 
 import os
+from fastapi import HTTPException
 from starlette.authentication import AuthenticationError
 from starlette.requests import Request
 from langgraph_sdk import Auth
+
+from app.auth import verify_jwt
+
+
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allow_anon_identity() -> bool:
+    if _is_truthy(os.getenv("LANGGRAPH_ALLOW_ANON")):
+        return True
+    variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower()
+    return variant == "local_dev"
 
 
 auth = Auth()
@@ -27,15 +43,21 @@ async def authenticate(request: Request, authorization: str | None = None):
         token = authorization[7:].strip()
     if not token:
         token = request.cookies.get(cookie_name)
+    allow_anon = _allow_anon_identity()
     if not token:
-        # Allow anonymous identity in local dev when enabled or when the runtime variant is local_dev
-        allow = (os.getenv("LANGGRAPH_ALLOW_ANON", "false") or "false").strip().lower() in ("1", "true", "yes", "on")
-        variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower()
-        if allow or variant == "local_dev":
+        if allow_anon:
             return "anon"
         raise AuthenticationError("Missing credentials")
-    # Minimal identity; attach tenant hint when provided
-    tid = request.headers.get("x-tenant-id")
-    user_id = f"tenant:{tid}" if tid else "user"
-    # You can also return (permissions, user) where permissions is a list[str]
-    return user_id
+    try:
+        claims = verify_jwt(token)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        raise AuthenticationError(detail)
+    tenant_id = claims.get("tenant_id")
+    if tenant_id:
+        request.state.tenant_id = tenant_id
+        request.state.roles = claims.get("roles", [])
+        return f"tenant:{tenant_id}"
+    if allow_anon:
+        return "anon"
+    raise AuthenticationError("Missing tenant_id claim")
