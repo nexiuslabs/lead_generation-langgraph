@@ -120,3 +120,40 @@ PERSIST_CRAWL_CORPUS = os.getenv("PERSIST_CRAWL_CORPUS", "false").lower() in (
     "yes",
     "on",
 )
+
+# --- Feature 11: Retry/Breaker/Flags -----------------------------------------
+# Retry/backoff policy (defaults align with DevPlan 11)
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3") or 3)
+RETRY_BASE_DELAY_MS = int(os.getenv("RETRY_BASE_DELAY_MS", "250") or 250)
+RETRY_MAX_DELAY_MS = int(os.getenv("RETRY_MAX_DELAY_MS", "4000") or 4000)
+
+# Circuit breaker config (per-tenant, per-vendor)
+CB_ERROR_THRESHOLD = int(os.getenv("CB_ERROR_THRESHOLD", "3") or 3)
+CB_COOL_OFF_S = int(os.getenv("CB_COOL_OFF_S", "300") or 300)
+CB_GLOBAL_EXEMPT_VENDORS = [
+    v.strip().lower()
+    for v in (os.getenv("CB_GLOBAL_EXEMPT_VENDORS", "") or "").split(",")
+    if v.strip()
+]
+
+# Fallback toggles
+ENABLE_TAVILY_FALLBACK = os.getenv("ENABLE_TAVILY_FALLBACK", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ENABLE_APIFY_LINKEDIN = os.getenv("ENABLE_APIFY_LINKEDIN", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Odoo export defaults behavior
+ODOO_EXPORT_SET_DEFAULTS = os.getenv("ODOO_EXPORT_SET_DEFAULTS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

@@ -441,47 +441,62 @@ async def run_tenant(tenant_id: int):
 
                 with obs.stage_timer(run_id, tenant_id, "export_odoo", total_inc=len(ids)):
                     store = OdooStore(tenant_id=tenant_id)
-                    for cid in ids:
-                        comp = comps.get(cid)
-                        if not comp:
-                            continue
-                        email = emails.get(cid)
-                        s = scores.get(cid) or {}
+                    skip_export = False
+                    # Best-effort connectivity probe; if unreachable, disable export for this batch
+                    try:
+                        await store.connectivity_smoke_test()
+                    except Exception:
                         try:
-                            odoo_id = await store.upsert_company(
-                                comp.get("name"),
-                                comp.get("uen"),
-                                industry_norm=comp.get("industry_norm"),
-                                employees_est=comp.get("employees_est"),
-                                revenue_bucket=comp.get("revenue_bucket"),
-                                incorporation_year=comp.get("incorporation_year"),
-                                website_domain=comp.get("website_domain"),
-                            )
-                            if email:
-                                try:
-                                    await store.add_contact(odoo_id, email)
-                                except Exception:
-                                    LOG.warning("odoo export: add_contact failed partner_id=%s", odoo_id)
-                            try:
-                                await store.merge_company_enrichment(odoo_id, {})
-                            except Exception:
-                                pass
-                            sc = float(s.get("score", 0) or 0)
-                            try:
-                                await store.create_lead_if_high(
-                                    odoo_id,
-                                    comp.get("name") or "",
-                                    sc,
-                                    features.get(cid, {}),
-                                    (s.get("rationale") or ""),
-                                    email,
-                                    threshold=threshold,
-                                )
-                            except Exception:
-                                LOG.warning("odoo export: create_lead failed partner_id=%s", odoo_id)
-                            exported += 1
+                            obs.log_event(run_id, tenant_id, "export_odoo", event="disabled", status="ok", extra={"reason": "odoo_unreachable"})
                         except Exception:
-                            LOG.exception("Odoo export failed for company_id=%s", cid)
+                            pass
+                        LOG.warning("tenant=%s Odoo unreachable; skipping export for this batch", tenant_id)
+                        skip_export = True
+                    if skip_export:
+                        # Skip processing without raising
+                        pass
+                    else:
+                        for cid in ids:
+                            comp = comps.get(cid)
+                            if not comp:
+                                continue
+                            email = emails.get(cid)
+                            s = scores.get(cid) or {}
+                            try:
+                                odoo_id = await store.upsert_company(
+                                    comp.get("name"),
+                                    comp.get("uen"),
+                                    industry_norm=comp.get("industry_norm"),
+                                    employees_est=comp.get("employees_est"),
+                                    revenue_bucket=comp.get("revenue_bucket"),
+                                    incorporation_year=comp.get("incorporation_year"),
+                                    website_domain=comp.get("website_domain"),
+                                )
+                                if email:
+                                    try:
+                                        await store.add_contact(odoo_id, email)
+                                    except Exception:
+                                        LOG.warning("odoo export: add_contact failed partner_id=%s", odoo_id)
+                                try:
+                                    await store.merge_company_enrichment(odoo_id, {})
+                                except Exception:
+                                    pass
+                                sc = float(s.get("score", 0) or 0)
+                                try:
+                                    await store.create_lead_if_high(
+                                        odoo_id,
+                                        comp.get("name") or "",
+                                        sc,
+                                        features.get(cid, {}),
+                                        (s.get("rationale") or ""),
+                                        email,
+                                        threshold=threshold,
+                                    )
+                                except Exception:
+                                    LOG.warning("odoo export: create_lead failed partner_id=%s", odoo_id)
+                                exported += 1
+                            except Exception:
+                                LOG.exception("Odoo export failed for company_id=%s", cid)
                 LOG.info("tenant=%s batch=%d odoo_exported=%d", tenant_id, batch_idx, exported)
             else:
                 LOG.info("tenant=%s batch=%d no ids to export to Odoo", tenant_id, batch_idx)
@@ -513,6 +528,11 @@ async def run_tenant(tenant_id: int):
         obs.write_summary(run_id, tenant_id, candidates=total_candidates, processed=processed, batches=batch_idx)
         # Compute p50/p95/p99 per stage from event logs
         obs.aggregate_percentiles(run_id, tenant_id)
+        try:
+            if enrich_mod.was_run_degraded():
+                obs.mark_run_degraded(run_id)
+        except Exception:
+            pass
         obs.finalize_run(run_id, status="succeeded")
     except Exception:
         pass

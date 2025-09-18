@@ -1,6 +1,6 @@
 import asyncio, random, time
 from dataclasses import dataclass
-from typing import Callable, Awaitable, Type, Sequence
+from typing import Callable, Awaitable, Type, Sequence, Optional
 
 class RetryableError(Exception):
     pass
@@ -13,7 +13,8 @@ class BackoffPolicy:
 
 async def with_retry(fn: Callable[[], Awaitable],
                      retry_on: Sequence[Type[BaseException]] = (RetryableError,),
-                     policy: BackoffPolicy = BackoffPolicy()):
+                     policy: BackoffPolicy = BackoffPolicy(),
+                     on_retry: Optional[Callable[[int, BaseException], None]] = None):
     attempt = 0
     last_exc: BaseException | None = None
     while attempt < policy.max_attempts:
@@ -29,6 +30,11 @@ async def with_retry(fn: Callable[[], Awaitable],
             # exponential backoff with jitter
             delay = min(policy.max_delay_ms, policy.base_delay_ms * (2 ** (attempt - 1)))
             delay = delay * (0.8 + 0.4 * random.random())
+            try:
+                if on_retry is not None:
+                    on_retry(attempt, e)
+            except Exception:
+                pass
             await asyncio.sleep(delay / 1000.0)
     if last_exc:
         raise last_exc
@@ -66,4 +72,3 @@ class CircuitBreaker:
             self._state[k] = (errors, time.time())
         else:
             self._state[k] = (errors, opened_at)
-

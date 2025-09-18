@@ -35,6 +35,25 @@ def finalize_run(run_id: int, status: str = "succeeded") -> None:
             (status, run_id),
         )
 
+def mark_run_degraded(run_id: int) -> None:
+    """Best-effort update to flag a run as degraded when any fallback/degradation occurred.
+
+    No-ops silently if the column doesn't exist.
+    """
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            try:
+                cur.execute("ALTER TABLE enrichment_runs ADD COLUMN IF NOT EXISTS degraded BOOL DEFAULT FALSE")
+            except Exception:
+                # Ignore if no permission or already present
+                pass
+            try:
+                cur.execute("UPDATE enrichment_runs SET degraded=TRUE WHERE run_id=%s", (run_id,))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def persist_manifest(run_id: int, tenant_id: int, selected_ids: list[int]) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -201,3 +220,40 @@ def create_qa_samples(run_id: int, tenant_id: int, company_ids: list[int], limit
             except Exception:
                 # Skip errors but continue sampling others
                 pass
+
+def bump_stage_counters(run_id: int, tenant_id: int, stage: str, *, retry_inc: int = 0, fallback_inc: int = 0) -> None:
+    """Increment retry and fallback counters for a stage.
+
+    This assumes `run_stage_stats` has retry_count and fallback_count columns; if not,
+    the UPDATE will no-op due to missing columns and errors will be ignored.
+    """
+    if retry_inc == 0 and fallback_inc == 0:
+        return
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            try:
+                # Ensure a row exists; insert zeroes if missing
+                cur.execute(
+                    """
+                    INSERT INTO run_stage_stats(run_id, tenant_id, stage)
+                    VALUES (%s,%s,%s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (run_id, tenant_id, stage),
+                )
+            except Exception:
+                pass
+            try:
+                cur.execute(
+                    """
+                    UPDATE run_stage_stats
+                    SET retry_count = COALESCE(retry_count,0) + %s,
+                        fallback_count = COALESCE(fallback_count,0) + %s
+                    WHERE run_id=%s AND tenant_id=%s AND stage=%s
+                    """,
+                    (retry_inc, fallback_inc, run_id, tenant_id, stage),
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass

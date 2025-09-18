@@ -6,6 +6,10 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, TypedDict
+try:  # Python 3.9/3.10 fallback
+    from typing import Annotated  # type: ignore
+except Exception:  # pragma: no cover
+    from typing_extensions import Annotated  # type: ignore
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -39,7 +43,8 @@ LEAD_SCORES_TABLE = os.getenv("LEAD_SCORES_TABLE", "lead_scores")
 
 
 class PreSDRState(TypedDict, total=False):
-    messages: List[BaseMessage]
+    # Use LangGraph message reducer so message updates append instead of replace
+    messages: Annotated[List[BaseMessage], add_messages]
     icp: Dict[str, Any]
     candidates: List[Dict[str, Any]]
     results: List[Dict[str, Any]]
@@ -562,7 +567,8 @@ def build_presdr_graph():
 
 
 class GraphState(TypedDict):
-    messages: List[BaseMessage]
+    # Ensure appends across runs/nodes
+    messages: Annotated[List[BaseMessage], add_messages]
     icp: Dict[str, Any]
     candidates: List[Dict[str, Any]]
     results: List[Dict[str, Any]]

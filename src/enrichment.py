@@ -24,7 +24,7 @@ from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 from tavily import TavilyClient
 from src.obs import bump_vendor as _obs_bump, log_event as _log_obs_event
-from src.retry import with_retry, RetryableError, CircuitBreaker
+from src.retry import with_retry, RetryableError, CircuitBreaker, BackoffPolicy
 
 from src.crawler import crawl_site
 from src.lusha_client import AsyncLushaClient, LushaError
@@ -35,7 +35,9 @@ from src.settings import (
     CRAWLER_MAX_PAGES,
     CRAWLER_TIMEOUT_S,
     CRAWLER_USER_AGENT,
+    ENABLE_TAVILY_FALLBACK,
     ENABLE_LUSHA_FALLBACK,
+    ENABLE_APIFY_LINKEDIN,
     EXTRACT_CORPUS_CHAR_LIMIT,
     LANGCHAIN_MODEL,
     TEMPERATURE,
@@ -45,6 +47,12 @@ from src.settings import (
     POSTGRES_DSN,
     TAVILY_API_KEY,
     ZEROBOUNCE_API_KEY,
+    RETRY_MAX_ATTEMPTS,
+    RETRY_BASE_DELAY_MS,
+    RETRY_MAX_DELAY_MS,
+    CB_ERROR_THRESHOLD,
+    CB_COOL_OFF_S,
+    CB_GLOBAL_EXEMPT_VENDORS,
 )
 
 load_dotenv()
@@ -103,7 +111,32 @@ _VENDOR_COUNTERS: dict[str, int] = {
     "apify_linkedin_calls": 0,
 }
 _VENDOR_CAPS: dict[str, int | None] = {"tavily_units": None, "contact_lookups": None}
-_CB = CircuitBreaker()
+_CB = CircuitBreaker(error_threshold=CB_ERROR_THRESHOLD, cool_off_s=CB_COOL_OFF_S)
+
+# Default retry/backoff policy from env
+_DEFAULT_RETRY_POLICY = BackoffPolicy(
+    max_attempts=RETRY_MAX_ATTEMPTS,
+    base_delay_ms=RETRY_BASE_DELAY_MS,
+    max_delay_ms=RETRY_MAX_DELAY_MS,
+)
+
+_RUN_ANY_DEGRADED = False
+
+def was_run_degraded() -> bool:
+    return bool(_RUN_ANY_DEGRADED)
+
+def _cb_allows(tenant_id: int | None, vendor: str) -> bool:
+    try:
+        if (vendor or "").lower() in CB_GLOBAL_EXEMPT_VENDORS:
+            return True
+    except Exception:
+        pass
+    if not tenant_id:
+        return True
+    try:
+        return _CB.allow(int(tenant_id), vendor)
+    except Exception:
+        return True
 
 def set_run_context(run_id: int, tenant_id: int):
     _RUN_CTX["run_id"] = int(run_id)
@@ -1025,6 +1058,7 @@ async def enrich_company_with_tavily(
         "lusha_used": False,
         "completed": False,
         "error": None,
+        "degraded_reasons": [],
     }
     try:
         logger.info(
@@ -1055,6 +1089,7 @@ class EnrichmentState(TypedDict, total=False):
     lusha_used: bool
     completed: bool
     error: Optional[str]
+    degraded_reasons: List[str]
 
 
 async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
@@ -1088,7 +1123,7 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         domains = []
 
     # 1) Tavily search if available
-    if not domains and tavily_client is not None:
+    if not domains and ENABLE_TAVILY_FALLBACK and tavily_client is not None:
         try:
             t0 = time.perf_counter()
             domains = find_domain(name)
@@ -1098,18 +1133,22 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
             _obs_vendor("tavily", calls=1, errors=1)
             _obs_log("find_domain", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(e).__name__)
             logger.warning("   ↳ Tavily find_domain failed", exc_info=True)
+            try:
+                (state.setdefault("degraded_reasons", [])) .append("TAVILY_FAIL")
+            except Exception:
+                pass
     # Lusha fallback if needed
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
             logger.info("   ↳ No domain via search; trying Lusha fallback…")
             tid = int(_RUN_CTX.get("tenant_id") or 0)
             lusha_domain = None
-            if not (tid and not _CB.allow(tid, "lusha")):
+            if _cb_allows(tid, "lusha"):
                 async with AsyncLushaClient() as lc:
                     async def _call():
                         return await lc.find_company_domain(name)
                     try:
-                        lusha_domain = await with_retry(_call, retry_on=(Exception,))
+                        lusha_domain = await with_retry(_call, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
                         _VENDOR_COUNTERS["lusha_lookups"] += 1
                         _obs_vendor("lusha", calls=1)
                         if tid:
@@ -1129,10 +1168,18 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
                 logger.info(f"   ↳ Lusha provided domain: {normalized}")
         except Exception as e:
             logger.warning("   ↳ Lusha domain fallback failed", exc_info=True)
+            try:
+                (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+            except Exception:
+                pass
     if not domains:
         # Graceful termination: no domain available, nothing to crawl/extract.
         # Mark as completed so upstream pipeline can proceed to scoring/next steps.
         state["error"] = "no_domain"
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("DATA_EMPTY:no_domain_name")
+        except Exception:
+            pass
         state["completed"] = True
         logger.info("   ↳ No domain found; marking enrichment as completed (no crawl)")
         return state
@@ -1153,12 +1200,12 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
         try:
             tid = int(_RUN_CTX.get("tenant_id") or 0)
             lusha_domain = None
-            if not (tid and not _CB.allow(tid, "lusha")):
+            if _cb_allows(tid, "lusha"):
                 async with AsyncLushaClient() as lc:
                     async def _call():
                         return await lc.find_company_domain(state.get("company_name") or "")
                     try:
-                        lusha_domain = await with_retry(_call, retry_on=(Exception,))
+                        lusha_domain = await with_retry(_call, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
                         _VENDOR_COUNTERS["lusha_lookups"] += 1
                         _obs_vendor("lusha", calls=1)
                         if tid:
@@ -1187,8 +1234,16 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
                     )
         except Exception as e:
             logger.warning("   ↳ Lusha fallback for filtered URLs failed", exc_info=True)
+            try:
+                (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+            except Exception:
+                pass
     if not filtered_urls:
         filtered_urls = [state["home"]]
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("CRAWL_THIN")
+        except Exception:
+            pass
     state["filtered_urls"] = filtered_urls
     return state
 
@@ -1217,7 +1272,7 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                 for _p in ("about", "aboutus"):
                     page_urls.append(f"{_root}/{_p}")
 
-        if tavily_crawl is not None and _dec_cap("tavily_units", 1):
+        if ENABLE_TAVILY_FALLBACK and tavily_crawl is not None and _dec_cap("tavily_units", 1):
             for root in roots[:3]:
                 try:
                     crawl_input = {
@@ -1246,6 +1301,10 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                     _obs_log("crawl", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"root": root})
                     logger.warning(f"          ↳ TavilyCrawl error for {root}", exc_info=True)
                     page_urls.append(root)
+                    try:
+                        (state.setdefault("degraded_reasons", [])) .append("CRAWL_ERROR")
+                    except Exception:
+                        pass
         else:
             logger.info("       ↳ TavilyCrawl unavailable; using seeded URLs only")
         page_urls = list(dict.fromkeys(page_urls))
@@ -1309,7 +1368,7 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     for u in page_urls:
         # Try TavilyExtract if configured
         raw_content: Optional[str] = None
-        if tavily_extract is not None:
+        if ENABLE_TAVILY_FALLBACK and tavily_extract is not None:
             payload = {
                 "urls": [u],
                 "schema": {"raw_content": "str"},
@@ -1325,6 +1384,10 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
                 _obs_vendor("tavily", calls=1, errors=1)
                 _obs_log("extract", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"url": u})
                 logger.warning(f"          ↳ TavilyExtract error for {u}", exc_info=True)
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("TAVILY_FAIL")
+                except Exception:
+                    pass
         if raw_content and isinstance(raw_content, str) and raw_content.strip():
             extracted_pages.append({"url": u, "title": "", "raw_content": raw_content})
         else:
@@ -1386,6 +1449,10 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
                 )
                 state["completed"] = True
                 state["extracted_pages"] = []
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("CRAWL_THIN")
+                except Exception:
+                    pass
                 return state
         except Exception as exc:
             logger.warning("   ↳ deterministic crawler fallback failed", exc_info=True)
@@ -1560,7 +1627,14 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
             or missing_names
             or missing_founder
         )
-        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger and _dec_cap("contact_lookups", 1):
+        if (ENABLE_APIFY_LINKEDIN and not ENABLE_LUSHA_FALLBACK):
+            # Placeholder; Feature 16 wires Apify. Mark as missing when needed.
+            if trigger:
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("CONTACTS_MISSING")
+                except Exception:
+                    pass
+        elif ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger and _dec_cap("contact_lookups", 1):
             website_hint = data.get("website_domain") or state.get("home") or ""
             try:
                 if website_hint.startswith("http"):
@@ -1571,7 +1645,7 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                 company_domain = None
             lusha_contacts: List[Dict[str, Any]] = []
             tid = int(_RUN_CTX.get("tenant_id") or 0)
-            if tid and not _CB.allow(tid, "lusha"):
+            if not _cb_allows(tid, "lusha"):
                 lusha_contacts = []
             else:
                 async with AsyncLushaClient() as lc:
@@ -1584,7 +1658,7 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                             limit=15,
                         )
                     try:
-                        lusha_contacts = await with_retry(_call1, retry_on=(Exception,))
+                        lusha_contacts = await with_retry(_call1, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
                         _VENDOR_COUNTERS["lusha_lookups"] += 1
                         _obs_vendor("lusha", calls=1)
                         if tid:
@@ -1603,7 +1677,7 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                                 limit=15,
                             )
                         try:
-                            lusha_contacts = await with_retry(_call2, retry_on=(Exception,))
+                            lusha_contacts = await with_retry(_call2, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
                             _VENDOR_COUNTERS["lusha_lookups"] += 1
                             _obs_vendor("lusha", calls=1)
                             if tid:
@@ -1669,9 +1743,17 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                 )
             except Exception as _upsert_exc:
                 logger.warning("       ↳ Lusha contacts upsert error", exc_info=True)
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+                except Exception:
+                    pass
             state["lusha_used"] = True
     except Exception as _lusha_contacts_exc:
         logger.warning("       ↳ Lusha contacts fallback failed", exc_info=True)
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+        except Exception:
+            pass
     state["data"] = data
     return state
 
@@ -1686,6 +1768,28 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
             update_company_core_fields(company_id, data)
         except Exception as exc:
             logger.exception("   ↳ update_company_core_fields failed")
+        # Best-effort projection of degradation reasons for this company
+        try:
+            reasons = ",".join(state.get("degraded_reasons") or []) or None
+            if reasons:
+                global _RUN_ANY_DEGRADED
+                _RUN_ANY_DEGRADED = True
+                conn = get_db_connection()
+                with conn:
+                    fields = {"company_id": company_id, "degraded_reasons": reasons}
+                    tid = _default_tenant_id()
+                    if tid is not None:
+                        fields["tenant_id"] = tid
+                    rid = _RUN_CTX.get("run_id")
+                    if rid is not None:
+                        fields["run_id"] = int(rid)
+                    _insert_company_enrichment_run(conn, fields)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return state
 
 

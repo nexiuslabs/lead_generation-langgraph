@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 import asyncpg
 
-from src.settings import ODOO_POSTGRES_DSN
+from src.settings import ODOO_POSTGRES_DSN, ODOO_EXPORT_SET_DEFAULTS
 from src.database import get_conn
 
 logger = logging.getLogger(__name__)
@@ -240,15 +240,33 @@ class OdooStore:
                     fields.get("incorporation_year"),
                     fields.get("website_domain"),
                 )
-            except Exception:
-                row = await conn.fetchrow(
-                    """
-                  INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, create_date)
-                  VALUES ($1, $1, 'contact', TRUE, TRUE, $1, now())
-                  RETURNING id
-                """,
-                    name,
-                )
+            except Exception as _insert_exc:
+                try:
+                    row = await conn.fetchrow(
+                        """
+                      INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, create_date)
+                      VALUES ($1, $1, 'contact', TRUE, TRUE, $1, now())
+                      RETURNING id
+                    """,
+                        name,
+                    )
+                except Exception as _minimal_exc:
+                    # As a last resort on templates with strict NOT NULLs (e.g., autopost_bills), set safe defaults
+                    if ODOO_EXPORT_SET_DEFAULTS:
+                        try:
+                            row = await conn.fetchrow(
+                                """
+                              INSERT INTO res_partner (name, complete_name, type, is_company, active, commercial_company_name, create_date, autopost_bills)
+                              VALUES ($1, $1, 'contact', TRUE, TRUE, $1, now(), FALSE)
+                              RETURNING id
+                            """,
+                                name,
+                            )
+                        except Exception:
+                            # Give up; re-raise minimal exception
+                            raise _minimal_exc
+                    else:
+                        raise _minimal_exc
             logger.info(
                 "Inserted Odoo company id=%s name=%s uen=%s", row["id"], name, uen
             )
