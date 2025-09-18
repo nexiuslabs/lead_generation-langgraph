@@ -42,6 +42,20 @@ async def main_async():
         job,
         CronTrigger(minute=minute, hour=hour, day=dom, month=month, day_of_week=dow),
     )
+    # Optional: schedule alerts checker (defaults to every 5 minutes)
+    try:
+        alerts_cron = os.getenv("ALERTS_CRON", "*/5 * * * *")
+        aminute, ahour, adom, amonth, adow = alerts_cron.split()
+        from scripts import alerts as _alerts
+        async def alert_job():
+            # run in thread to avoid blocking loop
+            try:
+                await asyncio.to_thread(_alerts.check_last_run_alerts)
+            except Exception as exc:
+                logging.getLogger("nightly").warning("alerts job failed: %s", exc)
+        sched.add_job(alert_job, CronTrigger(minute=aminute, hour=ahour, day=adom, month=amonth, day_of_week=adow))
+    except Exception as _e:
+        logging.getLogger("nightly").warning("alerts schedule skipped: %s", _e)
     # Start the scheduler inside a running event loop
     sched.start()
     try:

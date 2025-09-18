@@ -198,6 +198,10 @@ async def run_tenant(tenant_id: int):
     _t_run_start = _time.perf_counter()
     # Begin run and set context for vendor accounting
     run_id = obs.begin_run(tenant_id)
+    try:
+        obs.set_run_context(run_id, tenant_id)
+    except Exception:
+        pass
     # Vendor caps: None means unlimited
     tav_units = TAVILY_MAX_QUERIES if TAVILY_MAX_QUERIES > 0 else None
     contact_cap = LUSHA_MAX_CONTACT_LOOKUPS if LUSHA_MAX_CONTACT_LOOKUPS > 0 else None
@@ -330,6 +334,28 @@ async def run_tenant(tenant_id: int):
             batch_idx,
             len(scoring_state.get("lead_scores", [])),
         )
+
+        # 3.2) QA sampling for High bucket
+        try:
+            try:
+                env_thr = os.getenv("SCORE_MIN_EXPORT", os.getenv("LEAD_THRESHOLD", "0.66"))
+                qa_threshold = float(env_thr)
+            except Exception:
+                qa_threshold = 0.66
+            highs = [
+                int(s.get("company_id"))
+                for s in (scoring_state.get("lead_scores") or [])
+                if float(s.get("score", 0) or 0) >= qa_threshold
+            ]
+            if highs:
+                limit = 10
+                try:
+                    limit = int(os.getenv("QA_SAMPLE_LIMIT", "10") or 10)
+                except Exception:
+                    limit = 10
+                obs.create_qa_samples(run_id, tenant_id, highs, limit=limit, bucket="High")
+        except Exception:
+            LOG.warning("tenant=%s QA sampling skipped due to error", tenant_id)
 
         # 3.5) Batched ZeroBounce verification (best-effort)
         try:
@@ -485,6 +511,8 @@ async def run_tenant(tenant_id: int):
     try:
         obs.persist_manifest(run_id, tenant_id, selected_all)
         obs.write_summary(run_id, tenant_id, candidates=total_candidates, processed=processed, batches=batch_idx)
+        # Compute p50/p95/p99 per stage from event logs
+        obs.aggregate_percentiles(run_id, tenant_id)
         obs.finalize_run(run_id, status="succeeded")
     except Exception:
         pass

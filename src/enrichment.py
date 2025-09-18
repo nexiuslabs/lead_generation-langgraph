@@ -23,7 +23,7 @@ from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 from tavily import TavilyClient
-from src.obs import bump_vendor as _obs_bump
+from src.obs import bump_vendor as _obs_bump, log_event as _log_obs_event
 from src.retry import with_retry, RetryableError, CircuitBreaker
 
 from src.crawler import crawl_site
@@ -54,6 +54,27 @@ logger.info("🛠️  Initializing enrichment pipeline…")
 
 # Simple in-memory cache for ZeroBounce to avoid duplicate calls per-run
 ZB_CACHE: dict[str, dict] = {}
+
+def _mask_email(e: str) -> str:
+    try:
+        import hashlib
+        local, _, domain = (e or "").partition("@")
+        if not domain:
+            # Not an email shape; hash entire string
+            h = hashlib.sha256((e or "").encode()).hexdigest()[:8]
+            return f"hash:{h}"
+        head = (local[:2] + "***") if local else "***"
+        dom_parts = domain.split(".")
+        if len(dom_parts) >= 2:
+            dom = dom_parts[0][:1] + "***." + dom_parts[-1]
+        else:
+            dom = "***"
+        return f"{head}@{dom}"
+    except Exception:
+        return "***redacted***"
+
+def _redact_email_list(emails: list[str]) -> list[str]:
+    return [_mask_email(e) for e in emails]
 
 def _default_tenant_id() -> int | None:
     try:
@@ -117,7 +138,7 @@ def _dec_cap(key: str, need: int = 1) -> bool:
 
 _warned_no_tavily = False
 
-def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0):
+def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0, *, rate_limit_hits: int = 0, quota_exhausted: bool = False):
     """Record vendor usage and emit relevant one-time warnings.
 
     Only warn about missing Tavily key when actually calling Tavily and key is not set,
@@ -127,7 +148,7 @@ def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0):
     tid = _RUN_CTX.get("tenant_id")
     if rid and tid:
         try:
-            _obs_bump(int(rid), int(tid), vendor, calls=calls, errors=errors)
+            _obs_bump(int(rid), int(tid), vendor, calls=calls, errors=errors, rate_limit_hits=rate_limit_hits, quota_exhausted=quota_exhausted)
         except Exception:
             pass
     global _warned_no_tavily
@@ -136,6 +157,15 @@ def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0):
             "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
         )
         _warned_no_tavily = True
+
+def _obs_log(stage: str, event: str, status: str, *, company_id: Optional[int] = None, error_code: Optional[str] = None, duration_ms: Optional[int] = None, extra: Optional[Dict[str, Any]] = None):
+    try:
+        rid = _RUN_CTX.get("run_id")
+        tid = _RUN_CTX.get("tenant_id")
+        if rid and tid:
+            _log_obs_event(int(rid), int(tid), stage, event, status, company_id=company_id, error_code=error_code, duration_ms=duration_ms, trace_id=None, extra=extra)
+    except Exception:
+        pass
 
 # Initialize LangChain LLM for AI extraction
 # Use configured model; some models (e.g., gpt-5) do not accept an explicit
@@ -1060,8 +1090,13 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     # 1) Tavily search if available
     if not domains and tavily_client is not None:
         try:
+            t0 = time.perf_counter()
             domains = find_domain(name)
+            _obs_vendor("tavily", calls=1)
+            _obs_log("find_domain", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"query": name})
         except Exception as e:
+            _obs_vendor("tavily", calls=1, errors=1)
+            _obs_log("find_domain", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(e).__name__)
             logger.warning("   ↳ Tavily find_domain failed", exc_info=True)
     # Lusha fallback if needed
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
@@ -1192,9 +1227,11 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         "instructions": f"get all pages from {root}",
                         "enable_web_search": False,
                     }
+                    t0 = time.perf_counter()
                     crawl_result = tavily_crawl.run(crawl_input)
                     _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
                     _obs_vendor("tavily", calls=1)
+                    _obs_log("crawl", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"root": root})
                     raw_urls = (
                         crawl_result.get("results") or crawl_result.get("urls") or []
                     )
@@ -1205,6 +1242,8 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                             page_urls.append(item)
                     page_urls.append(root)
                 except Exception as exc:
+                    _obs_vendor("tavily", calls=1, errors=1)
+                    _obs_log("crawl", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"root": root})
                     logger.warning(f"          ↳ TavilyCrawl error for {root}", exc_info=True)
                     page_urls.append(root)
         else:
@@ -1277,9 +1316,14 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
                 "instructions": "Retrieve the main textual content from this page.",
             }
             try:
+                t0 = time.perf_counter()
                 raw_data = tavily_extract.run(payload)
+                _obs_vendor("tavily", calls=1)
+                _obs_log("extract", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"url": u})
                 raw_content = _extract_raw_from(raw_data)
             except Exception as exc:
+                _obs_vendor("tavily", calls=1, errors=1)
+                _obs_log("extract", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"url": u})
                 logger.warning(f"          ↳ TavilyExtract error for {u}", exc_info=True)
         if raw_content and isinstance(raw_content, str) and raw_content.strip():
             extracted_pages.append({"url": u, "title": "", "raw_content": raw_content})
@@ -2097,7 +2141,7 @@ def verify_emails(emails: list[str]) -> list[dict]:
     2.4 Email Verification via ZeroBounce adapter.
     Adapter returns dicts: {email, status, confidence, source}.
     """
-    print(f"    🔒 ZeroBounce Email Verification for {emails}")
+    print(f"    🔒 ZeroBounce Email Verification for {_redact_email_list(emails)}")
     results: list[dict] = []
     if not emails:
         return results
@@ -2125,11 +2169,13 @@ def verify_emails(emails: list[str]) -> list[dict]:
                 continue
             # Throttle to respect credits (simple delay)
             time.sleep(0.75)
+            t0 = time.perf_counter()
             resp = requests.get(
                 "https://api.zerobounce.net/v2/validate",
                 params={"api_key": ZEROBOUNCE_API_KEY, "email": e, "ip_address": ""},
                 timeout=10,
             )
+            status_code = getattr(resp, "status_code", 200)
             data = resp.json()
             status = data.get("status", "unknown")
             confidence = float(data.get("confidence", 0.0))
@@ -2139,6 +2185,23 @@ def verify_emails(emails: list[str]) -> list[dict]:
                 "confidence": confidence,
                 "source": "zerobounce",
             }
+            try:
+                # Vendor usage: bump one call per verify; include rate-limit/quota flags; record duration
+                rl = 1 if status_code == 429 else 0
+                quota = True if status_code == 402 else False
+                _obs_vendor("zerobounce", calls=1, rate_limit_hits=rl, quota_exhausted=quota)
+                # Optional cost per check
+                try:
+                    cost_per = float(os.getenv("ZEROBOUNCE_COST_PER_CHECK", "0.0") or 0.0)
+                except Exception:
+                    cost_per = 0.0
+                if cost_per > 0:
+                    rid = _RUN_CTX.get("run_id"); tid = _RUN_CTX.get("tenant_id")
+                    if rid and tid:
+                        _obs_bump(int(rid), int(tid), "zerobounce", calls=0, errors=0, cost_usd=cost_per)
+                _obs_log("verify_emails", "vendor_call", "ok", duration_ms=int((time.perf_counter()-t0)*1000), extra={"email": _mask_email(e), "status": status})
+            except Exception:
+                pass
             if conn:
                 _cache_set(conn, e, status, confidence)
                 try:
@@ -2147,12 +2210,17 @@ def verify_emails(emails: list[str]) -> list[dict]:
                     pass
             ZB_CACHE[e] = rec
             print(
-                f"       ✅ ZeroBounce result for {e}: status={status}, confidence={confidence}"
+                f"       ✅ ZeroBounce result for {_mask_email(e)}: status={status}, confidence={confidence}"
             )
         except Exception as exc:
-            print(f"       ⚠️ ZeroBounce API error for {e}: {exc}")
+            print(f"       ⚠️ ZeroBounce API error for {_mask_email(e)}: {exc}")
             status = "unknown"
             confidence = 0.0
+            try:
+                _obs_vendor("zerobounce", calls=1, errors=1)
+                _obs_log("verify_emails", "vendor_call", "error", error_code=type(exc).__name__, extra={"email": _mask_email(e)})
+            except Exception:
+                pass
             results.append(
                 {
                     "email": e,

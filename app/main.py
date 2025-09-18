@@ -1075,6 +1075,10 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         # last_refreshed_at heuristics: prefer enrichment/company run timestamps if present,
         # fallback to company last_seen joined to lead_scores, else None.
         last_ts: datetime | None = None
+        last_run_id = None
+        last_run_status = None
+        last_run_started_at = None
+        last_run_ended_at = None
 
         # Try company_enrichment_runs.run_timestamp
         try:
@@ -1084,12 +1088,19 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         except Exception:
             last_ts = last_ts
 
-        # Try enrichment_runs.started_at (subject to RLS)
+        # Try enrichment_runs.started_at and include run fields (subject to RLS)
         if last_ts is None:
             try:
-                ts = await conn.fetchval("SELECT MAX(started_at) FROM enrichment_runs")
-                if isinstance(ts, datetime):
-                    last_ts = ts
+                row = await conn.fetchrow(
+                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs ORDER BY run_id DESC LIMIT 1"
+                )
+                if row:
+                    last_run_id = row["run_id"]
+                    last_run_status = row["status"]
+                    last_run_started_at = row["started_at"]
+                    last_run_ended_at = row["ended_at"]
+                    if isinstance(last_run_started_at, datetime):
+                        last_ts = last_run_started_at
             except Exception:
                 last_ts = last_ts
 
@@ -1112,6 +1123,10 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         "tenant_id": tid,
         "total_scored": total_scored,
         "last_refreshed_at": (last_ts.isoformat() if isinstance(last_ts, datetime) else None),
+        "last_run_id": last_run_id,
+        "last_run_status": last_run_status,
+        "last_run_started_at": (last_run_started_at.isoformat() if isinstance(last_run_started_at, datetime) else None),
+        "last_run_ended_at": (last_run_ended_at.isoformat() if isinstance(last_run_ended_at, datetime) else None),
     }
     return out
 
@@ -1151,6 +1166,66 @@ async def scheduler_run_now(background: BackgroundTasks, claims: dict = Depends(
         background.add_task(_run)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule failed: {e}")
+
+
+# --- Observability endpoints (Feature 8) ---
+@app.get("/runs/{run_id}/stats")
+async def get_run_stats(run_id: int, _: dict = Depends(require_auth)):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows1 = await conn.fetch("SELECT * FROM run_stage_stats WHERE run_id=$1 ORDER BY stage", run_id)
+        rows2 = await conn.fetch("SELECT * FROM run_vendor_usage WHERE run_id=$1 ORDER BY vendor", run_id)
+    return {
+        "run_id": run_id,
+        "stage_stats": [dict(r) for r in rows1],
+        "vendor_usage": [dict(r) for r in rows2],
+    }
+
+
+@app.get("/export/run_events.csv")
+async def export_run_events(run_id: int, _: dict = Depends(require_auth)):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT run_id, tenant_id, stage, company_id, event, status, error_code, duration_ms, trace_id, extra, ts FROM run_event_logs WHERE run_id=$1 ORDER BY ts",
+            run_id,
+        )
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["run_id","tenant_id","stage","company_id","event","status","error_code","duration_ms","trace_id","extra","ts"])
+    for r in rows:
+        w.writerow([
+            r["run_id"], r["tenant_id"], r["stage"], r["company_id"], r["event"], r["status"],
+            r["error_code"], r["duration_ms"], r["trace_id"], r["extra"], r["ts"]
+        ])
+    from fastapi.responses import Response
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.get("/export/qa.csv")
+async def export_qa(run_id: int, _: dict = Depends(require_auth)):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT run_id, tenant_id, company_id, bucket, checks, result, notes, created_at
+            FROM qa_samples
+            WHERE run_id=$1
+            ORDER BY bucket, company_id
+            """,
+            run_id,
+        )
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["run_id","tenant_id","company_id","bucket","checks","result","notes","created_at"])
+    for r in rows:
+        w.writerow([
+            r["run_id"], r["tenant_id"], r["company_id"], r["bucket"], r["checks"], r["result"], r["notes"], r["created_at"]
+        ])
+    from fastapi.responses import Response
+    return Response(content=buf.getvalue(), media_type="text/csv")
 
     return {"status": "scheduled", "tenant_id": tid}
 

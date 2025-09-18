@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS run_vendor_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_rvu_tenant_run_vendor ON run_vendor_usage(tenant_id, run_id, vendor);
 
+-- Extend run_vendor_usage with rate limit and quota flags if not present
+DO $$ BEGIN
+  ALTER TABLE run_vendor_usage ADD COLUMN IF NOT EXISTS rate_limit_hits INT DEFAULT 0;
+  ALTER TABLE run_vendor_usage ADD COLUMN IF NOT EXISTS quota_exhausted BOOL DEFAULT FALSE;
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
 -- Event log (short retention)
 CREATE TABLE IF NOT EXISTS run_event_logs (
   run_id       BIGINT      NOT NULL,
@@ -85,3 +91,87 @@ CREATE TABLE IF NOT EXISTS run_summaries (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Enable RLS on new observability tables (idempotent) and add basic tenant isolation policies
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE run_stage_stats ENABLE ROW LEVEL SECURITY';
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='run_stage_stats' AND policyname='run_stage_stats_isolation'
+  ) THEN
+    CREATE POLICY run_stage_stats_isolation ON run_stage_stats
+      USING (tenant_id::text = current_setting('request.tenant_id', true))
+      WITH CHECK (tenant_id::text = current_setting('request.tenant_id', true));
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE run_vendor_usage ENABLE ROW LEVEL SECURITY';
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='run_vendor_usage' AND policyname='run_vendor_usage_isolation'
+  ) THEN
+    CREATE POLICY run_vendor_usage_isolation ON run_vendor_usage
+      USING (tenant_id::text = current_setting('request.tenant_id', true))
+      WITH CHECK (tenant_id::text = current_setting('request.tenant_id', true));
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE run_event_logs ENABLE ROW LEVEL SECURITY';
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='run_event_logs' AND policyname='run_event_logs_isolation'
+  ) THEN
+    CREATE POLICY run_event_logs_isolation ON run_event_logs
+      USING (tenant_id::text = current_setting('request.tenant_id', true))
+      WITH CHECK (tenant_id::text = current_setting('request.tenant_id', true));
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE qa_samples ENABLE ROW LEVEL SECURITY';
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='qa_samples' AND policyname='qa_samples_isolation'
+  ) THEN
+    CREATE POLICY qa_samples_isolation ON qa_samples
+      USING (tenant_id::text = current_setting('request.tenant_id', true))
+      WITH CHECK (tenant_id::text = current_setting('request.tenant_id', true));
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE run_manifests ENABLE ROW LEVEL SECURITY';
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='run_manifests' AND policyname='run_manifests_isolation'
+  ) THEN
+    CREATE POLICY run_manifests_isolation ON run_manifests
+      USING (tenant_id::text = current_setting('request.tenant_id', true))
+      WITH CHECK (tenant_id::text = current_setting('request.tenant_id', true));
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  EXECUTE 'ALTER TABLE run_summaries ENABLE ROW LEVEL SECURITY';
+EXCEPTION WHEN undefined_table THEN NULL; END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='run_summaries' AND policyname='run_summaries_isolation'
+  ) THEN
+    CREATE POLICY run_summaries_isolation ON run_summaries
+      USING (tenant_id::text = current_setting('request.tenant_id', true))
+      WITH CHECK (tenant_id::text = current_setting('request.tenant_id', true));
+  END IF;
+END $$;
