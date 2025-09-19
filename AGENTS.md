@@ -22,6 +22,8 @@ Key Env Vars (src/settings.py)
   - Use placeholders: %%QUERY%% for a single query string, %%QUERIES%% for an array of queries.
 - Optional: APIFY_SEARCH_ACTOR_ID for resolving LinkedIn profile URLs when the main actor requires `profileUrls`.
 - Optional: APIFY_DEBUG_LOG_ITEMS=true to log a small sample of Apify dataset items and normalized contacts. Control size via APIFY_LOG_SAMPLE_SIZE (default 3).
+- Optional: APIFY_USE_COMPANY_EMPLOYEE_CHAIN=true to use the chain company-by-name → employees → profile-details.
+- APIFY_COMPANY_ACTOR_ID=harvestapi~linkedin-company, APIFY_EMPLOYEES_ACTOR_ID=harvestapi~linkedin-company-employees, APIFY_LINKEDIN_ACTOR_ID=dev_fusion~linkedin-profile-scraper
 - ENABLE_LUSHA_FALLBACK=false (optional; set true only if you want Lusha as a fallback), LUSHA_API_KEY? (optional)
 - ICP_RULE_NAME=default, CRAWL_MAX_PAGES=6, EXTRACT_CORPUS_CHAR_LIMIT=35000
 - ODOO_POSTGRES_DSN (or resolve per-tenant via odoo_connections)

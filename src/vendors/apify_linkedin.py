@@ -24,6 +24,14 @@ def _search_actor_id() -> Optional[str]:
     v = os.getenv("APIFY_SEARCH_ACTOR_ID")
     return v if v else None
 
+def _company_actor_id() -> Optional[str]:
+    v = os.getenv("APIFY_COMPANY_ACTOR_ID", "harvestapi~linkedin-company")
+    return v or None
+
+def _employees_actor_id() -> Optional[str]:
+    v = os.getenv("APIFY_EMPLOYEES_ACTOR_ID", "harvestapi~linkedin-company-employees")
+    return v or None
+
 
 async def run_sync_get_dataset_items(
     payload: Dict[str, Any], *, dataset_format: str = "json", timeout_s: int = 600
@@ -358,15 +366,154 @@ def normalize_contacts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "full_name": it.get("fullName")
                 or it.get("name")
                 or it.get("full_name"),
-                "title": it.get("headline") or it.get("title"),
+                "title": it.get("headline") or it.get("jobTitle") or it.get("title"),
                 "company_current": it.get("companyName") or it.get("company_current"),
                 "linkedin_url": it.get("url")
                 or it.get("profileUrl")
+                or it.get("linkedinUrl")
                 or it.get("linkedin_url"),
-                "location": it.get("locationName") or it.get("location"),
+                "location": it.get("locationName") or it.get("addressWithCountry") or it.get("location"),
                 # emails rarely present
                 "email": it.get("email") or None,
                 "source_json": it,
             }
         )
     return out
+
+
+async def _run_actor_items(actor_id: str, payload: Dict[str, Any], *, dataset_format: str = "json", timeout_s: int = 600) -> List[Dict[str, Any]]:
+    """Run a specific Apify actor and return dataset items with logging.
+
+    Uses run-sync-get-dataset-items; falls back to run-sync + dataset fetch.
+    """
+    def _log_sample(items: List[Dict[str, Any]], label: str) -> None:
+        try:
+            dbg = os.getenv("APIFY_DEBUG_LOG_ITEMS", "").lower() in ("1", "true", "yes", "on")
+            if not dbg:
+                return
+            sample = []
+            keys = ("fullName", "name", "headline", "jobTitle", "profileUrl", "linkedinUrl")
+            for it in (items or [])[: int(os.getenv("APIFY_LOG_SAMPLE_SIZE", "3") or 3)]:
+                if isinstance(it, dict):
+                    rec = {k: it.get(k) for k in keys if it.get(k) is not None}
+                    if not rec:
+                        for k in list(it.keys())[:6]:
+                            rec[k] = it.get(k)
+                    sample.append(rec)
+            logger.info("Apify items sample label=%s n=%d sample=%s", label, len(sample), sample)
+        except Exception:
+            pass
+
+    aurl = f"{APIFY_BASE}/acts/{actor_id.replace('/', '~')}/run-sync-get-dataset-items"
+    headers = {"Content-Type": "application/json"}
+    params = {"token": _token(), "format": dataset_format}
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        try:
+            r = await client.post(aurl, params=params, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                _log_sample(data, f"{actor_id}:run-sync-get-dataset-items[list]")
+                return data
+            if isinstance(data, dict) and isinstance(data.get("items"), list):
+                _log_sample(data.get("items"), f"{actor_id}:run-sync-get-dataset-items")
+                return data.get("items")
+        except httpx.HTTPStatusError:
+            # Fallback: run-sync then fetch dataset items
+            run_url = f"{APIFY_BASE}/acts/{actor_id.replace('/', '~')}/run-sync"
+            ds_items_url = f"{APIFY_BASE}/datasets/{{ds_id}}/items"
+            try:
+                rr = await client.post(run_url, params={"token": _token()}, json=payload, headers=headers)
+                rr.raise_for_status()
+                run_data = rr.json()
+                ds_id = (
+                    run_data.get("defaultDatasetId")
+                    or (run_data.get("data") or {}).get("defaultDatasetId")
+                    or run_data.get("datasetId")
+                )
+                if not ds_id:
+                    items = run_data.get("items") or (run_data.get("data") or {}).get("items")
+                    out = items if isinstance(items, list) else []
+                    _log_sample(out, f"{actor_id}:run-sync[data->items]")
+                    return out
+                ir = await client.get(ds_items_url.format(ds_id=ds_id), params={"token": _token(), "format": dataset_format})
+                ir.raise_for_status()
+                data2 = ir.json()
+                if isinstance(data2, list):
+                    _log_sample(data2, f"{actor_id}:dataset-items[list]")
+                    return data2
+                if isinstance(data2, dict) and isinstance(data2.get("items"), list):
+                    _log_sample(data2.get("items"), f"{actor_id}:dataset-items")
+                    return data2.get("items")
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return []
+
+
+async def company_to_profile_urls(company_name: str, *, max_items: int = 50, timeout_s: int = 600) -> List[str]:
+    """Resolve a company's LinkedIn URL from name, then list employee profile URLs.
+
+    Uses harvestapi~linkedin-company and harvestapi~linkedin-company-employees.
+    """
+    comp_actor = _company_actor_id()
+    emp_actor = _employees_actor_id()
+    if not (comp_actor and emp_actor):
+        return []
+    # 1) Company lookup
+    comp_items = await _run_actor_items(comp_actor, {"companies": [company_name]}, timeout_s=timeout_s)
+    company_url = None
+    if comp_items:
+        first = comp_items[0] or {}
+        company_url = first.get("linkedinUrl") or (f"https://www.linkedin.com/company/{first.get('universalName')}/" if first.get("universalName") else None)
+    logger.info("Apify company actor: company=%s company_url=%s", company_name, company_url)
+    if not company_url:
+        return []
+    # 2) Employees listing
+    payload = {"companies": [company_url], "maxItems": max_items}
+    mode = os.getenv("APIFY_EMPLOYEES_SCRAPER_MODE")
+    if mode:
+        payload["profileScraperMode"] = mode
+    emp_items = await _run_actor_items(emp_actor, payload, timeout_s=timeout_s)
+    urls: List[str] = []
+    for it in emp_items or []:
+        url = it.get("linkedinUrl") or it.get("profileUrl") or it.get("url")
+        if isinstance(url, str) and ".linkedin.com/in/" in url:
+            urls.append(url)
+    urls = list(dict.fromkeys(urls))
+    logger.info("Apify employees actor: company_url=%s employees=%d", company_url, len(urls))
+    return urls
+
+
+def _title_matches(text: str | None, titles: List[str] | None) -> bool:
+    if not titles:
+        return True
+    t = (text or "").lower()
+    return any((x or "").strip().lower() in t for x in (titles or []))
+
+
+async def contacts_via_company_chain(company_name: str, titles: List[str] | None = None, *, max_items: int = 50, timeout_s: int = 600) -> List[Dict[str, Any]]:
+    """Chain: company-by-name -> employees -> profile details -> normalize.
+
+    Filters employee profiles by title keywords when provided, then enriches via
+    the profile actor configured in APIFY_LINKEDIN_ACTOR_ID.
+    """
+    profile_actor = _actor_id()
+    profile_urls = await company_to_profile_urls(company_name, max_items=max_items, timeout_s=timeout_s)
+    if not profile_urls:
+        return []
+    # If we can fetch employee details, optionally pre-filter by title using employees endpoint again to get headlines
+    # For now, we do a quick pre-filter by using the same employees actor payload above that already returned list items.
+    # As we only have URLs, we will filter after profile scrape using jobTitle/headline.
+    items = await _run_actor_items(profile_actor, {"profileUrls": profile_urls[:max_items], "maxItems": max_items}, timeout_s=timeout_s)
+    # Filter by titles if provided
+    if titles:
+        filtered = []
+        for it in items or []:
+            txt = (it.get("jobTitle") or it.get("headline") or "")
+            if _title_matches(txt, titles):
+                filtered.append(it)
+        items = filtered
+    logger.info("Apify profile actor: requested=%d received=%d filtered=%d", min(len(profile_urls), max_items), len(items or []), len(items or []))
+    return normalize_contacts(items or [])

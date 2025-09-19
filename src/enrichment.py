@@ -32,6 +32,7 @@ from src.vendors.apify_linkedin import (
     run_sync_get_dataset_items as apify_run,
     build_queries as apify_build_queries,
     normalize_contacts as apify_normalize,
+    contacts_via_company_chain as apify_contacts_via_chain,
 )
 from src.openai_client import get_embedding
 from src.settings import (
@@ -63,6 +64,9 @@ from src.settings import (
     CONTACT_TITLES,
     ICP_RULE_NAME,
     APIFY_DAILY_CAP,
+)
+from src.settings import (
+    APIFY_USE_COMPANY_EMPLOYEE_CHAIN,
 )
 
 load_dotenv()
@@ -1816,12 +1820,22 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                 else:
                     try:
                         t0 = time.perf_counter()
-                        raw = await apify_run(
-                            {"queries": queries},
-                            dataset_format=APIFY_DATASET_FORMAT,
-                            timeout_s=APIFY_SYNC_TIMEOUT_S,
-                        )
-                        contacts_raw = apify_normalize(raw)
+                        # Prefer company -> employees -> profiles chain if enabled
+                        if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                            contacts_raw = await apify_contacts_via_chain(
+                                company_name,
+                                titles=(titles if isinstance(titles, list) else None),
+                                max_items=25,
+                                timeout_s=APIFY_SYNC_TIMEOUT_S,
+                            )
+                            raw = contacts_raw  # for count logging below; already normalized
+                        else:
+                            raw = await apify_run(
+                                {"queries": queries},
+                                dataset_format=APIFY_DATASET_FORMAT,
+                                timeout_s=APIFY_SYNC_TIMEOUT_S,
+                            )
+                            contacts_raw = apify_normalize(raw)
                         logger.info(
                             f"[apify_contacts] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
                         )

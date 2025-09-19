@@ -168,6 +168,14 @@ APIFY_LINKEDIN_ACTOR_ID = os.getenv(
 APIFY_SEARCH_ACTOR_ID = os.getenv("APIFY_SEARCH_ACTOR_ID", "")
 APIFY_SYNC_TIMEOUT_S = int(os.getenv("APIFY_SYNC_TIMEOUT_S", "600") or 600)
 APIFY_DATASET_FORMAT = os.getenv("APIFY_DATASET_FORMAT", "json")
+APIFY_COMPANY_ACTOR_ID = os.getenv("APIFY_COMPANY_ACTOR_ID", "harvestapi~linkedin-company")
+APIFY_EMPLOYEES_ACTOR_ID = os.getenv("APIFY_EMPLOYEES_ACTOR_ID", "harvestapi~linkedin-company-employees")
+APIFY_USE_COMPANY_EMPLOYEE_CHAIN = os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Per-run/daily caps. We reuse 'contact_lookups' vendor cap for simplicity.
 try:
