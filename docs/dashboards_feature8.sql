@@ -33,3 +33,13 @@ FROM qa_samples
 GROUP BY 1,2,3
 ORDER BY run_id DESC, bucket;
 
+-- 5) Apify LinkedIn usage per day
+SELECT date_trunc('day', er.started_at) AS day,
+       er.tenant_id,
+       SUM(rv.calls)               AS apify_calls,
+       SUM(rv.errors)              AS apify_errors
+FROM run_vendor_usage rv
+JOIN enrichment_runs er USING(run_id, tenant_id)
+WHERE rv.vendor = 'apify_linkedin'
+GROUP BY 1,2
+ORDER BY day DESC, tenant_id;

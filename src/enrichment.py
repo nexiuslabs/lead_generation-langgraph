@@ -28,6 +28,11 @@ from src.retry import with_retry, RetryableError, CircuitBreaker, BackoffPolicy
 
 from src.crawler import crawl_site
 from src.lusha_client import AsyncLushaClient, LushaError
+from src.vendors.apify_linkedin import (
+    run_sync_get_dataset_items as apify_run,
+    build_queries as apify_build_queries,
+    normalize_contacts as apify_normalize,
+)
 from src.openai_client import get_embedding
 from src.settings import (
     CRAWL_KEYWORDS,
@@ -53,6 +58,11 @@ from src.settings import (
     CB_ERROR_THRESHOLD,
     CB_COOL_OFF_S,
     CB_GLOBAL_EXEMPT_VENDORS,
+    APIFY_DATASET_FORMAT,
+    APIFY_SYNC_TIMEOUT_S,
+    CONTACT_TITLES,
+    ICP_RULE_NAME,
+    APIFY_DAILY_CAP,
 )
 
 load_dotenv()
@@ -124,6 +134,71 @@ _RUN_ANY_DEGRADED = False
 
 def was_run_degraded() -> bool:
     return bool(_RUN_ANY_DEGRADED)
+
+
+def _apify_calls_today(tenant_id: int | None) -> int:
+    if not tenant_id:
+        return 0
+    try:
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(rv.calls),0)
+                FROM run_vendor_usage rv
+                JOIN enrichment_runs er USING(run_id, tenant_id)
+                WHERE rv.tenant_id=%s AND rv.vendor='apify_linkedin'
+                  AND er.started_at >= date_trunc('day', now())
+                """,
+                (int(tenant_id),),
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def _apify_cap_ok(tenant_id: int | None, need: int = 1) -> bool:
+    try:
+        cap = int(APIFY_DAILY_CAP)
+    except Exception:
+        cap = 50
+    if cap <= 0:
+        return True
+    current = _apify_calls_today(tenant_id)
+    return (current + need) <= cap
+
+
+def icp_preferred_titles_for_tenant(tenant_id: int | None) -> List[str]:
+    if not tenant_id:
+        return []
+    try:
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload->'preferred_titles'
+                FROM icp_rules
+                WHERE tenant_id=%s AND name=%s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (int(tenant_id), ICP_RULE_NAME),
+            )
+            row = cur.fetchone()
+            if not row:
+                return []
+            val = row[0]
+            if isinstance(val, list):
+                return [str(x).strip() for x in val if (str(x) or "").strip()]
+            import json as _json
+            try:
+                arr = _json.loads(val) if isinstance(val, str) else []
+                if isinstance(arr, list):
+                    return [str(x).strip() for x in arr if (str(x) or "").strip()]
+            except Exception:
+                pass
+    except Exception:
+        return []
+    return []
 
 def _cb_allows(tenant_id: int | None, vendor: str) -> bool:
     try:
@@ -521,6 +596,87 @@ def _normalize_lusha_contact(c: dict) -> dict:
         phones.append(src_phones)
     out["phones"] = [p for p in phones if p]
     return out
+
+
+def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
+    """Upsert normalized Apify contacts into contacts table.
+
+    Returns tuple (inserted_count, updated_count).
+    """
+    inserted, updated = 0, 0
+    conn = None
+    try:
+        conn = get_db_connection()
+        cols = _get_table_columns(conn, "contacts")
+        has_updated_at = "updated_at" in cols
+        with conn, conn.cursor() as cur:
+            for c in contacts or []:
+                row: Dict[str, Any] = {"company_id": company_id}
+                if "full_name" in cols and c.get("full_name"):
+                    row["full_name"] = c.get("full_name")
+                if "title" in cols and c.get("title"):
+                    row["title"] = c.get("title")
+                if "linkedin_profile" in cols and c.get("linkedin_url"):
+                    row["linkedin_profile"] = c.get("linkedin_url")
+                if "linkedin_url" in cols and c.get("linkedin_url"):
+                    row["linkedin_url"] = c.get("linkedin_url")
+                if "location_city" in cols and c.get("location"):
+                    row["location_city"] = c.get("location")
+                if "contact_source" in cols:
+                    row["contact_source"] = "apify_linkedin"
+                email = c.get("email")
+                has_email_col = "email" in cols
+                if has_email_col and email:
+                    row["email"] = email
+
+                exists = False
+                if has_email_col and email:
+                    cur.execute(
+                        "SELECT 1 FROM contacts WHERE company_id=%s AND email IS NOT DISTINCT FROM %s LIMIT 1",
+                        (company_id, email),
+                    )
+                    exists = bool(cur.fetchone())
+                else:
+                    if c.get("linkedin_url") and ("linkedin_url" in cols or "linkedin_profile" in cols):
+                        lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                        cur.execute(
+                            f"SELECT 1 FROM contacts WHERE company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s LIMIT 1",
+                            (company_id, c.get("linkedin_url")),
+                        )
+                        exists = bool(cur.fetchone())
+                if exists:
+                    set_cols = [k for k in row.keys() if k not in ("company_id", "email")]
+                    if set_cols:
+                        assignments = ", ".join([f"{k}=%s" for k in set_cols])
+                        params = [row[k] for k in set_cols]
+                        if has_email_col and email:
+                            where_clause = "company_id=%s AND email IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, email])
+                        else:
+                            lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                            where_clause = f"company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, c.get("linkedin_url")])
+                        if has_updated_at:
+                            assignments = assignments + ", updated_at=now()"
+                        cur.execute(f"UPDATE contacts SET {assignments} WHERE {where_clause}", params)
+                        updated += cur.rowcount or 0
+                else:
+                    cols_list = list(row.keys())
+                    placeholders = ",".join(["%s"] * len(cols_list))
+                    cur.execute(
+                        f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                        [row[k] for k in cols_list],
+                    )
+                    inserted += cur.rowcount or 0
+    except Exception:
+        return (inserted, updated)
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+    return inserted, updated
 
 
 def upsert_contacts_from_lusha(
@@ -1606,7 +1762,7 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
     return state
 
 
-async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
+async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed"):
         return state
     data = state.get("data") or {}
@@ -1627,13 +1783,176 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
             or missing_names
             or missing_founder
         )
-        if (ENABLE_APIFY_LINKEDIN and not ENABLE_LUSHA_FALLBACK):
-            # Placeholder; Feature 16 wires Apify. Mark as missing when needed.
-            if trigger:
-                try:
-                    (state.setdefault("degraded_reasons", [])) .append("CONTACTS_MISSING")
-                except Exception:
-                    pass
+        # Prefer Apify when enabled, or when Lusha fallback is disabled/missing
+        tid = int(_RUN_CTX.get("tenant_id") or 0)
+        rid = _RUN_CTX.get("run_id")
+        prefer_apify = (
+            ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
+        )
+        if prefer_apify and trigger and _dec_cap("contact_lookups", 1):
+            # Use Apify LinkedIn Actor for contact discovery when trigger conditions met
+            titles_env = CONTACT_TITLES or []
+            titles_tenant = icp_preferred_titles_for_tenant(tid if tid else None)
+            titles = titles_tenant or titles_env or LUSHA_PREFERRED_TITLES
+            company_name = state.get("company_name") or ""
+            queries = apify_build_queries(company_name, titles)
+            if queries:
+                logger.info(
+                    f"[apify_contacts] Using Apify for contact discovery; company_id={company_id} queries={queries}"
+                )
+                # Daily cap enforcement
+                if not _apify_cap_ok(tid, need=1):
+                    try:
+                        _obs_log(
+                            "contact_discovery",
+                            "vendor_call",
+                            "disabled",
+                            company_id=company_id,
+                            extra={"reason": "apify_daily_cap"},
+                        )
+                        (state.setdefault("degraded_reasons", [])) .append("APIFY_CAP_EXCEEDED")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        t0 = time.perf_counter()
+                        raw = await apify_run(
+                            {"queries": queries},
+                            dataset_format=APIFY_DATASET_FORMAT,
+                            timeout_s=APIFY_SYNC_TIMEOUT_S,
+                        )
+                        contacts_raw = apify_normalize(raw)
+                        logger.info(
+                            f"[apify_contacts] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
+                        )
+                        # Optional: log a small sample of the Apify raw items and normalized contacts
+                        try:
+                            dbg = os.getenv("APIFY_DEBUG_LOG_ITEMS", "").lower() in ("1", "true", "yes", "on")
+                            if dbg:
+                                try:
+                                    n = int(os.getenv("APIFY_LOG_SAMPLE_SIZE", "3") or 3)
+                                except Exception:
+                                    n = 3
+                                # Build raw sample with selected fields to keep logs compact
+                                def _pick_fields(it: dict) -> dict:
+                                    keys = [
+                                        "fullName",
+                                        "name",
+                                        "headline",
+                                        "title",
+                                        "companyName",
+                                        "company",
+                                        "profileUrl",
+                                        "url",
+                                        "linkedin_url",
+                                        "locationName",
+                                        "location",
+                                        "email",
+                                    ]
+                                    out = {k: it.get(k) for k in keys if (isinstance(it, dict) and it.get(k) is not None)}
+                                    if not out and isinstance(it, dict):
+                                        for k in list(it.keys())[:6]:
+                                            out[k] = it.get(k)
+                                    return out
+                                raw_sample = [_pick_fields(x) for x in (raw or [])[:n] if isinstance(x, dict)]
+                                norm_sample = [
+                                    {k: c.get(k) for k in ("full_name", "title", "company_current", "linkedin_url", "location", "email") if c.get(k) is not None}
+                                    for c in (contacts_raw or [])[:n]
+                                ]
+                                logger.info(
+                                    f"[apify_contacts] items_sample={raw_sample} company_id={company_id}"
+                                )
+                                logger.info(
+                                    f"[apify_contacts] normalized_sample={norm_sample} company_id={company_id}"
+                                )
+                        except Exception:
+                            pass
+                        # Upsert into contacts table (best-effort)
+                        try:
+                            ins, upd = upsert_contacts_from_apify(company_id, contacts_raw)
+                            logger.info(
+                                f"[apify_contacts] upserted: inserted={ins}, updated={upd} company_id={company_id}"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "[apify_contacts] upsert error; continuing", exc_info=True
+                            )
+                        # Verify any provided emails and upsert into lead_emails
+                        try:
+                            emails = [c.get("email") for c in contacts_raw if c.get("email")]
+                            if emails:
+                                verification = verify_emails(emails)
+                                with get_db_connection() as conn:
+                                    with conn.cursor() as cur:
+                                        for ver in verification:
+                                            email_verified = True if ver.get("status") == "valid" else False
+                                            cur.execute(
+                                                """
+                                                INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                                VALUES (%s,%s,%s,%s,%s, now())
+                                                ON CONFLICT (email) DO UPDATE SET
+                                                  company_id=EXCLUDED.company_id,
+                                                  verification_status=EXCLUDED.verification_status,
+                                                  smtp_confidence=EXCLUDED.smtp_confidence,
+                                                  source=EXCLUDED.source,
+                                                  last_verified_at=EXCLUDED.last_verified_at
+                                                """,
+                                                (
+                                                    ver["email"],
+                                                    company_id,
+                                                    ver.get("status"),
+                                                    ver.get("confidence"),
+                                                    "apify_linkedin",
+                                                ),
+                                            )
+                                logger.info(
+                                    f"[apify_contacts] verified_emails={len(emails)} company_id={company_id}"
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[apify_contacts] email verify/upsert skipped", exc_info=True
+                            )
+                        # Vendor usage + obs
+                        _VENDOR_COUNTERS["apify_linkedin_calls"] = _VENDOR_COUNTERS.get("apify_linkedin_calls", 0) + 1
+                        try:
+                            if rid and tid:
+                                _obs_vendor("apify_linkedin", calls=1)
+                                _obs_log(
+                                    "contact_discovery",
+                                    "vendor_call",
+                                    "ok",
+                                    company_id=company_id,
+                                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                                    extra={"queries": queries},
+                                )
+                        except Exception:
+                            pass
+                        state["apify_used"] = True
+                        # Consider contacts added as mitigating trigger
+                        if contacts_raw:
+                            need_emails = need_emails and (len(emails or []) == 0)
+                            needs_contacts = False
+                            missing_names = False
+                            missing_founder = False
+                    except Exception as e:
+                        try:
+                            _obs_vendor("apify_linkedin", calls=1, errors=1)
+                            _obs_log(
+                                "contact_discovery",
+                                "vendor_call",
+                                "error",
+                                company_id=company_id,
+                                error_code=type(e).__name__,
+                            )
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "[apify_contacts] Apify LinkedIn call failed", exc_info=True
+                        )
+                        try:
+                            (state.setdefault("degraded_reasons", [])) .append("APIFY_LINKEDIN_FAIL")
+                        except Exception:
+                            pass
         elif ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger and _dec_cap("contact_lookups", 1):
             website_hint = data.get("website_domain") or state.get("home") or ""
             try:
@@ -1835,7 +2154,7 @@ enrichment_graph.add_node("expand_crawl", node_expand_crawl)
 enrichment_graph.add_node("extract_pages", node_extract_pages)
 enrichment_graph.add_node("build_chunks", node_build_chunks)
 enrichment_graph.add_node("llm_extract", node_llm_extract)
-enrichment_graph.add_node("lusha_contacts", node_lusha_contacts)
+enrichment_graph.add_node("apify_contacts", node_apify_contacts)
 enrichment_graph.add_node("persist_core", node_persist_core)
 enrichment_graph.add_node("persist_legacy", node_persist_legacy)
 
@@ -1856,8 +2175,8 @@ enrichment_graph.add_edge("discover_urls", "expand_crawl")
 enrichment_graph.add_edge("expand_crawl", "extract_pages")
 enrichment_graph.add_edge("extract_pages", "build_chunks")
 enrichment_graph.add_edge("build_chunks", "llm_extract")
-enrichment_graph.add_edge("llm_extract", "lusha_contacts")
-enrichment_graph.add_edge("lusha_contacts", "persist_core")
+enrichment_graph.add_edge("llm_extract", "apify_contacts")
+enrichment_graph.add_edge("apify_contacts", "persist_core")
 enrichment_graph.add_edge("persist_core", "persist_legacy")
 
 enrichment_agent = enrichment_graph.compile()

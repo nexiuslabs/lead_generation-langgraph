@@ -96,7 +96,8 @@ LUSHA_API_KEY = os.getenv("LUSHA_API_KEY", "")
 LUSHA_BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")
 
 # Toggle to enable/disable Lusha fallback without redeploying
-ENABLE_LUSHA_FALLBACK = os.getenv("ENABLE_LUSHA_FALLBACK", "true").lower() in (
+# Default disabled now that Apify replaces Lusha in the pipeline
+ENABLE_LUSHA_FALLBACK = os.getenv("ENABLE_LUSHA_FALLBACK", "false").lower() in (
     "1",
     "true",
     "yes",
@@ -143,7 +144,8 @@ ENABLE_TAVILY_FALLBACK = os.getenv("ENABLE_TAVILY_FALLBACK", "true").lower() in 
     "yes",
     "on",
 )
-ENABLE_APIFY_LINKEDIN = os.getenv("ENABLE_APIFY_LINKEDIN", "false").lower() in (
+# Prefer Apify LinkedIn by default
+ENABLE_APIFY_LINKEDIN = os.getenv("ENABLE_APIFY_LINKEDIN", "true").lower() in (
     "1",
     "true",
     "yes",
@@ -157,3 +159,25 @@ ODOO_EXPORT_SET_DEFAULTS = os.getenv("ODOO_EXPORT_SET_DEFAULTS", "true").lower()
     "yes",
     "on",
 )
+
+# --- Feature 16: Apify LinkedIn configuration ---------------------------------
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+APIFY_LINKEDIN_ACTOR_ID = os.getenv(
+    "APIFY_LINKEDIN_ACTOR_ID", "dev_fusion~linkedin-profile-scraper"
+)
+APIFY_SEARCH_ACTOR_ID = os.getenv("APIFY_SEARCH_ACTOR_ID", "")
+APIFY_SYNC_TIMEOUT_S = int(os.getenv("APIFY_SYNC_TIMEOUT_S", "600") or 600)
+APIFY_DATASET_FORMAT = os.getenv("APIFY_DATASET_FORMAT", "json")
+
+# Per-run/daily caps. We reuse 'contact_lookups' vendor cap for simplicity.
+try:
+    APIFY_DAILY_CAP = int(os.getenv("APIFY_DAILY_CAP", "50") or 50)
+except Exception:
+    APIFY_DAILY_CAP = 50
+
+# Preferred contact titles (fallback); otherwise derive from ICP rules or env
+CONTACT_TITLES = [
+    t.strip()
+    for t in (os.getenv("CONTACT_TITLES", "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal") or "").split(",")
+    if t.strip()
+]
