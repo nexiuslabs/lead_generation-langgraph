@@ -866,13 +866,19 @@ def health():
 
 # --- Export endpoints (JSON/CSV) ---
 @app.get("/export/latest_scores.json")
-async def export_latest_scores_json(limit: int = 200, request: Request = None, _: dict = Depends(require_auth)):
+async def export_latest_scores_json(limit: int = 200, request: Request = None, claims: dict = Depends(require_identity)):
+    # Resolve tenant from identity and Odoo mapping (supports tokens without tenant_id claim)
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         # Set per-request tenant GUC for RLS
         try:
-            if request and getattr(request.state, "tenant_id", None):
-                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", request.state.tenant_id)
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
         rows = await conn.fetch(
@@ -890,12 +896,18 @@ async def export_latest_scores_json(limit: int = 200, request: Request = None, _
 
 
 @app.get("/export/latest_scores.csv")
-async def export_latest_scores_csv(limit: int = 200, request: Request = None, _: dict = Depends(require_auth)):
+async def export_latest_scores_csv(limit: int = 200, request: Request = None, claims: dict = Depends(require_identity)):
+    # Resolve tenant from identity and Odoo mapping (supports tokens without tenant_id claim)
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         try:
-            if request and getattr(request.state, "tenant_id", None):
-                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", request.state.tenant_id)
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
         rows = await conn.fetch(
