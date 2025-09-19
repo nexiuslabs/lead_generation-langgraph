@@ -1,25 +1,37 @@
 # app/main.py
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
-from langserve import add_routes
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from app.pre_sdr_graph import build_graph
+from app.onboarding import handle_first_login, get_onboarding_status
+from app.odoo_connection_info import get_odoo_connection_info
 from src.database import get_pg_pool, get_conn
-from src.icp import _find_ssic_codes_by_terms
+from app.auth import require_auth, require_identity, require_optional_identity
+from app.odoo_store import OdooStore
+from src.settings import OPENAI_API_KEY
+import os
 import csv
 from io import StringIO
 import logging
 import re
 import os
+from datetime import datetime
 
-logger = logging.getLogger("input_norm")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
-    h.setFormatter(fmt)
-    logger.addHandler(h)
-logger.setLevel("INFO")
+fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
+
+def _ensure_logger(name: str, level: str = "INFO"):
+    lg = logging.getLogger(name)
+    if not lg.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(fmt)
+        lg.addHandler(h)
+    lg.setLevel(level)
+    return lg
+
+# Configure important app loggers so they are visible in Uvicorn output
+logger = _ensure_logger("input_norm")
+_ensure_logger("onboarding")
+_ensure_logger("app.odoo_store")
 
 # Ensure LangGraph checkpoint directory exists to prevent FileNotFoundError
 # e.g., '.langgraph_api/.langgraph_checkpoint.*.pckl.tmp'
@@ -31,19 +43,47 @@ except Exception as e:
 
 app = FastAPI(title="Pre-SDR LangGraph Server")
 
+# CORS allowlist (env-extensible)
+extra_origins = []
+try:
+    raw = os.getenv("EXTRA_CORS_ORIGINS", "")
+    if raw:
+        extra_origins = [o.strip() for o in raw.split(",") if o.strip()]
+except Exception:
+    extra_origins = []
+
+allow_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+] + extra_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-    ],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-graph = build_graph()
+# Lazily enable /agent routes only when LLM is configured to avoid import-time errors
+graph = None
+
+# Mount auth cookie routes
+try:
+    from app.auth_routes import router as auth_router
+    app.include_router(auth_router)
+except Exception as _e:
+    logger.warning("Auth routes not mounted: %s", _e)
+
+# Optional: mount split-origin graph proxy if configured
+try:
+    if (os.getenv("ENABLE_GRAPH_PROXY") or "").strip().lower() in ("1", "true", "yes", "on"):
+        from app.graph_proxy import router as graph_router
+        app.include_router(graph_router)
+        logger.info("/graph proxy routes enabled")
+except Exception as _e:
+    logger.warning("Graph proxy not mounted: %s", _e)
 
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
@@ -383,30 +423,458 @@ def normalize_input(payload: dict) -> dict:
 
     return state
 
-ui_adapter = RunnableLambda(normalize_input) | graph
+ENABLE_LANGSERVE_IN_APP = os.getenv("ENABLE_LANGSERVE_IN_APP", "false").lower() in ("1", "true", "yes", "on")
+try:
+    if ENABLE_LANGSERVE_IN_APP and OPENAI_API_KEY:
+        # Import inside conditional to avoid loading langserve when mounted into LangGraph Server
+        from langserve import add_routes  # type: ignore
+        from app.pre_sdr_graph import build_graph  # type: ignore
 
-# expose adapted runnable so /agent accepts role-based payloads
-add_routes(app, ui_adapter, path="/agent")
+        graph = build_graph()
+        ui_adapter = RunnableLambda(normalize_input) | graph
+        add_routes(app, ui_adapter, path="/agent")
+        logger.info("/agent routes enabled (LLM configured)")
+    else:
+        logger.info("Skipping /agent routes (ENABLE_LANGSERVE_IN_APP is false or OPENAI_API_KEY missing)")
+except Exception as e:
+    # Never block API/docs if LangServe wiring fails; just log and continue
+    logger.warning("Skipping /agent routes due to initialization error: %s", e)
+
+@app.get("/info")
+async def info(_: dict = Depends(require_auth)):
+    # Expose capability hints and current auth mode (no secrets)
+    checkpoint_enabled = True if CHECKPOINT_DIR else False
+    dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")
+    issuer = (os.getenv("NEXIUS_ISSUER") or "").strip() or None
+    audience = (os.getenv("NEXIUS_AUDIENCE") or "").strip() or None
+    return {
+        "ok": True,
+        "checkpoint_enabled": checkpoint_enabled,
+        "auth": {"dev_bypass": dev_bypass, "issuer": issuer, "audience": audience},
+    }
+
+@app.get("/whoami")
+async def whoami(claims: dict = Depends(require_auth)):
+    return {
+        "sub": claims.get("sub"),
+        "email": claims.get("email"),
+        "tenant_id": claims.get("tenant_id"),
+        "roles": claims.get("roles", []),
+    }
+
+@app.get("/onboarding/verify_odoo")
+async def verify_odoo(claims: dict = Depends(require_identity)):
+    """Verify Odoo mapping + connectivity for the current session.
+
+    Aligns with PRD/DevPlan: does not require a tenant_id claim; resolves
+    tenant via DSN→odoo_connections, claim, or email mapping. Uses
+    odoo_connection_info for smoke test.
+    """
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+
+    # Use shared resolver + smoke test
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+
+    # Determine whether an active mapping exists
+    exists = False
+    if tid is not None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT active FROM odoo_connections WHERE tenant_id=%s", (tid,))
+                row = cur.fetchone()
+                exists = bool(row and row[0])
+        except Exception as e:
+            logger.exception("Odoo verify DB lookup failed tenant_id=%s", tid)
+            return {"tenant_id": tid, "exists": False, "ready": False, "error": str(e)}
+
+    smoke = bool((info.get("odoo") or {}).get("ready"))
+    error = (info.get("odoo") or {}).get("error")
+
+    out = {
+        "tenant_id": tid,
+        "exists": exists,
+        "smoke": smoke,
+        "ready": bool(exists and smoke),
+        "error": error,
+    }
+    try:
+        if out.get("tenant_id") is not None and out.get("ready"):
+            os.environ["DEFAULT_TENANT_ID"] = str(out.get("tenant_id"))
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/debug/tenant")
+async def debug_tenant(claims: dict = Depends(require_auth)):
+    """Return current user identity, tenant mapping, and Odoo connectivity status."""
+    email = claims.get("email") or claims.get("preferred_username")
+    tid = claims.get("tenant_id")
+    roles = claims.get("roles", [])
+
+    db_name = None
+    mapping_exists = False
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tid,))
+            row = cur.fetchone()
+            if row:
+                mapping_exists = True
+                db_name = row[0]
+    except Exception as e:
+        return {
+            "email": email,
+            "tenant_id": tid,
+            "roles": roles,
+            "odoo": {"exists": False, "ready": False, "error": f"mapping fetch failed: {e}"},
+        }
+
+    # Try connectivity
+    ready = False
+    error = None
+    try:
+        store = OdooStore(tenant_id=int(tid))
+        await store.connectivity_smoke_test()
+        ready = True
+    except Exception as e:
+        error = str(e)
+
+    return {
+        "email": email,
+        "tenant_id": tid,
+        "roles": roles,
+        "odoo": {"exists": mapping_exists, "db_name": db_name, "ready": ready, "error": error},
+    }
+
+
+@app.get("/session/odoo_info")
+async def session_odoo_info(claims: dict = Depends(require_optional_identity)):
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    try:
+        if info.get("tenant_id") is not None and (info.get("odoo") or {}).get("ready"):
+            os.environ["DEFAULT_TENANT_ID"] = str(info.get("tenant_id"))
+    except Exception:
+        pass
+    return info
+
+
+@app.post("/onboarding/repair_admin")
+async def onboarding_repair_admin(body: dict, _: dict = Depends(require_auth)):
+    """Reset the admin login/password for a tenant's Odoo DB via XML-RPC.
+
+    Body: { tenant_id: int, email: str, password: str }
+    Requires: ODOO_SERVER_URL, ODOO_TEMPLATE_ADMIN_LOGIN, ODOO_TEMPLATE_ADMIN_PASSWORD
+    """
+    tenant_id = (body or {}).get("tenant_id")
+    email = (body or {}).get("email")
+    password = (body or {}).get("password")
+    if not tenant_id or not email or not password:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="tenant_id, email, password required")
+    server = (os.getenv("ODOO_SERVER_URL") or "").rstrip("/")
+    admin_login = os.getenv("ODOO_TEMPLATE_ADMIN_LOGIN", "admin")
+    admin_pw = os.getenv("ODOO_TEMPLATE_ADMIN_PASSWORD")
+    if not server or not admin_pw:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="Missing ODOO server or template admin credentials")
+    # Resolve db_name for tenant
+    db_name = None
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tenant_id,))
+        r = cur.fetchone()
+        db_name = r[0] if r and r[0] else None
+    if not db_name:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="No db_name for tenant")
+    # XML-RPC update
+    import xmlrpc.client
+    common = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/common")
+    uid = common.authenticate(db_name, admin_login, admin_pw, {})
+    if not uid:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Template admin auth failed (check dbfilter/password)")
+    models = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/object")
+    ids = models.execute_kw(db_name, uid, admin_pw, 'res.users', 'search', [[['login', '=', admin_login]]], {'limit': 1}) or [2]
+    models.execute_kw(db_name, uid, admin_pw, 'res.users', 'write', [ids, {'login': email, 'password': password}])
+    try:
+        recs = models.execute_kw(db_name, uid, admin_pw, 'res.users', 'read', [ids, ['partner_id']])
+        if recs and recs[0].get('partner_id'):
+            models.execute_kw(db_name, uid, admin_pw, 'res.partner', 'write', [[recs[0]['partner_id'][0]], {'email': email}])
+    except Exception:
+        pass
+    return {"ok": True, "db_name": db_name}
+
+
+@app.post("/onboarding/verify_admin_login")
+async def onboarding_verify_admin_login(body: dict, _: dict = Depends(require_auth)):
+    """Verify that the provided email/password can authenticate to the tenant's Odoo DB.
+
+    Body: { tenant_id?: int, email: str, password: str }
+    Resolves tenant_id from body or from odoo_connections via email mapping when omitted.
+    """
+    email = (body or {}).get("email") or ""
+    password = (body or {}).get("password") or ""
+    tenant_id = (body or {}).get("tenant_id")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password required")
+    # Resolve tenant_id if not provided
+    if tenant_id is None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+                r = cur.fetchone()
+                if r:
+                    tenant_id = int(r[0])
+        except Exception:
+            tenant_id = tenant_id
+    if tenant_id is None:
+        raise HTTPException(status_code=404, detail="tenant_id not found for email")
+    # Resolve db_name for tenant
+    db_name = None
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s", (tenant_id,))
+        r = cur.fetchone()
+        db_name = r[0] if r and r[0] else None
+    if not db_name:
+        raise HTTPException(status_code=404, detail="No db_name for tenant")
+    server = (os.getenv("ODOO_SERVER_URL") or "").rstrip("/")
+    if not server:
+        raise HTTPException(status_code=500, detail="Missing ODOO_SERVER_URL")
+    # XML-RPC authenticate
+    try:
+        import xmlrpc.client
+        common = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/common")
+        uid = common.authenticate(db_name, email, password, {})
+        ok = bool(uid)
+        return {"ok": ok, "tenant_id": tenant_id, "db_name": db_name, "uid": uid or None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"XML-RPC auth failed: {e}")
+
+
+@app.post("/onboarding/first_login")
+async def onboarding_first_login(
+    background: BackgroundTasks, claims: dict = Depends(require_optional_identity)
+):
+    email = claims.get("email") or claims.get("preferred_username")
+    # Ignore tenant_id from token to avoid reliance on claim
+    tenant_id_claim = None
+
+    # If we already have an onboarding record for this tenant in progress or ready,
+    # avoid enqueueing duplicate background tasks. Resolve candidate tenant ID from
+    # DSN→odoo_connections mapping first, then fall back to existing user mapping by email.
+    try:
+        candidate_tid = None
+        # DSN-based mapping: if ODOO_POSTGRES_DSN points at a specific DB, find the active mapping
+        from src.settings import ODOO_POSTGRES_DSN
+        try:
+            inferred_db = None
+            if ODOO_POSTGRES_DSN:
+                from urllib.parse import urlparse
+                u = urlparse(ODOO_POSTGRES_DSN)
+                inferred_db = (u.path or "/").lstrip("/") or None
+            if inferred_db:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT tenant_id FROM odoo_connections WHERE db_name=%s AND active=TRUE LIMIT 1", (inferred_db,))
+                    row = cur.fetchone()
+                    if row:
+                        candidate_tid = int(row[0])
+        except Exception:
+            candidate_tid = candidate_tid  # keep any value already found
+
+        # Fallback to email → tenant_users mapping
+        if candidate_tid is None:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+                row = cur.fetchone()
+                if row:
+                    candidate_tid = int(row[0])
+
+        if candidate_tid is not None:
+            current = get_onboarding_status(int(candidate_tid))
+            # Dedup for all known in-progress/ready states
+            if current and current.get("status") in {"provisioning", "syncing", "ready", "starting", "creating_odoo", "configuring_oidc", "seeding"}:
+                logger.info(
+                    "onboarding:first_login dedup tenant_id=%s inferred_db=%s email=%s status=%s",
+                    candidate_tid,
+                    locals().get("inferred_db"),
+                    email,
+                    current.get("status"),
+                )
+                return {"status": current.get("status"), "tenant_id": current.get("tenant_id"), "error": current.get("error")}
+    except Exception:
+        # Non-blocking; proceed to kickoff if status lookup fails
+        pass
+
+    async def _run():
+        # No password available here; only register flow can pass one
+        await handle_first_login(email, tenant_id_claim, user_password=None)
+
+    background.add_task(_run)
+    return {"status": "provisioning"}
+
+
+@app.get("/onboarding/status")
+async def onboarding_status(claims: dict = Depends(require_optional_identity)):
+    # Resolve tenant id primarily via DSN→odoo_connections; fallback to claim or email mapping
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    logger.info("onboarding_status: enter email=%s claim_tid=%s", email, claims.get("tenant_id"))
+    tid = None
+    try:
+        from src.settings import ODOO_POSTGRES_DSN
+        inferred_db = None
+        if ODOO_POSTGRES_DSN:
+            from urllib.parse import urlparse
+            u = urlparse(ODOO_POSTGRES_DSN)
+            inferred_db = (u.path or "/").lstrip("/") or None
+        if inferred_db:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM odoo_connections WHERE db_name=%s AND active=TRUE LIMIT 1", (inferred_db,))
+                row = cur.fetchone()
+                if row:
+                    tid = int(row[0])
+    except Exception:
+        tid = None
+
+    if tid is None:
+        tid = claims.get("tenant_id") or getattr(getattr(app, "state", object()), "tenant_id", None)
+
+    if tid is None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+                row = cur.fetchone()
+                if row:
+                    tid = int(row[0])
+        except Exception:
+            tid = tid
+
+    # Guard: if tenant_id is still unknown, return a provisioning placeholder instead of 500
+    if tid is None:
+        logger.info("onboarding_status: no tenant yet for email=%s → returning provisioning placeholder", email)
+        return {"tenant_id": None, "status": "provisioning", "error": None}
+
+    try:
+        res = get_onboarding_status(int(tid))
+        # Back-compat: normalize legacy 'complete' to 'ready' for UI gate
+        try:
+            if (res or {}).get("status") == "complete":
+                res["status"] = "ready"
+        except Exception:
+            pass
+        logger.info("onboarding_status: tenant_id=%s status=%s", tid, res.get("status"))
+        return res
+    except Exception as e:
+        logger.exception("Onboarding status failed tenant_id=%s", tid)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"tenant_id": tid, "status": "error", "error": str(e)})
+
+
+@app.get("/tenants/{tenant_id}")
+async def tenant_status(tenant_id: int, _: dict = Depends(require_optional_identity)):
+    """PRD alias for onboarding status by explicit tenant id."""
+    try:
+        res = get_onboarding_status(int(tenant_id))
+        # Back-compat normalization
+        try:
+            if (res or {}).get("status") == "complete":
+                res["status"] = "ready"
+        except Exception:
+            pass
+        return res
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"tenant_id": tenant_id, "status": "error", "error": str(e)})
+
+
+# --- Role-based access helpers and ICP endpoints ---
+def require_roles(allowed: set[str]):
+    async def _dep(request: Request):
+        roles = getattr(request.state, "roles", []) or []
+        if not any(r in allowed for r in roles):
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return True
+    return _dep
+
+
+@app.post("/api/icp/by-ssic")
+async def api_icp_by_ssic(payload: dict):
+    import src.icp as icp_module
+
+    terms = (payload or {}).get("terms")
+    if not isinstance(terms, list):
+        terms = []
+    norm_terms = [t.strip().lower() for t in terms if isinstance(t, str) and t.strip()]
+    matched = icp_module._find_ssic_codes_by_terms(norm_terms)
+    codes = [code for code, _title, _score in matched]
+    acra = icp_module._select_acra_by_ssic_codes(codes)
+    return {
+        "matched_ssic": [{"code": c, "title": t, "score": s} for c, t, s in matched],
+        "acra_candidates": acra,
+    }
+
+
+@app.get("/icp/rules")
+async def list_icp_rules(_: dict = Depends(require_auth), request: Request = None):
+    # List ICP rules for current tenant (viewer allowed)
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        tid = getattr(request.state, "tenant_id", None)
+        if tid:
+            try:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+            except Exception:
+                pass
+        rows = await conn.fetch(
+            "SELECT rule_id, tenant_id, name, payload, created_at FROM icp_rules ORDER BY created_at DESC LIMIT 50"
+        )
+    return [dict(r) for r in rows]
+
+
+@app.post("/icp/rules")
+async def upsert_icp_rule(item: dict, _: dict = Depends(require_auth), __: bool = Depends(require_roles({"ops", "admin"})), request: Request = None):
+    # Upsert ICP rule for tenant (ops/admin only)
+    name = (item or {}).get("name") or "Default ICP"
+    payload = (item or {}).get("payload") or {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be an object")
+    tid = getattr(request.state, "tenant_id", None)
+    if not tid:
+        raise HTTPException(status_code=400, detail="missing tenant context")
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (tid,))
+        except Exception:
+            pass
+        cur.execute(
+            """
+            INSERT INTO icp_rules(tenant_id, name, payload)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (rule_id) DO NOTHING
+            """,
+            (tid, name, payload),
+        )
+    return {"ok": True}
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# --- Lightweight tenant middleware (optional header-based) ---
-@app.middleware("http")
-async def tenant_middleware(request: Request, call_next):
-    # Extract tenant_id from header (e.g., set by SSO/edge); no validation here
-    tenant_id = request.headers.get("X-Tenant-ID") or None
-    request.state.tenant_id = tenant_id
-    return await call_next(request)
-
-
 # --- Export endpoints (JSON/CSV) ---
 @app.get("/export/latest_scores.json")
-async def export_latest_scores_json(limit: int = 200):
+async def export_latest_scores_json(limit: int = 200, request: Request = None, _: dict = Depends(require_auth)):
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
+        # Set per-request tenant GUC for RLS
+        try:
+            if request and getattr(request.state, "tenant_id", None):
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", request.state.tenant_id)
+        except Exception:
+            pass
         rows = await conn.fetch(
             """
             SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
@@ -422,9 +890,14 @@ async def export_latest_scores_json(limit: int = 200):
 
 
 @app.get("/export/latest_scores.csv")
-async def export_latest_scores_csv(limit: int = 200):
+async def export_latest_scores_csv(limit: int = 200, request: Request = None, _: dict = Depends(require_auth)):
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
+        try:
+            if request and getattr(request.state, "tenant_id", None):
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", request.state.tenant_id)
+        except Exception:
+            pass
         rows = await conn.fetch(
             """
             SELECT c.company_id, c.name, c.industry_norm, c.employees_est,
@@ -444,3 +917,351 @@ async def export_latest_scores_csv(limit: int = 200):
     for r in rows:
         writer.writerow(dict(r))
     return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.post("/export/odoo/sync")
+async def export_odoo_sync(body: dict | None = None, request: Request = None, claims: dict = Depends(require_identity)):
+    """Export scored companies to Odoo for the current tenant.
+
+    Body (optional): { "min_score": float, "limit": int }
+    - Selects top scored rows for the tenant and upserts company + primary contact; creates a lead when score ≥ min_score.
+    """
+    min_score = 0.0
+    limit = 100
+    try:
+        if isinstance(body, dict):
+            if isinstance(body.get("min_score"), (int, float)):
+                min_score = float(body["min_score"])  # type: ignore[index]
+            if isinstance(body.get("limit"), int):
+                limit = int(body["limit"])  # type: ignore[index]
+    except Exception:
+        pass
+
+    # Resolve tenant context even if token lacks tenant_id
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        # Set per-request tenant for RLS
+        try:
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+        except Exception:
+            pass
+        rows = await conn.fetch(
+            """
+            SELECT s.company_id, s.score, s.rationale,
+                   c.name, c.uen, c.industry_norm, c.employees_est, c.revenue_bucket,
+                   c.incorporation_year, c.website_domain,
+                   (SELECT e.email FROM lead_emails e WHERE e.company_id=s.company_id LIMIT 1) AS primary_email
+            FROM lead_scores s
+            JOIN companies c ON c.company_id = s.company_id
+            ORDER BY s.score DESC NULLS LAST
+            LIMIT $1
+            """,
+            limit,
+        )
+    # Use tenant-scoped Odoo mapping
+    store = OdooStore(tenant_id=int(tid)) if tid is not None else OdooStore()
+    exported = 0
+    errors: list[dict] = []
+    for r in rows:
+        try:
+            odoo_id = await store.upsert_company(
+                r["name"],
+                r["uen"],
+                industry_norm=r["industry_norm"],
+                employees_est=r["employees_est"],
+                revenue_bucket=r["revenue_bucket"],
+                incorporation_year=r["incorporation_year"],
+                website_domain=r["website_domain"],
+            )
+            try:
+                import logging as _lg
+                _lg.getLogger("onboarding").info("export: upsert company partner_id=%s name=%s", odoo_id, r["name"])
+            except Exception:
+                pass
+            if r["primary_email"]:
+                try:
+                    await store.add_contact(odoo_id, r["primary_email"])
+                    try:
+                        import logging as _lg
+                        _lg.getLogger("onboarding").info("export: add_contact email=%s partner_id=%s", r["primary_email"], odoo_id)
+                    except Exception:
+                        pass
+                except Exception as _c_exc:
+                    errors.append({"company_id": r["company_id"], "error": f"contact: {_c_exc}"})
+            await store.merge_company_enrichment(odoo_id, {})
+            sc = float(r["score"] or 0)
+            try:
+                await store.create_lead_if_high(
+                    odoo_id,
+                    r["name"],
+                    sc,
+                    {},
+                    r["rationale"] or "",
+                    r["primary_email"],
+                    threshold=min_score,
+                )
+                try:
+                    import logging as _lg
+                    _lg.getLogger("onboarding").info("export: lead check partner_id=%s score=%.2f threshold=%.2f", odoo_id, sc, min_score)
+                except Exception:
+                    pass
+            except Exception as _l_exc:
+                errors.append({"company_id": r["company_id"], "error": f"lead: {_l_exc}"})
+            exported += 1
+        except Exception as e:
+            errors.append({"company_id": r["company_id"], "error": str(e)})
+    return {"exported": exported, "count": len(rows), "min_score": min_score, "errors": errors}
+@app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    # Always let CORS preflight through
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+    # Allow unauthenticated for health and docs
+    open_paths = {"/health", "/docs", "/openapi.json"}
+    if request.url.path in open_paths:
+        return await call_next(request)
+    # In production, do not double-enforce here; route dependencies perform auth
+    return await call_next(request)
+
+# --- Admin/ops: rotate per-tenant Odoo API key ---
+@app.post("/tenants/{tenant_id}/odoo/api-key/rotate")
+async def rotate_odoo_key(tenant_id: int = Path(...), _: dict = Depends(require_auth)):
+    import secrets
+    new_secret = secrets.token_urlsafe(32)
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE odoo_connections SET secret=%s WHERE tenant_id=%s", (new_secret, tenant_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rotate failed: {e}")
+    return Response(status_code=204)
+
+
+# --- Shortlist status and ad-hoc scheduler trigger ---
+@app.get("/shortlist/status")
+async def shortlist_status(request: Request = None, claims: dict = Depends(require_optional_identity)):
+    """Return shortlist freshness and size for the current tenant.
+
+    Response: { last_refreshed_at: ISO8601|null, total_scored: int, tenant_id?: int }
+    """
+    # Resolve tenant from identity and Odoo mapping (same approach as export)
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        # Apply RLS tenant context if known
+        try:
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+        except Exception:
+            pass
+
+        # Count scored rows (RLS will scope if enabled)
+        try:
+            total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores"))
+        except Exception:
+            total_scored = 0
+
+        # last_refreshed_at heuristics: prefer enrichment/company run timestamps if present,
+        # fallback to company last_seen joined to lead_scores, else None.
+        last_ts: datetime | None = None
+        last_run_id = None
+        last_run_status = None
+        last_run_started_at = None
+        last_run_ended_at = None
+
+        # Try company_enrichment_runs.run_timestamp
+        try:
+            ts = await conn.fetchval("SELECT MAX(run_timestamp) FROM company_enrichment_runs")
+            if isinstance(ts, datetime):
+                last_ts = ts
+        except Exception:
+            last_ts = last_ts
+
+        # Try enrichment_runs.started_at and include run fields (subject to RLS)
+        if last_ts is None:
+            try:
+                row = await conn.fetchrow(
+                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs ORDER BY run_id DESC LIMIT 1"
+                )
+                if row:
+                    last_run_id = row["run_id"]
+                    last_run_status = row["status"]
+                    last_run_started_at = row["started_at"]
+                    last_run_ended_at = row["ended_at"]
+                    if isinstance(last_run_started_at, datetime):
+                        last_ts = last_run_started_at
+            except Exception:
+                last_ts = last_ts
+
+        # Fallback: companies.last_seen for rows that have scores
+        if last_ts is None:
+            try:
+                ts = await conn.fetchval(
+                    """
+                    SELECT MAX(c.last_seen)
+                    FROM companies c
+                    JOIN lead_scores s ON s.company_id = c.company_id
+                    """
+                )
+                if isinstance(ts, datetime):
+                    last_ts = ts
+            except Exception:
+                last_ts = last_ts
+
+    out = {
+        "tenant_id": tid,
+        "total_scored": total_scored,
+        "last_refreshed_at": (last_ts.isoformat() if isinstance(last_ts, datetime) else None),
+        "last_run_id": last_run_id,
+        "last_run_status": last_run_status,
+        "last_run_started_at": (last_run_started_at.isoformat() if isinstance(last_run_started_at, datetime) else None),
+        "last_run_ended_at": (last_run_ended_at.isoformat() if isinstance(last_run_ended_at, datetime) else None),
+    }
+    return out
+
+
+@app.post("/scheduler/run_now")
+async def scheduler_run_now(background: BackgroundTasks, claims: dict = Depends(require_auth)):
+    """Trigger a background run for the current tenant (ad-hoc).
+
+    Returns immediately with {status: "scheduled", tenant_id}.
+    """
+    # Resolve tenant from identity and Odoo mapping
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    from app.odoo_connection_info import get_odoo_connection_info
+    info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+    tid = info.get("tenant_id")
+    if tid is None:
+        raise HTTPException(status_code=400, detail="Unable to resolve tenant for current session")
+
+    try:
+        # Import runner lazily to avoid import-time overhead unless used
+        from scripts.run_nightly import run_tenant_partial  # type: ignore
+
+        async def _run():
+            try:
+                import os
+                # Process up to 10 now; leave remainder for nightly scheduler
+                limit = 10
+                try:
+                    limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
+                except Exception:
+                    limit = 10
+                await run_tenant_partial(int(tid), max_now=limit)
+            except Exception as exc:
+                logging.getLogger("nightly").exception("ad-hoc run failed tenant_id=%s: %s", tid, exc)
+
+        background.add_task(_run)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule failed: {e}")
+
+
+# --- Observability endpoints (Feature 8) ---
+@app.get("/runs/{run_id}/stats")
+async def get_run_stats(run_id: int, _: dict = Depends(require_auth)):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows1 = await conn.fetch("SELECT * FROM run_stage_stats WHERE run_id=$1 ORDER BY stage", run_id)
+        rows2 = await conn.fetch("SELECT * FROM run_vendor_usage WHERE run_id=$1 ORDER BY vendor", run_id)
+    return {
+        "run_id": run_id,
+        "stage_stats": [dict(r) for r in rows1],
+        "vendor_usage": [dict(r) for r in rows2],
+    }
+
+
+@app.get("/export/run_events.csv")
+async def export_run_events(run_id: int, _: dict = Depends(require_auth)):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT run_id, tenant_id, stage, company_id, event, status, error_code, duration_ms, trace_id, extra, ts FROM run_event_logs WHERE run_id=$1 ORDER BY ts",
+            run_id,
+        )
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["run_id","tenant_id","stage","company_id","event","status","error_code","duration_ms","trace_id","extra","ts"])
+    for r in rows:
+        w.writerow([
+            r["run_id"], r["tenant_id"], r["stage"], r["company_id"], r["event"], r["status"],
+            r["error_code"], r["duration_ms"], r["trace_id"], r["extra"], r["ts"]
+        ])
+    from fastapi.responses import Response
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.get("/export/qa.csv")
+async def export_qa(run_id: int, _: dict = Depends(require_auth)):
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT run_id, tenant_id, company_id, bucket, checks, result, notes, created_at
+            FROM qa_samples
+            WHERE run_id=$1
+            ORDER BY bucket, company_id
+            """,
+            run_id,
+        )
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["run_id","tenant_id","company_id","bucket","checks","result","notes","created_at"])
+    for r in rows:
+        w.writerow([
+            r["run_id"], r["tenant_id"], r["company_id"], r["bucket"], r["checks"], r["result"], r["notes"], r["created_at"]
+        ])
+    from fastapi.responses import Response
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+    return {"status": "scheduled", "tenant_id": tid}
+
+
+# --- Admin: kickoff full nightly run (optionally for a single tenant) ---
+@app.post("/admin/runs/nightly")
+async def admin_run_nightly(background: BackgroundTasks, request: Request, claims: dict = Depends(require_auth)):
+    roles = claims.get("roles", []) or []
+    if "admin" not in roles:
+        raise HTTPException(status_code=403, detail="admin role required")
+    # Optional tenant_id query param
+    try:
+        tenant_id = request.query_params.get("tenant_id")
+        tenant_id = int(tenant_id) if tenant_id is not None else None
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid tenant_id")
+
+    try:
+        from scripts.run_nightly import run_all, run_tenant  # type: ignore
+
+        async def _run_all():
+            try:
+                await run_all()
+            except Exception as exc:
+                logging.getLogger("nightly").exception("admin run_all failed: %s", exc)
+
+        async def _run_one(tid: int):
+            try:
+                await run_tenant(tid)
+            except Exception as exc:
+                logging.getLogger("nightly").exception("admin run_tenant failed tenant_id=%s: %s", tid, exc)
+
+        if tenant_id is None:
+            background.add_task(_run_all)
+        else:
+            background.add_task(_run_one, tenant_id)
+        return {"status": "scheduled", "tenant_id": tenant_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule failed: {e}")

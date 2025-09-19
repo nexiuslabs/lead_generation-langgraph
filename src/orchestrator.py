@@ -4,6 +4,8 @@ from src.icp import normalize_agent, icp_refresh_agent, _find_ssic_codes_by_term
 from src.settings import ICP_RULE_NAME
 from src.openai_client import generate_rationale
 from src.lead_scoring import lead_scoring_agent
+from app.odoo_store import OdooStore  # type: ignore
+from app.odoo_connection_info import get_odoo_connection_info  # type: ignore
 import logging
 import sys
 
@@ -166,6 +168,119 @@ async def main():
     scoring_state = await lead_scoring_agent.ainvoke(scoring_initial_state)
     logging.info("\n\n ✅ Lead scoring results:\n")
     logging.info(json.dumps(scoring_state['lead_scores'], indent=2, default=str))
+
+    # --- Export to Odoo: upsert companies + contacts; create leads for high scores ---
+    try:
+        # Resolve tenant (prefer app DB mapping; fallback to ODOO_POSTGRES_DSN)
+        tid = None
+        try:
+            info = await get_odoo_connection_info(email="exporter@nexiuslabs.local", claim_tid=None)
+            tid = info.get("tenant_id")
+        except Exception:
+            tid = None
+        if tid is None:
+            # Fallback: pick the first active mapping
+            try:
+                conn_map = psycopg2.connect(dsn=POSTGRES_DSN)
+                with conn_map, conn_map.cursor() as curm:
+                    curm.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                    rowm = curm.fetchone()
+                    if rowm:
+                        tid = int(rowm[0])
+            except Exception:
+                tid = None
+            finally:
+                try:
+                    conn_map.close()
+                except Exception:
+                    pass
+        store = OdooStore(tenant_id=int(tid)) if tid is not None else OdooStore()
+
+        # Build lookups from scoring_state
+        scores = {s["company_id"]: s for s in scoring_state.get("lead_scores", [])}
+        features = {f["company_id"]: f for f in scoring_state.get("lead_features", [])}
+
+        ids = candidate_ids
+        if not ids:
+            ids = [s["company_id"] for s in scoring_state.get("lead_scores", []) if s.get("company_id") is not None]
+
+        if ids:
+            # Fetch company core info and primary emails
+            conn = psycopg2.connect(dsn=POSTGRES_DSN)
+            try:
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT company_id, name, uen, industry_norm, employees_est, revenue_bucket,
+                               incorporation_year, website_domain
+                        FROM companies WHERE company_id = ANY(%s)
+                        """,
+                        (ids,),
+                    )
+                    comp_rows = cur.fetchall()
+                    comps = {r[0]: {
+                        "name": r[1],
+                        "uen": r[2],
+                        "industry_norm": r[3],
+                        "employees_est": r[4],
+                        "revenue_bucket": r[5],
+                        "incorporation_year": r[6],
+                        "website_domain": r[7],
+                    } for r in comp_rows}
+                    cur.execute("SELECT company_id, email FROM lead_emails WHERE company_id = ANY(%s)", (ids,))
+                    email_rows = cur.fetchall()
+                    emails = {}
+                    for cid, em in email_rows:
+                        emails.setdefault(cid, em)
+            finally:
+                conn.close()
+
+            # Threshold (optional) from env — align with PRD7 SCORE_MIN_EXPORT, fallback to LEAD_THRESHOLD
+            try:
+                env_thr = os.getenv("SCORE_MIN_EXPORT", os.getenv("LEAD_THRESHOLD", "0.0"))
+                threshold = float(env_thr)
+            except Exception:
+                threshold = 0.0
+
+            exported = 0
+            for cid in ids:
+                comp = comps.get(cid)
+                if not comp:
+                    continue
+                email = emails.get(cid)
+                s = scores.get(cid) or {}
+                try:
+                    odoo_id = await store.upsert_company(
+                        comp.get("name"),
+                        comp.get("uen"),
+                        industry_norm=comp.get("industry_norm"),
+                        employees_est=comp.get("employees_est"),
+                        revenue_bucket=comp.get("revenue_bucket"),
+                        incorporation_year=comp.get("incorporation_year"),
+                        website_domain=comp.get("website_domain"),
+                    )
+                    if email:
+                        await store.add_contact(odoo_id, email)
+                    # Merge any enrichment features if available
+                    await store.merge_company_enrichment(odoo_id, {})
+                    sc = float(s.get("score", 0) or 0)
+                    await store.create_lead_if_high(
+                        odoo_id,
+                        comp.get("name") or "",
+                        sc,
+                        features.get(cid, {}),
+                        (s.get("rationale") or ""),
+                        email,
+                        threshold=threshold,
+                    )
+                    exported += 1
+                except Exception as exc:
+                    logging.exception("Odoo export failed for company_id=%s", cid)
+            logging.info("✅ Exported %d companies to Odoo", exported)
+        else:
+            logging.info("No candidate IDs to export to Odoo")
+    except Exception:
+        logging.exception("Odoo export step failed")
 
 if __name__ == '__main__':
     asyncio.run(main())

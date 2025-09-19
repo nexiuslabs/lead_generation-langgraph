@@ -1,5 +1,6 @@
 # tools.py
 import asyncio
+import os
 import json
 import re
 import time
@@ -22,9 +23,17 @@ from langchain_tavily import TavilyCrawl, TavilyExtract
 from langgraph.graph import END, StateGraph
 from psycopg2.extras import Json
 from tavily import TavilyClient
+from src.obs import bump_vendor as _obs_bump, log_event as _log_obs_event
+from src.retry import with_retry, RetryableError, CircuitBreaker, BackoffPolicy
 
 from src.crawler import crawl_site
 from src.lusha_client import AsyncLushaClient, LushaError
+from src.vendors.apify_linkedin import (
+    run_sync_get_dataset_items as apify_run,
+    build_queries as apify_build_queries,
+    normalize_contacts as apify_normalize,
+    contacts_via_company_chain as apify_contacts_via_chain,
+)
 from src.openai_client import get_embedding
 from src.settings import (
     CRAWL_KEYWORDS,
@@ -32,7 +41,9 @@ from src.settings import (
     CRAWLER_MAX_PAGES,
     CRAWLER_TIMEOUT_S,
     CRAWLER_USER_AGENT,
+    ENABLE_TAVILY_FALLBACK,
     ENABLE_LUSHA_FALLBACK,
+    ENABLE_APIFY_LINKEDIN,
     EXTRACT_CORPUS_CHAR_LIMIT,
     LANGCHAIN_MODEL,
     TEMPERATURE,
@@ -42,6 +53,20 @@ from src.settings import (
     POSTGRES_DSN,
     TAVILY_API_KEY,
     ZEROBOUNCE_API_KEY,
+    RETRY_MAX_ATTEMPTS,
+    RETRY_BASE_DELAY_MS,
+    RETRY_MAX_DELAY_MS,
+    CB_ERROR_THRESHOLD,
+    CB_COOL_OFF_S,
+    CB_GLOBAL_EXEMPT_VENDORS,
+    APIFY_DATASET_FORMAT,
+    APIFY_SYNC_TIMEOUT_S,
+    CONTACT_TITLES,
+    ICP_RULE_NAME,
+    APIFY_DAILY_CAP,
+)
+from src.settings import (
+    APIFY_USE_COMPANY_EMPLOYEE_CHAIN,
 )
 
 load_dotenv()
@@ -52,6 +77,34 @@ logger.info("🛠️  Initializing enrichment pipeline…")
 # Simple in-memory cache for ZeroBounce to avoid duplicate calls per-run
 ZB_CACHE: dict[str, dict] = {}
 
+def _mask_email(e: str) -> str:
+    try:
+        import hashlib
+        local, _, domain = (e or "").partition("@")
+        if not domain:
+            # Not an email shape; hash entire string
+            h = hashlib.sha256((e or "").encode()).hexdigest()[:8]
+            return f"hash:{h}"
+        head = (local[:2] + "***") if local else "***"
+        dom_parts = domain.split(".")
+        if len(dom_parts) >= 2:
+            dom = dom_parts[0][:1] + "***." + dom_parts[-1]
+        else:
+            dom = "***"
+        return f"{head}@{dom}"
+    except Exception:
+        return "***redacted***"
+
+def _redact_email_list(emails: list[str]) -> list[str]:
+    return [_mask_email(e) for e in emails]
+
+def _default_tenant_id() -> int | None:
+    try:
+        v = os.getenv("DEFAULT_TENANT_ID")
+        return int(v) if v and v.isdigit() else None
+    except Exception:
+        return None
+
 # Initialize Tavily clients (optional). If no API key, skip Tavily and rely on fallbacks.
 if TAVILY_API_KEY:
     tavily_client = TavilyClient(TAVILY_API_KEY)
@@ -61,9 +114,170 @@ else:
     tavily_client = None  # type: ignore[assignment]
     tavily_crawl = None  # type: ignore[assignment]
     tavily_extract = None  # type: ignore[assignment]
-    logger.warning(
-        "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
-    )
+
+# ---- Run context and vendor counters/caps ----
+_RUN_CTX: dict[str, int | None] = {"run_id": None, "tenant_id": None}
+_VENDOR_COUNTERS: dict[str, int] = {
+    "tavily_queries": 0,
+    "tavily_crawl_calls": 0,
+    "tavily_extract_calls": 0,
+    "lusha_lookups": 0,
+    "apify_linkedin_calls": 0,
+}
+_VENDOR_CAPS: dict[str, int | None] = {"tavily_units": None, "contact_lookups": None}
+_CB = CircuitBreaker(error_threshold=CB_ERROR_THRESHOLD, cool_off_s=CB_COOL_OFF_S)
+
+# Default retry/backoff policy from env
+_DEFAULT_RETRY_POLICY = BackoffPolicy(
+    max_attempts=RETRY_MAX_ATTEMPTS,
+    base_delay_ms=RETRY_BASE_DELAY_MS,
+    max_delay_ms=RETRY_MAX_DELAY_MS,
+)
+
+_RUN_ANY_DEGRADED = False
+
+def was_run_degraded() -> bool:
+    return bool(_RUN_ANY_DEGRADED)
+
+
+def _apify_calls_today(tenant_id: int | None) -> int:
+    if not tenant_id:
+        return 0
+    try:
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(rv.calls),0)
+                FROM run_vendor_usage rv
+                JOIN enrichment_runs er USING(run_id, tenant_id)
+                WHERE rv.tenant_id=%s AND rv.vendor='apify_linkedin'
+                  AND er.started_at >= date_trunc('day', now())
+                """,
+                (int(tenant_id),),
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def _apify_cap_ok(tenant_id: int | None, need: int = 1) -> bool:
+    try:
+        cap = int(APIFY_DAILY_CAP)
+    except Exception:
+        cap = 50
+    if cap <= 0:
+        return True
+    current = _apify_calls_today(tenant_id)
+    return (current + need) <= cap
+
+
+def icp_preferred_titles_for_tenant(tenant_id: int | None) -> List[str]:
+    if not tenant_id:
+        return []
+    try:
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload->'preferred_titles'
+                FROM icp_rules
+                WHERE tenant_id=%s AND name=%s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (int(tenant_id), ICP_RULE_NAME),
+            )
+            row = cur.fetchone()
+            if not row:
+                return []
+            val = row[0]
+            if isinstance(val, list):
+                return [str(x).strip() for x in val if (str(x) or "").strip()]
+            import json as _json
+            try:
+                arr = _json.loads(val) if isinstance(val, str) else []
+                if isinstance(arr, list):
+                    return [str(x).strip() for x in arr if (str(x) or "").strip()]
+            except Exception:
+                pass
+    except Exception:
+        return []
+    return []
+
+def _cb_allows(tenant_id: int | None, vendor: str) -> bool:
+    try:
+        if (vendor or "").lower() in CB_GLOBAL_EXEMPT_VENDORS:
+            return True
+    except Exception:
+        pass
+    if not tenant_id:
+        return True
+    try:
+        return _CB.allow(int(tenant_id), vendor)
+    except Exception:
+        return True
+
+def set_run_context(run_id: int, tenant_id: int):
+    _RUN_CTX["run_id"] = int(run_id)
+    _RUN_CTX["tenant_id"] = int(tenant_id)
+
+def set_vendor_caps(tavily_units: int | None = None, contact_lookups: int | None = None):
+    _VENDOR_CAPS["tavily_units"] = tavily_units
+    _VENDOR_CAPS["contact_lookups"] = contact_lookups
+
+def get_vendor_counters() -> dict[str, int]:
+    return dict(_VENDOR_COUNTERS)
+
+def reset_vendor_counters():
+    for k in _VENDOR_COUNTERS.keys():
+        _VENDOR_COUNTERS[k] = 0
+
+def _units_used(key: str) -> int:
+    if key == "tavily_units":
+        # Tightened definition: treat Tavily units as (search queries + extract calls).
+        # Crawl discovery is not charged as an extra unit here since extract calls
+        # usually dominate cost. Adjust if your billing model differs.
+        return _VENDOR_COUNTERS["tavily_queries"] + _VENDOR_COUNTERS["tavily_extract_calls"]
+    if key == "contact_lookups":
+        return _VENDOR_COUNTERS["lusha_lookups"] + _VENDOR_COUNTERS["apify_linkedin_calls"]
+    return 0
+
+def _dec_cap(key: str, need: int = 1) -> bool:
+    cap = _VENDOR_CAPS.get(key)
+    if cap is None:
+        return True
+    return (_units_used(key) + need) <= cap
+
+_warned_no_tavily = False
+
+def _obs_vendor(vendor: str, calls: int = 1, errors: int = 0, *, rate_limit_hits: int = 0, quota_exhausted: bool = False):
+    """Record vendor usage and emit relevant one-time warnings.
+
+    Only warn about missing Tavily key when actually calling Tavily and key is not set,
+    and do so at most once per process to avoid log spam.
+    """
+    rid = _RUN_CTX.get("run_id")
+    tid = _RUN_CTX.get("tenant_id")
+    if rid and tid:
+        try:
+            _obs_bump(int(rid), int(tid), vendor, calls=calls, errors=errors, rate_limit_hits=rate_limit_hits, quota_exhausted=quota_exhausted)
+        except Exception:
+            pass
+    global _warned_no_tavily
+    if (vendor.startswith("tavily")) and not TAVILY_API_KEY and not _warned_no_tavily:
+        logger.warning(
+            "⚠️  TAVILY_API_KEY not set; using deterministic/HTTP fallbacks for crawl/extract."
+        )
+        _warned_no_tavily = True
+
+def _obs_log(stage: str, event: str, status: str, *, company_id: Optional[int] = None, error_code: Optional[str] = None, duration_ms: Optional[int] = None, extra: Optional[Dict[str, Any]] = None):
+    try:
+        rid = _RUN_CTX.get("run_id")
+        tid = _RUN_CTX.get("tenant_id")
+        if rid and tid:
+            _log_obs_event(int(rid), int(tid), stage, event, status, company_id=company_id, error_code=error_code, duration_ms=duration_ms, trace_id=None, extra=extra)
+    except Exception:
+        pass
 
 # Initialize LangChain LLM for AI extraction
 # Use configured model; some models (e.g., gpt-5) do not accept an explicit
@@ -184,6 +398,13 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
         ):
             try:
                 with conn.cursor() as cur:
+                    # Ensure tenant context is set for RLS-aware inserts
+                    try:
+                        tid_guc = _default_tenant_id()
+                        if tid_guc is not None:
+                            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid_guc),))
+                    except Exception:
+                        pass
                     # Ensure enrichment_runs table exists (idempotent create)
                     cur.execute(
                         """
@@ -193,9 +414,31 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
                         );
                         """
                     )
-                    cur.execute(
-                        "INSERT INTO enrichment_runs DEFAULT VALUES RETURNING run_id"
-                    )
+                    # Ensure tenant_id column exists if RLS/migrations are applied
+                    try:
+                        cur.execute("ALTER TABLE enrichment_runs ADD COLUMN IF NOT EXISTS tenant_id INT")
+                    except Exception:
+                        pass
+                    # Insert a run row; include tenant_id when column exists
+                    has_tenant_col = False
+                    try:
+                        cur.execute(
+                            "SELECT 1 FROM information_schema.columns WHERE table_name='enrichment_runs' AND column_name='tenant_id'"
+                        )
+                        has_tenant_col = cur.fetchone() is not None
+                    except Exception:
+                        has_tenant_col = False
+
+                    tid_val = _default_tenant_id()
+                    if has_tenant_col and tid_val is not None:
+                        cur.execute(
+                            "INSERT INTO enrichment_runs(tenant_id) VALUES (%s) RETURNING run_id",
+                            (tid_val,),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO enrichment_runs DEFAULT VALUES RETURNING run_id"
+                        )
                     rid = cur.fetchone()[0]
                     fields["run_id"] = rid
             except Exception:
@@ -357,6 +600,87 @@ def _normalize_lusha_contact(c: dict) -> dict:
         phones.append(src_phones)
     out["phones"] = [p for p in phones if p]
     return out
+
+
+def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
+    """Upsert normalized Apify contacts into contacts table.
+
+    Returns tuple (inserted_count, updated_count).
+    """
+    inserted, updated = 0, 0
+    conn = None
+    try:
+        conn = get_db_connection()
+        cols = _get_table_columns(conn, "contacts")
+        has_updated_at = "updated_at" in cols
+        with conn, conn.cursor() as cur:
+            for c in contacts or []:
+                row: Dict[str, Any] = {"company_id": company_id}
+                if "full_name" in cols and c.get("full_name"):
+                    row["full_name"] = c.get("full_name")
+                if "title" in cols and c.get("title"):
+                    row["title"] = c.get("title")
+                if "linkedin_profile" in cols and c.get("linkedin_url"):
+                    row["linkedin_profile"] = c.get("linkedin_url")
+                if "linkedin_url" in cols and c.get("linkedin_url"):
+                    row["linkedin_url"] = c.get("linkedin_url")
+                if "location_city" in cols and c.get("location"):
+                    row["location_city"] = c.get("location")
+                if "contact_source" in cols:
+                    row["contact_source"] = "apify_linkedin"
+                email = c.get("email")
+                has_email_col = "email" in cols
+                if has_email_col and email:
+                    row["email"] = email
+
+                exists = False
+                if has_email_col and email:
+                    cur.execute(
+                        "SELECT 1 FROM contacts WHERE company_id=%s AND email IS NOT DISTINCT FROM %s LIMIT 1",
+                        (company_id, email),
+                    )
+                    exists = bool(cur.fetchone())
+                else:
+                    if c.get("linkedin_url") and ("linkedin_url" in cols or "linkedin_profile" in cols):
+                        lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                        cur.execute(
+                            f"SELECT 1 FROM contacts WHERE company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s LIMIT 1",
+                            (company_id, c.get("linkedin_url")),
+                        )
+                        exists = bool(cur.fetchone())
+                if exists:
+                    set_cols = [k for k in row.keys() if k not in ("company_id", "email")]
+                    if set_cols:
+                        assignments = ", ".join([f"{k}=%s" for k in set_cols])
+                        params = [row[k] for k in set_cols]
+                        if has_email_col and email:
+                            where_clause = "company_id=%s AND email IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, email])
+                        else:
+                            lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                            where_clause = f"company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, c.get("linkedin_url")])
+                        if has_updated_at:
+                            assignments = assignments + ", updated_at=now()"
+                        cur.execute(f"UPDATE contacts SET {assignments} WHERE {where_clause}", params)
+                        updated += cur.rowcount or 0
+                else:
+                    cols_list = list(row.keys())
+                    placeholders = ",".join(["%s"] * len(cols_list))
+                    cur.execute(
+                        f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                        [row[k] for k in cols_list],
+                    )
+                    inserted += cur.rowcount or 0
+    except Exception:
+        return (inserted, updated)
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+    return inserted, updated
 
 
 def upsert_contacts_from_lusha(
@@ -824,16 +1148,20 @@ async def _deterministic_crawl_and_persist(company_id: int, url: str):
 
     conn = get_db_connection()
     with conn:
+        fields = {
+            "company_id": company_id,
+            "about_text": about_text,
+            "tech_stack": tech_stack,
+            "public_emails": public_emails,
+            "jobs_count": jobs_count,
+            "linkedin_url": None,
+        }
+        tid = _default_tenant_id()
+        if tid is not None:
+            fields["tenant_id"] = tid
         _insert_company_enrichment_run(
             conn,
-            {
-                "company_id": company_id,
-                "about_text": about_text,
-                "tech_stack": tech_stack,
-                "public_emails": public_emails,
-                "jobs_count": jobs_count,
-                "linkedin_url": None,
-            },
+            fields,
         )
     conn.close()
 
@@ -890,6 +1218,7 @@ async def enrich_company_with_tavily(
         "lusha_used": False,
         "completed": False,
         "error": None,
+        "degraded_reasons": [],
     }
     try:
         logger.info(
@@ -920,6 +1249,7 @@ class EnrichmentState(TypedDict, total=False):
     lusha_used: bool
     completed: bool
     error: Optional[str]
+    degraded_reasons: List[str]
 
 
 async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
@@ -953,32 +1283,63 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         domains = []
 
     # 1) Tavily search if available
-    if not domains and tavily_client is not None:
+    if not domains and ENABLE_TAVILY_FALLBACK and tavily_client is not None:
         try:
+            t0 = time.perf_counter()
             domains = find_domain(name)
+            _obs_vendor("tavily", calls=1)
+            _obs_log("find_domain", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"query": name})
         except Exception as e:
+            _obs_vendor("tavily", calls=1, errors=1)
+            _obs_log("find_domain", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(e).__name__)
             logger.warning("   ↳ Tavily find_domain failed", exc_info=True)
+            try:
+                (state.setdefault("degraded_reasons", [])) .append("TAVILY_FAIL")
+            except Exception:
+                pass
     # Lusha fallback if needed
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
             logger.info("   ↳ No domain via search; trying Lusha fallback…")
-            async with AsyncLushaClient() as lc:
-                lusha_domain = await lc.find_company_domain(name)
-                if lusha_domain:
-                    normalized = (
-                        lusha_domain
-                        if lusha_domain.startswith("http")
-                        else f"https://{lusha_domain}"
-                    )
-                    domains = [normalized]
-                    state["lusha_used"] = True
-                    logger.info(f"   ↳ Lusha provided domain: {normalized}")
+            tid = int(_RUN_CTX.get("tenant_id") or 0)
+            lusha_domain = None
+            if _cb_allows(tid, "lusha"):
+                async with AsyncLushaClient() as lc:
+                    async def _call():
+                        return await lc.find_company_domain(name)
+                    try:
+                        lusha_domain = await with_retry(_call, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
+                        _VENDOR_COUNTERS["lusha_lookups"] += 1
+                        _obs_vendor("lusha", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "lusha")
+                    except Exception:
+                        if tid:
+                            _CB.on_error(tid, "lusha")
+                        lusha_domain = None
+            if lusha_domain:
+                normalized = (
+                    lusha_domain
+                    if lusha_domain.startswith("http")
+                    else f"https://{lusha_domain}"
+                )
+                domains = [normalized]
+                state["lusha_used"] = True
+                logger.info(f"   ↳ Lusha provided domain: {normalized}")
         except Exception as e:
             logger.warning("   ↳ Lusha domain fallback failed", exc_info=True)
+            try:
+                (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+            except Exception:
+                pass
     if not domains:
         # Graceful termination: no domain available, nothing to crawl/extract.
         # Mark as completed so upstream pipeline can proceed to scoring/next steps.
         state["error"] = "no_domain"
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("DATA_EMPTY:no_domain_name")
+        except Exception:
+            pass
         state["completed"] = True
         logger.info("   ↳ No domain found; marking enrichment as completed (no crawl)")
         return state
@@ -997,10 +1358,22 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
     filtered_urls: List[str] = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
     if not filtered_urls and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
-            async with AsyncLushaClient() as lc:
-                lusha_domain = await lc.find_company_domain(
-                    state.get("company_name") or ""
-                )
+            tid = int(_RUN_CTX.get("tenant_id") or 0)
+            lusha_domain = None
+            if _cb_allows(tid, "lusha"):
+                async with AsyncLushaClient() as lc:
+                    async def _call():
+                        return await lc.find_company_domain(state.get("company_name") or "")
+                    try:
+                        lusha_domain = await with_retry(_call, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
+                        _VENDOR_COUNTERS["lusha_lookups"] += 1
+                        _obs_vendor("lusha", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "lusha")
+                    except Exception:
+                        if tid:
+                            _CB.on_error(tid, "lusha")
+                        lusha_domain = None
             if lusha_domain:
                 candidate_home = (
                     lusha_domain
@@ -1021,8 +1394,16 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
                     )
         except Exception as e:
             logger.warning("   ↳ Lusha fallback for filtered URLs failed", exc_info=True)
+            try:
+                (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+            except Exception:
+                pass
     if not filtered_urls:
         filtered_urls = [state["home"]]
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("CRAWL_THIN")
+        except Exception:
+            pass
     state["filtered_urls"] = filtered_urls
     return state
 
@@ -1051,7 +1432,7 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                 for _p in ("about", "aboutus"):
                     page_urls.append(f"{_root}/{_p}")
 
-        if tavily_crawl is not None:
+        if ENABLE_TAVILY_FALLBACK and tavily_crawl is not None and _dec_cap("tavily_units", 1):
             for root in roots[:3]:
                 try:
                     crawl_input = {
@@ -1061,7 +1442,11 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         "instructions": f"get all pages from {root}",
                         "enable_web_search": False,
                     }
+                    t0 = time.perf_counter()
                     crawl_result = tavily_crawl.run(crawl_input)
+                    _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
+                    _obs_vendor("tavily", calls=1)
+                    _obs_log("crawl", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"root": root})
                     raw_urls = (
                         crawl_result.get("results") or crawl_result.get("urls") or []
                     )
@@ -1072,8 +1457,14 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                             page_urls.append(item)
                     page_urls.append(root)
                 except Exception as exc:
+                    _obs_vendor("tavily", calls=1, errors=1)
+                    _obs_log("crawl", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"root": root})
                     logger.warning(f"          ↳ TavilyCrawl error for {root}", exc_info=True)
                     page_urls.append(root)
+                    try:
+                        (state.setdefault("degraded_reasons", [])) .append("CRAWL_ERROR")
+                    except Exception:
+                        pass
         else:
             logger.info("       ↳ TavilyCrawl unavailable; using seeded URLs only")
         page_urls = list(dict.fromkeys(page_urls))
@@ -1137,17 +1528,26 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     for u in page_urls:
         # Try TavilyExtract if configured
         raw_content: Optional[str] = None
-        if tavily_extract is not None:
+        if ENABLE_TAVILY_FALLBACK and tavily_extract is not None:
             payload = {
                 "urls": [u],
                 "schema": {"raw_content": "str"},
                 "instructions": "Retrieve the main textual content from this page.",
             }
             try:
+                t0 = time.perf_counter()
                 raw_data = tavily_extract.run(payload)
+                _obs_vendor("tavily", calls=1)
+                _obs_log("extract", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"url": u})
                 raw_content = _extract_raw_from(raw_data)
             except Exception as exc:
+                _obs_vendor("tavily", calls=1, errors=1)
+                _obs_log("extract", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"url": u})
                 logger.warning(f"          ↳ TavilyExtract error for {u}", exc_info=True)
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("TAVILY_FAIL")
+                except Exception:
+                    pass
         if raw_content and isinstance(raw_content, str) and raw_content.strip():
             extracted_pages.append({"url": u, "title": "", "raw_content": raw_content})
         else:
@@ -1209,6 +1609,10 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
                 )
                 state["completed"] = True
                 state["extracted_pages"] = []
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("CRAWL_THIN")
+                except Exception:
+                    pass
                 return state
         except Exception as exc:
             logger.warning("   ↳ deterministic crawler fallback failed", exc_info=True)
@@ -1362,7 +1766,7 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
     return state
 
 
-async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
+async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed"):
         return state
     data = state.get("data") or {}
@@ -1383,7 +1787,187 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
             or missing_names
             or missing_founder
         )
-        if ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger:
+        # Prefer Apify when enabled, or when Lusha fallback is disabled/missing
+        tid = int(_RUN_CTX.get("tenant_id") or 0)
+        rid = _RUN_CTX.get("run_id")
+        prefer_apify = (
+            ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
+        )
+        if prefer_apify and trigger and _dec_cap("contact_lookups", 1):
+            # Use Apify LinkedIn Actor for contact discovery when trigger conditions met
+            titles_env = CONTACT_TITLES or []
+            titles_tenant = icp_preferred_titles_for_tenant(tid if tid else None)
+            titles = titles_tenant or titles_env or LUSHA_PREFERRED_TITLES
+            company_name = state.get("company_name") or ""
+            queries = apify_build_queries(company_name, titles)
+            if queries:
+                logger.info(
+                    f"[apify_contacts] Using Apify for contact discovery; company_id={company_id} queries={queries}"
+                )
+                # Daily cap enforcement
+                if not _apify_cap_ok(tid, need=1):
+                    try:
+                        _obs_log(
+                            "contact_discovery",
+                            "vendor_call",
+                            "disabled",
+                            company_id=company_id,
+                            extra={"reason": "apify_daily_cap"},
+                        )
+                        (state.setdefault("degraded_reasons", [])) .append("APIFY_CAP_EXCEEDED")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        t0 = time.perf_counter()
+                        # Prefer company -> employees -> profiles chain if enabled
+                        if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                            contacts_raw = await apify_contacts_via_chain(
+                                company_name,
+                                titles=(titles if isinstance(titles, list) else None),
+                                max_items=25,
+                                timeout_s=APIFY_SYNC_TIMEOUT_S,
+                            )
+                            raw = contacts_raw  # for count logging below; already normalized
+                        else:
+                            raw = await apify_run(
+                                {"queries": queries},
+                                dataset_format=APIFY_DATASET_FORMAT,
+                                timeout_s=APIFY_SYNC_TIMEOUT_S,
+                            )
+                            contacts_raw = apify_normalize(raw)
+                        logger.info(
+                            f"[apify_contacts] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
+                        )
+                        # Optional: log a small sample of the Apify raw items and normalized contacts
+                        try:
+                            dbg = os.getenv("APIFY_DEBUG_LOG_ITEMS", "").lower() in ("1", "true", "yes", "on")
+                            if dbg:
+                                try:
+                                    n = int(os.getenv("APIFY_LOG_SAMPLE_SIZE", "3") or 3)
+                                except Exception:
+                                    n = 3
+                                # Build raw sample with selected fields to keep logs compact
+                                def _pick_fields(it: dict) -> dict:
+                                    keys = [
+                                        "fullName",
+                                        "name",
+                                        "headline",
+                                        "title",
+                                        "companyName",
+                                        "company",
+                                        "profileUrl",
+                                        "url",
+                                        "linkedin_url",
+                                        "locationName",
+                                        "location",
+                                        "email",
+                                    ]
+                                    out = {k: it.get(k) for k in keys if (isinstance(it, dict) and it.get(k) is not None)}
+                                    if not out and isinstance(it, dict):
+                                        for k in list(it.keys())[:6]:
+                                            out[k] = it.get(k)
+                                    return out
+                                raw_sample = [_pick_fields(x) for x in (raw or [])[:n] if isinstance(x, dict)]
+                                norm_sample = [
+                                    {k: c.get(k) for k in ("full_name", "title", "company_current", "linkedin_url", "location", "email") if c.get(k) is not None}
+                                    for c in (contacts_raw or [])[:n]
+                                ]
+                                logger.info(
+                                    f"[apify_contacts] items_sample={raw_sample} company_id={company_id}"
+                                )
+                                logger.info(
+                                    f"[apify_contacts] normalized_sample={norm_sample} company_id={company_id}"
+                                )
+                        except Exception:
+                            pass
+                        # Upsert into contacts table (best-effort)
+                        try:
+                            ins, upd = upsert_contacts_from_apify(company_id, contacts_raw)
+                            logger.info(
+                                f"[apify_contacts] upserted: inserted={ins}, updated={upd} company_id={company_id}"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "[apify_contacts] upsert error; continuing", exc_info=True
+                            )
+                        # Verify any provided emails and upsert into lead_emails
+                        try:
+                            emails = [c.get("email") for c in contacts_raw if c.get("email")]
+                            if emails:
+                                verification = verify_emails(emails)
+                                with get_db_connection() as conn:
+                                    with conn.cursor() as cur:
+                                        for ver in verification:
+                                            email_verified = True if ver.get("status") == "valid" else False
+                                            cur.execute(
+                                                """
+                                                INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                                VALUES (%s,%s,%s,%s,%s, now())
+                                                ON CONFLICT (email) DO UPDATE SET
+                                                  company_id=EXCLUDED.company_id,
+                                                  verification_status=EXCLUDED.verification_status,
+                                                  smtp_confidence=EXCLUDED.smtp_confidence,
+                                                  source=EXCLUDED.source,
+                                                  last_verified_at=EXCLUDED.last_verified_at
+                                                """,
+                                                (
+                                                    ver["email"],
+                                                    company_id,
+                                                    ver.get("status"),
+                                                    ver.get("confidence"),
+                                                    "apify_linkedin",
+                                                ),
+                                            )
+                                logger.info(
+                                    f"[apify_contacts] verified_emails={len(emails)} company_id={company_id}"
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[apify_contacts] email verify/upsert skipped", exc_info=True
+                            )
+                        # Vendor usage + obs
+                        _VENDOR_COUNTERS["apify_linkedin_calls"] = _VENDOR_COUNTERS.get("apify_linkedin_calls", 0) + 1
+                        try:
+                            if rid and tid:
+                                _obs_vendor("apify_linkedin", calls=1)
+                                _obs_log(
+                                    "contact_discovery",
+                                    "vendor_call",
+                                    "ok",
+                                    company_id=company_id,
+                                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                                    extra={"queries": queries},
+                                )
+                        except Exception:
+                            pass
+                        state["apify_used"] = True
+                        # Consider contacts added as mitigating trigger
+                        if contacts_raw:
+                            need_emails = need_emails and (len(emails or []) == 0)
+                            needs_contacts = False
+                            missing_names = False
+                            missing_founder = False
+                    except Exception as e:
+                        try:
+                            _obs_vendor("apify_linkedin", calls=1, errors=1)
+                            _obs_log(
+                                "contact_discovery",
+                                "vendor_call",
+                                "error",
+                                company_id=company_id,
+                                error_code=type(e).__name__,
+                            )
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "[apify_contacts] Apify LinkedIn call failed", exc_info=True
+                        )
+                        try:
+                            (state.setdefault("degraded_reasons", [])) .append("APIFY_LINKEDIN_FAIL")
+                        except Exception:
+                            pass
+        elif ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger and _dec_cap("contact_lookups", 1):
             website_hint = data.get("website_domain") or state.get("home") or ""
             try:
                 if website_hint.startswith("http"):
@@ -1393,22 +1977,48 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
             except Exception:
                 company_domain = None
             lusha_contacts: List[Dict[str, Any]] = []
-            async with AsyncLushaClient() as lc:
-                lusha_contacts = await lc.search_and_enrich_contacts(
-                    company_name=state.get("company_name") or "",
-                    company_domain=company_domain,
-                    country=data.get("hq_country"),
-                    titles=LUSHA_PREFERRED_TITLES,
-                    limit=15,
-                )
-                if not lusha_contacts:
-                    lusha_contacts = await lc.search_and_enrich_contacts(
-                        company_name=state.get("company_name") or "",
-                        company_domain=company_domain,
-                        country=data.get("hq_country"),
-                        titles=None,
-                        limit=15,
-                    )
+            tid = int(_RUN_CTX.get("tenant_id") or 0)
+            if not _cb_allows(tid, "lusha"):
+                lusha_contacts = []
+            else:
+                async with AsyncLushaClient() as lc:
+                    async def _call1():
+                        return await lc.search_and_enrich_contacts(
+                            company_name=state.get("company_name") or "",
+                            company_domain=company_domain,
+                            country=data.get("hq_country"),
+                            titles=LUSHA_PREFERRED_TITLES,
+                            limit=15,
+                        )
+                    try:
+                        lusha_contacts = await with_retry(_call1, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
+                        _VENDOR_COUNTERS["lusha_lookups"] += 1
+                        _obs_vendor("lusha", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "lusha")
+                    except Exception:
+                        if tid:
+                            _CB.on_error(tid, "lusha")
+                        lusha_contacts = []
+                    if not lusha_contacts:
+                        async def _call2():
+                            return await lc.search_and_enrich_contacts(
+                                company_name=state.get("company_name") or "",
+                                company_domain=company_domain,
+                                country=data.get("hq_country"),
+                                titles=None,
+                                limit=15,
+                            )
+                        try:
+                            lusha_contacts = await with_retry(_call2, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
+                            _VENDOR_COUNTERS["lusha_lookups"] += 1
+                            _obs_vendor("lusha", calls=1)
+                            if tid:
+                                _CB.on_success(tid, "lusha")
+                        except Exception:
+                            if tid:
+                                _CB.on_error(tid, "lusha")
+                            lusha_contacts = []
             added_emails: List[str] = []
             added_phones: List[str] = []
             for c in lusha_contacts or []:
@@ -1466,9 +2076,17 @@ async def node_lusha_contacts(state: EnrichmentState) -> EnrichmentState:
                 )
             except Exception as _upsert_exc:
                 logger.warning("       ↳ Lusha contacts upsert error", exc_info=True)
+                try:
+                    (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+                except Exception:
+                    pass
             state["lusha_used"] = True
     except Exception as _lusha_contacts_exc:
         logger.warning("       ↳ Lusha contacts fallback failed", exc_info=True)
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
+        except Exception:
+            pass
     state["data"] = data
     return state
 
@@ -1483,6 +2101,28 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
             update_company_core_fields(company_id, data)
         except Exception as exc:
             logger.exception("   ↳ update_company_core_fields failed")
+        # Best-effort projection of degradation reasons for this company
+        try:
+            reasons = ",".join(state.get("degraded_reasons") or []) or None
+            if reasons:
+                global _RUN_ANY_DEGRADED
+                _RUN_ANY_DEGRADED = True
+                conn = get_db_connection()
+                with conn:
+                    fields = {"company_id": company_id, "degraded_reasons": reasons}
+                    tid = _default_tenant_id()
+                    if tid is not None:
+                        fields["tenant_id"] = tid
+                    rid = _RUN_CTX.get("run_id")
+                    if rid is not None:
+                        fields["run_id"] = int(rid)
+                    _insert_company_enrichment_run(conn, fields)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return state
 
 
@@ -1528,7 +2168,7 @@ enrichment_graph.add_node("expand_crawl", node_expand_crawl)
 enrichment_graph.add_node("extract_pages", node_extract_pages)
 enrichment_graph.add_node("build_chunks", node_build_chunks)
 enrichment_graph.add_node("llm_extract", node_llm_extract)
-enrichment_graph.add_node("lusha_contacts", node_lusha_contacts)
+enrichment_graph.add_node("apify_contacts", node_apify_contacts)
 enrichment_graph.add_node("persist_core", node_persist_core)
 enrichment_graph.add_node("persist_legacy", node_persist_legacy)
 
@@ -1549,8 +2189,8 @@ enrichment_graph.add_edge("discover_urls", "expand_crawl")
 enrichment_graph.add_edge("expand_crawl", "extract_pages")
 enrichment_graph.add_edge("extract_pages", "build_chunks")
 enrichment_graph.add_edge("build_chunks", "llm_extract")
-enrichment_graph.add_edge("llm_extract", "lusha_contacts")
-enrichment_graph.add_edge("lusha_contacts", "persist_core")
+enrichment_graph.add_edge("llm_extract", "apify_contacts")
+enrichment_graph.add_edge("apify_contacts", "persist_core")
 enrichment_graph.add_edge("persist_core", "persist_legacy")
 
 enrichment_agent = enrichment_graph.compile()
@@ -1602,18 +2242,22 @@ def find_domain(company_name: str) -> list[str]:
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
 
-    # 1) Exact-match search first, with fallbacks
+    # 1) Use normalized name first, fall back to quoted variants
     try:
         queries = [
+            f"{normalized_query} official website",
             f'"{company_name}" "official website"',
             f'"{company_name}" site:.sg',
-            f"{normalized_query} official website",
             f"{company_name} official website",
         ]
         response = None
         for q in queries:
+            if not _dec_cap("tavily_units", 1):
+                break
             try:
                 response = tavily_client.search(q)
+                _VENDOR_COUNTERS["tavily_queries"] += 1
+                _obs_vendor("tavily", calls=1)
             except Exception:
                 response = None
             if isinstance(response, dict) and response.get("results"):
@@ -1797,8 +2441,13 @@ def extract_website_data(url: str) -> dict:
             "crawl_depth": 2,
             "enable_web_search": False,
         }
-        crawl_result = tavily_crawl.run(crawl_input)
-        raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+        if tavily_crawl is not None and _dec_cap("tavily_units", 1):
+            crawl_result = tavily_crawl.run(crawl_input)
+            _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
+            _obs_vendor("tavily", calls=1)
+            raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+        else:
+            raw_urls = []
     except Exception as exc:
         print(f"       ↳ Crawl error: {exc}")
         raw_urls = []
@@ -1828,7 +2477,31 @@ def extract_website_data(url: str) -> dict:
             "instructions": "Retrieve the main textual content from this page.",
         }
         try:
-            raw_data = tavily_extract.run(payload)
+            if tavily_extract is not None and _dec_cap("tavily_units", 1):
+                tid = int(_RUN_CTX.get("tenant_id") or 0)
+                if tid and not _CB.allow(tid, "tavily"):
+                    raise RuntimeError("tavily_circuit_open")
+                import time as _t, random as _rnd
+                attempts = 0
+                raw_data = None
+                while attempts < 3:
+                    try:
+                        raw_data = tavily_extract.run(payload)
+                        _VENDOR_COUNTERS["tavily_extract_calls"] += 1
+                        _obs_vendor("tavily", calls=1)
+                        if tid:
+                            _CB.on_success(tid, "tavily")
+                        break
+                    except Exception:
+                        attempts += 1
+                        if tid:
+                            _CB.on_error(tid, "tavily")
+                        if attempts >= 3:
+                            raise
+                        delay = 0.25 * (2 ** (attempts - 1)) * (0.8 + 0.4 * _rnd.random())
+                        _t.sleep(delay)
+            else:
+                raise RuntimeError("tavily_units_cap_reached")
         # print("          ↳ Tavily raw_data:", raw_data)
         except Exception as exc:
             print(f"          ↳ TavilyExtract error: {exc}")
@@ -1905,7 +2578,7 @@ def verify_emails(emails: list[str]) -> list[dict]:
     2.4 Email Verification via ZeroBounce adapter.
     Adapter returns dicts: {email, status, confidence, source}.
     """
-    print(f"    🔒 ZeroBounce Email Verification for {emails}")
+    print(f"    🔒 ZeroBounce Email Verification for {_redact_email_list(emails)}")
     results: list[dict] = []
     if not emails:
         return results
@@ -1933,11 +2606,13 @@ def verify_emails(emails: list[str]) -> list[dict]:
                 continue
             # Throttle to respect credits (simple delay)
             time.sleep(0.75)
+            t0 = time.perf_counter()
             resp = requests.get(
                 "https://api.zerobounce.net/v2/validate",
                 params={"api_key": ZEROBOUNCE_API_KEY, "email": e, "ip_address": ""},
                 timeout=10,
             )
+            status_code = getattr(resp, "status_code", 200)
             data = resp.json()
             status = data.get("status", "unknown")
             confidence = float(data.get("confidence", 0.0))
@@ -1947,6 +2622,23 @@ def verify_emails(emails: list[str]) -> list[dict]:
                 "confidence": confidence,
                 "source": "zerobounce",
             }
+            try:
+                # Vendor usage: bump one call per verify; include rate-limit/quota flags; record duration
+                rl = 1 if status_code == 429 else 0
+                quota = True if status_code == 402 else False
+                _obs_vendor("zerobounce", calls=1, rate_limit_hits=rl, quota_exhausted=quota)
+                # Optional cost per check
+                try:
+                    cost_per = float(os.getenv("ZEROBOUNCE_COST_PER_CHECK", "0.0") or 0.0)
+                except Exception:
+                    cost_per = 0.0
+                if cost_per > 0:
+                    rid = _RUN_CTX.get("run_id"); tid = _RUN_CTX.get("tenant_id")
+                    if rid and tid:
+                        _obs_bump(int(rid), int(tid), "zerobounce", calls=0, errors=0, cost_usd=cost_per)
+                _obs_log("verify_emails", "vendor_call", "ok", duration_ms=int((time.perf_counter()-t0)*1000), extra={"email": _mask_email(e), "status": status})
+            except Exception:
+                pass
             if conn:
                 _cache_set(conn, e, status, confidence)
                 try:
@@ -1955,12 +2647,17 @@ def verify_emails(emails: list[str]) -> list[dict]:
                     pass
             ZB_CACHE[e] = rec
             print(
-                f"       ✅ ZeroBounce result for {e}: status={status}, confidence={confidence}"
+                f"       ✅ ZeroBounce result for {_mask_email(e)}: status={status}, confidence={confidence}"
             )
         except Exception as exc:
-            print(f"       ⚠️ ZeroBounce API error for {e}: {exc}")
+            print(f"       ⚠️ ZeroBounce API error for {_mask_email(e)}: {exc}")
             status = "unknown"
             confidence = 0.0
+            try:
+                _obs_vendor("zerobounce", calls=1, errors=1)
+                _obs_log("verify_emails", "vendor_call", "error", error_code=type(exc).__name__, extra={"email": _mask_email(e)})
+            except Exception:
+                pass
             results.append(
                 {
                     "email": e,
@@ -2044,18 +2741,22 @@ def store_enrichment(company_id: int, domain: str, data: dict):
     phones_norm = _normalize_phone_list(data.get("phone_number") or [])
 
     with conn:
+        fields2 = {
+            "company_id": company_id,
+            "about_text": data.get("about_text"),
+            "tech_stack": (data.get("tech_stack") or []),
+            "public_emails": (data.get("public_emails") or []),
+            "jobs_count": data.get("jobs_count"),
+            "linkedin_url": data.get("linkedin_url"),
+            "verification_results": Json(verification),
+            "embedding": embedding,
+        }
+        tid2 = _default_tenant_id()
+        if tid2 is not None:
+            fields2["tenant_id"] = tid2
         _insert_company_enrichment_run(
             conn,
-            {
-                "company_id": company_id,
-                "about_text": data.get("about_text"),
-                "tech_stack": (data.get("tech_stack") or []),
-                "public_emails": (data.get("public_emails") or []),
-                "jobs_count": data.get("jobs_count"),
-                "linkedin_url": data.get("linkedin_url"),
-                "verification_results": Json(verification),
-                "embedding": embedding,
-            },
+            fields2,
         )
         print("       ↳ history saved")
         with conn.cursor() as cur:
@@ -2177,16 +2878,20 @@ async def enrich_company(company_id: int, company_name: str):
 
         conn = get_db_connection()
         with conn:
+            fields3 = {
+                "company_id": company_id,
+                "about_text": about_text,
+                "tech_stack": tech_stack,
+                "public_emails": public_emails,
+                "jobs_count": jobs_count,
+                "linkedin_url": None,
+            }
+            tid3 = _default_tenant_id()
+            if tid3 is not None:
+                fields3["tenant_id"] = tid3
             _insert_company_enrichment_run(
                 conn,
-                {
-                    "company_id": company_id,
-                    "about_text": about_text,
-                    "tech_stack": tech_stack,
-                    "public_emails": public_emails,
-                    "jobs_count": jobs_count,
-                    "linkedin_url": None,
-                },
+                fields3,
             )
         conn.close()
 

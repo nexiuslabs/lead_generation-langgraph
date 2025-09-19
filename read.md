@@ -32,7 +32,7 @@ Create a local `.env` (never commit). GitHub Push Protection will block pushes i
 
 Required
 - POSTGRES_DSN: e.g. `postgres://user:password@host:5432/dbname`
-- OPENAI_API_KEY: used by LLM extraction and scoring rationale
+- OPENAI_API_KEY: used by LLM extraction, scoring rationale, and local LangGraph runs
 - TAVILY_API_KEY: used by Tavily search
 
 Optional / Recommended
@@ -43,6 +43,7 @@ Optional / Recommended
 - CRAWL_MAX_PAGES: default `6` (total site pages after homepage)
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
 - ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
+- ENABLE_LANGSERVE_IN_APP: set to `true` to expose `/agent` routes for LangGraph development
 
 Example `.env` (do not use real keys here)
 ```
@@ -56,7 +57,17 @@ LANGCHAIN_MODEL=gpt-4o-mini
 TEMPERATURE=0.3
 CRAWL_MAX_PAGES=6
 EXTRACT_CORPUS_CHAR_LIMIT=35000
+ENABLE_LANGSERVE_IN_APP=true
 ```
+
+## Local LangGraph Development
+
+The API can expose a LangGraph at `/agent` for interactive testing.
+
+1. Set `OPENAI_API_KEY` in your environment.
+2. Set `ENABLE_LANGSERVE_IN_APP=true` to mount the `/agent` routes when running `uvicorn`.
+3. Start the server: `uvicorn app.main:app --host 0.0.0.0 --port 2024`.
+4. When using `npx langgraph dev` or LangGraph Studio, supply the same `OPENAI_API_KEY`; the key is used client-side for OpenAI calls.
 
 ## Odoo Integration
 
@@ -184,6 +195,20 @@ Logs & Output
 - Candidate IDs, enrichment steps, and lead scores are printed to console
 - Use `output_candidate_records()` for quick JSON snapshots of `companies`
 
+## Scheduler & Cron
+- Start the async scheduler: `python lead_generation-main/scripts/run_scheduler.py`
+- Control start time via `SCHED_START_CRON` (default `0 1 * * *` for 01:00 SGT)
+- Limits & caps:
+  - `SCHED_DAILY_CAP_PER_TENANT` (default 20)
+  - `SCHED_COMPANY_BATCH_SIZE` (per-batch company count)
+  - Tavily cap (coarse): `TAVILY_MAX_QUERIES` (units ≈ search + crawl + extract calls)
+  - Contacts cap (coarse): `LUSHA_MAX_CONTACT_LOOKUPS`
+  - ZeroBounce caps: `ZEROBOUNCE_MAX_VERIFICATIONS`, `ZEROBOUNCE_BATCH_SIZE`
+- Admin kickoff HTTP:
+  - Run all tenants: `POST /admin/runs/nightly`
+  - One tenant: `POST /admin/runs/nightly?tenant_id=<id>`
+  - Requires admin role; cookie-based auth (`nx_access`)
+
 ## Security & Secrets
 - `.gitignore` excludes `.env` and secrets. Never commit keys.
 - If a secret is accidentally committed, rewrite history (e.g., `git filter-repo --invert-paths --path src/.env`) and rotate keys.
@@ -193,6 +218,8 @@ Logs & Output
 - `asyncpg` DataError on industry code: ensure `industry_code` is TEXT
 - Missing tables: run the SQL migrations above
 - ZeroBounce errors: missing/invalid key; enrichment continues without verified status
+- `GET /whoami 403`: the request lacks a valid Nexius SSO token or `tenant_id` claim. Sign in and include `Authorization: Bearer <JWT>` when calling `/whoami`.
+- `Failed to connect to LangGraph server`: ensure the API is running, `OPENAI_API_KEY` is set, and `ENABLE_LANGSERVE_IN_APP=true` to expose `/agent`.
 
 ## Notes
 - Default OpenAI model is `gpt-4o-mini`; set `LANGCHAIN_MODEL` to change

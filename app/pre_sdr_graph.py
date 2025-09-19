@@ -6,6 +6,10 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, TypedDict
+try:  # Python 3.9/3.10 fallback
+    from typing import Annotated  # type: ignore
+except Exception:  # pragma: no cover
+    from typing_extensions import Annotated  # type: ignore
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -14,7 +18,8 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 from app.odoo_store import OdooStore
-from src.database import get_pg_pool
+from psycopg2.extras import Json
+from src.database import get_pg_pool, get_conn
 from src.icp import _find_ssic_codes_by_terms, _select_acra_by_ssic_codes
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
@@ -38,10 +43,141 @@ LEAD_SCORES_TABLE = os.getenv("LEAD_SCORES_TABLE", "lead_scores")
 
 
 class PreSDRState(TypedDict, total=False):
-    messages: List[BaseMessage]
+    # Use LangGraph message reducer so message updates append instead of replace
+    messages: Annotated[List[BaseMessage], add_messages]
     icp: Dict[str, Any]
     candidates: List[Dict[str, Any]]
     results: List[Dict[str, Any]]
+
+
+# ---------- ICP persistence helpers ----------
+async def _resolve_tenant_id_for_write(state: dict) -> Optional[int]:
+    # Prefer explicit tenant in state
+    try:
+        v = state.get("tenant_id") if isinstance(state, dict) else None
+        if v is not None:
+            return int(v)
+    except Exception:
+        pass
+    # Default tenant for server-side jobs (env)
+    try:
+        v = os.getenv("DEFAULT_TENANT_ID")
+        if v and v.isdigit():
+            return int(v)
+    except Exception:
+        pass
+    # Infer from ODOO_POSTGRES_DSN via odoo_connections
+    try:
+        inferred_db = None
+        if ODOO_POSTGRES_DSN:
+            from urllib.parse import urlparse
+            u = urlparse(ODOO_POSTGRES_DSN)
+            inferred_db = (u.path or "/").lstrip("/") or None
+        if inferred_db:
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                    (inferred_db, ODOO_POSTGRES_DSN),
+                )
+                _row = _cur.fetchone()
+                if _row:
+                    return int(_row[0])
+    except Exception:
+        pass
+    # Last resort: first active
+    try:
+        with get_conn() as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+            _row = _cur.fetchone()
+            if _row:
+                return int(_row[0])
+    except Exception:
+        pass
+    return None
+
+
+def _icp_payload_from_state_icp(icp: dict) -> dict:
+    # Normalize chat state into orchestrator-friendly payload
+    inds = []
+    if isinstance(icp.get("industries"), list):
+        inds = [str(s).strip() for s in icp.get("industries") if isinstance(s, str) and s.strip()]
+    emp_min = icp.get("employees_min")
+    emp_max = icp.get("employees_max")
+    y_min = icp.get("year_min")
+    y_max = icp.get("year_max")
+    payload: dict[str, Any] = {}
+    if inds:
+        payload["industries"] = inds
+    if isinstance(emp_min, int) or isinstance(emp_max, int):
+        payload["employee_range"] = {"min": emp_min if isinstance(emp_min, int) else None, "max": emp_max if isinstance(emp_max, int) else None}
+    if isinstance(y_min, int) or isinstance(y_max, int):
+        payload["incorporation_year"] = {"min": y_min if isinstance(y_min, int) else None, "max": y_max if isinstance(y_max, int) else None}
+    if isinstance(icp.get("geos"), list):
+        geos = [str(s).strip() for s in icp.get("geos") if isinstance(s, str) and s.strip()]
+        if geos:
+            payload["geos"] = geos
+    if isinstance(icp.get("signals"), list):
+        sigs = [str(s).strip() for s in icp.get("signals") if isinstance(s, str) and s.strip()]
+        if sigs:
+            payload["signals"] = sigs
+    return payload
+
+
+def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> None:
+    # Insert a new ICP rule row for this tenant; rely on RLS via GUC
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
+        except Exception:
+            pass
+        cur.execute(
+            """
+            INSERT INTO icp_rules(tenant_id, name, payload)
+            VALUES (%s, %s, %s)
+            """,
+            (tid, name, Json(payload)),
+        )
+
+
+def _resolve_tenant_id_for_write_sync(state: dict) -> Optional[int]:
+    try:
+        v = state.get("tenant_id") if isinstance(state, dict) else None
+        if v is not None:
+            return int(v)
+    except Exception:
+        pass
+    try:
+        v = os.getenv("DEFAULT_TENANT_ID")
+        if v and v.isdigit():
+            return int(v)
+    except Exception:
+        pass
+    try:
+        inferred_db = None
+        if ODOO_POSTGRES_DSN:
+            from urllib.parse import urlparse
+            u = urlparse(ODOO_POSTGRES_DSN)
+            inferred_db = (u.path or "/") .lstrip("/") or None
+        if inferred_db:
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                    (inferred_db, ODOO_POSTGRES_DSN),
+                )
+                _row = _cur.fetchone()
+                if _row:
+                    return int(_row[0])
+    except Exception:
+        pass
+    try:
+        with get_conn() as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+            _row = _cur.fetchone()
+            if _row:
+                return int(_row[0])
+    except Exception:
+        pass
+    return None
 
 
 def _last_text(msgs) -> str:
@@ -137,6 +273,16 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
 
 @log_node("confirm")
 def icp_confirm(state: PreSDRState) -> PreSDRState:
+    # Persist ICP from the basic flow when user confirms
+    try:
+        icp = dict(state.get("icp") or {})
+        payload = _icp_payload_from_state_icp(icp)
+        if payload:
+            tid = _resolve_tenant_id_for_write_sync(state)
+            if isinstance(tid, int):
+                _save_icp_rule_sync(tid, payload, name="Default ICP")
+    except Exception:
+        pass
     state["messages"].append(
         AIMessage(
             "✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**."
@@ -163,12 +309,97 @@ def parse_candidates(state: PreSDRState) -> PreSDRState:
 
 @log_node("enrich")
 async def run_enrichment(state: PreSDRState) -> PreSDRState:
+    # Persist ICP for the basic flow as soon as enrichment starts
+    try:
+        icp_cur = dict(state.get("icp") or {})
+        payload = _icp_payload_from_state_icp(icp_cur)
+        if payload:
+            tid = _resolve_tenant_id_for_write_sync(state)  # basic flow uses sync helper
+            if isinstance(tid, int):
+                _save_icp_rule_sync(tid, payload, name="Default ICP")
+    except Exception:
+        pass
+
     candidates = state.get("candidates") or []
     if not candidates:
         return state
 
     pool = await get_pg_pool()
-    store = OdooStore()
+    # Resolve tenant for Odoo with robust fallbacks (env → DSN→mapping → first active)
+    _tid = None
+    try:
+        _tid_env = os.getenv("DEFAULT_TENANT_ID")
+        _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+    except Exception:
+        _tid = None
+    if _tid is None:
+        try:
+            from src.settings import ODOO_POSTGRES_DSN
+            inferred_db = None
+            if ODOO_POSTGRES_DSN:
+                from urllib.parse import urlparse
+                u = urlparse(ODOO_POSTGRES_DSN)
+                inferred_db = (u.path or "/").lstrip("/") or None
+            if inferred_db:
+                with get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                        (inferred_db, ODOO_POSTGRES_DSN),
+                    )
+                    _row = _cur.fetchone()
+                    if _row:
+                        _tid = int(_row[0])
+        except Exception:
+            pass
+    if _tid is None:
+        try:
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                _row = _cur.fetchone()
+                if _row:
+                    _tid = int(_row[0])
+        except Exception:
+            pass
+    store = None
+    try:
+        logger.info("odoo resolve: tenant_id=%s (env DEFAULT_TENANT_ID=%s)", _tid, os.getenv("DEFAULT_TENANT_ID"))
+    except Exception:
+        pass
+    try:
+        store = OdooStore(tenant_id=_tid)
+    except Exception as _init_exc:
+        # Fallback: derive DSN for current tenant first; only use first active when tenant is unknown
+        try:
+            db_name = None
+            with get_conn() as _c, _c.cursor() as _cur:
+                if _tid is not None:
+                    _cur.execute(
+                        "SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active=TRUE LIMIT 1",
+                        (_tid,),
+                    )
+                    _row = _cur.fetchone()
+                    db_name = _row[0] if _row and _row[0] else None
+                if db_name is None and _tid is None:
+                    _cur.execute("SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                    _row = _cur.fetchone()
+                    db_name = _row[0] if _row and _row[0] else None
+            if db_name:
+                tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE", "") or "").strip()
+                if tpl:
+                    dsn = tpl.format(db_name=db_name)
+                else:
+                    dsn = db_name if str(db_name).startswith("postgresql://") else None
+                if dsn:
+                    logger.info(
+                        "odoo init: fallback DSN via mapping db=%s%s",
+                        db_name,
+                        f" (tenant_id={_tid})" if _tid is not None else "",
+                    )
+                    store = OdooStore(dsn=dsn)
+        except Exception as _fb_exc:
+            logger.warning("odoo init fallback error: %s", _fb_exc)
+        if store is None:
+            logger.warning("odoo init skipped: %s", _init_exc)
 
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]
@@ -241,17 +472,31 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 website_domain=comp.get("website_domain"),
             )
             if email:
-                await store.add_contact(odoo_id, email)
-            await store.merge_company_enrichment(odoo_id, {})
+                try:
+                    await store.add_contact(odoo_id, email)
+                    logger.info("odoo export: contact added email=%s for partner_id=%s", email, odoo_id)
+                except Exception as _contact_exc:
+                    logger.warning("odoo export: add_contact failed email=%s err=%s", email, _contact_exc)
+            try:
+                logger.info("odoo export: upsert company partner_id=%s name=%s", odoo_id, comp.get("name"))
+            except Exception:
+                pass
+            try:
+                await store.merge_company_enrichment(odoo_id, {})
+            except Exception:
+                pass
             if score:
-                await store.create_lead_if_high(
-                    odoo_id,
-                    comp.get("name"),
-                    score.get("score"),
-                    features.get(cid, {}),
-                    score.get("rationale", ""),
-                    email,
-                )
+                try:
+                    await store.create_lead_if_high(
+                        odoo_id,
+                        comp.get("name"),
+                        score.get("score"),
+                        features.get(cid, {}),
+                        score.get("rationale", ""),
+                        email,
+                    )
+                except Exception as _lead_exc:
+                    logger.warning("odoo export: create_lead failed partner_id=%s err=%s", odoo_id, _lead_exc)
         except Exception as exc:
             logger.exception("odoo sync failed for company_id=%s", cid)
 
@@ -322,7 +567,8 @@ def build_presdr_graph():
 
 
 class GraphState(TypedDict):
-    messages: List[BaseMessage]
+    # Ensure appends across runs/nodes
+    messages: Annotated[List[BaseMessage], add_messages]
     icp: Dict[str, Any]
     candidates: List[Dict[str, Any]]
     results: List[Dict[str, Any]]
@@ -984,6 +1230,16 @@ async def candidates_node(state: GraphState) -> GraphState:
 
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
+    # Persist ICP captured in the dynamic graph flow
+    try:
+        icp = dict(state.get("icp") or {})
+        payload = _icp_payload_from_state_icp(icp)
+        if payload:
+            tid = await _resolve_tenant_id_for_write(state)
+            if isinstance(tid, int):
+                _save_icp_rule_sync(tid, payload, name="Default ICP")
+    except Exception:
+        pass
 
     # Ensure we have candidates to work with post-confirm
     if not state.get("candidates"):
@@ -1054,6 +1310,17 @@ async def confirm_node(state: GraphState) -> GraphState:
 
 
 async def enrich_node(state: GraphState) -> GraphState:
+    # Persist current ICP immediately when enrichment is requested, even if user skipped explicit confirm
+    try:
+        icp_cur = dict(state.get("icp") or {})
+        payload = _icp_payload_from_state_icp(icp_cur)
+        if payload:
+            tid = await _resolve_tenant_id_for_write(state)
+            if isinstance(tid, int):
+                _save_icp_rule_sync(tid, payload, name="Default ICP")
+    except Exception:
+        pass
+
     text = _last_user_text(state)
     if not state.get("candidates"):
         pasted = _parse_company_list(text)
@@ -1087,6 +1354,35 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     pool = await get_pg_pool()
 
+    # Limit immediate enrichment to a small batch (default 10) and defer the rest to nightly
+    try:
+        import os
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+
+    total_candidates = len(candidates)
+    if total_candidates > enrich_now_limit:
+        # Ensure company rows exist for all candidates so nightly can pick them up later
+        ensured_ids: list[int] = []
+        for c in candidates:
+            try:
+                nm = c.get("name") if isinstance(c, dict) else None
+                if not nm:
+                    continue
+                cid = c.get("id") or await _ensure_company_row(pool, nm)
+                ensured_ids.append(int(cid))
+            except Exception:
+                # Best-effort; if ensure fails for some, still proceed with available ones
+                pass
+
+        # Choose the first N candidates to process now (preserve current order)
+        selected_ids = set(ensured_ids[:enrich_now_limit]) if ensured_ids else set()
+        if selected_ids:
+            candidates = [c for c in candidates if (c.get("id") in selected_ids) or (not c.get("id") and False)] or candidates[:enrich_now_limit]
+        else:
+            candidates = candidates[:enrich_now_limit]
+
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
@@ -1105,9 +1401,11 @@ async def enrich_node(state: GraphState) -> GraphState:
     state["enrichment_completed"] = all_done
 
     if all_done:
+        # Compose completion message; mention nightly continuation generically
+        done_msg = f"Enrichment complete for {len(results)} companies. The enrichment pipeline will continue by nightly runner."
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [AIMessage(content=f"Enrichment complete for {len(results)} companies.")],
+            [AIMessage(content=done_msg)],
         )
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
@@ -1170,10 +1468,102 @@ async def enrich_node(state: GraphState) -> GraphState:
                     from app.odoo_store import OdooStore
 
                     try:
-                        store = OdooStore()
-                    except Exception as _odoo_init_exc:
-                        logger.warning("odoo init skipped: %s", _odoo_init_exc)
-                        store = None  # type: ignore
+                        try:
+                            logger.info("odoo resolve: tenant_id=%s (env DEFAULT_TENANT_ID=%s)", _tid, os.getenv("DEFAULT_TENANT_ID"))
+                        except Exception:
+                            pass
+                        # Resolve tenant for OdooStore in this order:
+                        # 1) DEFAULT_TENANT_ID (for non-HTTP runs)
+                        # 2) Map DSN path -> odoo_connections.tenant_id
+                        # 3) First active mapping in odoo_connections
+                        # Prefer tenant_id from state (multi-user safe)
+                        _tid_val = state.get("tenant_id") if isinstance(state, dict) else None
+                        try:
+                            _tid = int(_tid_val) if _tid_val is not None else None
+                        except Exception:
+                            _tid = None
+                        # Env fallback for dev/single-user
+                        try:
+                            if _tid is None:
+                                _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                                _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                        except Exception:
+                            _tid = None
+
+                        if _tid is None:
+                            try:
+                                from src.settings import ODOO_POSTGRES_DSN
+                                inferred_db = None
+                                if ODOO_POSTGRES_DSN:
+                                    from urllib.parse import urlparse
+                                    u = urlparse(ODOO_POSTGRES_DSN)
+                                    inferred_db = (u.path or "/").lstrip("/") or None
+                                if inferred_db:
+                                    with get_conn() as _c, _c.cursor() as _cur:
+                                        _cur.execute(
+                                            "SELECT tenant_id FROM odoo_connections WHERE (db_name=%s OR db_name=%s) AND active=TRUE LIMIT 1",
+                                            (inferred_db, ODOO_POSTGRES_DSN),
+                                        )
+                                        _row = _cur.fetchone()
+                                        if _row:
+                                            _tid = int(_row[0])
+                            except Exception:
+                                pass
+
+                        if _tid is None:
+                            try:
+                                with get_conn() as _c, _c.cursor() as _cur:
+                                    _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                    _row = _cur.fetchone()
+                                    if _row:
+                                        _tid = int(_row[0])
+                            except Exception:
+                                pass
+
+                        store = None
+                        try:
+                            store = OdooStore(tenant_id=_tid)
+                        except Exception as _odoo_init_exc:
+                            # Fallback DSN from mapping + template
+                            try:
+                                db_name = None
+                                with get_conn() as _c, _c.cursor() as _cur:
+                                    if _tid is not None:
+                                        _cur.execute(
+                                            "SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active=TRUE LIMIT 1",
+                                            (_tid,),
+                                        )
+                                        _row = _cur.fetchone()
+                                        db_name = _row[0] if _row and _row[0] else None
+                                    if db_name is None and _tid is None:
+                                        _cur.execute(
+                                            "SELECT db_name FROM odoo_connections WHERE active=TRUE LIMIT 1"
+                                        )
+                                        _row = _cur.fetchone()
+                                        db_name = _row[0] if _row and _row[0] else None
+                                if db_name:
+                                    tpl = (os.getenv("ODOO_BASE_DSN_TEMPLATE", "") or "").strip()
+                                    if tpl:
+                                        dsn = tpl.format(db_name=db_name)
+                                    else:
+                                        dsn = db_name if str(db_name).startswith("postgresql://") else None
+                                    if dsn:
+                                        logger.info(
+                                            "odoo init: fallback DSN via mapping db=%s (tenant_id=%s)",
+                                            db_name,
+                                            _tid,
+                                        )
+                                        store = OdooStore(dsn=dsn)
+                            except Exception as _fb_exc:
+                                logger.warning("odoo init fallback error: %s", _fb_exc)
+                            if store is None:
+                                logger.warning("odoo init skipped: %s", _odoo_init_exc)
+
+                    except Exception as _tid_init_block_exc:
+                        # Catch-all for any unexpected errors during tenant resolution
+                        # and initial OdooStore creation so the outer block can continue.
+                        logger.warning("odoo init block error: %s", _tid_init_block_exc)
+                        store = None
 
                     if store:
                         for cid in ids:
@@ -1192,18 +1582,48 @@ async def enrich_node(state: GraphState) -> GraphState:
                                     incorporation_year=comp.get("incorporation_year"),
                                     website_domain=comp.get("website_domain"),
                                 )
-                                if email:
-                                    await store.add_contact(odoo_id, email)
-                                await store.merge_company_enrichment(odoo_id, {})
-                                if "score" in score:
-                                    await store.create_lead_if_high(
+                                try:
+                                    logger.info(
+                                        "odoo export: upsert company partner_id=%s name=%s",
                                         odoo_id,
                                         comp.get("name"),
-                                        float(score.get("score") or 0.0),
-                                        {},
-                                        str(score.get("rationale") or ""),
-                                        email,
                                     )
+                                except Exception:
+                                    pass
+                                if email:
+                                    try:
+                                        await store.add_contact(odoo_id, email)
+                                        logger.info(
+                                            "odoo export: contact added email=%s partner_id=%s",
+                                            email,
+                                            odoo_id,
+                                        )
+                                    except Exception as _c_exc:
+                                        logger.warning(
+                                            "odoo export: add_contact failed email=%s err=%s",
+                                            email,
+                                            _c_exc,
+                                        )
+                                try:
+                                    await store.merge_company_enrichment(odoo_id, {})
+                                except Exception:
+                                    pass
+                                if "score" in score:
+                                    try:
+                                        await store.create_lead_if_high(
+                                            odoo_id,
+                                            comp.get("name"),
+                                            float(score.get("score") or 0.0),
+                                            {},
+                                            str(score.get("rationale") or ""),
+                                            email,
+                                        )
+                                    except Exception as _lead_exc:
+                                        logger.warning(
+                                            "odoo export: create_lead failed partner_id=%s err=%s",
+                                            odoo_id,
+                                            _lead_exc,
+                                        )
                             except Exception as exc:
                                 logger.exception(
                                     "odoo sync failed for company_id=%s", cid

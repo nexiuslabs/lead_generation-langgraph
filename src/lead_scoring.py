@@ -142,6 +142,14 @@ async def persist_results(state: LeadScoringState) -> LeadScoringState:
     """
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
+        # Try set tenant GUC for RLS from env (supports non-HTTP runs)
+        try:
+            import os as _os
+            _tenant = _os.getenv('DEFAULT_TENANT_ID')
+            if _tenant:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", _tenant)
+        except Exception:
+            pass
         # Ensure tables exist
         await conn.execute(
             """
@@ -162,29 +170,66 @@ async def persist_results(state: LeadScoringState) -> LeadScoringState:
             );
             """
         )
+        # Detect tenant_id column presence
+        has_tenant = bool(
+            await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns WHERE table_name='lead_scores' AND column_name='tenant_id' LIMIT 1"
+            )
+        )
+        tenant_val = None
+        try:
+            import os as _os
+            tenant_val = _os.getenv('DEFAULT_TENANT_ID')
+        except Exception:
+            tenant_val = None
         for feat, score in zip(state['lead_features'], state['lead_scores']):
             # Upsert features
-            await conn.execute(
-                """
-                INSERT INTO lead_features (company_id, features)
-                VALUES ($1, $2::jsonb)
-                ON CONFLICT (company_id) DO UPDATE SET features = EXCLUDED.features;
-                """,
-                feat['company_id'], json.dumps(feat)
-            )
+            if has_tenant and tenant_val is not None:
+                await conn.execute(
+                    """
+                    INSERT INTO lead_features (company_id, features, tenant_id)
+                    VALUES ($1, $2::jsonb, $3::int)
+                    ON CONFLICT (company_id) DO UPDATE SET features = EXCLUDED.features, tenant_id = EXCLUDED.tenant_id;
+                    """,
+                    feat['company_id'], json.dumps(feat), int(tenant_val)
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO lead_features (company_id, features)
+                    VALUES ($1, $2::jsonb)
+                    ON CONFLICT (company_id) DO UPDATE SET features = EXCLUDED.features;
+                    """,
+                    feat['company_id'], json.dumps(feat)
+                )
             # Upsert scores
-            await conn.execute(
-                """
-                INSERT INTO lead_scores (company_id, score, bucket, rationale, cache_key)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (company_id) DO UPDATE SET
-                  score = EXCLUDED.score,
-                  bucket = EXCLUDED.bucket,
-                  rationale = EXCLUDED.rationale,
-                  cache_key = EXCLUDED.cache_key;
-                """,
-                score['company_id'], score['score'], score['bucket'], score['rationale'], score['cache_key']
-            )
+            if has_tenant and tenant_val is not None:
+                await conn.execute(
+                    """
+                    INSERT INTO lead_scores (company_id, score, bucket, rationale, cache_key, tenant_id)
+                    VALUES ($1, $2, $3, $4, $5, $6::int)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                      score = EXCLUDED.score,
+                      bucket = EXCLUDED.bucket,
+                      rationale = EXCLUDED.rationale,
+                      cache_key = EXCLUDED.cache_key,
+                      tenant_id = EXCLUDED.tenant_id;
+                    """,
+                    score['company_id'], score['score'], score['bucket'], score['rationale'], score['cache_key'], int(tenant_val)
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO lead_scores (company_id, score, bucket, rationale, cache_key)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                      score = EXCLUDED.score,
+                      bucket = EXCLUDED.bucket,
+                      rationale = EXCLUDED.rationale,
+                      cache_key = EXCLUDED.cache_key;
+                    """,
+                    score['company_id'], score['score'], score['bucket'], score['rationale'], score['cache_key']
+                )
     return state
 
 # Build and compile LangGraph pipeline

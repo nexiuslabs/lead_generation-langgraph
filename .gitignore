@@ -58,9 +58,6 @@ coverage.xml
 .ipynb_checkpoints
 
 # Environments
-.env
-.env.*.local
-.env.local
 .venv/
 venv/
 ENV/
@@ -69,9 +66,8 @@ venv.bak/
 env.bak/
 
 # Project secrets (explicit)
-src/.env
-Documents/NexiusLabs_Projects/Lead_Management_Agent/src/.env
-*.env
+# Note: We intentionally allow .env files to be tracked per user request.
+# Remove or revert these allowances if you need to keep secrets out of git.
 *.key
 *.pem
 *.p12

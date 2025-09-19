@@ -1,39 +1,61 @@
-# Repository Guidelines
+Agents Guide — lead_generation-main
 
-## Project Structure & Module Organization
-- `src/`: Core pipeline modules (crawler, enrichment, ICP, orchestrator, DB, settings).
-- `app/`: FastAPI + LangGraph server (`main.py`, `pre_sdr_graph.py`, `lg_entry.py`).
-- `scripts/`: Utilities (e.g., `run_odoo_migration.py`).
-- `app/migrations/`: SQL for Odoo-safe migration(s).
-- `.env`/`.env.example`: Runtime configuration. Do not commit real secrets.
+Purpose
+- Pre-SDR pipeline: normalize → ICP candidates → deterministic crawl + Tavily/Apify → ZeroBounce verify → scoring + rationale → export → optional Odoo sync.
 
-## Build, Test, and Development Commands
-- Create env: `python -m venv .venv && source .venv/bin/activate`
-- Install deps: `pip install -r requirements.txt`
-- Run API: `uvicorn app.main:app --reload` (serves `/agent` and `/health`).
-- LangGraph dev: `langgraph dev` (uses `app/lg_entry.py:make_graph`).
-- Orchestrator (CLI): `python src/orchestrator.py`
-- DB migration (Odoo): `python scripts/run_odoo_migration.py`
+Run API (LangGraph server)
+- python -m venv .venv && source .venv/bin/activate
+- pip install -r requirements.txt
+- uvicorn app.main:app --host 0.0.0.0 --port 2024
+- Endpoints: /agent (LangServe), /export/latest_scores.csv, /docs
 
-## Coding Style & Naming Conventions
-- Python 3.11+; 4‑space indentation; prefer type hints.
-- Names: modules/functions `snake_case`, classes `PascalCase`, constants `UPPER_SNAKE`.
-- Formatting: run `black .` and `isort .` (both in `requirements.txt`).
-- Imports: standard → third‑party → local; avoid wildcard imports.
+Run Orchestrator (one-off)
+- source .venv/bin/activate
+- python -m src.orchestrator
 
-## Testing Guidelines
-- Current repo has no formal tests. Prefer `pytest` for new tests.
-- Layout: `tests/test_*.py`; mirror `src/` packages; use fixtures for I/O and DB.
-- Fast checks: run orchestrator and server locally; validate `/health` and a minimal `/agent` call.
-- Optional: add coverage with `pytest --cov=src` when tests exist.
+Key Env Vars (src/settings.py)
+- POSTGRES_DSN (required)
+- OPENAI_API_KEY, LANGCHAIN_MODEL=gpt-4o-mini, TEMPERATURE=0.3
+- TAVILY_API_KEY?, ZEROBOUNCE_API_KEY?
+- APIFY_TOKEN (required for Apify), ENABLE_APIFY_LINKEDIN=true
+- Optional: APIFY_INPUT_JSON to pass a custom actor input JSON template.
+  - Use placeholders: %%QUERY%% for a single query string, %%QUERIES%% for an array of queries.
+- Optional: APIFY_SEARCH_ACTOR_ID for resolving LinkedIn profile URLs when the main actor requires `profileUrls`.
+- Optional: APIFY_DEBUG_LOG_ITEMS=true to log a small sample of Apify dataset items and normalized contacts. Control size via APIFY_LOG_SAMPLE_SIZE (default 3).
+- Optional: APIFY_USE_COMPANY_EMPLOYEE_CHAIN=true to use the chain company-by-name → employees → profile-details.
+- APIFY_COMPANY_ACTOR_ID=harvestapi~linkedin-company, APIFY_EMPLOYEES_ACTOR_ID=harvestapi~linkedin-company-employees, APIFY_LINKEDIN_ACTOR_ID=dev_fusion~linkedin-profile-scraper
+- ENABLE_LUSHA_FALLBACK=false (optional; set true only if you want Lusha as a fallback), LUSHA_API_KEY? (optional)
+- ICP_RULE_NAME=default, CRAWL_MAX_PAGES=6, EXTRACT_CORPUS_CHAR_LIMIT=35000
+- ODOO_POSTGRES_DSN (or resolve per-tenant via odoo_connections)
 
-## Commit & Pull Request Guidelines
-- Commit style: brief imperative subject; include context in body when needed.
-- Prefer Conventional Commits prefixes: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`.
-- PRs must include: clear description, rationale, before/after notes; link issues; screenshots or logs when UI/API behavior changes.
-- Keep PRs focused and small; include any schema or env changes in the description.
+Migrations
+- Apply multi-tenant + MV: app/migrations/004_multi_tenant_icp.sql
+- Odoo columns: app/migrations/001_presdr_odoo.sql
 
-## Security & Configuration Tips
-- Secrets: never commit `.env`; use `.env.example` for placeholders.
-- Required env: `POSTGRES_DSN`, `OPENAI_API_KEY`, `TAVILY_API_KEY`; optional `ZEROBOUNCE_API_KEY`, `ICP_RULE_NAME`, `LANGCHAIN_MODEL`, `TEMPERATURE`.
-- Settings load order includes project root and `src/.env`; prefer `POSTGRES_DSN` over `DATABASE_URL`.
+Tenancy & Auth (Section 6)
+- Production: Validate Nexius SSO JWT, set request.state.tenant_id and roles.
+- Enforce RLS/filters on tenant-owned tables; set GUC request.tenant_id per request.
+- Dev: X-Tenant-ID header may be accepted for local testing only.
+
+Common Ops
+- Refresh MV: REFRESH MATERIALIZED VIEW CONCURRENTLY icp_candidate_companies;
+- Export shortlist: curl "http://localhost:2024/export/latest_scores.csv?limit=200" -o shortlist.csv
+- Logs: tail -f .logs/*.log
+
+Troubleshooting
+- Postgres connect errors: verify POSTGRES_DSN and DB reachable.
+- Tavily/Apify/ZeroBounce: missing keys → fallbacks/pathways skip gracefully; check settings flags.
+
+Scheduler & Cron
+- Use the async scheduler entry: `python lead_generation-main/scripts/run_scheduler.py`
+- Configure start time via `SCHED_START_CRON` (default `0 1 * * *` for 01:00 SGT)
+- Limits & caps:
+  - `SCHED_DAILY_CAP_PER_TENANT` (default 20 in .env)
+  - `SCHED_COMPANY_BATCH_SIZE` (per-batch company count; default 1)
+  - Vendor caps (coarse): `TAVILY_MAX_QUERIES`, `APIFY_DAILY_CAP`, `LUSHA_MAX_CONTACT_LOOKUPS` (only if Lusha fallback enabled)
+  - ZeroBounce: `ZEROBOUNCE_MAX_VERIFICATIONS`, `ZEROBOUNCE_BATCH_SIZE`
+
+Admin Kickoff Endpoint
+- POST `/admin/runs/nightly` (requires admin role)
+  - Run all tenants: `curl -X POST http://localhost:2024/admin/runs/nightly -b 'nx_access=...'`
+  - Run a single tenant: `curl -X POST 'http://localhost:2024/admin/runs/nightly?tenant_id=123' -b 'nx_access=...'`

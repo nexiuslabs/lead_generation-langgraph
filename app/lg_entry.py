@@ -398,6 +398,15 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm_msgs = [_to_message(m) for m in msgs] or [HumanMessage(content="")]
     state: Dict[str, Any] = {"messages": norm_msgs}
 
+    # Propagate tenant_id from context or input for multi-user runs
+    try:
+        ctx = payload.get("context") or data.get("context") or {}
+        tid = ctx.get("tenant_id") or data.get("tenant_id")
+        if tid is not None:
+            state["tenant_id"] = tid
+    except Exception:
+        pass
+
     # optional “companies”/“candidates” passthrough for your graph
     if "candidates" in data:
         state["candidates"] = data["candidates"]
