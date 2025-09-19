@@ -1767,8 +1767,12 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
 
 
 async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
-    if state.get("completed"):
+    # Allow Apify to run even when earlier steps marked the run completed due to no domain.
+    # We can often discover LinkedIn contacts by company name alone.
+    if state.get("completed") and state.get("error") != "no_domain":
         return state
+    if state.get("completed") and state.get("error") == "no_domain":
+        logger.info("[apify_contacts] No domain found; proceeding to Apify by company name")
     data = state.get("data") or {}
     company_id = state.get("company_id")
     if not company_id:
