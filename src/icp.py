@@ -72,6 +72,16 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
                     )
                     or "NULL"
                 )
+                src_owner = (
+                    pick(
+                        "business_constitution_description",
+                        "company_type_description",
+                        "entity_type_description",
+                        "paf_constitution_description",
+                        "ownership_type",
+                    )
+                    or "NULL"
+                )
                 src_status = (
                     pick(
                         "entity_status_description",
@@ -89,6 +99,7 @@ def _fetch_staging_rows(limit: int = 100) -> List[Dict[str, Any]]:
                       {src_desc}  AS primary_ssic_description,
                       {src_code}  AS primary_ssic_code,
                       {src_year}  AS raw_year,
+                      {src_owner} AS ownership_type,
                       {src_status} AS entity_status_description
                     FROM staging_acra_companies
                     ORDER BY 1
@@ -178,6 +189,7 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "website_domain": _norm_str(r.get("website_domain") or r.get("website")),
         "incorporation_year": year,
         "founded_year": founded,
+        "ownership_type": _norm_str(r.get("ownership_type")),
         "sg_registered": sg,
     }
     return norm
@@ -238,6 +250,7 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
             else ("incorporation_year" if "incorporation_year" in cols else None)
         )
         col_sg = "sg_registered" if "sg_registered" in cols else None
+        has_owner = "ownership_type" in cols
 
         for r in rows:
             # Build column map for this row
@@ -275,6 +288,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
             if col_sg and r.get("sg_registered") is not None:
                 insert_cols.append(col_sg)
                 params.append(r.get("sg_registered"))
+            if has_owner and r.get("ownership_type") is not None:
+                insert_cols.append("ownership_type")
+                params.append(r.get("ownership_type"))
 
             # Always set last_seen on update; insert via NOW()
             insert_cols_sql = (
@@ -376,7 +392,7 @@ def _find_ssic_codes_by_terms(terms: list[str]) -> list[tuple[str, str, float]]:
                      GREATEST(similarity(title, %s),
                               similarity(coalesce(description,''), %s)) AS score
               FROM ssic_ref
-              WHERE title % %s OR coalesce(description,'') % %s
+              WHERE title %% %s OR coalesce(description,'') %% %s
               ORDER BY score DESC
               LIMIT 30
             """,

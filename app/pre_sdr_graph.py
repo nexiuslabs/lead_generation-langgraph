@@ -883,9 +883,9 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
 
 async def _ensure_company_row(pool, name: str) -> int:
     """
-    Find an existing company row by name and return its primary key.
-    Supports schemas where the PK column is either `company_id` or `id`.
-    As a last resort, attempts to insert a minimal row and return the new id.
+    Find an existing company row by name and return its primary key (company_id).
+    Only uses the canonical column `company_id` as defined in the schema.
+    As a last resort, inserts a minimal row and returns the new company_id.
     """
     async with pool.acquire() as conn:
         # 1) Try company_id first (most common in this repo)
@@ -896,10 +896,7 @@ async def _ensure_company_row(pool, name: str) -> int:
         if row and "company_id" in row:
             return int(row["company_id"])  # type: ignore[index]
 
-        # 2) Try id as fallback
-        row = await conn.fetchrow("SELECT id FROM companies WHERE name = $1", name)
-        if row and "id" in row:
-            return int(row["id"])  # type: ignore[index]
+        # No legacy `id` support — schema defines only `company_id`.
 
         # 3) Insert minimal row; prefer returning company_id if present
         # Try RETURNING company_id
@@ -912,16 +909,7 @@ async def _ensure_company_row(pool, name: str) -> int:
                 return int(row["company_id"])  # type: ignore[index]
         except Exception:
             pass
-        # Try RETURNING id
-        try:
-            row = await conn.fetchrow(
-                "INSERT INTO companies(name) VALUES ($1) RETURNING id",
-                name,
-            )
-            if row and "id" in row:
-                return int(row["id"])  # type: ignore[index]
-        except Exception:
-            pass
+        # Do not attempt RETURNING id; only company_id exists
 
         # 4) As a final fallback (schemas without defaults), synthesize a new company_id
         #    WARNING: This is best-effort and not concurrency-safe, but unblocks local flows.
@@ -1217,11 +1205,29 @@ async def candidates_node(state: GraphState) -> GraphState:
                     lines.append(
                         f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
                     )
+                # Fallback: if we still have no candidates selected from companies,
+                # derive initial candidates directly from ACRA sample (name + UEN).
+                if n == 0 and not state.get("candidates"):
+                    try:
+                        derived = []
+                        for r in rows[:20]:
+                            nm = (r.get("entity_name") or "").strip()
+                            if not nm:
+                                continue
+                            derived.append({"name": nm, "uen": (r.get("uen") or "").strip() or None})
+                        if derived:
+                            state["candidates"] = derived
+                            n = len(derived)
+                    except Exception:
+                        pass
             else:
                 lines.append("- Found 0 ACRA candidates.")
     except Exception:
         pass
-    lines.append("Started Enrichment. Please wait...")
+    if n > 0:
+        lines.append("Started Enrichment. Please wait...")
+    else:
+        lines.append("No candidates yet. I’ll keep collecting ICP details.")
     msg = "\n".join([ln for ln in lines if ln])
 
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=msg)])
@@ -1293,13 +1299,30 @@ async def confirm_node(state: GraphState) -> GraphState:
                     msg_lines.append(
                         f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
                     )
+                # Fallback: seed candidates directly from ACRA when none exist
+                if n == 0 and not state.get("candidates"):
+                    try:
+                        derived = []
+                        for r in rows[:20]:
+                            nm = (r.get("entity_name") or "").strip()
+                            if not nm:
+                                continue
+                            derived.append({"name": nm, "uen": (r.get("uen") or "").strip() or None})
+                        if derived:
+                            state["candidates"] = derived
+                            n = len(derived)
+                    except Exception:
+                        pass
             else:
                 msg_lines.append("- Found 0 ACRA candidates.")
     except Exception:
         # Don’t block on SSIC/ACRA preview errors
         pass
 
-    msg_lines.append("Started Enrichment. Please wait...")
+    if n > 0:
+        msg_lines.append("Started Enrichment. Please wait...")
+    else:
+        msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
     text = "\n".join([ln for ln in msg_lines if ln])
 
     # Signal that we've shown the SSIC/ACRA preview
