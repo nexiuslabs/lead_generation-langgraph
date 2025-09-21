@@ -286,6 +286,24 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
             cur_sel = conn.cursor(name="staging_upsert_sel")
             cur_sel.itersize = 500
             cur_sel.execute(select_sql, select_params)
+            try:
+                col_aliases = [
+                    getattr(desc, "name", None)
+                    or (desc[0] if isinstance(desc, (list, tuple)) and desc else None)
+                    for desc in (cur_sel.description or [])
+                ]
+            except Exception:
+                col_aliases = []
+
+            def row_to_map(row: tuple) -> Dict[str, Any]:
+                if not col_aliases:
+                    return {}
+                limit = min(len(col_aliases), len(row))
+                return {
+                    col_aliases[i]: row[i]
+                    for i in range(limit)
+                    if col_aliases[i]
+                }
             batch_size = 500
             logger.info("Upserting staging companies by %s in batches of %d", source_mode, batch_size)
             processed = 0
@@ -296,21 +314,21 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                     break
                 logger.info("Processing batch of %d rows (processed=%d/%d)", len(rows), processed, total_matches)
                 with conn.cursor() as cur_up:
-                    for (
-                        uen,
-                        entity_name,
-                        ssic_desc,
-                        ssic_code,
-                        inc_year,
-                        status_de,
-                    ) in rows:
+                    for row in rows:
+                        row_map = row_to_map(row)
+                        uen = row_map.get("uen")
+                        entity_name = row_map.get("entity_name")
+                        ssic_desc = row_map.get("primary_ssic_description")
+                        ssic_code = row_map.get("primary_ssic_code")
+                        inc_year = row_map.get("incorporation_year")
+                        status_de = row_map.get("entity_status_de")
                         # capture names for preview if SSIC-based selection
                         if source_mode == 'ssic' and len(names_preview_list) < 50:
-                            nm = (entity_name or "").strip()
+                            nm = (entity_name or "").strip()  # type: ignore[arg-type]
                             if nm:
                                 names_preview_list.append(nm)
-                        name = (entity_name or "").strip() or None
-                        desc_lower = (ssic_desc or "").strip().lower()
+                        name = (entity_name or "").strip() or None  # type: ignore[arg-type]
+                        desc_lower = (ssic_desc or "").strip().lower()  # type: ignore[arg-type]
                         match_term = None
                         for t in lower_terms:
                             if desc_lower == t or (t in desc_lower):
@@ -322,7 +340,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                         try:
                             sg_registered = (
                                 (status_de or "").strip().lower() in {"live", "registered", "existing"}
-                            )
+                            )  # type: ignore[arg-type]
                         except Exception:
                             pass
 
