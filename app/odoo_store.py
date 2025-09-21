@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import time
+import asyncio
 from typing import Any, Dict, Optional
 
 import asyncpg
@@ -93,7 +94,12 @@ class OdooStore:
         if ssh_password:
             if shutil.which("sshpass") is None:
                 logger.error(
-                    "sshpass not found but SSH_PASSWORD is set; cannot auto-open tunnel."
+                    "sshpass not found but SSH_PASSWORD is set; cannot auto-open tunnel.\n"
+                    "Install sshpass or switch to key-based auth.\n"
+                    "Examples:\n"
+                    "  - macOS (Homebrew): brew install hudochenkov/sshpass/sshpass\n"
+                    "  - Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y sshpass\n"
+                    "  - Or unset SSH_PASSWORD and rely on SSH keys/agent."
                 )
                 # Do not mark as opened; leave it false so future attempts can retry
                 OdooStore._tunnel_opened = False
@@ -114,6 +120,12 @@ class OdooStore:
                 "ExitOnForwardFailure=yes",
                 "-o",
                 "StrictHostKeyChecking=no",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=10",
             ]
         else:
             cmd = [
@@ -129,6 +141,12 @@ class OdooStore:
                 "ExitOnForwardFailure=yes",
                 "-o",
                 "StrictHostKeyChecking=no",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=10",
             ]
 
         try:
@@ -160,19 +178,57 @@ class OdooStore:
             OdooStore._tunnel_opened = False
 
     async def _acquire(self):
-        # Re-check/ensure tunnel in case previous attempt failed or was terminated
-        self._ensure_tunnel_once()
-        # Best-effort visibility if local port is not open
+        # Robust connect with retry/backoff and tunnel reopen
         try:
-            from urllib.parse import urlparse
-            u = urlparse(self.dsn)
-            host = u.hostname or "127.0.0.1"
-            port = u.port or 5432
-            if not self._port_open(host, port):
-                logger.warning("Odoo DSN target %s:%s not reachable before connect()", host, port)
+            max_retries = int(os.getenv("ODOO_CONNECT_MAX_RETRIES", "5") or 5)
         except Exception:
-            pass
-        return await asyncpg.connect(self.dsn)
+            max_retries = 5
+        try:
+            backoff_ms = int(os.getenv("ODOO_CONNECT_BACKOFF_MS", "300") or 300)
+        except Exception:
+            backoff_ms = 300
+
+        from urllib.parse import urlparse
+        u = urlparse(self.dsn)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or 5432
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_retries + 1):
+            # Ensure (or re-open) tunnel if port not reachable
+            if not self._port_open(host, port):
+                logger.warning(
+                    "Odoo DSN target %s:%s not reachable before connect(); attempt %d/%d — reopening tunnel",
+                    host,
+                    port,
+                    attempt,
+                    max_retries,
+                )
+                # Force a re-open by resetting flag
+                OdooStore._tunnel_opened = False
+                self._ensure_tunnel_once()
+                # Short wait for local port to open
+                await asyncio.sleep(0.3)
+            try:
+                return await asyncpg.connect(self.dsn)
+            except Exception as e:
+                last_exc = e
+                if attempt >= max_retries:
+                    break
+                delay_s = min(2.0, (backoff_ms / 1000.0) * (2 ** (attempt - 1)))
+                logger.warning(
+                    "Odoo connect failed (attempt %d/%d): %s — retrying in %.2fs",
+                    attempt,
+                    max_retries,
+                    getattr(e, "__class__", type(e)).__name__,
+                    delay_s,
+                )
+                await asyncio.sleep(delay_s)
+        # Exhausted retries
+        if last_exc:
+            raise last_exc
+        # Fallback raise
+        raise ConnectionError("Odoo connection retries exhausted")
 
     async def upsert_company(self, name: str, uen: str | None = None, **fields) -> int:
 

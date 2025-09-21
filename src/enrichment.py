@@ -1220,6 +1220,50 @@ async def enrich_company_with_tavily(
         "error": None,
         "degraded_reasons": [],
     }
+    # Early-exit guard: skip re-enrichment if recently enriched
+    try:
+        days_env = os.getenv("ENRICH_RECHECK_DAYS", "7").strip()
+        recheck_days = int(days_env) if days_env.isdigit() else 7
+    except Exception:
+        recheck_days = 7
+    if recheck_days > 0:
+        try:
+            conn = get_db_connection()
+            with conn, conn.cursor() as cur:
+                # Ensure table exists before querying
+                cur.execute("SELECT to_regclass('public.company_enrichment_runs')")
+                exists = cur.fetchone()[0] is not None
+                if exists:
+                    cur.execute(
+                        """
+                        SELECT MAX(updated_at) AS last_enriched
+                        FROM company_enrichment_runs
+                        WHERE company_id=%s
+                        """,
+                        (company_id,),
+                    )
+                    row = cur.fetchone()
+                    last_enriched = row[0] if row else None
+                    if last_enriched is not None:
+                        # Compare in SQL for timezone correctness
+                        cur.execute(
+                            "SELECT %s > (now() - (%s || ' days')::interval)",
+                            (last_enriched, str(recheck_days)),
+                        )
+                        is_recent = bool(cur.fetchone()[0])
+                        if is_recent:
+                            logger.info(
+                                f"[enrichment] skip company_id={company_id} — recently enriched within {recheck_days}d"
+                            )
+                            initial_state["completed"] = True
+                            try:
+                                (initial_state.setdefault("degraded_reasons", [])) .append("SKIP_RECENT")
+                            except Exception:
+                                pass
+                            return initial_state
+        except Exception:
+            # Best-effort only; continue if any error
+            pass
     try:
         logger.info(
             f"[enrichment] start company_id={company_id}, name={company_name!r}"
@@ -2734,7 +2778,38 @@ def _normalize_phone_list(values: list[str]) -> list[str]:
 def store_enrichment(company_id: int, domain: str, data: dict):
     print(f"    💾 store_enrichment({company_id}, {domain})")
     conn = get_db_connection()
-    embedding = get_embedding(data.get("about_text", "") or "")
+    # Compute embedding only when about_text changed (best-effort)
+    about_new = (data.get("about_text") or "").strip()
+    about_prev = None
+    try:
+        with conn.cursor() as cur:
+            # Check latest about_text from company_enrichment_runs if table/column exist
+            cur.execute("SELECT to_regclass('public.company_enrichment_runs')")
+            has_runs = cur.fetchone()[0] is not None
+            if has_runs:
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='company_enrichment_runs' AND column_name='about_text'
+                    """
+                )
+                has_col = cur.fetchone() is not None
+                if has_col:
+                    cur.execute(
+                        "SELECT about_text FROM company_enrichment_runs WHERE company_id=%s ORDER BY updated_at DESC LIMIT 1",
+                        (company_id,),
+                    )
+                    row = cur.fetchone()
+                    about_prev = (row[0] or "").strip() if row and row[0] else None
+    except Exception:
+        about_prev = None
+    # Only compute when changed
+    embedding = []
+    try:
+        if about_new and (about_prev is None or about_new != about_prev):
+            embedding = get_embedding(about_new)
+    except Exception:
+        embedding = []
     verification = verify_emails(data.get("public_emails") or [])
 
     # Normalize domain (apex, lowercase) and phone list
@@ -2753,8 +2828,13 @@ def store_enrichment(company_id: int, domain: str, data: dict):
             "jobs_count": data.get("jobs_count"),
             "linkedin_url": data.get("linkedin_url"),
             "verification_results": Json(verification),
-            "embedding": embedding,
         }
+        # Include embedding only when computed (and column may or may not exist)
+        try:
+            if embedding:
+                fields2["embedding"] = embedding
+        except Exception:
+            pass
         tid2 = _default_tenant_id()
         if tid2 is not None:
             fields2["tenant_id"] = tid2

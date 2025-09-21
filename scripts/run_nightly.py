@@ -52,6 +52,7 @@ TAVILY_MAX_QUERIES = _int_env("TAVILY_MAX_QUERIES", 0)  # 0 means no extra cap b
 LUSHA_MAX_CONTACT_LOOKUPS = _int_env("LUSHA_MAX_CONTACT_LOOKUPS", 0)
 ZB_MAX_VERIFY = _int_env("ZEROBOUNCE_MAX_VERIFICATIONS", 0)
 ZB_BATCH_SIZE = _int_env("ZEROBOUNCE_BATCH_SIZE", 50)
+ENRICH_RECHECK_DAYS = _int_env("ENRICH_RECHECK_DAYS", 7)  # skip re-enrich within N days
 
 
 def list_active_tenants() -> List[int]:
@@ -142,20 +143,60 @@ def select_target_set(candidates: List[int], limit: int) -> List[int]:
     if not candidates:
         return []
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
+        # Check if company_enrichment_runs exists with updated_at for recency filter
+        has_enrichment_runs = False
+        has_updated_at = False
+        try:
+            cur.execute("SELECT to_regclass('public.company_enrichment_runs')")
+            has_enrichment_runs = cur.fetchone()[0] is not None
+            if has_enrichment_runs:
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='company_enrichment_runs' AND column_name='updated_at'
+                    """
+                )
+                has_updated_at = cur.fetchone() is not None
+        except Exception:
+            has_enrichment_runs = False
+            has_updated_at = False
+
+        params = [candidates, limit]
+        if has_enrichment_runs and has_updated_at and ENRICH_RECHECK_DAYS > 0:
+            # Filter: skip companies enriched within the last ENRICH_RECHECK_DAYS
+            sql = """
+                WITH last_enriched AS (
+                  SELECT company_id, MAX(updated_at) AS last_enriched
+                  FROM company_enrichment_runs
+                  GROUP BY company_id
+                )
+                SELECT c.company_id
+                FROM companies c
+                LEFT JOIN lead_scores s ON s.company_id=c.company_id
+                LEFT JOIN contacts k ON k.company_id=c.company_id
+                LEFT JOIN last_enriched e ON e.company_id=c.company_id
+                WHERE c.company_id = ANY(%s)
+                  AND (e.last_enriched IS NULL OR e.last_enriched < (now() - (%s || ' days')::interval))
+                ORDER BY (s.company_id IS NULL) DESC,
+                         (k.company_id IS NULL) DESC,
+                         c.last_seen DESC NULLS LAST
+                LIMIT %s
             """
-            SELECT c.company_id
-            FROM companies c
-            LEFT JOIN lead_scores s ON s.company_id=c.company_id
-            LEFT JOIN contacts k ON k.company_id=c.company_id
-            WHERE c.company_id = ANY(%s)
-            ORDER BY (s.company_id IS NULL) DESC,
-                     (k.company_id IS NULL) DESC,
-                     c.last_seen DESC NULLS LAST
-            LIMIT %s
-            """,
-            (candidates, limit),
-        )
+            # insert days as second param
+            params = [candidates, str(ENRICH_RECHECK_DAYS), limit]
+        else:
+            sql = """
+                SELECT c.company_id
+                FROM companies c
+                LEFT JOIN lead_scores s ON s.company_id=c.company_id
+                LEFT JOIN contacts k ON k.company_id=c.company_id
+                WHERE c.company_id = ANY(%s)
+                ORDER BY (s.company_id IS NULL) DESC,
+                         (k.company_id IS NULL) DESC,
+                         c.last_seen DESC NULLS LAST
+                LIMIT %s
+            """
+        cur.execute(sql, params)
         return [int(r[0]) for r in cur.fetchall()]
 
 
