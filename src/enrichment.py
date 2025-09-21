@@ -2364,6 +2364,7 @@ def find_domain(company_name: str) -> list[str]:
         "expedia.com",
         "yelp.com",
         "recordowl.com",
+        "sgpgrid.com",
     }
     for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
