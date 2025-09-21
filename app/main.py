@@ -275,30 +275,59 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                 """
                 cur.execute(select_sql, (lower_terms, like_patterns))
             rows = cur.fetchall()
-            if code_list and rows:
+            try:
+                col_aliases = [
+                    getattr(desc, "name", None)
+                    or (desc[0] if isinstance(desc, (list, tuple)) and desc else None)
+                    for desc in (cur.description or [])
+                ]
+            except Exception:
+                col_aliases = []
+
+            def row_to_map(row: tuple) -> dict[str, object]:
+                if not col_aliases:
+                    return {}
+                limit = min(len(col_aliases), len(row))
+                return {
+                    col_aliases[i]: row[i]
+                    for i in range(limit)
+                    if col_aliases[i]
+                }
+
+            if code_list and rows and col_aliases:
                 # Log matched names for visibility (preview up to 50)
                 try:
-                    name_idx = 1  # entity_name is second selected column
-                    names = [(r[name_idx] or "").strip() for r in rows]
-                    names = [n for n in names if n]
-                    names_preview = ", ".join(names[:50])
-                    extra = f", ... (+{len(names)-50} more)" if len(names) > 50 else ""
-                    logger.info("staging_acra_companies matched %d rows by SSIC code; names: %s%s", len(names), names_preview, extra)
+                    names = []
+                    for r in rows:
+                        row_map = row_to_map(r)
+                        nm = (row_map.get("entity_name") or "").strip()  # type: ignore[arg-type]
+                        if nm:
+                            names.append(nm)
+                    if names:
+                        names_preview = ", ".join(names[:50])
+                        extra = f", ... (+{len(names)-50} more)" if len(names) > 50 else ""
+                        logger.info(
+                            "staging_acra_companies matched %d rows by SSIC code; names: %s%s",
+                            len(names),
+                            names_preview,
+                            extra,
+                        )
                 except Exception:
                     pass
             if not rows:
                 return 0
-            for (
-                uen,
-                entity_name,
-                ssic_desc,
-                ssic_code,
-                website,
-                inc_year,
-                status_de,
-            ) in rows:
-                name = (entity_name or "").strip() or None
-                desc_lower = (ssic_desc or "").strip().lower()
+            for row in rows:
+                row_map = row_to_map(row)
+                uen = row_map.get("uen")
+                entity_name = row_map.get("entity_name")
+                ssic_desc = row_map.get("primary_ssic_description")
+                ssic_code = row_map.get("primary_ssic_code")
+                website = row_map.get("website")
+                inc_year = row_map.get("incorporation_year")
+                status_de = row_map.get("entity_status_de")
+
+                name = (entity_name or "").strip() or None  # type: ignore[arg-type]
+                desc_lower = (ssic_desc or "").strip().lower()  # type: ignore[arg-type]
                 # Prefer setting industry_norm to the user's term if it appears in the description
                 match_term = None
                 for t in industries:
@@ -307,12 +336,12 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
                         break
                 industry_norm = (match_term or desc_lower) or None
                 industry_code = str(ssic_code) if ssic_code is not None else None
-                website_domain = (website or "").strip() or None
+                website_domain = (website or "").strip() or None  # type: ignore[arg-type]
                 sg_registered = None
                 try:
                     sg_registered = (
                         (status_de or "").strip().lower() in {"live", "registered", "existing"}
-                    )
+                    )  # type: ignore[arg-type]
                 except Exception:
                     pass
 
