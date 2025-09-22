@@ -1083,6 +1083,82 @@ async def _default_candidates(
 
 
 # ------------------------------
+# ICP industry helpers
+# ------------------------------
+
+def _extract_icp_industries_from_text(text: str) -> list[str]:
+    """Extract user-intended industry phrases from free text (last human message).
+
+    - Splits on common separators/connectors
+    - Removes conversational fillers and bullets
+    - Prefers multi-word phrases and drops contained single-word generics
+    """
+    if not text:
+        return []
+    parts = re.split(r"[,\n;]+|\band\b|\bor\b|/|\\\\|\|", text, flags=re.IGNORECASE)
+    stop = {
+        "sg",
+        "singapore",
+        "global",
+        "worldwide",
+        "sea",
+        "apac",
+        "emea",
+        "us",
+        "usa",
+        "uk",
+        "eu",
+        "startup",
+        "startups",
+        "smb",
+        "sme",
+        "enterprise",
+        "b2b",
+        "b2c",
+        "small",
+        "medium",
+        "large",
+        "which",
+        "which geographies",
+        "which industries",
+        "problem spaces",
+        "should we target",
+        "e.g.",
+        "eg",
+    }
+    raw: list[str] = []
+    for p in parts:
+        s = (p or "").strip()
+        if not s or len(s) < 2:
+            continue
+        if s.strip().startswith("-"):
+            continue
+        if any(ch in s for ch in ("?", "(", ")", ":")):
+            continue
+        if not re.search(r"[A-Za-z]", s):
+            continue
+        sl = s.lower()
+        if sl in stop:
+            continue
+        sl = re.sub(r"\s+", " ", sl)
+        raw.append(sl)
+    # Dedupe preserve order
+    seen = set()
+    out: list[str] = []
+    for t in raw:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    # Prefer multiword phrases; drop single-word tokens contained in multiwords
+    multi = [t for t in out if " " in t]
+    if multi:
+        singles = {t for t in out if " " not in t}
+        singles = {s for s in singles if any(s in m.split() for m in multi)}
+        out = [t for t in out if not (" " not in t and t in singles)]
+    return out[:10]
+
+
+# ------------------------------
 # LangGraph nodes
 # ------------------------------
 
@@ -1095,16 +1171,48 @@ async def icp_node(state: GraphState) -> GraphState:
 
     text = _last_user_text(state)
 
+    # Reset flow when user types 'start' explicitly
+    if re.search(r"\bstart\b", text.strip(), flags=re.IGNORECASE):
+        state["icp"] = {}
+        # Clear transient outputs so we ask fresh ICP questions
+        for k in ("candidates", "results", "scored", "ask_counts", "enrichment_completed"):
+            try:
+                if k in state:
+                    del state[k]  # type: ignore[index]
+            except Exception:
+                pass
+        # Proceed to question generation with an empty ICP
+        text = ""  # ensure extractor doesn't pollute with previous context
+
     # 1) Extract structured update
     update = await extract_update_from_text(text)
 
     icp = dict(state.get("icp") or {})
 
-    # 2) Merge extractor output into ICP
-    if update.industries:
-        icp["industries"] = sorted(
-            set([s.strip() for s in update.industries if s.strip()])
-        )
+    # 2) Merge extractor output into ICP (prefer precise phrases from user text)
+    if True:
+        human_terms = _extract_icp_industries_from_text(text)
+        llm_terms = [s.strip() for s in (update.industries or []) if s and s.strip()]
+        merged: list[str] = []
+        # human phrases first, preserve order
+        for t in human_terms:
+            if t not in merged:
+                merged.append(t)
+        # then LLM terms if new (case-insensitive dedupe)
+        low = {t.lower(): t for t in merged}
+        for t in llm_terms:
+            tl = t.lower()
+            if tl not in low:
+                merged.append(t)
+                low[tl] = t
+        # Prefer multiword phrases: drop single-word generics contained in multiwords
+        multi = [t for t in merged if " " in t]
+        if multi:
+            singles = {t for t in merged if " " not in t}
+            singles = {s for s in singles if any(s.lower() in m.split() for m in multi)}
+            merged = [t for t in merged if not (" " not in t and t in singles)]
+        if merged:
+            icp["industries"] = merged
     if update.employees_min is not None:
         icp["employees_min"] = update.employees_min
     if update.employees_max is not None:
@@ -1416,7 +1524,12 @@ async def enrich_node(state: GraphState) -> GraphState:
             if isinstance(final_state, dict)
             else False
         )
-        return {"company_id": cid, "name": name, "uen": uen, "completed": completed}
+        err = None
+        try:
+            err = final_state.get("error") if isinstance(final_state, dict) else None
+        except Exception:
+            err = None
+        return {"company_id": cid, "name": name, "uen": uen, "completed": completed, "error": err}
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
     all_done = all(bool(r.get("completed")) for r in results) if results else False
@@ -1432,8 +1545,14 @@ async def enrich_node(state: GraphState) -> GraphState:
         )
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
-            ids = [
-                r.get("company_id") for r in results if r.get("company_id") is not None
+            # Include all results for scoring, but export to Odoo only for non-skipped rows
+            ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
+            ids_export = [
+                r.get("company_id")
+                for r in results
+                if r.get("company_id") is not None
+                and bool(r.get("completed"))
+                and (r.get("error") or "") != "skip_prior_enrichment"
             ]
             if ids:
                 scoring_initial_state = {
@@ -1459,7 +1578,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                 # Immediately render scores into chat for better UX
                 state = await score_node(state)
 
-                # Best-effort Odoo sync for completed companies
+                # Best-effort Odoo sync for completed companies (skip ones we skipped enriching)
                 try:
                     pool = await get_pg_pool()
                     async with pool.acquire() as conn:
@@ -1469,13 +1588,13 @@ async def enrich_node(state: GraphState) -> GraphState:
                                    revenue_bucket, incorporation_year, website_domain
                             FROM companies WHERE company_id = ANY($1::int[])
                             """,
-                            ids,
+                            ids_export,
                         )
                         comps = {r["company_id"]: dict(r) for r in comp_rows}
 
                         email_rows = await conn.fetch(
                             "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
-                            ids,
+                            ids_export,
                         )
                         emails: Dict[int, str] = {}
                         for row in email_rows:
@@ -1484,7 +1603,7 @@ async def enrich_node(state: GraphState) -> GraphState:
 
                         score_rows = await conn.fetch(
                             "SELECT company_id, score, rationale FROM lead_scores WHERE company_id = ANY($1::int[])",
-                            ids,
+                            ids_export,
                         )
                         scores = {r["company_id"]: dict(r) for r in score_rows}
 
@@ -1589,7 +1708,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                         store = None
 
                     if store:
-                        for cid in ids:
+                        for cid in ids_export:
                             comp = comps.get(cid, {})
                             if not comp:
                                 continue

@@ -1,6 +1,7 @@
 import asyncio
 import os
 from src.icp import normalize_agent, icp_refresh_agent, _find_ssic_codes_by_terms
+from src.enrichment import _should_skip_enrichment
 from src.settings import ICP_RULE_NAME
 from src.openai_client import generate_rationale
 from src.lead_scoring import lead_scoring_agent
@@ -203,6 +204,13 @@ async def main():
         ids = candidate_ids
         if not ids:
             ids = [s["company_id"] for s in scoring_state.get("lead_scores", []) if s.get("company_id") is not None]
+
+        # Skip Odoo export for companies where enrichment was skipped
+        try:
+            ids = [cid for cid in ids if not _should_skip_enrichment(int(cid))]
+        except Exception:
+            # Best-effort: if guard fails, proceed with original ids
+            ids = ids
 
         if ids:
             # Fetch company core info and primary emails
