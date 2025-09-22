@@ -456,6 +456,36 @@ def _select_acra_by_ssic_codes(codes: Set[str], limit: int = 1000) -> list[dict]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _count_acra_by_ssic_codes(codes: Set[str]) -> int:
+    """Return total number of staging_acra_companies rows matching normalized SSIC codes."""
+    if not codes:
+        return 0
+    codes = {_norm_ssic(c) for c in codes if c}
+    codes.discard(None)
+    if not codes:
+        return 0
+    with get_conn() as conn, conn.cursor() as cur:
+        code_col = _pick_col(
+            cur,
+            "staging_acra_companies",
+            "primary_ssic_code",
+            "ssic_code",
+            "primary_ssic",
+            "ssic",
+        )
+        if not code_col:
+            return 0
+        cur.execute(
+            f"SELECT COUNT(*) FROM staging_acra_companies WHERE regexp_replace({code_col}::text, '\\D', '', 'g') = ANY(%s)",
+            (list(codes),),
+        )
+        row = cur.fetchone()
+        try:
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception:
+            return 0
+
+
 # ---------- LangGraph nodes ----------
 
 
