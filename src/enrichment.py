@@ -68,6 +68,7 @@ from src.settings import (
 from src.settings import (
     APIFY_USE_COMPANY_EMPLOYEE_CHAIN,
 )
+from src.settings import ENRICH_RECHECK_DAYS, ENRICH_SKIP_IF_ANY_HISTORY
 
 load_dotenv()
 
@@ -1221,6 +1222,19 @@ async def enrich_company_with_tavily(
         "degraded_reasons": [],
     }
     try:
+        # Global skip logic to avoid re-enriching companies that already have
+        # recent or any enrichment history (configurable).
+        try:
+            if _should_skip_enrichment(company_id):
+                logger.info(
+                    f"[enrichment] skip company_id={company_id} name={company_name!r} due to prior enrichment"
+                )
+                initial_state["completed"] = True
+                initial_state["error"] = "skip_prior_enrichment"
+                return initial_state
+        except Exception:
+            # Non-blocking: if the guard fails, proceed with enrichment to avoid false negatives
+            pass
         logger.info(
             f"[enrichment] start company_id={company_id}, name={company_name!r}"
         )
@@ -1232,6 +1246,45 @@ async def enrich_company_with_tavily(
     except Exception:
         logger.exception("   ↳ Enrichment graph invoke failed")
         return initial_state
+
+
+def _should_skip_enrichment(company_id: int) -> bool:
+    """Return True if enrichment should be skipped based on prior history.
+
+    Rules:
+    - If ENRICH_SKIP_IF_ANY_HISTORY is true, skip when ANY row exists in company_enrichment_runs.
+    - Else if ENRICH_RECHECK_DAYS > 0, skip when a row exists with updated_at within the window.
+    - Else, do not skip.
+    Best-effort: If company_enrichment_runs is absent or errors, do not skip.
+    """
+    try:
+        conn = get_db_connection()
+        with conn, conn.cursor() as cur:
+            if ENRICH_SKIP_IF_ANY_HISTORY:
+                cur.execute(
+                    "SELECT 1 FROM company_enrichment_runs WHERE company_id=%s LIMIT 1",
+                    (company_id,),
+                )
+                return cur.fetchone() is not None
+            try:
+                days = int(ENRICH_RECHECK_DAYS)
+            except Exception:
+                days = 0
+            if days and days > 0:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM company_enrichment_runs
+                    WHERE company_id=%s
+                      AND COALESCE(updated_at, now()) >= now() - (%s::text || ' days')::interval
+                    LIMIT 1
+                    """,
+                    (company_id, str(days)),
+                )
+                return cur.fetchone() is not None
+    except Exception:
+        return False
+    return False
 
 
 class EnrichmentState(TypedDict, total=False):
@@ -1447,9 +1500,11 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                     _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
                     _obs_vendor("tavily", calls=1)
                     _obs_log("crawl", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"root": root})
-                    raw_urls = (
-                        crawl_result.get("results") or crawl_result.get("urls") or []
-                    )
+                    raw_urls = []
+                    if isinstance(crawl_result, dict):
+                        raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
+                    elif isinstance(crawl_result, list):
+                        raw_urls = crawl_result
                     for item in raw_urls:
                         if isinstance(item, dict) and item.get("url"):
                             page_urls.append(item["url"])
@@ -1767,8 +1822,12 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
 
 
 async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
-    if state.get("completed"):
+    # Allow Apify to run even when earlier steps marked the run completed due to no domain.
+    # We can often discover LinkedIn contacts by company name alone.
+    if state.get("completed") and state.get("error") != "no_domain":
         return state
+    if state.get("completed") and state.get("error") == "no_domain":
+        logger.info("[apify_contacts] No domain found; proceeding to Apify by company name")
     data = state.get("data") or {}
     company_id = state.get("company_id")
     if not company_id:
@@ -2304,6 +2363,8 @@ def find_domain(company_name: str) -> list[str]:
         "tripadvisor.com",
         "expedia.com",
         "yelp.com",
+        "recordowl.com",
+        "sgpgrid.com",
     }
     for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
@@ -2346,12 +2407,11 @@ def find_domain(company_name: str) -> list[str]:
         # - Reject marketplaces/aggregators (unless the brand name equals the aggregator apex e.g., Amazon)
         if is_aggregator and not is_brand_exact:
             continue
-        # - Keep only .sg domains or exact brand apex/domain
-        if not (is_sg or is_brand_exact):
-            continue
-        # - Also require name evidence in label or text for safety
+        # - Require name evidence in domain label or page text (or exact brand apex)
         if not (label_match or text_match or is_brand_exact):
             continue
+        # Previously we forced .sg or exact brand; relax to accept legitimate non-.sg brand domains
+        # as long as aggregator is excluded and name evidence is present.
 
         filtered_urls.append(url)
 

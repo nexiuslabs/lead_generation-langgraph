@@ -142,20 +142,64 @@ def select_target_set(candidates: List[int], limit: int) -> List[int]:
     if not candidates:
         return []
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT c.company_id
-            FROM companies c
-            LEFT JOIN lead_scores s ON s.company_id=c.company_id
-            LEFT JOIN contacts k ON k.company_id=c.company_id
-            WHERE c.company_id = ANY(%s)
-            ORDER BY (s.company_id IS NULL) DESC,
-                     (k.company_id IS NULL) DESC,
-                     c.last_seen DESC NULLS LAST
-            LIMIT %s
-            """,
-            (candidates, limit),
-        )
+        # Exclude recently (or ever) enriched companies based on env flags.
+        # Use a max(updated_at) per company_id from company_enrichment_runs.
+        # If ENRICH_RECHECK_DAYS <= 0 and ENRICH_SKIP_IF_ANY_HISTORY is false, include all.
+        try:
+            from src.settings import ENRICH_RECHECK_DAYS, ENRICH_SKIP_IF_ANY_HISTORY
+            days = 0
+            try:
+                days = int(ENRICH_RECHECK_DAYS)
+            except Exception:
+                days = 0
+            any_hist = bool(ENRICH_SKIP_IF_ANY_HISTORY)
+        except Exception:
+            days = 0
+            any_hist = False
+
+        if any_hist:
+            where_exclude = "cr.company_id IS NULL"
+            params = (candidates, limit)
+            sql = (
+                "SELECT c.company_id\n"
+                "FROM companies c\n"
+                "LEFT JOIN (SELECT DISTINCT company_id FROM company_enrichment_runs) cr ON cr.company_id=c.company_id\n"
+                "LEFT JOIN lead_scores s ON s.company_id=c.company_id\n"
+                "LEFT JOIN contacts k ON k.company_id=c.company_id\n"
+                "WHERE c.company_id = ANY(%s) AND "
+                + where_exclude
+                + "\nORDER BY (s.company_id IS NULL) DESC, (k.company_id IS NULL) DESC, c.last_seen DESC NULLS LAST\nLIMIT %s"
+            )
+            cur.execute(sql, params)
+        elif days and days > 0:
+            where_exclude = "(cr.last_enriched_at IS NULL OR cr.last_enriched_at < now() - (%s::text || ' days')::interval)"
+            params = (candidates, str(days), limit)
+            sql = (
+                "SELECT c.company_id\n"
+                "FROM companies c\n"
+                "LEFT JOIN (SELECT company_id, MAX(updated_at) AS last_enriched_at FROM company_enrichment_runs GROUP BY 1) cr ON cr.company_id=c.company_id\n"
+                "LEFT JOIN lead_scores s ON s.company_id=c.company_id\n"
+                "LEFT JOIN contacts k ON k.company_id=c.company_id\n"
+                "WHERE c.company_id = ANY(%s) AND "
+                + where_exclude
+                + "\nORDER BY (s.company_id IS NULL) DESC, (k.company_id IS NULL) DESC, c.last_seen DESC NULLS LAST\nLIMIT %s"
+            )
+            cur.execute(sql, params)
+        else:
+            cur.execute(
+                """
+                SELECT c.company_id
+                FROM companies c
+                LEFT JOIN lead_scores s ON s.company_id=c.company_id
+                LEFT JOIN contacts k ON k.company_id=c.company_id
+                WHERE c.company_id = ANY(%s)
+                ORDER BY (s.company_id IS NULL) DESC,
+                         (k.company_id IS NULL) DESC,
+                         c.last_seen DESC NULLS LAST
+                LIMIT %s
+                """,
+                (candidates, limit),
+            )
         return [int(r[0]) for r in cur.fetchall()]
 
 

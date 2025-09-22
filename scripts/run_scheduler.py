@@ -21,7 +21,7 @@ async def main_async():
         )
         return
 
-    from run_nightly import run_all
+    from run_nightly import run_all, list_active_tenants
 
     logging.basicConfig(level=logging.INFO)
     tz = ZoneInfo("Asia/Singapore")
@@ -34,6 +34,46 @@ async def main_async():
     async def job():
         try:
             await run_all()
+            # After nightly completes, run acceptance checks per tenant and log results
+            try:
+                from scripts import acceptance_check as _acc
+                import asyncpg
+                dsn = os.getenv("POSTGRES_DSN") or os.getenv("DATABASE_URL")
+                if not dsn:
+                    raise RuntimeError("POSTGRES_DSN not configured for acceptance checks")
+                tenants = await asyncio.to_thread(list_active_tenants)
+                # Load thresholds from env or use defaults from the script
+                def _f(env_name: str, default: float) -> float:
+                    try:
+                        return float(os.getenv(env_name, str(default)))
+                    except Exception:
+                        return default
+                thresholds = {
+                    "min_domain_rate": _f("MIN_DOMAIN_RATE", 0.70),
+                    "min_about_rate": _f("MIN_ABOUT_RATE", 0.60),
+                    "min_email_rate": _f("MIN_EMAIL_RATE", 0.40),
+                    "max_bucket_dominance": _f("MAX_BUCKET_DOMINANCE", 0.70),
+                }
+                async with asyncpg.create_pool(dsn=dsn, min_size=0, max_size=1) as pool:
+                    async with pool.acquire() as conn:
+                        for tid in tenants:
+                            try:
+                                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", str(tid))
+                            except Exception:
+                                pass
+                            metrics = await _acc.compute_metrics(conn)
+                            passed, results = _acc.evaluate(metrics, thresholds)
+                            logging.getLogger("nightly").info(
+                                "acceptance-check tenant=%s passed=%s domain=%.2f about=%.2f email=%.2f dominance=%.2f",
+                                tid,
+                                passed,
+                                (metrics.get("domain_rate") or 0.0),
+                                (metrics.get("about_rate") or 0.0),
+                                (metrics.get("email_rate") or 0.0),
+                                results.get("bucket_dominance") or 0.0,
+                            )
+            except Exception as exc:
+                logging.getLogger("nightly").warning("acceptance-check post-run failed: %s", exc)
         except Exception as exc:
             logging.exception("nightly run failed: %s", exc)
 

@@ -189,3 +189,20 @@ CONTACT_TITLES = [
     for t in (os.getenv("CONTACT_TITLES", "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal") or "").split(",")
     if t.strip()
 ]
+
+# --- Enrichment recency guards -------------------------------------------------
+# If > 0, skip enrichment when a company has an enrichment history row updated
+# within this many days. Set to 0 to disable time-based skipping.
+try:
+    ENRICH_RECHECK_DAYS = int(os.getenv("ENRICH_RECHECK_DAYS", "7") or 7)
+except Exception:
+    ENRICH_RECHECK_DAYS = 7
+
+# If true, skip enrichment whenever ANY history exists for the company,
+# regardless of how old it is. Useful to eliminate duplicate vendor costs.
+ENRICH_SKIP_IF_ANY_HISTORY = os.getenv("ENRICH_SKIP_IF_ANY_HISTORY", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

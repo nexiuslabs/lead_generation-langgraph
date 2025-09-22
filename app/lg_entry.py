@@ -1,5 +1,7 @@
 # app/lg_entry.py
 from typing import Dict, Any, List, Union
+import os
+import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
@@ -125,6 +127,18 @@ def _extract_industry_terms(text: str) -> List[str]:
         "industries",
         "sector",
         "sectors",
+        # conversational fillers
+        "start",
+        "which",
+        "which industries",
+        "problem spaces",
+        "should we target",
+        "e.g.",
+        "eg",
+        # revenue buckets that shouldn't be treated as industries
+        "small",
+        "medium",
+        "large",
     }
     for c in chunks:
         s = (c or "").strip()
@@ -132,36 +146,47 @@ def _extract_industry_terms(text: str) -> List[str]:
             continue
         if not re.search(r"[a-zA-Z]", s):
             continue
+        # Drop bullets/parentheticals and obvious question fragments
+        if s.strip().startswith("-"):
+            continue
+        if any(ch in s for ch in ("?", "(", ")", ":")):
+            continue
         sl = s.lower()
         if sl in stop:
             continue
         sl = re.sub(r"\s+", " ", sl)
         terms.append(sl)
+    # Dedupe, prefer multi-word phrases
     seen = set()
     out: List[str] = []
     for t in terms:
         if t not in seen:
             seen.add(t)
             out.append(t)
-    return out[:20]
+    multi = [t for t in out if " " in t]
+    if multi:
+        singles = {t for t in out if " " not in t}
+        singles = {s for s in singles if any(s in m.split() for m in multi)}
+        out = [t for t in out if not (" " not in t and t in singles)]
+    return out[:10]
 
 
 def _collect_industry_terms(messages: List[BaseMessage] | None) -> List[str]:
     if not messages:
         return []
-    seen = set()
-    out: List[str] = []
-    for m in messages:
-        # Parse terms from all message roles; filtering is handled inside extractor
-        for t in _extract_industry_terms((m.content or "")):
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-                if len(out) >= 20:
-                    return out
-    return out
+    # Use only the most recent Human message to avoid including assistant prompts
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return _extract_industry_terms(m.content or "")
+    return []
 
 
+# Feature 18 flags (defaults)
+STAGING_UPSERT_MODE = os.getenv("STAGING_UPSERT_MODE", "background").strip().lower()
+try:
+    UPSERT_SYNC_LIMIT = int(os.getenv("UPSERT_SYNC_LIMIT", "10") or 10)
+except Exception:
+    UPSERT_SYNC_LIMIT = 10
 def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
     if not industries:
         return 0
@@ -199,14 +224,15 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                 'primary_ssic_code', 'ssic_code', 'industry_code', 'ssic', 'primary_ssic',
                 'primary_industry_code'
             )
-            # Prefer registration_incorporation_date but extract YEAR when present
+            # Prefer registration_incorporation_date but robustly extract a 4-digit YEAR from text
             src_year = pick('registration_incorporation_date','incorporation_year','year_incorporated','inc_year','founded_year') or 'NULL'
-            # Build an expression that yields a numeric year
-            if isinstance(src_year, str) and src_year.lower() == 'registration_incorporation_date':
-                src_year_expr = f"EXTRACT(YEAR FROM CAST({src_year} AS date))::int"
+            # Use regex substring to be resilient to text-formatted dates
+            if isinstance(src_year, str):
+                src_year_expr = f"NULLIF(substring({src_year}::text from '\\d{{4}}'), '')::int"
             else:
-                src_year_expr = src_year
+                src_year_expr = 'NULL'
             src_stat = pick('entity_status_de','entity_status','status','entity_status_description') or 'NULL'
+            src_owner = pick('business_constitution_description','company_type_description','entity_type_description','paf_constitution_description','ownership_type') or 'NULL'
 
             if not src_desc or not src_code:
                 logger.warning(
@@ -244,7 +270,8 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                       {src_desc} AS primary_ssic_description,
                       {src_code} AS primary_ssic_code,
                       {src_year_expr} AS incorporation_year,
-                      {src_stat} AS entity_status_de
+                      {src_stat} AS entity_status_de,
+                      {src_owner} AS ownership_type
                     FROM staging_acra_companies
                     WHERE regexp_replace({src_code}::text, '\\D', '', 'g') = ANY(%s::text[])
                 """
@@ -263,7 +290,8 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                       {src_desc} AS primary_ssic_description,
                       {src_code} AS primary_ssic_code,
                       {src_year_expr} AS incorporation_year,
-                      {src_stat} AS entity_status_de
+                      {src_stat} AS entity_status_de,
+                      {src_owner} AS ownership_type
                     FROM staging_acra_companies
                     WHERE LOWER({src_desc}) = ANY(%s::text[])
                        OR {src_desc} ILIKE ANY(%s::text[])
@@ -279,7 +307,11 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                 count_sql = f"SELECT COUNT(*) FROM staging_acra_companies WHERE LOWER({src_desc}) = ANY(%s::text[]) OR {src_desc} ILIKE ANY(%s::text[])"
                 count_params = (lower_terms, like_patterns)
             cur.execute(count_sql, count_params)
-            total_matches = cur.fetchone()[0] or 0
+            _row = cur.fetchone()
+            try:
+                total_matches = int(_row[0]) if (_row and len(_row) >= 1 and _row[0] is not None) else 0
+            except Exception:
+                total_matches = 0
             logger.info("Matched %d staging rows by %s", total_matches, source_mode)
 
             # Stream rows using a server-side cursor; use a separate cursor for upserts
@@ -290,27 +322,68 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
             logger.info("Upserting staging companies by %s in batches of %d", source_mode, batch_size)
             processed = 0
             names_preview_list: List[str] = []  # collect first ~50 names that matched codes
+
+            # Defer alias discovery until after first fetch to guarantee description is populated
+            col_aliases: List[str | None] = []
+
+            def row_to_map(row: object, aliases: List[str | None]) -> Dict[str, Any]:
+                try:
+                    if not isinstance(row, (list, tuple)):
+                        return {}
+                    limit = min(len(aliases), len(row)) if aliases else 0
+                    out: Dict[str, Any] = {}
+                    for i in range(limit):
+                        key = aliases[i]
+                        if key:
+                            out[key] = row[i]
+                    return out
+                except Exception:
+                    return {}
+
+            first_batch = True
             while True:
                 rows = cur_sel.fetchmany(batch_size)
                 if not rows:
                     break
                 logger.info("Processing batch of %d rows (processed=%d/%d)", len(rows), processed, total_matches)
+                # Build alias list on first batch
+                if first_batch:
+                    try:
+                        desc = cur_sel.description or []
+                        col_aliases = [
+                            getattr(d, 'name', None) or (d[0] if isinstance(d, (list, tuple)) and d else None)
+                            for d in desc
+                        ]
+                    except Exception:
+                        col_aliases = []
+                    # If still empty, default to the expected aliases from SELECT
+                    if not col_aliases:
+                        col_aliases = [
+                            'uen', 'entity_name', 'primary_ssic_description', 'primary_ssic_code',
+                            'incorporation_year', 'entity_status_de', 'ownership_type'
+                        ]
+                    first_batch = False
                 with conn.cursor() as cur_up:
-                    for (
-                        uen,
-                        entity_name,
-                        ssic_desc,
-                        ssic_code,
-                        inc_year,
-                        status_de,
-                    ) in rows:
+                    for r in rows:
+                        m = row_to_map(r, col_aliases)
+                        uen = m.get('uen')
+                        entity_name = m.get('entity_name')
+                        ssic_desc = m.get('primary_ssic_description')
+                        ssic_code = m.get('primary_ssic_code')
+                        inc_year = m.get('incorporation_year')
+                        status_de = m.get('entity_status_de')
+                        ownership_type = m.get('ownership_type')
+
                         # capture names for preview if SSIC-based selection
                         if source_mode == 'ssic' and len(names_preview_list) < 50:
-                            nm = (entity_name or "").strip()
+                            nm = (entity_name or "").strip() if isinstance(entity_name, str) else ""
                             if nm:
                                 names_preview_list.append(nm)
-                        name = (entity_name or "").strip() or None
-                        desc_lower = (ssic_desc or "").strip().lower()
+
+                        name = (entity_name or "").strip() if isinstance(entity_name, str) else None
+                        if name == "":
+                            name = None
+                        desc_lower = (ssic_desc or "").strip().lower() if isinstance(ssic_desc, str) else ""
                         match_term = None
                         for t in lower_terms:
                             if desc_lower == t or (t in desc_lower):
@@ -322,7 +395,7 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                         try:
                             sg_registered = (
                                 (status_de or "").strip().lower() in {"live", "registered", "existing"}
-                            )
+                            ) if isinstance(status_de, str) else None
                         except Exception:
                             pass
 
@@ -331,12 +404,12 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                         if uen:
                             cur_up.execute("SELECT company_id FROM companies WHERE uen = %s LIMIT 1", (uen,))
                             row = cur_up.fetchone()
-                            if row:
+                            if row and isinstance(row, (list, tuple)) and len(row) >= 1:
                                 company_id = row[0]
                         if company_id is None and name:
                             cur_up.execute("SELECT company_id FROM companies WHERE LOWER(name) = LOWER(%s) LIMIT 1", (name,))
                             row = cur_up.fetchone()
-                            if row:
+                            if row and isinstance(row, (list, tuple)) and len(row) >= 1:
                                 company_id = row[0]
 
                         fields = {
@@ -348,11 +421,12 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                             "incorporation_year": inc_year,
                             "founded_year": inc_year,
                             "sg_registered": sg_registered,
+                            "ownership_type": ownership_type,
                         }
 
                         if company_id is not None:
-                            set_parts = []
-                            params = []
+                            set_parts: List[str] = []
+                            params: List[Any] = []
                             for k, v in fields.items():
                                 if v is not None:
                                     set_parts.append(f"{k} = %s")
@@ -366,23 +440,27 @@ def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
                         else:
                             cols = [k for k, v in fields.items() if v is not None]
                             vals = [fields[k] for k in cols]
+                            if not cols:
+                                continue
                             cols_sql = ", ".join(cols)
                             ph = ",".join(["%s"] * len(vals))
                             cur_up.execute(
                                 f"INSERT INTO companies ({cols_sql}) VALUES ({ph}) RETURNING company_id",
                                 vals,
                             )
-                            new_id = cur_up.fetchone()[0]
-                            cur_up.execute("UPDATE companies SET last_seen = NOW() WHERE company_id = %s", (new_id,))
-                            affected += 1
+                            rw_new = cur_up.fetchone()
+                            new_id = rw_new[0] if (rw_new and isinstance(rw_new, (list, tuple)) and len(rw_new) >= 1) else None
+                            if new_id is not None:
+                                cur_up.execute("UPDATE companies SET last_seen = NOW() WHERE company_id = %s", (new_id,))
+                                affected += 1
                 processed += len(rows)
             if source_mode == 'ssic' and names_preview_list:
                 extra = f", ... (+{total_matches - len(names_preview_list)} more)" if total_matches > len(names_preview_list) else ""
                 logger.info("staging_acra_companies matched %d rows by SSIC code; names: %s%s", total_matches, ", ".join(names_preview_list), extra)
             logger.info("Finished upserting by %s (%d rows processed, %d affected)", source_mode, processed, affected)
         return affected
-    except Exception as e:
-        logger.warning("staging upsert skipped: %s", e)
+    except Exception:
+        logger.exception("staging upsert error")
         return 0
 def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -413,15 +491,40 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     elif "companies" in data:
         state["candidates"] = data["companies"]
 
-    # Best-effort staging→companies upsert based on any human-mentioned industries across the message history.
+    # Feature 18: Upsert up to 10 synchronously (no enrichment); enqueue remainder for nightly
     try:
         inds = _collect_industry_terms(state.get("messages"))
-        if inds:
-            affected = _upsert_companies_from_staging_by_industries(inds)
-            if affected:
-                logger.info("Upserted %d companies from staging by industries=%s", affected, inds)
+        if inds and STAGING_UPSERT_MODE != "off":
+            head = max(0, int(UPSERT_SYNC_LIMIT))
+            if head > 0:
+                try:
+                    # Reuse helper from app.main to perform head upsert only and capture IDs
+                    from app.main import upsert_by_industries_head
+                    ids = upsert_by_industries_head(inds, limit=head)
+                    if ids:
+                        logger.info(
+                            "Upserted(head=%d) %d companies for industries=%s",
+                            head, len(ids), inds,
+                        )
+                        state["sync_head_company_ids"] = ids
+                except Exception as e:
+                    logger.info("sync head upsert skipped: %s", e)
+            # Enqueue remainder for nightly processing (best-effort)
+            try:
+                from src.jobs import enqueue_staging_upsert
+                # Resolve tenant best-effort; allow None
+                tid = None
+                try:
+                    from app.odoo_connection_info import get_odoo_connection_info
+                    info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
+                    tid = info.get("tenant_id") if isinstance(info, dict) else None
+                except Exception:
+                    tid = None
+                enqueue_staging_upsert(tid, inds)
+            except Exception as _qe:
+                logger.info("enqueue nightly staging_upsert failed: %s", _qe)
     except Exception as _e:
-        logger.warning("input-normalization staging sync failed: %s", _e)
+        logger.warning("input-normalization staging handling failed: %s", _e)
 
     return state
 

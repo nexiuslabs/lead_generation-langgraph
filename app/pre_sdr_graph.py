@@ -21,6 +21,11 @@ from app.odoo_store import OdooStore
 from psycopg2.extras import Json
 from src.database import get_pg_pool, get_conn
 from src.icp import _find_ssic_codes_by_terms, _select_acra_by_ssic_codes
+try:
+    # New helper for accurate ACRA totals
+    from src.icp import _count_acra_by_ssic_codes  # type: ignore
+except Exception:  # pragma: no cover
+    _count_acra_by_ssic_codes = None  # type: ignore
 from src.enrichment import enrich_company_with_tavily
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
@@ -283,11 +288,116 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                 _save_icp_rule_sync(tid, payload, name="Default ICP")
     except Exception:
         pass
-    state["messages"].append(
-        AIMessage(
-            "✅ ICP saved. Paste companies (comma-separated), or type **run enrichment**."
+    # Compose preview message with accurate counts and plan for enrichment
+    icp = state.get("icp") or {}
+    terms = []
+    try:
+        # Support either single 'industry' or list 'industries'
+        if isinstance(icp.get("industry"), str) and icp.get("industry").strip():
+            terms.append(icp.get("industry").strip().lower())
+        inds = icp.get("industries") or []
+        if isinstance(inds, list):
+            terms.extend([s.strip().lower() for s in inds if isinstance(s, str) and s.strip()])
+        terms = sorted(set(terms))
+    except Exception:
+        terms = []
+
+    # Seed candidates from sync_head_company_ids when none provided
+    if not state.get("candidates"):
+        try:
+            ids = state.get("sync_head_company_ids") or []
+            if isinstance(ids, list) and ids:
+                with get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT company_id, name, uen FROM companies WHERE company_id = ANY(%s)",
+                        (ids,),
+                    )
+                    rows = _cur.fetchall()
+                    cand = []
+                    for r in rows:
+                        cid = int(r[0]) if r and r[0] is not None else None
+                        nm = (r[1] or "").strip() if len(r) > 1 else ""
+                        uen = (r[2] or "").strip() if len(r) > 2 else None
+                        if cid and nm:
+                            cand.append({"id": cid, "name": nm, "uen": uen})
+                    if cand:
+                        state["candidates"] = cand
+        except Exception:
+            pass
+    # Current candidate count (preview list)
+    n = len(state.get("candidates") or [])
+
+    # Count ICP-matched total in companies
+    icp_total = 0
+    try:
+        clauses: list[str] = []
+        params: list = []
+        if terms:
+            clauses.append("LOWER(industry_norm) = ANY(%s)")
+            params.append(terms)
+        sql = "SELECT COUNT(*) FROM companies " + ("WHERE " + " AND ".join(clauses) if clauses else "")
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            icp_total = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        icp_total = n
+
+    msg_lines: list[str] = []
+    msg_lines.append(f"Got {n} companies.")
+
+    # SSIC resolution and ACRA totals
+    ssic_matches = []
+    try:
+        if terms:
+            ssic_matches = _find_ssic_codes_by_terms(terms)
+            if ssic_matches:
+                top_code, top_title, _ = ssic_matches[0]
+                msg_lines.append(f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)")
+            else:
+                msg_lines.append("Matched 0 SSIC codes")
+            # ACRA total and sample
+            codes = {c for (c, _t, _s) in ssic_matches}
+            total_acra = 0
+            rows = []
+            try:
+                if _count_acra_by_ssic_codes:
+                    total_acra = _count_acra_by_ssic_codes(codes)  # type: ignore[arg-type]
+                rows = _select_acra_by_ssic_codes(codes, 10)
+            except Exception:
+                total_acra = 0
+                rows = []
+            if total_acra:
+                msg_lines.append(f"Found {total_acra} ACRA candidates. Sample:")
+                for r in rows[:2]:
+                    uen = (r.get("uen") or "").strip()
+                    nm = (r.get("entity_name") or "").strip()
+                    code = (r.get("primary_ssic_code") or "").strip()
+                    status = (r.get("entity_status_description") or "").strip()
+                    msg_lines.append(f"UEN: {uen} – {nm} – SSIC {code} – status: {status}")
+            else:
+                msg_lines.append("Found 0 ACRA candidates.")
+    except Exception:
+        # Non-blocking
+        pass
+
+    # Planned enrichment counts
+    try:
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+    do_now = min(n, enrich_now_limit) if n else 0
+    if n > 0:
+        msg_lines.append(
+            f"Starting enrichment for {do_now} companies now; {max(icp_total - do_now, 0)} scheduled for nightly."
         )
-    )
+    else:
+        msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
+
+    text = "\n\n".join([ln for ln in msg_lines if ln])
+    state["icp_match_total"] = icp_total
+    state["enrich_now_planned"] = do_now
+    state["messages"].append(AIMessage(text))
     return state
 
 
@@ -321,6 +431,26 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         pass
 
     candidates = state.get("candidates") or []
+    # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
+    if not candidates:
+        try:
+            ids = state.get("sync_head_company_ids") or []
+            if isinstance(ids, list) and ids:
+                async with (await get_pg_pool()).acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id AS id, name, uen FROM companies WHERE company_id = ANY($1::int[])",
+                        [int(i) for i in ids if isinstance(i, int) or (isinstance(i, str) and str(i).isdigit())],
+                    )
+                cand = []
+                for r in rows:
+                    nm = r.get("name") or ""
+                    if nm:
+                        cand.append({"id": int(r.get("id")), "name": nm, "uen": r.get("uen")})
+                if cand:
+                    candidates = cand
+                    state["candidates"] = cand
+        except Exception:
+            pass
     if not candidates:
         return state
 
@@ -883,9 +1013,9 @@ def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
 
 async def _ensure_company_row(pool, name: str) -> int:
     """
-    Find an existing company row by name and return its primary key.
-    Supports schemas where the PK column is either `company_id` or `id`.
-    As a last resort, attempts to insert a minimal row and return the new id.
+    Find an existing company row by name and return its primary key (company_id).
+    Only uses the canonical column `company_id` as defined in the schema.
+    As a last resort, inserts a minimal row and returns the new company_id.
     """
     async with pool.acquire() as conn:
         # 1) Try company_id first (most common in this repo)
@@ -896,10 +1026,7 @@ async def _ensure_company_row(pool, name: str) -> int:
         if row and "company_id" in row:
             return int(row["company_id"])  # type: ignore[index]
 
-        # 2) Try id as fallback
-        row = await conn.fetchrow("SELECT id FROM companies WHERE name = $1", name)
-        if row and "id" in row:
-            return int(row["id"])  # type: ignore[index]
+        # No legacy `id` support — schema defines only `company_id`.
 
         # 3) Insert minimal row; prefer returning company_id if present
         # Try RETURNING company_id
@@ -912,16 +1039,7 @@ async def _ensure_company_row(pool, name: str) -> int:
                 return int(row["company_id"])  # type: ignore[index]
         except Exception:
             pass
-        # Try RETURNING id
-        try:
-            row = await conn.fetchrow(
-                "INSERT INTO companies(name) VALUES ($1) RETURNING id",
-                name,
-            )
-            if row and "id" in row:
-                return int(row["id"])  # type: ignore[index]
-        except Exception:
-            pass
+        # Do not attempt RETURNING id; only company_id exists
 
         # 4) As a final fallback (schemas without defaults), synthesize a new company_id
         #    WARNING: This is best-effort and not concurrency-safe, but unblocks local flows.
@@ -1095,6 +1213,82 @@ async def _default_candidates(
 
 
 # ------------------------------
+# ICP industry helpers
+# ------------------------------
+
+def _extract_icp_industries_from_text(text: str) -> list[str]:
+    """Extract user-intended industry phrases from free text (last human message).
+
+    - Splits on common separators/connectors
+    - Removes conversational fillers and bullets
+    - Prefers multi-word phrases and drops contained single-word generics
+    """
+    if not text:
+        return []
+    parts = re.split(r"[,\n;]+|\band\b|\bor\b|/|\\\\|\|", text, flags=re.IGNORECASE)
+    stop = {
+        "sg",
+        "singapore",
+        "global",
+        "worldwide",
+        "sea",
+        "apac",
+        "emea",
+        "us",
+        "usa",
+        "uk",
+        "eu",
+        "startup",
+        "startups",
+        "smb",
+        "sme",
+        "enterprise",
+        "b2b",
+        "b2c",
+        "small",
+        "medium",
+        "large",
+        "which",
+        "which geographies",
+        "which industries",
+        "problem spaces",
+        "should we target",
+        "e.g.",
+        "eg",
+    }
+    raw: list[str] = []
+    for p in parts:
+        s = (p or "").strip()
+        if not s or len(s) < 2:
+            continue
+        if s.strip().startswith("-"):
+            continue
+        if any(ch in s for ch in ("?", "(", ")", ":")):
+            continue
+        if not re.search(r"[A-Za-z]", s):
+            continue
+        sl = s.lower()
+        if sl in stop:
+            continue
+        sl = re.sub(r"\s+", " ", sl)
+        raw.append(sl)
+    # Dedupe preserve order
+    seen = set()
+    out: list[str] = []
+    for t in raw:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    # Prefer multiword phrases; drop single-word tokens contained in multiwords
+    multi = [t for t in out if " " in t]
+    if multi:
+        singles = {t for t in out if " " not in t}
+        singles = {s for s in singles if any(s in m.split() for m in multi)}
+        out = [t for t in out if not (" " not in t and t in singles)]
+    return out[:10]
+
+
+# ------------------------------
 # LangGraph nodes
 # ------------------------------
 
@@ -1107,16 +1301,48 @@ async def icp_node(state: GraphState) -> GraphState:
 
     text = _last_user_text(state)
 
+    # Reset flow when user types 'start' explicitly
+    if re.search(r"\bstart\b", text.strip(), flags=re.IGNORECASE):
+        state["icp"] = {}
+        # Clear transient outputs so we ask fresh ICP questions
+        for k in ("candidates", "results", "scored", "ask_counts", "enrichment_completed"):
+            try:
+                if k in state:
+                    del state[k]  # type: ignore[index]
+            except Exception:
+                pass
+        # Proceed to question generation with an empty ICP
+        text = ""  # ensure extractor doesn't pollute with previous context
+
     # 1) Extract structured update
     update = await extract_update_from_text(text)
 
     icp = dict(state.get("icp") or {})
 
-    # 2) Merge extractor output into ICP
-    if update.industries:
-        icp["industries"] = sorted(
-            set([s.strip() for s in update.industries if s.strip()])
-        )
+    # 2) Merge extractor output into ICP (prefer precise phrases from user text)
+    if True:
+        human_terms = _extract_icp_industries_from_text(text)
+        llm_terms = [s.strip() for s in (update.industries or []) if s and s.strip()]
+        merged: list[str] = []
+        # human phrases first, preserve order
+        for t in human_terms:
+            if t not in merged:
+                merged.append(t)
+        # then LLM terms if new (case-insensitive dedupe)
+        low = {t.lower(): t for t in merged}
+        for t in llm_terms:
+            tl = t.lower()
+            if tl not in low:
+                merged.append(t)
+                low[tl] = t
+        # Prefer multiword phrases: drop single-word generics contained in multiwords
+        multi = [t for t in merged if " " in t]
+        if multi:
+            singles = {t for t in merged if " " not in t}
+            singles = {s for s in singles if any(s.lower() in m.split() for m in multi)}
+            merged = [t for t in merged if not (" " not in t and t in singles)]
+        if merged:
+            icp["industries"] = merged
     if update.employees_min is not None:
         icp["employees_min"] = update.employees_min
     if update.employees_max is not None:
@@ -1174,6 +1400,25 @@ async def icp_node(state: GraphState) -> GraphState:
 
 
 async def candidates_node(state: GraphState) -> GraphState:
+    # Prefer 10 upserted IDs captured during chat normalize if present
+    if not state.get("candidates"):
+        try:
+            ids = state.get("sync_head_company_ids") or []
+            if isinstance(ids, list) and ids:
+                async with (await get_pg_pool()).acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id AS id, name, uen FROM companies WHERE company_id = ANY($1::int[])",
+                        [int(i) for i in ids if isinstance(i, int) or (isinstance(i, str) and str(i).isdigit())],
+                    )
+                cand = []
+                for r in rows:
+                    nm = r.get("name") or ""
+                    if nm:
+                        cand.append({"id": int(r.get("id")), "name": nm, "uen": r.get("uen")})
+                if cand:
+                    state["candidates"] = cand
+        except Exception:
+            pass
     if not state.get("candidates"):
         pool = await get_pg_pool()
         cand = await _default_candidates(pool, state.get("icp") or {}, limit=20)
@@ -1189,7 +1434,20 @@ async def candidates_node(state: GraphState) -> GraphState:
         if isinstance(s, str) and s.strip()
     ]
     lines: list[str] = []
-    lines.append(f"Got {n} companies. ")
+    # Compute ICP total in companies (not just the preview list)
+    icp_total = 0
+    try:
+        clauses: list[str] = []
+        params: list = []
+        if terms:
+            clauses.append("LOWER(industry_norm) = ANY($1)")
+            params.append(terms)
+        sql = "SELECT COUNT(*) FROM companies " + ("WHERE " + " AND ".join(clauses) if clauses else "")
+        async with (await get_pg_pool()).acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+            icp_total = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        icp_total = n
     try:
         if terms:
             ssic_matches = _find_ssic_codes_by_terms(terms)
@@ -1200,15 +1458,21 @@ async def candidates_node(state: GraphState) -> GraphState:
                 )
             else:
                 lines.append("Matched 0 SSIC codes")
-            # ACRA sample
+            # ACRA count + sample
             try:
                 codes = {c for (c, _t, _s) in ssic_matches}
-                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 50)
+                total_acra = 0
+                try:
+                    if _count_acra_by_ssic_codes:
+                        total_acra = await asyncio.to_thread(_count_acra_by_ssic_codes, codes)
+                except Exception:
+                    total_acra = 0
+                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 10)
             except Exception:
                 rows = []
-            m = len(rows)
-            if m:
-                lines.append(f"- Found {m} ACRA candidates. Sample:")
+                total_acra = 0
+            if total_acra:
+                lines.append(f"- Found {total_acra} ACRA candidates. Sample:")
                 for r in rows[:2]:
                     uen = (r.get("uen") or "").strip()
                     nm = (r.get("entity_name") or "").strip()
@@ -1217,11 +1481,69 @@ async def candidates_node(state: GraphState) -> GraphState:
                     lines.append(
                         f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
                     )
+                # If we have fewer candidates than the immediate enrichment cap, top up from ACRA by ensuring company rows
+                try:
+                    import os as _os
+                    enrich_now_limit = int(_os.getenv("CHAT_ENRICH_LIMIT", _os.getenv("RUN_NOW_LIMIT", "10") or 10))
+                except Exception:
+                    enrich_now_limit = 10
+                if (state.get("candidates") or []) and len(state.get("candidates") or []) < enrich_now_limit:
+                    try:
+                        pool = await get_pg_pool()
+                        needed = enrich_now_limit - len(state.get("candidates") or [])
+                        added: list[dict] = []
+                        for r in rows:
+                            if needed <= 0:
+                                break
+                            nm = (r.get("entity_name") or "").strip()
+                            if not nm:
+                                continue
+                            try:
+                                cid = await _ensure_company_row(pool, nm)
+                            except Exception:
+                                continue
+                            added.append({"id": cid, "name": nm, "uen": (r.get("uen") or "").strip() or None})
+                            needed -= 1
+                        if added:
+                            state["candidates"] = (state.get("candidates") or []) + added
+                            n = len(state["candidates"])
+                    except Exception:
+                        pass
             else:
                 lines.append("- Found 0 ACRA candidates.")
     except Exception:
         pass
-    lines.append("Started Enrichment. Please wait...")
+    # After potential top-up, refresh n and state, then report count
+    n = len(state.get("candidates") or [])
+    lines.insert(0, f"Got {n} companies. ")
+    # Plan and communicate enrichment counts
+    try:
+        import os as _os
+        enrich_now_limit = int(_os.getenv("CHAT_ENRICH_LIMIT", _os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+    do_now = min(n, enrich_now_limit) if n else 0
+    if n > 0:
+        # If user already confirmed (router sent us here due to no candidates yet), reflect that enrichment will start now without extra prompt
+        try:
+            just_confirmed = _user_just_confirmed(state)
+        except Exception:
+            just_confirmed = False
+        if just_confirmed:
+            # Prefer ACRA total for nightly planning if available
+            try:
+                scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
+            except Exception:
+                scheduled = max(icp_total - do_now, 0)
+            lines.append(f"Starting enrichment for {do_now} companies now; {scheduled} scheduled for nightly.")
+        else:
+            try:
+                scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
+            except Exception:
+                scheduled = max(icp_total - do_now, 0)
+            lines.append(f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Reply **confirm** or type **run enrichment** to proceed.")
+    else:
+        lines.append("No candidates yet. I’ll keep collecting ICP details.")
     msg = "\n".join([ln for ln in lines if ln])
 
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=msg)])
@@ -1250,7 +1572,137 @@ async def confirm_node(state: GraphState) -> GraphState:
         except Exception:
             state["candidates"] = []
 
+    # Ensure we have up to 10 candidates ready (prefer sync head IDs; then top up from ACRA)
+    try:
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+    if not state.get("candidates"):
+        try:
+            ids = state.get("sync_head_company_ids") or []
+            if isinstance(ids, list) and ids:
+                async with (await get_pg_pool()).acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id AS id, name, uen FROM companies WHERE company_id = ANY($1::int[])",
+                        [int(i) for i in ids if isinstance(i, int) or (isinstance(i, str) and str(i).isdigit())],
+                    )
+                cand = []
+                for r in rows:
+                    nm = r.get("name") or ""
+                    if nm:
+                        cand.append({"id": int(r.get("id")), "name": nm, "uen": r.get("uen")})
+                if cand:
+                    state["candidates"] = cand[:enrich_now_limit]
+        except Exception:
+            pass
+    # If still fewer than limit and we have SSIC codes, top up from ACRA by ensuring rows
     n = len(state.get("candidates") or [])
+    if n < enrich_now_limit:
+        try:
+            icp = state.get("icp") or {}
+            terms = [
+                s.strip().lower() for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()
+            ]
+            if terms:
+                ssic_matches = _find_ssic_codes_by_terms(terms)
+                codes = {c for (c, _t, _s) in ssic_matches}
+                if codes:
+                    rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, enrich_now_limit)
+                    pool = await get_pg_pool()
+                    added: list[dict] = []
+                    needed = enrich_now_limit - n
+                    for r in rows:
+                        if needed <= 0:
+                            break
+                        nm = (r.get("entity_name") or "").strip()
+                        if not nm:
+                            continue
+                        try:
+                            cid = await _ensure_company_row(pool, nm)
+                        except Exception:
+                            continue
+                        added.append({"id": cid, "name": nm, "uen": (r.get("uen") or "").strip() or None})
+                        needed -= 1
+                    if added:
+                        state["candidates"] = (state.get("candidates") or []) + added
+                        n = len(state["candidates"])  # refresh
+        except Exception:
+            pass
+    # Cap to limit
+    if n > enrich_now_limit:
+        state["candidates"] = (state.get("candidates") or [])[:enrich_now_limit]
+        n = enrich_now_limit
+    # Compute total ICP-matched companies for transparency (not just the preview list)
+    async def _count_companies_by_icp(icp: Dict[str, Any]) -> int:
+        icp = icp or {}
+        industries_param: List[str] = []
+        # Back-compat: allow single 'industry' or list 'industries'
+        if isinstance(icp.get("industry"), str) and icp.get("industry").strip():
+            industries_param.append(icp.get("industry").strip().lower())
+        inds = icp.get("industries") or []
+        if isinstance(inds, list):
+            industries_param.extend([s.strip().lower() for s in inds if isinstance(s, str) and s.strip()])
+        industries_param = sorted(set(industries_param))
+        emp_min = icp.get("employees_min")
+        emp_max = icp.get("employees_max")
+        rev_bucket = (
+            (icp.get("revenue_bucket") or "").strip().lower()
+            if isinstance(icp.get("revenue_bucket"), str)
+            else None
+        )
+        y_min = icp.get("year_min")
+        y_max = icp.get("year_max")
+        geos = icp.get("geos") or []
+
+        clauses: List[str] = []
+        params: List[Any] = []
+        if industries_param:
+            clauses.append(f"LOWER(industry_norm) = ANY(${len(params)+1})")
+            params.append(industries_param)
+        if isinstance(emp_min, int):
+            clauses.append(f"employees_est >= ${len(params)+1}")
+            params.append(emp_min)
+        if isinstance(emp_max, int):
+            clauses.append(f"employees_est <= ${len(params)+1}")
+            params.append(emp_max)
+        if rev_bucket in ("small", "medium", "large"):
+            clauses.append(f"LOWER(revenue_bucket) = ${len(params)+1}")
+            params.append(rev_bucket)
+        if isinstance(y_min, int):
+            clauses.append(f"incorporation_year >= ${len(params)+1}")
+            params.append(y_min)
+        if isinstance(y_max, int):
+            clauses.append(f"incorporation_year <= ${len(params)+1}")
+            params.append(y_max)
+        if isinstance(geos, list) and geos:
+            geo_like_params: List[str] = []
+            geo_subclauses: List[str] = []
+            for g in geos:
+                if not isinstance(g, str) or not g.strip():
+                    continue
+                like_val = f"%{g.strip()}%"
+                geo_subclauses.append(f"hq_country ILIKE ${len(params)+len(geo_like_params)+1}")
+                geo_like_params.append(like_val)
+                geo_subclauses.append(f"hq_city ILIKE ${len(params)+len(geo_like_params)+1}")
+                geo_like_params.append(like_val)
+            if geo_subclauses:
+                clauses.append("(" + " OR ".join(geo_subclauses) + ")")
+                params.extend(geo_like_params)
+
+        where_clause = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT COUNT(*) FROM companies {where_clause}"
+        async with (await get_pg_pool()).acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+            try:
+                return int(row[0]) if row else 0
+            except Exception:
+                return 0
+
+    icp_total = 0
+    try:
+        icp_total = await _count_companies_by_icp(icp)
+    except Exception:
+        icp_total = n
 
     # Resolve SSIC by industries (if provided)
     icp = state.get("icp") or {}
@@ -1279,12 +1731,15 @@ async def confirm_node(state: GraphState) -> GraphState:
             # Fetch ACRA sample
             try:
                 codes = {c for (c, _t, _s) in ssic_matches}
-                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 50)
+                # Count all candidates and fetch a small sample for display
+                from src.icp import _count_acra_by_ssic_codes
+                total_acra = await asyncio.to_thread(_count_acra_by_ssic_codes, codes)
+                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 10)
             except Exception:
                 rows = []
-            m = len(rows)
-            if m:
-                msg_lines.append(f"- Found {m} ACRA candidates. Sample:")
+                total_acra = 0
+            if total_acra:
+                msg_lines.append(f"- Found {total_acra} ACRA candidates. Sample:")
                 for r in rows[:2]:
                     uen = (r.get("uen") or "").strip()
                     nm = (r.get("entity_name") or "").strip()
@@ -1293,18 +1748,44 @@ async def confirm_node(state: GraphState) -> GraphState:
                     msg_lines.append(
                         f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
                     )
+                # Fallback: seed candidates directly from ACRA when none exist
+                if n == 0 and not state.get("candidates"):
+                    try:
+                        derived = []
+                        for r in rows[:20]:
+                            nm = (r.get("entity_name") or "").strip()
+                            if not nm:
+                                continue
+                            derived.append({"name": nm, "uen": (r.get("uen") or "").strip() or None})
+                        if derived:
+                            state["candidates"] = derived
+                            n = len(derived)
+                    except Exception:
+                        pass
             else:
                 msg_lines.append("- Found 0 ACRA candidates.")
     except Exception:
         # Don’t block on SSIC/ACRA preview errors
         pass
 
-    msg_lines.append("Started Enrichment. Please wait...")
+    # Plan enrichment counts: how many now vs later
+    do_now = min(n, enrich_now_limit) if n else 0
+    if n > 0:
+        # Compute nightly remainder from ACRA total when available
+        scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
+        msg_lines.append(
+            f"Starting enrichment for {do_now} companies now; {scheduled} scheduled for nightly."
+        )
+    else:
+        msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
     text = "\n".join([ln for ln in msg_lines if ln])
 
     # Signal that we've shown the SSIC/ACRA preview
     state["ssic_probe_done"] = True
 
+    # Keep totals in state for later nodes
+    state["icp_match_total"] = icp_total
+    state["enrich_now_planned"] = do_now
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=text)])
     return state
 
@@ -1323,6 +1804,27 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     text = _last_user_text(state)
     if not state.get("candidates"):
+        # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
+        try:
+            ids = state.get("sync_head_company_ids") or []
+            if isinstance(ids, list) and ids:
+                pool = await get_pg_pool()
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id AS id, name, uen FROM companies WHERE company_id = ANY($1::int[])",
+                        [int(i) for i in ids if isinstance(i, int) or (isinstance(i, str) and str(i).isdigit())],
+                    )
+                cand = []
+                for r in rows:
+                    nm = r.get("name") or ""
+                    if nm:
+                        cand.append({"id": int(r.get("id")), "name": nm, "uen": r.get("uen")})
+                if cand:
+                    state["candidates"] = cand
+        except Exception:
+            # Best-effort: fall back to pasted/default candidates below
+            pass
+    if not state.get("candidates"):
         pasted = _parse_company_list(text)
         if pasted:
             state["candidates"] = [{"name": n} for n in pasted]
@@ -1337,6 +1839,14 @@ async def enrich_node(state: GraphState) -> GraphState:
                 pass
 
     candidates = state.get("candidates") or []
+    # Cap immediate enrichment to avoid heavy runs in chat context
+    try:
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+    if len(candidates) > enrich_now_limit:
+        candidates = candidates[:enrich_now_limit]
+        state["candidates"] = candidates
     if not candidates:
         # Offer clear next steps when no candidates could be found
         state["messages"] = add_messages(
@@ -1393,7 +1903,12 @@ async def enrich_node(state: GraphState) -> GraphState:
             if isinstance(final_state, dict)
             else False
         )
-        return {"company_id": cid, "name": name, "uen": uen, "completed": completed}
+        err = None
+        try:
+            err = final_state.get("error") if isinstance(final_state, dict) else None
+        except Exception:
+            err = None
+        return {"company_id": cid, "name": name, "uen": uen, "completed": completed, "error": err}
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
     all_done = all(bool(r.get("completed")) for r in results) if results else False
@@ -1401,16 +1916,33 @@ async def enrich_node(state: GraphState) -> GraphState:
     state["enrichment_completed"] = all_done
 
     if all_done:
-        # Compose completion message; mention nightly continuation generically
-        done_msg = f"Enrichment complete for {len(results)} companies. The enrichment pipeline will continue by nightly runner."
+        # Compose completion message; include ICP total and remainder planned for nightly if available
+        icp_total = 0
+        try:
+            icp_total = int(state.get("icp_match_total") or 0)
+        except Exception:
+            icp_total = 0
+        remaining = max(icp_total - len(results), 0) if icp_total else None
+        suffix = (
+            f" ICP-matched total: {icp_total}. Remaining scheduled nightly: {remaining}."
+            if icp_total
+            else " The enrichment pipeline will continue by nightly runner."
+        )
+        done_msg = f"Enrichment complete for {len(results)} companies." + suffix
         state["messages"] = add_messages(
             state.get("messages") or [],
             [AIMessage(content=done_msg)],
         )
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
-            ids = [
-                r.get("company_id") for r in results if r.get("company_id") is not None
+            # Include all results for scoring, but export to Odoo only for non-skipped rows
+            ids = [r.get("company_id") for r in results if r.get("company_id") is not None]
+            ids_export = [
+                r.get("company_id")
+                for r in results
+                if r.get("company_id") is not None
+                and bool(r.get("completed"))
+                and (r.get("error") or "") != "skip_prior_enrichment"
             ]
             if ids:
                 scoring_initial_state = {
@@ -1436,7 +1968,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                 # Immediately render scores into chat for better UX
                 state = await score_node(state)
 
-                # Best-effort Odoo sync for completed companies
+                # Best-effort Odoo sync for completed companies (skip ones we skipped enriching)
                 try:
                     pool = await get_pg_pool()
                     async with pool.acquire() as conn:
@@ -1446,13 +1978,13 @@ async def enrich_node(state: GraphState) -> GraphState:
                                    revenue_bucket, incorporation_year, website_domain
                             FROM companies WHERE company_id = ANY($1::int[])
                             """,
-                            ids,
+                            ids_export,
                         )
                         comps = {r["company_id"]: dict(r) for r in comp_rows}
 
                         email_rows = await conn.fetch(
                             "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
-                            ids,
+                            ids_export,
                         )
                         emails: Dict[int, str] = {}
                         for row in email_rows:
@@ -1461,7 +1993,7 @@ async def enrich_node(state: GraphState) -> GraphState:
 
                         score_rows = await conn.fetch(
                             "SELECT company_id, score, rationale FROM lead_scores WHERE company_id = ANY($1::int[])",
-                            ids,
+                            ids_export,
                         )
                         scores = {r["company_id"]: dict(r) for r in score_rows}
 
@@ -1566,7 +2098,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                         store = None
 
                     if store:
-                        for cid in ids:
+                        for cid in ids_export:
                             comp = comps.get(cid, {})
                             if not comp:
                                 continue
