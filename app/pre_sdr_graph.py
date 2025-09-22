@@ -1454,6 +1454,27 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     text = _last_user_text(state)
     if not state.get("candidates"):
+        # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
+        try:
+            ids = state.get("sync_head_company_ids") or []
+            if isinstance(ids, list) and ids:
+                pool = await get_pg_pool()
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id AS id, name, uen FROM companies WHERE company_id = ANY($1::int[])",
+                        [int(i) for i in ids if isinstance(i, int) or (isinstance(i, str) and str(i).isdigit())],
+                    )
+                cand = []
+                for r in rows:
+                    nm = r.get("name") or ""
+                    if nm:
+                        cand.append({"id": int(r.get("id")), "name": nm, "uen": r.get("uen")})
+                if cand:
+                    state["candidates"] = cand
+        except Exception:
+            # Best-effort: fall back to pasted/default candidates below
+            pass
+    if not state.get("candidates"):
         pasted = _parse_company_list(text)
         if pasted:
             state["candidates"] = [{"name": n} for n in pasted]

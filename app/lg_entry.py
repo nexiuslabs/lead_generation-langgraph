@@ -1,5 +1,7 @@
 # app/lg_entry.py
 from typing import Dict, Any, List, Union
+import os
+import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
@@ -179,6 +181,12 @@ def _collect_industry_terms(messages: List[BaseMessage] | None) -> List[str]:
     return []
 
 
+# Feature 18 flags (defaults)
+STAGING_UPSERT_MODE = os.getenv("STAGING_UPSERT_MODE", "background").strip().lower()
+try:
+    UPSERT_SYNC_LIMIT = int(os.getenv("UPSERT_SYNC_LIMIT", "10") or 10)
+except Exception:
+    UPSERT_SYNC_LIMIT = 10
 def _upsert_companies_from_staging_by_industries(industries: List[str]) -> int:
     if not industries:
         return 0
@@ -483,15 +491,40 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     elif "companies" in data:
         state["candidates"] = data["companies"]
 
-    # Best-effort staging→companies upsert based on any human-mentioned industries across the message history.
+    # Feature 18: Upsert up to 10 synchronously (no enrichment); enqueue remainder for nightly
     try:
         inds = _collect_industry_terms(state.get("messages"))
-        if inds:
-            affected = _upsert_companies_from_staging_by_industries(inds)
-            if affected:
-                logger.info("Upserted %d companies from staging by industries=%s", affected, inds)
+        if inds and STAGING_UPSERT_MODE != "off":
+            head = max(0, int(UPSERT_SYNC_LIMIT))
+            if head > 0:
+                try:
+                    # Reuse helper from app.main to perform head upsert only and capture IDs
+                    from app.main import upsert_by_industries_head
+                    ids = upsert_by_industries_head(inds, limit=head)
+                    if ids:
+                        logger.info(
+                            "Upserted(head=%d) %d companies for industries=%s",
+                            head, len(ids), inds,
+                        )
+                        state["sync_head_company_ids"] = ids
+                except Exception as e:
+                    logger.info("sync head upsert skipped: %s", e)
+            # Enqueue remainder for nightly processing (best-effort)
+            try:
+                from src.jobs import enqueue_staging_upsert
+                # Resolve tenant best-effort; allow None
+                tid = None
+                try:
+                    from app.odoo_connection_info import get_odoo_connection_info
+                    info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
+                    tid = info.get("tenant_id") if isinstance(info, dict) else None
+                except Exception:
+                    tid = None
+                enqueue_staging_upsert(tid, inds)
+            except Exception as _qe:
+                logger.info("enqueue nightly staging_upsert failed: %s", _qe)
     except Exception as _e:
-        logger.warning("input-normalization staging sync failed: %s", _e)
+        logger.warning("input-normalization staging handling failed: %s", _e)
 
     return state
 
