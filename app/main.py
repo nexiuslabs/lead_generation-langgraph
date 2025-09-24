@@ -1,5 +1,5 @@
 # app/main.py
-from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path
+from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
@@ -385,6 +385,26 @@ def upsert_by_industries_head(industries: list[str], limit: int = UPSERT_SYNC_LI
         logger.exception("sync head upsert error")
         return []
 
+def _trigger_enrichment_async(company_ids: list[int]) -> None:
+    """Fire-and-forget enrichment for provided company IDs (non-blocking)."""
+    if not company_ids:
+        return
+    try:
+        from src.orchestrator import enrich_companies as _enrich_async
+    except Exception:
+        logger.info("Enrichment module unavailable; skipping async enrichment trigger")
+        return
+    import threading, asyncio as _asyncio
+    def _runner(ids: list[int]):
+        try:
+            _asyncio.run(_enrich_async(ids))
+        except Exception:
+            logger.warning("Async enrichment failed for ids=%s", ids)
+    try:
+        threading.Thread(target=_runner, args=(list(company_ids),), daemon=True).start()
+    except Exception:
+        logger.info("Failed to start enrichment thread; skipping")
+
 def _collect_industry_terms(messages: list[BaseMessage] | None) -> list[str]:
     if not messages:
         return []
@@ -644,8 +664,9 @@ def normalize_input(payload: dict) -> dict:
                     ids = upsert_by_industries_head(inds, limit=head)
                     if ids:
                         logger.info("Upserted(head=%d) %d companies for industries=%s", head, len(ids), inds)
-                        # Expose IDs for graph to enrich after ICP confirmation
                         state["sync_head_company_ids"] = ids
+                        # Immediate enrichment for the head set (non-blocking)
+                        _trigger_enrichment_async(ids)
                 # Always enqueue remaining for nightly processing
                 try:
                     from src.jobs import enqueue_staging_upsert
@@ -694,6 +715,215 @@ async def info(_: dict = Depends(require_auth)):
         "checkpoint_enabled": checkpoint_enabled,
         "auth": {"dev_bypass": dev_bypass, "issuer": issuer, "audience": audience},
     }
+
+
+# --- Keyset pagination endpoints ---
+@app.get("/scores/latest")
+async def scores_latest(limit: int = Query(50, ge=1, le=200), afterScore: float | None = None, afterId: int | None = None, _: dict = Depends(require_auth)):
+    """List latest lead scores with keyset pagination.
+
+    Returns { items: [...], nextCursor: { afterScore, afterId } | null }
+    """
+    from src.database import get_conn
+    items: list[dict] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        if afterScore is None or afterId is None:
+            cur.execute(
+                """
+                SELECT s.company_id, s.score, s.bucket, s.rationale
+                FROM lead_scores s
+                ORDER BY s.score DESC, s.company_id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT s.company_id, s.score, s.bucket, s.rationale
+                FROM lead_scores s
+                WHERE (s.score, s.company_id) < (%s, %s)
+                ORDER BY s.score DESC, s.company_id DESC
+                LIMIT %s
+                """,
+                (afterScore, afterId, limit),
+            )
+        rows = cur.fetchall() or []
+        for r in rows:
+            items.append({"company_id": r[0], "score": float(r[1]), "bucket": r[2], "rationale": r[3]})
+    next_cursor = None
+    if items and len(items) == limit:
+        last = items[-1]
+        next_cursor = {"afterScore": last["score"], "afterId": last["company_id"]}
+    return {"items": items, "nextCursor": next_cursor}
+
+
+@app.get("/candidates/latest")
+async def candidates_latest(
+    limit: int = Query(50, ge=1, le=200),
+    afterUpdatedAt: datetime | None = None,
+    afterId: int | None = None,
+    industry: str | None = None,
+    _: dict = Depends(require_auth),
+):
+    """List latest companies (optionally filtered by industry) with keyset pagination.
+
+    Returns { items: [...], nextCursor: { afterUpdatedAt, afterId } | null }
+    """
+    items: list[dict] = []
+    where = []
+    params: list = []
+    if industry and industry.strip():
+        where.append("LOWER(industry_norm) = LOWER(%s)")
+        params.append(industry.strip())
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    with get_conn() as conn, conn.cursor() as cur:
+        if afterUpdatedAt is None or afterId is None:
+            cur.execute(
+                f"""
+                SELECT company_id, name, industry_norm, website_domain, last_seen
+                FROM companies
+                {where_sql}
+                ORDER BY last_seen DESC NULLS LAST, company_id DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+        else:
+            cur.execute(
+                f"""
+                SELECT company_id, name, industry_norm, website_domain, last_seen
+                FROM companies
+                {where_sql} {' AND ' if where_sql else ' WHERE '} (last_seen, company_id) < (%s, %s)
+                ORDER BY last_seen DESC NULLS LAST, company_id DESC
+                LIMIT %s
+                """,
+                (*params, afterUpdatedAt, afterId, limit),
+            )
+        rows = cur.fetchall() or []
+        for r in rows:
+            items.append(
+                {
+                    "company_id": r[0],
+                    "name": r[1],
+                    "industry_norm": r[2],
+                    "website_domain": r[3],
+                    "last_seen": r[4].isoformat() if isinstance(r[4], datetime) else None,
+                }
+            )
+    next_cursor = None
+    if items and len(items) == limit:
+        last = items[-1]
+        next_cursor = {"afterUpdatedAt": last["last_seen"], "afterId": last["company_id"]}
+    return {"items": items, "nextCursor": next_cursor}
+
+
+@app.get("/metrics")
+async def metrics(_: dict = Depends(require_auth)):
+    """Light metrics for ops and dashboards with richer stats."""
+    out = {
+        "job_queue_depth": 0,
+        "jobs_processed_total": 0,
+        "lead_scores_total": 0,
+        "rows_per_min": None,
+        "p95_job_ms": None,
+        "chat_ttfb_p95_ms": None,
+    }
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute("SELECT COUNT(*) FROM background_jobs WHERE status='queued'")
+            out["job_queue_depth"] = int((cur.fetchone() or [0])[0] or 0)
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT COALESCE(SUM(processed),0) FROM background_jobs WHERE job_type='staging_upsert' AND status='done'")
+            out["jobs_processed_total"] = int((cur.fetchone() or [0])[0] or 0)
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT COUNT(*) FROM lead_scores")
+            out["lead_scores_total"] = int((cur.fetchone() or [0])[0] or 0)
+        except Exception:
+            pass
+        # rows/min and p95 job duration from recent completed jobs
+        try:
+            cur.execute(
+                """
+                SELECT processed, EXTRACT(EPOCH FROM (ended_at - started_at)) AS secs
+                FROM background_jobs
+                WHERE job_type='staging_upsert' AND status='done' AND started_at IS NOT NULL AND ended_at IS NOT NULL
+                ORDER BY job_id DESC
+                LIMIT 20
+                """
+            )
+            rows = cur.fetchall() or []
+            rates = []
+            durs = []
+            for r in rows:
+                p = (r[0] or 0)
+                s = float(r[1] or 0.0)
+                if s > 0:
+                    rates.append((p / s) * 60.0)
+                    durs.append(s * 1000.0)
+            if rates:
+                out["rows_per_min"] = sum(rates) / len(rates)
+            if durs:
+                durs_sorted = sorted(durs)
+                k = max(0, int(0.95 * (len(durs_sorted) - 1)))
+                out["p95_job_ms"] = durs_sorted[k]
+        except Exception:
+            pass
+        # Chat TTFB p95 from recent run_event_logs stage='chat'/event='ttfb'
+        try:
+            cur.execute(
+                """
+                SELECT duration_ms FROM run_event_logs
+                WHERE stage='chat' AND event='ttfb' AND ts > NOW() - INTERVAL '7 days' AND duration_ms IS NOT NULL
+                ORDER BY duration_ms
+                LIMIT 1000
+                """
+            )
+            rows = [int(r[0]) for r in (cur.fetchall() or []) if r and r[0] is not None]
+            if rows:
+                k = max(0, int(0.95 * (len(rows) - 1)))
+                out["chat_ttfb_p95_ms"] = float(rows[k])
+        except Exception:
+            pass
+    # Structured metrics log (best-effort)
+    try:
+        logging.getLogger("metrics").info("%s", out)
+    except Exception:
+        pass
+    return out
+
+@app.post("/metrics/ttfb")
+async def metric_ttfb(body: dict, claims: dict = Depends(require_optional_identity)):
+    """Allow FE to record chat TTFB (first token) as an event for p95 aggregation."""
+    try:
+        ttfb_ms = int((body or {}).get("ttfb_ms"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="ttfb_ms integer required")
+    # resolve tenant
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    claim_tid = claims.get("tenant_id")
+    tid = None
+    try:
+        info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
+        tid = info.get("tenant_id")
+    except Exception:
+        tid = claim_tid
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO run_event_logs(run_id, tenant_id, stage, company_id, event, status, error_code, duration_ms, trace_id, extra)
+                VALUES (0, %s, 'chat', NULL, 'ttfb', 'ok', NULL, %s, NULL, NULL)
+                """,
+                (tid if tid is not None else 0, ttfb_ms),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"persist failed: {e}")
+    return {"ok": True}
 
 
 # Jobs API for staging_upsert (nightly queued)

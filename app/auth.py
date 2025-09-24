@@ -105,8 +105,13 @@ async def require_auth(request: Request) -> dict:
     claims = verify_jwt(token)
     request.state.tenant_id = claims.get("tenant_id")
     request.state.roles = claims.get("roles", [])
+    # Allow explicit X-Tenant-ID header to satisfy tenant requirement when claim is absent
     if not request.state.tenant_id:
-        raise HTTPException(status_code=403, detail="Missing tenant_id claim")
+        hdr_tid = request.headers.get("x-tenant-id") or request.headers.get("X-Tenant-ID")
+        if hdr_tid and str(hdr_tid).strip():
+            request.state.tenant_id = str(hdr_tid).strip()
+        else:
+            raise HTTPException(status_code=403, detail="Missing tenant_id (claim or X-Tenant-ID header)")
     return claims
 
 

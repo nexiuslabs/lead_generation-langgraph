@@ -1,18 +1,16 @@
--- Feature 18: Performance indexes for ICP flows
+-- Hot-path indexes for Feature PRD 18 (create concurrently where possible)
+-- Note: CONCURRENTLY cannot run inside a transaction; ensure your migration runner handles this accordingly.
 
--- Industry norm lookups
 CREATE INDEX IF NOT EXISTS idx_companies_industry_norm_lower
   ON companies (LOWER(industry_norm));
 
--- Company name equality match (normalize_input upsert; dedupe)
 CREATE INDEX IF NOT EXISTS idx_companies_name_lower
   ON companies (LOWER(name));
 
--- Website-domain equality match
 CREATE INDEX IF NOT EXISTS idx_companies_website_domain
   ON companies (website_domain);
 
--- Optional: score-sorted shortlist browsing
+-- Optional: frequent sort for latest scores
 CREATE INDEX IF NOT EXISTS idx_lead_scores_score_id
   ON lead_scores (score DESC, company_id DESC);
 

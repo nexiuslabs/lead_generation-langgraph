@@ -40,6 +40,9 @@ def enqueue_staging_upsert(tenant_id: Optional[int], terms: List[str]) -> dict:
 
 
 async def run_staging_upsert(job_id: int) -> None:
+    import time
+    t0 = time.perf_counter()
+    log.info("{\"job\":\"staging_upsert\",\"phase\":\"start\",\"job_id\":%s}", job_id)
     # Mark running
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -65,6 +68,8 @@ async def run_staging_upsert(job_id: int) -> None:
                 "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
                 (processed, total, job_id),
             )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"staging_upsert\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:  # pragma: no cover
         log.exception("staging_upsert job failed: %s", e)
         with get_conn() as conn, conn.cursor() as cur:
@@ -72,3 +77,5 @@ async def run_staging_upsert(job_id: int) -> None:
                 "UPDATE background_jobs SET status='error', error=%s, processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
                 (str(e), processed, total, job_id),
             )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"staging_upsert\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))

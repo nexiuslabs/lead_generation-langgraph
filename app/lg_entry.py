@@ -491,24 +491,25 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     elif "companies" in data:
         state["candidates"] = data["companies"]
 
-    # Feature 18: Upsert up to 10 synchronously (no enrichment); enqueue remainder for nightly
+    # Feature 18: Upsert up to 10 synchronously and kick off enrichment immediately; enqueue remainder for nightly
     try:
         inds = _collect_industry_terms(state.get("messages"))
         if inds and STAGING_UPSERT_MODE != "off":
             head = max(0, int(UPSERT_SYNC_LIMIT))
             if head > 0:
                 try:
-                    # Reuse helper from app.main to perform head upsert only and capture IDs
-                    from app.main import upsert_by_industries_head
+                    # Reuse helper from app.main to perform head upsert and enrichment
+                    from app.main import upsert_by_industries_head, _trigger_enrichment_async
                     ids = upsert_by_industries_head(inds, limit=head)
                     if ids:
                         logger.info(
-                            "Upserted(head=%d) %d companies for industries=%s",
+                            "Upserted+enriching(head=%d) %d companies for industries=%s",
                             head, len(ids), inds,
                         )
                         state["sync_head_company_ids"] = ids
+                        _trigger_enrichment_async(ids)
                 except Exception as e:
-                    logger.info("sync head upsert skipped: %s", e)
+                    logger.info("sync head upsert/enrich skipped: %s", e)
             # Enqueue remainder for nightly processing (best-effort)
             try:
                 from src.jobs import enqueue_staging_upsert
