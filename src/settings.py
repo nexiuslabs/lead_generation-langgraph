@@ -90,6 +90,15 @@ CRAWL_KEYWORDS = [
 # Max combined characters to send to LLM extraction (cost guard)
 EXTRACT_CORPUS_CHAR_LIMIT = int(os.getenv("EXTRACT_CORPUS_CHAR_LIMIT", "35000"))
 
+# Limit how many chunks we pass to LLM per company (keeps latency bounded)
+LLM_MAX_CHUNKS = int(os.getenv("LLM_MAX_CHUNKS", "2") or 2)
+
+# LLM extraction timeout per chunk (seconds)
+LLM_CHUNK_TIMEOUT_S = float(os.getenv("LLM_CHUNK_TIMEOUT_S", "30") or 30)
+
+# Timeout for deterministic merge step during llm_extract (seconds)
+MERGE_DETERMINISTIC_TIMEOUT_S = float(os.getenv("MERGE_DETERMINISTIC_TIMEOUT_S", "10") or 10)
+
 # --- Lusha configuration -------------------------------------------------------
 # Minimal flags and keys for optional Lusha fallbacks
 LUSHA_API_KEY = os.getenv("LUSHA_API_KEY", "")

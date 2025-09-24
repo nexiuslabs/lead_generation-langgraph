@@ -67,6 +67,9 @@ from src.settings import (
 )
 from src.settings import (
     APIFY_USE_COMPANY_EMPLOYEE_CHAIN,
+    LLM_MAX_CHUNKS,
+    LLM_CHUNK_TIMEOUT_S,
+    MERGE_DETERMINISTIC_TIMEOUT_S,
 )
 from src.settings import ENRICH_RECHECK_DAYS, ENRICH_SKIP_IF_ANY_HISTORY
 
@@ -1522,8 +1525,25 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         pass
         else:
             logger.info("       ↳ TavilyCrawl unavailable; using seeded URLs only")
-        page_urls = list(dict.fromkeys(page_urls))
-        page_urls = [u for u in page_urls if "*" not in u]
+        # Deduplicate and sanitize URLs (handle stray dicts from vendor responses)
+        def _coerce_url(val):
+            if isinstance(val, str):
+                return val
+            if isinstance(val, dict):
+                u = val.get("url")
+                return u if isinstance(u, str) else None
+            return None
+
+        seen = set()
+        cleaned: List[str] = []
+        for it in page_urls:
+            u = _coerce_url(it)
+            if not u or "*" in u or not u.startswith("http"):
+                continue
+            if u not in seen:
+                seen.add(u)
+                cleaned.append(u)
+        page_urls = cleaned
         try:
             logger.info(
                 f"       ↳ Seeded/Discovered {len(page_urls)} URLs (incl. about seeds)"
@@ -1762,21 +1782,25 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         "about_text",
     ]
     data: Dict[str, Any] = {}
-    for i, chunk in enumerate(state["chunks"], start=1):
+    # Limit chunks to keep per-company latency bounded
+    chunks = list(state["chunks"])[: max(1, int(LLM_MAX_CHUNKS))]
+    for i, chunk in enumerate(chunks, start=1):
         try:
-            ai_output = extract_chain.invoke(
-                {
-                    "raw_content": f"Company: {company_name}\n\n{chunk}",
-                    "schema_keys": schema_keys,
-                    "instructions": (
-                        "Return a single JSON object with only the above keys. Use null for unknown. "
-                        "For tech_stack, email, and phone_number return arrays of strings. "
-                        "Use integers for employees_est and incorporation_year when possible. "
-                        "website_domain should be the official domain for the company. "
-                        "about_text should be a concise 1-3 sentence summary of the company."
-                    ),
-                }
-            )
+            async def _do_llm(payload: dict) -> str:
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, lambda: extract_chain.invoke(payload))
+            payload = {
+                "raw_content": f"Company: {company_name}\n\n{chunk}",
+                "schema_keys": schema_keys,
+                "instructions": (
+                    "Return a single JSON object with only the above keys. Use null for unknown. "
+                    "For tech_stack, email, and phone_number return arrays of strings. "
+                    "Use integers for employees_est and incorporation_year when possible. "
+                    "website_domain should be the official domain for the company. "
+                    "about_text should be a concise 1-3 sentence summary of the company."
+                ),
+            }
+            ai_output = await asyncio.wait_for(_do_llm(payload), timeout=float(LLM_CHUNK_TIMEOUT_S))
             m = re.search(r"\{.*\}", ai_output, re.S)
             piece = json.loads(m.group(0)) if m else json.loads(ai_output)
             data = _merge_extracted_records(data, piece)
@@ -1786,19 +1810,18 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
             if "context length" in msg.lower() or "maximum context length" in msg.lower():
                 try:
                     trimmed = chunk[: int(len(chunk) * 0.6)]
-                    ai_output = extract_chain.invoke(
-                        {
-                            "raw_content": f"Company: {company_name}\n\n{trimmed}",
-                            "schema_keys": schema_keys,
-                            "instructions": (
-                                "Return a single JSON object with only the above keys. Use null for unknown. "
-                                "For tech_stack, email, and phone_number return arrays of strings. "
-                                "Use integers for employees_est and incorporation_year when possible. "
-                                "website_domain should be the official domain for the company. "
-                                "about_text should be a concise 1-3 sentence summary of the company."
-                            ),
-                        }
-                    )
+                    payload_trim = {
+                        "raw_content": f"Company: {company_name}\n\n{trimmed}",
+                        "schema_keys": schema_keys,
+                        "instructions": (
+                            "Return a single JSON object with only the above keys. Use null for unknown. "
+                            "For tech_stack, email, and phone_number return arrays of strings. "
+                            "Use integers for employees_est and incorporation_year when possible. "
+                            "website_domain should be the official domain for the company. "
+                            "about_text should be a concise 1-3 sentence summary of the company."
+                        ),
+                    }
+                    ai_output = await asyncio.wait_for(_do_llm(payload_trim), timeout=float(LLM_CHUNK_TIMEOUT_S))
                     m = re.search(r"\{.*\}", ai_output, re.S)
                     piece = json.loads(m.group(0)) if m else json.loads(ai_output)
                     data = _merge_extracted_records(data, piece)
@@ -1812,10 +1835,13 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         data[k] = _ensure_list(data.get(k)) or []
     try:
         if state.get("home"):
-            data = await _merge_with_deterministic(
-                data, state["home"]
-            )  # augment with crawler signals
-    except Exception as exc:
+            data = await asyncio.wait_for(
+                _merge_with_deterministic(data, state["home"]),
+                timeout=float(MERGE_DETERMINISTIC_TIMEOUT_S),
+            )
+    except asyncio.TimeoutError:
+        logger.warning("   ↳ deterministic merge timed out; skipping")
+    except Exception:
         logger.warning("   ↳ deterministic merge skipped", exc_info=True)
     state["data"] = data
     return state
@@ -2365,6 +2391,11 @@ def find_domain(company_name: str) -> list[str]:
         "yelp.com",
         "recordowl.com",
         "sgpgrid.com",
+        # Add common non-official/aggregator content domains observed
+        "made-in-china.com",
+        "morepaper.org",
+        "artbarblog.com",
+        "jumpfrompaper.com",
     }
     for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
@@ -2438,6 +2469,8 @@ def find_domain(company_name: str) -> list[str]:
 
     if filtered_urls:
         filtered_urls = sorted(set(filtered_urls), key=_rank)
+        # Only keep top 2 that most likely represent the official company website
+        filtered_urls = filtered_urls[:2]
         print(f"       ↳ Filtered URLs: {filtered_urls}")
         return filtered_urls
     print("       ↳ No matching URLs found after heuristics.")

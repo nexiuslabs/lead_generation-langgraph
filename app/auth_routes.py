@@ -121,16 +121,24 @@ async def refresh(request: Request, response: Response):
     }
     if CLIENT_SECRET:
         data["client_secret"] = CLIENT_SECRET
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(_token_url(), data=data)
-        if r.status_code != 200:
-            raise HTTPException(status_code=401, detail="Refresh failed")
-        tok = r.json()
-        access = tok.get("id_token") or tok.get("access_token")
-        refresh_token = tok.get("refresh_token")
-        if not access:
-            raise HTTPException(status_code=500, detail="No token in refresh response")
-        _set_session(response, access, refresh_token)
+    # Keep refresh resilient: short connect/read timeouts and graceful 401 on failure
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=None)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(_token_url(), data=data)
+            if r.status_code != 200:
+                raise HTTPException(status_code=401, detail="Refresh failed")
+            tok = r.json()
+            access = tok.get("id_token") or tok.get("access_token")
+            refresh_token = tok.get("refresh_token")
+            if not access:
+                raise HTTPException(status_code=401, detail="No token in refresh response")
+            _set_session(response, access, refresh_token)
+    except httpx.TimeoutException:
+        # Signal the client to re-auth without taking down the app
+        raise HTTPException(status_code=401, detail="SSO refresh timeout")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=401, detail=f"SSO refresh error: {e}")
     return {"ok": True}
 
 
