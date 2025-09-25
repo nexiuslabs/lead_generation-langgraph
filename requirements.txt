@@ -24,3 +24,8 @@ sse-starlette
 pydantic
 passlib
 apscheduler
+anyio
+pytest-asyncio
+pytest-tornasync
+pytest-trio
+pytest-twisted

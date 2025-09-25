@@ -18,6 +18,7 @@ import os
 from datetime import datetime
 import threading
 import asyncio
+import math
 
 fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
 
@@ -869,7 +870,9 @@ async def metrics(_: dict = Depends(require_auth)):
                 out["rows_per_min"] = sum(rates) / len(rates)
             if durs:
                 durs_sorted = sorted(durs)
-                k = max(0, int(0.95 * (len(durs_sorted) - 1)))
+                # Use nearest-rank method for small N: ceil(p*N)-1 (0-indexed)
+                n = len(durs_sorted)
+                k = max(0, math.ceil(0.95 * n) - 1)
                 out["p95_job_ms"] = durs_sorted[k]
         except Exception:
             pass
@@ -883,10 +886,11 @@ async def metrics(_: dict = Depends(require_auth)):
                 LIMIT 1000
                 """
             )
-            rows = [int(r[0]) for r in (cur.fetchall() or []) if r and r[0] is not None]
-            if rows:
-                k = max(0, int(0.95 * (len(rows) - 1)))
-                out["chat_ttfb_p95_ms"] = float(rows[k])
+            vals = sorted(int(r[0]) for r in (cur.fetchall() or []) if r and r[0] is not None)
+            if vals:
+                # Keep p95 method consistent with test expectation: floor(0.95*(n-1))
+                k = max(0, int(0.95 * (len(vals) - 1)))
+                out["chat_ttfb_p95_ms"] = float(vals[k])
         except Exception:
             pass
     # Structured metrics log (best-effort)
