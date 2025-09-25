@@ -88,6 +88,18 @@ try:
 except Exception as _e:
     logger.warning("Graph proxy not mounted: %s", _e)
 
+# Mount ICP Finder endpoints when enabled
+try:
+    from src.settings import ENABLE_ICP_INTAKE  # type: ignore
+    if ENABLE_ICP_INTAKE:
+        from app.icp_endpoints import router as icp_router  # type: ignore
+        app.include_router(icp_router)
+        logger.info("/icp endpoints enabled")
+    else:
+        logger.info("Skipping /icp endpoints (ENABLE_ICP_INTAKE is false)")
+except Exception as _e:
+    logger.warning("ICP endpoints not mounted: %s", _e)
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"
@@ -631,6 +643,9 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
         logger.exception("staging upsert error")
         return 0
 
+from src.settings import ENABLE_ICP_INTAKE  # ensure available for gating
+
+
 def normalize_input(payload: dict) -> dict:
     """
     Accept a variety of UI payloads and emit the graph state:
@@ -654,33 +669,41 @@ def normalize_input(payload: dict) -> dict:
     elif "companies" in data:
         state["candidates"] = data["companies"]
 
-    # NEW: Feature 18 — small synchronous head upsert+enrich, enqueue remainder for nightly
+    # NEW: Feature 18 — small synchronous head upsert+enrich.
+    # When ICP Finder is enabled, defer upsert/enrichment until after ICP intake completes
     try:
         inds = _collect_industry_terms(state.get("messages"))
-        if inds:
-            if STAGING_UPSERT_MODE != "off":
-                # Upsert only the first `head` records synchronously (no enrichment yet)
-                head = max(0, int(UPSERT_SYNC_LIMIT))
-                if head > 0:
-                    ids = upsert_by_industries_head(inds, limit=head)
-                    if ids:
-                        logger.info("Upserted(head=%d) %d companies for industries=%s", head, len(ids), inds)
-                        state["sync_head_company_ids"] = ids
-                        # Immediate enrichment for the head set (non-blocking)
-                        _trigger_enrichment_async(ids)
-                # Always enqueue remaining for nightly processing
+        if inds and STAGING_UPSERT_MODE != "off":
+            if ENABLE_ICP_INTAKE:
+                # Defer during ICP Finder; allow explicit override via keyword
+                text = " ".join([(m.content or "") for m in norm_msgs if isinstance(m, HumanMessage)])
+                if re.search(r"\brun enrichment\b", text, flags=re.IGNORECASE):
+                    logger.info("ICP Finder override: running enrichment for inds=%s", inds)
+                else:
+                    logger.info("Deferring staging upsert/enrich while ICP Finder is active; inds=%s", inds)
+                    return state
+            # Upsert only the first `head` records synchronously (no enrichment yet)
+            head = max(0, int(UPSERT_SYNC_LIMIT))
+            if head > 0:
+                ids = upsert_by_industries_head(inds, limit=head)
+                if ids:
+                    logger.info("Upserted(head=%d) %d companies for industries=%s", head, len(ids), inds)
+                    state["sync_head_company_ids"] = ids
+                    # Immediate enrichment for the head set (non-blocking)
+                    _trigger_enrichment_async(ids)
+            # Always enqueue remaining for nightly processing
+            try:
+                from src.jobs import enqueue_staging_upsert
+                # Resolve tenant best-effort; OK to be None
+                tid = None
                 try:
-                    from src.jobs import enqueue_staging_upsert
-                    # Resolve tenant best-effort; OK to be None
+                    info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
+                    tid = info.get("tenant_id") if isinstance(info, dict) else None
+                except Exception:
                     tid = None
-                    try:
-                        info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
-                        tid = info.get("tenant_id") if isinstance(info, dict) else None
-                    except Exception:
-                        tid = None
-                    enqueue_staging_upsert(tid, inds)
-                except Exception as _qe:
-                    logger.info("enqueue nightly staging_upsert failed: %s", _qe)
+                enqueue_staging_upsert(tid, inds)
+            except Exception as _qe:
+                logger.info("enqueue nightly staging_upsert failed: %s", _qe)
     except Exception as _e:
         # Never block the chat flow; log and continue
         logger.warning("input-normalization staging sync failed: %s", _e)

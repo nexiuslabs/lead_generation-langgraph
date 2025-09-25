@@ -27,8 +27,26 @@ try:
 except Exception:  # pragma: no cover
     _count_acra_by_ssic_codes = None  # type: ignore
 from src.enrichment import enrich_company_with_tavily
+# ICP Finder helpers (Feature 17)
+try:
+    from src.icp_intake import (
+        save_icp_intake as _icp_save_intake,
+        map_seeds_to_evidence as _icp_map_seeds,
+        refresh_icp_patterns as _icp_refresh_patterns,
+        generate_suggestions as _icp_generate_suggestions,
+        store_intake_evidence as _icp_store_intake_evidence,
+    )
+except Exception:  # pragma: no cover
+    _icp_save_intake = None  # type: ignore
+    _icp_map_seeds = None  # type: ignore
+    _icp_refresh_patterns = None  # type: ignore
+    _icp_generate_suggestions = None  # type: ignore
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
+try:
+    from src.settings import ENABLE_ICP_INTAKE  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_ICP_INTAKE = False  # type: ignore
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -196,6 +214,163 @@ def _last_text(msgs) -> str:
     return str(m)
 
 
+def _parse_website(text: str) -> Optional[str]:
+    try:
+        s = (text or "").strip()
+        if not s:
+            return None
+        m = re.search(r"https?://[^\s]+", s, re.IGNORECASE)
+        if m:
+            return m.group(0)
+        # fallback: bare domain
+        m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", s, re.IGNORECASE)
+        return m.group(0) if m else None
+    except Exception:
+        return None
+
+
+def _parse_seeds(text: str) -> list[dict]:
+    """Parse seeds in forms like 'Company — domain' separated by newlines/semicolons/commas."""
+    out: list[dict] = []
+    try:
+        s = (text or "").strip()
+        if not s:
+            return out
+        # split into items generously
+        parts = re.split(r"[\n;]+|\s{2,}", s)
+        for p in parts:
+            pp = p.strip().strip(",")
+            if not pp or len(pp) < 3:
+                continue
+            # prefer em dash / hyphen separator
+            if "—" in pp:
+                name, dom = [x.strip() for x in pp.split("—", 1)]
+            elif " - " in pp:
+                name, dom = [x.strip() for x in pp.split(" - ", 1)]
+            else:
+                # fallback: take first token as name and look for domain inside
+                m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", pp, re.IGNORECASE)
+                dom = m.group(0) if m else None
+                name = pp if dom is None else pp.replace(dom, "").strip(" -—,|:")
+            if name and dom:
+                # Filter out protocol placeholders and too-short names (avoid parsing bare URLs as seeds)
+                low = name.strip().lower()
+                if low in {"http", "https", "www"}:
+                    continue
+                if not re.search(r"[a-z]", low):
+                    continue
+                if len(low) < 3:
+                    continue
+                out.append({"seed_name": name[:120], "domain": dom.lower()})
+        # dedupe by domain/name
+        seen = set()
+        dedup: list[dict] = []
+        for it in out:
+            key = (it.get("seed_name"), it.get("domain"))
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(it)
+        return dedup[:20]
+    except Exception:
+        return out
+
+
+def _parse_lost_churned(text: str) -> list[dict]:
+    """Parse entries like 'Company — domain — reason' per line."""
+    out: list[dict] = []
+    try:
+        s = (text or "").strip()
+        if not s:
+            return out
+        lines = re.split(r"[\n;]+", s)
+        for ln in lines:
+            ln = ln.strip().strip(",")
+            if not ln:
+                continue
+            parts = [p.strip() for p in re.split(r"\s+—\s+|\s+-\s+|\s+--\s+", ln)]
+            # Expect 2 or 3 parts: name, domain[, reason]
+            if len(parts) >= 2:
+                name, dom = parts[0], parts[1]
+                reason = parts[2] if len(parts) >= 3 else None
+                # basic filters
+                if not re.search(r"[a-z]", name.lower()):
+                    continue
+                m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", dom, re.IGNORECASE)
+                domain = m.group(0).lower() if m else None
+                if name and domain:
+                    rec = {"seed_name": name[:120], "domain": domain}
+                    if reason and isinstance(reason, str) and reason.strip():
+                        rec["reason"] = reason.strip()[:240]
+                    out.append(rec)
+        # dedupe by (name, domain)
+        seen = set()
+        dedup = []
+        for it in out:
+            key = (it.get("seed_name"), it.get("domain"))
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(it)
+        return dedup[:20]
+    except Exception:
+        return out
+
+
+def _parse_titles_list(text: str) -> list[str]:
+    parts = [p.strip() for p in re.split(r"[,/\n;]+", text or "") if p and p.strip()]
+    out: list[str] = []
+    for p in parts:
+        if len(p) < 2:
+            continue
+        if p.lower() in {"skip", "none", "any"}:
+            continue
+        out.append(p[:60])
+    # dedupe preserving order
+    seen = set()
+    ded = []
+    for t in out:
+        if t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        ded.append(t)
+    return ded[:10]
+
+
+def _parse_currency_usd(text: str) -> float | None:
+    try:
+        s = (text or "").lower()
+        # extract like $18k, 18k, $18000, 18,000
+        m = re.search(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)(\s*[km])?", s)
+        if not m:
+            return None
+        num = float(m.group(1).replace(",", ""))
+        suffix = (m.group(2) or "").strip().lower()
+        if suffix == "k":
+            num *= 1_000
+        elif suffix == "m":
+            num *= 1_000_000
+        return float(num)
+    except Exception:
+        return None
+
+
+def _parse_weeks_range(text: str) -> tuple[float | None, float | None]:
+    try:
+        s = (text or "").lower()
+        # strip non-digit separators, read patterns like 4–8 weeks, 4-8w, 6 weeks
+        m = re.search(r"(\d{1,3})(?:\s*(?:[-–]|to)\s*(\d{1,3}))?\s*(w|wk|wks|week|weeks)?", s)
+        if not m:
+            return (None, None)
+        lo = float(m.group(1))
+        hi = float(m.group(2)) if m.group(2) else None
+        return (lo, hi)
+    except Exception:
+        return (None, None)
+    except Exception:
+        return out
+
+
 def _log_state(prefix: str, state: Dict[str, Any]):
     prev = _last_text(state.get("messages"))
     logger.info("%s last='%s' keys=%s", prefix, prev[:120], list(state.keys()))
@@ -247,6 +422,43 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
     state["icp"] = icp
     text = _last_text(state.get("messages")).lower()
 
+    # Feature 17: ICP Finder (agent-led, minimal inputs). When enabled, prefer
+    # asking for website + seed customers instead of industry/employees.
+    try:
+        if ENABLE_ICP_INTAKE:
+            last = _last_text(state.get("messages"))
+            # Ask website first
+            if not icp.get("website_url"):
+                url = _parse_website(last)
+                if url:
+                    icp["website_url"] = url
+                else:
+                    state["messages"].append(
+                        AIMessage("Let's infer your ICP from evidence. What's your website URL?")
+                    )
+                    return state
+            # Ask for seeds next
+            if not icp.get("seeds_list"):
+                seeds = _parse_seeds(last)
+                if seeds:
+                    icp["seeds_list"] = seeds
+                else:
+                    state["messages"].append(
+                        AIMessage(
+                            "Share 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                        )
+                    )
+                    return state
+            # Ready to confirm
+            state["messages"].append(
+                AIMessage(
+                    "Thanks! I’ll crawl your site + seed sites, map to ACRA/SSIC, and propose micro‑ICPs with evidence. Reply confirm to proceed, or add more seeds."
+                )
+            )
+            return state
+    except Exception:
+        pass
+
     if "industry" not in icp:
         state["messages"].append(
             AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)")
@@ -280,6 +492,33 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
 def icp_confirm(state: PreSDRState) -> PreSDRState:
     # Persist ICP from the basic flow when user confirms
     try:
+        # Feature 17: ICP Finder — save intake (website + seeds) and run mapping/suggestions
+        if ENABLE_ICP_INTAKE:
+            icp = dict(state.get("icp") or {})
+            url = icp.get("website_url")
+            seeds = icp.get("seeds_list") or []
+            if url and isinstance(seeds, list) and seeds:
+                tid = _resolve_tenant_id_for_write_sync(state)
+                if isinstance(tid, int) and _icp_save_intake is not None:
+                    answers = {"website": url}
+                    payload = {"answers": answers, "seeds": seeds}
+                    try:
+                        _icp_save_intake(tid, "chat", payload)
+                        # Synchronously map and refresh patterns for fast suggestions
+                        if _icp_map_seeds and _icp_refresh_patterns and _icp_generate_suggestions:
+                            _icp_map_seeds(tid)
+                            _icp_refresh_patterns()
+                            items = _icp_generate_suggestions(tid)
+                            if items:
+                                lines = ["Here are draft micro‑ICPs:"]
+                                for i, it in enumerate(items, 1):
+                                    title = it.get("title") or it.get("id")
+                                    ev = it.get("evidence_count") or 0
+                                    lines.append(f"{i}) {title} (evidence: {ev})")
+                                state["messages"].append(AIMessage("\n".join(lines)))
+                    except Exception:
+                        pass
+        # Legacy flow persistence
         icp = dict(state.get("icp") or {})
         payload = _icp_payload_from_state_icp(icp)
         if payload:
@@ -873,6 +1112,17 @@ def _parse_company_list(text: str) -> List[str]:
     ]
     # Keep only tokens that look like companies/domains
     names = [n for n in names if _is_company_like(n)]
+    # Guard: when ICP Finder is enabled, avoid treating a single URL/domain as an
+    # explicit company list (the user likely pasted their website URL).
+    try:
+        if ENABLE_ICP_INTAKE and len(names) == 1:
+            t = names[0]
+            if re.search(r"^https?://", t, flags=re.IGNORECASE) or re.search(
+                r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", t, flags=re.IGNORECASE
+            ):
+                return []
+    except Exception:
+        pass
     return names
 
 
@@ -1225,6 +1475,11 @@ def _extract_icp_industries_from_text(text: str) -> list[str]:
     """
     if not text:
         return []
+    # Strip URLs to avoid domain tokens becoming "industries"
+    try:
+        text = re.sub(r"https?://\S+", " ", text)
+    except Exception:
+        pass
     parts = re.split(r"[,\n;]+|\band\b|\bor\b|/|\\\\|\|", text, flags=re.IGNORECASE)
     stop = {
         "sg",
@@ -1255,6 +1510,10 @@ def _extract_icp_industries_from_text(text: str) -> list[str]:
         "should we target",
         "e.g.",
         "eg",
+        # URL/common web tokens
+        "http",
+        "https",
+        "www",
     }
     raw: list[str] = []
     for p in parts:
@@ -1267,6 +1526,12 @@ def _extract_icp_industries_from_text(text: str) -> list[str]:
             continue
         if not re.search(r"[A-Za-z]", s):
             continue
+        # Skip bare domains (example.com)
+        try:
+            if re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", s, flags=re.IGNORECASE):
+                continue
+        except Exception:
+            pass
         sl = s.lower()
         if sl in stop:
             continue
@@ -1314,6 +1579,347 @@ async def icp_node(state: GraphState) -> GraphState:
         # Proceed to question generation with an empty ICP
         text = ""  # ensure extractor doesn't pollute with previous context
 
+    # Feature 17: ICP Finder intake (website + seeds + core key points) when enabled
+    try:
+        if ENABLE_ICP_INTAKE:
+            icp_f = dict(state.get("icp") or {})
+            # Ask for website URL first
+            if not icp_f.get("website_url"):
+                url = _parse_website(text)
+                if url:
+                    icp_f["website_url"] = url
+                else:
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Let's infer your ICP from evidence. What's your website URL?")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+            # Ask for seed customers next (ask-then-parse pattern to avoid parsing the website URL as a seed)
+            if not icp_f.get("seeds_list"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("seeds", 0) == 0:
+                    asks["seeds"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [
+                            AIMessage(
+                                "Share 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                            )
+                        ],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    seeds = _parse_seeds(text)
+                    if seeds:
+                        icp_f["seeds_list"] = seeds
+                    else:
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [AIMessage("Got it. Please list seeds as 'Company — domain' per line.")],
+                        )
+                        state["icp"] = icp_f
+                        return state
+            # Collect core ICP points before confirmation: industries -> employees -> geos -> (optional) signals
+            # 1) Industries
+            if not icp_f.get("industries"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("industries", 0) == 0:
+                    asks["industries"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Which industries or problem spaces? (e.g., SaaS, professional services, logistics)")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    try:
+                        from typing import List as _List
+                        from_lang = _extract_icp_industries_from_text(text)
+                        inds: _List[str] = [s.strip() for s in from_lang if s and s.strip()]
+                    except Exception:
+                        inds = []  # type: ignore
+                    if inds:
+                        icp_f["industries"] = inds
+                    else:
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [AIMessage("A few examples help (e.g., SaaS, logistics). You can also type 'skip' if not sure.")],
+                        )
+                        state["icp"] = icp_f
+                        return state
+            # 2) Employees
+            if not (icp_f.get("employees_min") or icp_f.get("employees_max")):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("employees", 0) == 0:
+                    asks["employees"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Typical company size? (e.g., 10–200 employees)")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    m = re.search(r"(\d{1,6})\s*(?:[-–]|to)\s*(\d{1,6})", text)
+                    if m:
+                        try:
+                            lo = int(m.group(1))
+                            hi = int(m.group(2))
+                            if lo > 0 and hi >= lo:
+                                icp_f["employees_min"], icp_f["employees_max"] = lo, hi
+                        except Exception:
+                            pass
+                    if not (icp_f.get("employees_min") or icp_f.get("employees_max")):
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [AIMessage("Please provide a range like 10–200, 50-500, or 10 to 200.")],
+                        )
+                        state["icp"] = icp_f
+                        return state
+            # 3) Geos
+            if not icp_f.get("geos"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("geos", 0) == 0:
+                    asks["geos"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Primary geographies? (e.g., SG, SEA, global)")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    parts = [p.strip() for p in re.split(r"[,\n]+", text) if p and p.strip()]
+                    geos = [p for p in parts if 1 <= len(p) <= 40 and p.lower() not in {"confirm", "start"}]
+                    geo_words = {"sg", "singapore", "sea", "apac", "global", "worldwide", "us", "usa", "uk", "eu", "emea", "asia"}
+                    geos = [g for g in geos if g.lower() in geo_words or len(g) <= 20]
+                    if geos:
+                        icp_f["geos"] = sorted(set(geos))
+                    else:
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [AIMessage("Examples: SG, SEA, APAC, Global. You can list multiple separated by commas.")],
+                        )
+                        state["icp"] = icp_f
+                        return state
+            # Optional: signals (skip if none)
+            if not icp_f.get("signals") and not icp_f.get("signals_done"):
+                if re.search(r"\b(none|skip|any)\b", text.strip(), flags=re.IGNORECASE):
+                    icp_f["signals_done"] = True
+                else:
+                    # Ask once; subsequent turn can proceed with confirm if skipped
+                    asks = dict(state.get("ask_counts") or {})
+                    if asks.get("signals", 0) < 1:
+                        asks["signals"] = 1
+                        state["ask_counts"] = asks
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [AIMessage("Buying signals? (e.g., hiring, specific tech stack, certifications). Reply 'skip' to continue.")],
+                        )
+                        state["icp"] = icp_f
+                        return state
+            # --- Fast‑Start additions ---
+            # 4) Lost/Churned (name — website — 1-line reason)
+            if not icp_f.get("lost_churned") and icp_f.get("seeds_list"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("lost_churned", 0) == 0:
+                    asks["lost_churned"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("List 3 lost/churned (Company — website — 1‑line reason). Type 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["lost_churned"] = []
+                    else:
+                        lc = _parse_lost_churned(text)
+                        if lc:
+                            icp_f["lost_churned"] = lc
+                        else:
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("Please format as 'Company — domain — reason'. Or type 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # 5) Must‑have integrations
+            if not icp_f.get("integrations_required"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("integrations", 0) == 0:
+                    asks["integrations"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Must‑have integrations? (e.g., HubSpot, Salesforce, Shopify). Comma‑separated; 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["integrations_required"] = []
+                    else:
+                        icp_f["integrations_required"] = _parse_titles_list(text)
+                        if not icp_f["integrations_required"]:
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("List integrations separated by commas (e.g., HubSpot, Salesforce). Or type 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # 6) Average deal size (ACV)
+            if not icp_f.get("acv_usd"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("acv", 0) == 0:
+                    asks["acv"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Average deal size (ACV)? e.g., $18k. Type 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["acv_usd"] = None
+                    else:
+                        v = _parse_currency_usd(text)
+                        if v and v > 0:
+                            icp_f["acv_usd"] = v
+                        else:
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("Please provide a number like $18k, 18,000, or type 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # 7) Deal cycle length
+            if not (icp_f.get("cycle_weeks_min") or icp_f.get("cycle_weeks_max")):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("cycle", 0) == 0:
+                    asks["cycle"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Typical deal cycle length? e.g., 4–8 weeks. Type 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["cycle_weeks_min"] = None
+                        icp_f["cycle_weeks_max"] = None
+                    else:
+                        lo, hi = _parse_weeks_range(text)
+                        if lo:
+                            icp_f["cycle_weeks_min"] = lo
+                        if hi:
+                            icp_f["cycle_weeks_max"] = hi
+                        if not (lo or hi):
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("Please provide a value like 4–8 weeks or 6 weeks, or 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # 8) Price floor
+            if not icp_f.get("price_floor_usd"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("price_floor", 0) == 0:
+                    asks["price_floor"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Price floor? Deals usually fail when budget < … e.g., <$8k ACV. Type 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["price_floor_usd"] = None
+                    else:
+                        v = _parse_currency_usd(text)
+                        if v and v > 0:
+                            icp_f["price_floor_usd"] = v
+                        else:
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("Provide a number like $8k, 8000, or type 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # 9) Champion titles
+            if not icp_f.get("champion_titles"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("champions", 0) == 0:
+                    asks["champions"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("Champion title(s)? e.g., RevOps Lead, Head of Sales. Comma‑separated; 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["champion_titles"] = []
+                    else:
+                        t = _parse_titles_list(text)
+                        if t:
+                            icp_f["champion_titles"] = t
+                        else:
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("List titles separated by commas (e.g., RevOps Lead, Head of Sales), or 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # 10) Predictive events
+            if not icp_f.get("triggers"):
+                asks = dict(state.get("ask_counts") or {})
+                if asks.get("triggers", 0) == 0:
+                    asks["triggers"] = 1
+                    state["ask_counts"] = asks
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [AIMessage("3 events that predict a good fit? e.g., Hiring RevOps, migrating to HubSpot. Comma‑separated; 'skip' to continue.")],
+                    )
+                    state["icp"] = icp_f
+                    return state
+                else:
+                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
+                        icp_f["triggers"] = []
+                    else:
+                        icp_f["triggers"] = _parse_titles_list(text)
+                        if not icp_f["triggers"]:
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage("List events separated by commas (e.g., Hiring RevOps, HubSpot migration), or 'skip'.")],
+                            )
+                            state["icp"] = icp_f
+                            return state
+            # Ready to confirm
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [
+                    AIMessage(
+                        "Thanks! I’ll crawl your site + seed sites, map to ACRA/SSIC, enrich evidence, mine patterns, and propose micro‑ICPs. Reply confirm to proceed, or adjust any detail."
+                    )
+                ],
+            )
+            state["icp"] = icp_f
+            return state
+    except Exception:
+        # Non-blocking: fall through to legacy questions if anything goes wrong
+        pass
+
+    # Legacy Q&A path (industries, size, geos, signals)
     # 1) Extract structured update
     update = await extract_update_from_text(text)
 
@@ -1555,6 +2161,55 @@ async def confirm_node(state: GraphState) -> GraphState:
     # Persist ICP captured in the dynamic graph flow
     try:
         icp = dict(state.get("icp") or {})
+        # Feature 17: if Finder inputs present, save intake and generate suggestions immediately
+        try:
+            if ENABLE_ICP_INTAKE and icp.get("website_url") and icp.get("seeds_list") and _icp_save_intake:
+                tid = await _resolve_tenant_id_for_write(state)
+                if isinstance(tid, int):
+                    # Collect Fast‑Start answers for persistence
+                    answers = {
+                        "website": icp.get("website_url"),
+                        "industries": icp.get("industries"),
+                        "employees_min": icp.get("employees_min"),
+                        "employees_max": icp.get("employees_max"),
+                        "geos": icp.get("geos"),
+                        "signals": icp.get("signals") if icp.get("signals") else [],
+                        "lost_churned": icp.get("lost_churned") if icp.get("lost_churned") else [],
+                        "integrations_required": icp.get("integrations_required") if icp.get("integrations_required") else [],
+                        "acv_usd": icp.get("acv_usd"),
+                        "cycle_weeks_min": icp.get("cycle_weeks_min"),
+                        "cycle_weeks_max": icp.get("cycle_weeks_max"),
+                        "price_floor_usd": icp.get("price_floor_usd"),
+                        "champion_titles": icp.get("champion_titles") if icp.get("champion_titles") else [],
+                        "triggers": icp.get("triggers") if icp.get("triggers") else [],
+                    }
+                    payload_in = {"answers": answers, "seeds": icp.get("seeds_list")}
+                    await asyncio.to_thread(_icp_save_intake, tid, "chat", payload_in)
+                    # Store intake-derived evidence
+                    try:
+                        if _icp_store_intake_evidence:
+                            await asyncio.to_thread(_icp_store_intake_evidence, tid, answers)
+                    except Exception:
+                        pass
+                    # Synchronously map seeds and refresh patterns for fast suggestions
+                    if _icp_map_seeds and _icp_refresh_patterns and _icp_generate_suggestions:
+                        await asyncio.to_thread(_icp_map_seeds, tid)
+                        await asyncio.to_thread(_icp_refresh_patterns)
+                        items = await asyncio.to_thread(_icp_generate_suggestions, tid)
+                        if items:
+                            lines = ["Here are draft micro‑ICPs:"]
+                            for i, it in enumerate(items, 1):
+                                title = it.get("title") or it.get("id")
+                                ev = it.get("evidence_count") or 0
+                                lines.append(f"{i}) {title} (evidence: {ev})")
+                            state["messages"] = add_messages(
+                                state.get("messages") or [], [AIMessage("\n".join(lines))]
+                            )
+        except Exception:
+            # Non-blocking; fall back to legacy persistence
+            pass
+
+        # Legacy persistence for industry-based ICP
         payload = _icp_payload_from_state_icp(icp)
         if payload:
             tid = await _resolve_tenant_id_for_write(state)
@@ -2324,6 +2979,10 @@ def router(state: GraphState) -> str:
 
     # 3) Fast-path: user requested enrichment
     if "run enrichment" in text:
+        # When ICP Finder is enabled and ICP is incomplete, continue Q&A first
+        if ENABLE_ICP_INTAKE and not _icp_complete(icp):
+            logger.info("router -> icp (Finder gating: need core ICP before enrichment)")
+            return "icp"
         if state.get("candidates"):
             logger.info("router -> enrich (user requested enrichment)")
             return "enrich"
@@ -2335,11 +2994,18 @@ def router(state: GraphState) -> str:
     pasted = _parse_company_list(text)
     # Only jump early if at least one looks like a domain or multi-word name
     if pasted and any(("." in n) or (" " in n) for n in pasted):
+        if ENABLE_ICP_INTAKE and not _icp_complete(icp):
+            logger.info("router -> icp (Finder gating: ignore explicit list until ICP set)")
+            return "icp"
         logger.info("router -> candidates (explicit company list)")
         return "candidates"
 
     # 5) User said confirm: proceed forward once (avoid loops)
     if _user_just_confirmed(state):
+        # Require core ICP first when Finder is enabled
+        if ENABLE_ICP_INTAKE and not _icp_complete(icp):
+            logger.info("router -> icp (Finder gating: confirmation ignored until ICP set)")
+            return "icp"
         # If we already derived candidates, move ahead to enrichment; else collect candidates first.
         if state.get("candidates"):
             logger.info("router -> enrich (user confirmed ICP; have candidates)")

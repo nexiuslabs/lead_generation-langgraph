@@ -94,6 +94,11 @@ def _to_message(msg: dict | BaseMessage) -> BaseMessage:
 def _extract_industry_terms(text: str) -> List[str]:
     if not text:
         return []
+    # Strip URLs to avoid misclassifying them as industry tokens
+    try:
+        text = re.sub(r"https?://\S+", " ", text)
+    except Exception:
+        pass
     chunks = re.split(r"[,\n;:=]+|\band\b|\bor\b|/|\\\\|\|", text, flags=re.IGNORECASE)
     terms: List[str] = []
     # Extract explicit key-value patterns like "industry = technology" or "industries: fintech"
@@ -139,6 +144,10 @@ def _extract_industry_terms(text: str) -> List[str]:
         "small",
         "medium",
         "large",
+        # URL/common web tokens
+        "http",
+        "https",
+        "www",
     }
     for c in chunks:
         s = (c or "").strip()
@@ -146,6 +155,12 @@ def _extract_industry_terms(text: str) -> List[str]:
             continue
         if not re.search(r"[a-zA-Z]", s):
             continue
+        # Skip bare domains (e.g., example.com) — not industries
+        try:
+            if re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", s, flags=re.IGNORECASE):
+                continue
+        except Exception:
+            pass
         # Drop bullets/parentheticals and obvious question fragments
         if s.strip().startswith("-"):
             continue
