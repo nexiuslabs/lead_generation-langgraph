@@ -510,6 +510,17 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inds = _collect_industry_terms(state.get("messages"))
         if inds and STAGING_UPSERT_MODE != "off":
+            # Gate staging upsert/enrichment while ICP Finder intake is active to prevent early runs
+            try:
+                from src.settings import ENABLE_ICP_INTAKE as _FINDER_ON  # type: ignore
+            except Exception:
+                _FINDER_ON = False  # type: ignore
+            if _FINDER_ON:
+                # Only proceed if the user explicitly asked to run enrichment
+                txt = " ".join([(m.content or "") for m in norm_msgs if isinstance(m, HumanMessage)])
+                if not re.search(r"\brun enrichment\b", txt, flags=re.IGNORECASE):
+                    logger.info("Deferring staging upsert/enrich while ICP Finder is active; inds=%s", inds)
+                    return state
             head = max(0, int(UPSERT_SYNC_LIMIT))
             if head > 0:
                 try:

@@ -171,6 +171,11 @@ def store_intake_evidence(tenant_id: int, answers: Dict[str, Any]) -> int:
     """
     written = 0
     with get_conn() as conn, conn.cursor() as cur:
+        try:
+            # Avoid transaction-wide aborts: autocommit small inserts so one failure does not poison the cursor
+            setattr(conn, "autocommit", True)
+        except Exception:
+            pass
         def put(key: str, value: Any):
             nonlocal written
             try:
@@ -181,6 +186,11 @@ def store_intake_evidence(tenant_id: int, answers: Dict[str, Any]) -> int:
                 written += 1
             except Exception as e:
                 log.info("intake evidence insert failed: %s", e)
+                try:
+                    # Best effort: clear error state if transaction aborted
+                    conn.rollback()
+                except Exception:
+                    pass
 
         # Champion titles
         titles = answers.get("champion_titles") or []
