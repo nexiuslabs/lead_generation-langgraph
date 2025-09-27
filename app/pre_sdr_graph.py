@@ -2133,6 +2133,19 @@ async def candidates_node(state: GraphState) -> GraphState:
         for s in (icp.get("industries") or [])
         if isinstance(s, str) and s.strip()
     ]
+    # New: derive SSIC codes from Finder suggestions if present
+    sugg = state.get("micro_icp_suggestions") or []
+    codes_from_suggestions: list[str] = []
+    try:
+        if isinstance(sugg, list) and sugg:
+            for it in sugg:
+                sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                    code = sid.split(":", 1)[1]
+                    if code and code.strip():
+                        codes_from_suggestions.append(code.strip())
+    except Exception:
+        codes_from_suggestions = []
     lines: list[str] = []
     # Compute ICP total in companies (not just the preview list)
     icp_total = 0
@@ -2142,6 +2155,10 @@ async def candidates_node(state: GraphState) -> GraphState:
         if terms:
             clauses.append("LOWER(industry_norm) = ANY($1)")
             params.append(terms)
+        # If no free-text terms but we have SSIC codes from suggestions, count by industry_code
+        if not terms and codes_from_suggestions:
+            clauses.append("regexp_replace(industry_code::text, '\\D', '', 'g') = ANY($" + str(len(params)+1) + "::text[])")
+            params.append(codes_from_suggestions)
         sql = "SELECT COUNT(*) FROM companies " + ("WHERE " + " AND ".join(clauses) if clauses else "")
         async with (await get_pg_pool()).acquire() as conn:
             row = await conn.fetchrow(sql, *params)
@@ -2149,8 +2166,9 @@ async def candidates_node(state: GraphState) -> GraphState:
     except Exception:
         icp_total = n
     try:
-        if terms:
-            ssic_matches = _find_ssic_codes_by_terms(terms)
+        # Prefer free-text terms flow when provided; otherwise leverage SSIC codes from suggestions
+        if terms or codes_from_suggestions:
+            ssic_matches = _find_ssic_codes_by_terms(terms) if terms else [(c, "", 1.0) for c in codes_from_suggestions]
             if ssic_matches:
                 top_code, top_title, _ = ssic_matches[0]
                 lines.append(
@@ -2211,6 +2229,51 @@ async def candidates_node(state: GraphState) -> GraphState:
                         pass
             else:
                 lines.append("- Found 0 ACRA candidates.")
+
+        # If still no candidates and we have SSIC codes from suggestions, try pulling directly by code from companies
+        if not (state.get("candidates") or []) and codes_from_suggestions:
+            try:
+                async with (await get_pg_pool()).acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT company_id AS id, name, uen, website_domain AS domain
+                        FROM companies
+                        WHERE regexp_replace(industry_code::text, '\\D', '', 'g') = ANY($1::text[])
+                        ORDER BY employees_est DESC NULLS LAST, name ASC
+                        LIMIT 20
+                        """,
+                        codes_from_suggestions,
+                    )
+                cand = [{"id": int(r["id"]), "name": r["name"], "uen": r["uen"], "domain": r["domain"]} for r in rows]
+                if cand:
+                    state["candidates"] = cand
+                    n = len(cand)
+            except Exception:
+                pass
+            # If still empty, attempt ACRA→companies ensure by codes
+            if not (state.get("candidates") or []):
+                try:
+                    rows = await asyncio.to_thread(_select_acra_by_ssic_codes, set(codes_from_suggestions), 20)
+                except Exception:
+                    rows = []
+                if rows:
+                    try:
+                        pool = await get_pg_pool()
+                        added: list[dict] = []
+                        for r in rows:
+                            nm = (r.get("entity_name") or "").strip()
+                            if not nm:
+                                continue
+                            try:
+                                cid = await _ensure_company_row(pool, nm)
+                                added.append({"id": cid, "name": nm, "uen": (r.get("uen") or "").strip() or None})
+                            except Exception:
+                                continue
+                        if added:
+                            state["candidates"] = added
+                            n = len(added)
+                    except Exception:
+                        pass
     except Exception:
         pass
     # After potential top-up, refresh n and state, then report count
