@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover
     from typing_extensions import Annotated  # type: ignore
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from uuid import uuid4
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -60,6 +61,10 @@ try:
     from src.settings import ENABLE_ICP_INTAKE  # type: ignore
 except Exception:  # pragma: no cover
     ENABLE_ICP_INTAKE = False  # type: ignore
+try:
+    from src.settings import ICP_WIZARD_FAST_START_ONLY  # type: ignore
+except Exception:  # pragma: no cover
+    ICP_WIZARD_FAST_START_ONLY = True  # type: ignore
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -72,6 +77,51 @@ if not logger.handlers:
     h.setFormatter(fmt)
     logger.addHandler(h)
 logger.setLevel(_level)
+
+# Session-boot token: used to gate explicit actions after server restarts
+BOOT_TOKEN = os.getenv("LG_SERVER_BOOT_TOKEN") or str(uuid4())
+
+# --- Helper: ensure required Fast-Start fields are present (asked and captured) ---
+def _icp_required_fields_done(icp: dict, ask_counts: dict | None = None) -> bool:
+    """Return True when all required Fast-Start fields have been captured.
+
+    Required keys (no industry):
+      - website_url
+      - seeds_list (>=5)
+      - lost_churned (present; can be empty if user skipped)
+      - employees_min or employees_max
+      - geos (list)
+      - integrations_required (present; can be empty)
+      - acv_usd (present; can be None)
+      - cycle_weeks_min or cycle_weeks_max (present; can be None)
+      - price_floor_usd (present; can be None)
+      - champion_titles (present; can be empty)
+      - triggers (present; can be empty)
+    """
+    icp = icp or {}
+    def present(k: str) -> bool:
+        return k in icp
+    if not icp.get("website_url"):
+        return False
+    seeds = icp.get("seeds_list") or []
+    if not isinstance(seeds, list) or len(seeds) < 5:
+        return False
+    if not present("lost_churned"):
+        return False
+    if not (present("employees_min") or present("employees_max")):
+        return False
+    if not (isinstance(icp.get("geos"), list)):
+        return False
+    for k in ("integrations_required", "acv_usd", "price_floor_usd"):
+        if not present(k):
+            return False
+    if not (present("cycle_weeks_min") or present("cycle_weeks_max")):
+        return False
+    if not present("champion_titles"):
+        return False
+    if not present("triggers"):
+        return False
+    return True
 
 # ---------- DB table names (env-overridable) ----------
 COMPANY_TABLE = os.getenv("COMPANY_TABLE", "companies")
@@ -480,28 +530,30 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
     except Exception:
         pass
 
-    if "industry" not in icp:
-        state["messages"].append(
-            AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)")
-        )
-        icp["industry"] = True
-        return state
-    if "employees" not in icp:
-        state["messages"].append(
-            AIMessage("Typical company size? (e.g., 10–200 employees)")
-        )
-        icp["employees"] = True
-        return state
-    if "geo" not in icp:
-        state["messages"].append(AIMessage("Primary geographies? (SG, SEA, global)"))
-        icp["geo"] = True
-        return state
-    if "signals" not in icp:
-        state["messages"].append(
-            AIMessage("Buying signals? (hiring, stack, certifications)")
-        )
-        icp["signals"] = True
-        return state
+    # Legacy prompts only when Finder is disabled
+    if not ENABLE_ICP_INTAKE:
+        if "industry" not in icp:
+            state["messages"].append(
+                AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)")
+            )
+            icp["industry"] = True
+            return state
+        if "employees" not in icp:
+            state["messages"].append(
+                AIMessage("Typical company size? (e.g., 10–200 employees)")
+            )
+            icp["employees"] = True
+            return state
+        if "geo" not in icp:
+            state["messages"].append(AIMessage("Primary geographies? (SG, SEA, global)"))
+            icp["geo"] = True
+            return state
+        if "signals" not in icp:
+            state["messages"].append(
+                AIMessage("Buying signals? (hiring, stack, certifications)")
+            )
+            icp["signals"] = True
+            return state
 
     state["messages"].append(
         AIMessage("Great. Reply **confirm** to save, or tell me what to change.")
@@ -537,6 +589,8 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                                     ev = it.get("evidence_count") or 0
                                     lines.append(f"{i}) {title} (evidence: {ev})")
                                 state["messages"].append(AIMessage("\n".join(lines)))
+                                state["micro_icp_suggestions"] = items
+                                state["finder_suggestions_done"] = True
                     except Exception:
                         pass
         # Legacy flow persistence
@@ -1716,9 +1770,22 @@ async def icp_node(state: GraphState) -> GraphState:
                         )
                         state["icp"] = icp_f
                         return state
+            # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation
+            if ICP_WIZARD_FAST_START_ONLY and not icp_f.get("fast_start_explained"):
+                expl = [
+                    "I will infer industries from evidence instead of asking.",
+                    "What I will crawl:",
+                    "- Your site: Industries served, Customers/Case Studies, Integrations, Pricing (ACV hints), Careers (buyer/team clues), Partners, blog topics.",
+                    "- Seed and anti-customer sites: industry labels, product lines, About text, Careers (roles/scale), Integrations pages, locations.",
+                    "I'll map seeds → SSIC codes via ssic_ref → ACRA (primary_ssic_code) to learn which SSICs and bands dominate winners.",
+                ]
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
+                icp_f["fast_start_explained"] = True
+                state["icp"] = icp_f
+
             # Collect core ICP points before confirmation: industries -> employees -> geos -> (optional) signals
-            # 1) Industries
-            if not icp_f.get("industries"):
+            # 1) Industries (skip when fast-start is enabled; we infer from evidence)
+            if not ICP_WIZARD_FAST_START_ONLY and not icp_f.get("industries"):
                 asks = dict(state.get("ask_counts") or {})
                 if asks.get("industries", 0) == 0:
                     asks["industries"] = 1
@@ -2292,11 +2359,26 @@ async def candidates_node(state: GraphState) -> GraphState:
             just_confirmed = _user_just_confirmed(state)
         except Exception:
             just_confirmed = False
-        # Prefer ACRA total for nightly planning if available
+        # Prefer ACRA total for nightly planning using suggested SSIC codes when available
+        scheduled = 0
         try:
-            scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
+            sugg = state.get("micro_icp_suggestions") or []
+            codes_from_suggestions: list[str] = []
+            for it in sugg:
+                sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                    code = sid.split(":", 1)[1]
+                    if code and code.strip():
+                        codes_from_suggestions.append(code.strip())
+            if codes_from_suggestions and _count_acra_by_ssic_codes:
+                acra_total = await asyncio.to_thread(_count_acra_by_ssic_codes, set(codes_from_suggestions))
+                scheduled = max(int(acra_total) - do_now, 0)
+            elif 'total_acra' in locals():
+                scheduled = max(int(total_acra) - do_now, 0)
+            else:
+                scheduled = max(int(icp_total) - do_now, 0)
         except Exception:
-            scheduled = max(icp_total - do_now, 0)
+            scheduled = max(int(icp_total) - do_now, 0)
         lines.append(
             f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Accept a micro‑ICP, then type 'run enrichment' to proceed."
         )
@@ -2393,8 +2475,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         low_conf += 1
                                 if low_conf:
                                     lines.append(f"{low_conf} low‑confidence matches. Reply with edits if any domain looks off.")
-                                state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
-                                chips.append("Domain resolve ✓")
+                        state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+                        chips.append("Domain resolve ✓")
                     except Exception:
                         pass
 
@@ -2402,24 +2484,51 @@ async def confirm_node(state: GraphState) -> GraphState:
                     try:
                         ev_count = 0
                         acra_count = 0
+                        # Crawl user's own website first for industries/customers/integrations/pricing/careers/partners/blog
+                        try:
+                            site_url = (icp.get("website_url") or "").strip()
+                            if site_url and _icp_collect_evidence_for_domain:
+                                # Normalize to apex domain
+                                from urllib.parse import urlparse
+                                _apex = (urlparse(site_url).netloc or site_url).lower()
+                                if _apex:
+                                    n0 = await _icp_collect_evidence_for_domain(tid, None, _apex)
+                                    logger.info("[confirm] Evidence rows for tenant website=%s: %s", _apex, n0)
+                                    ev_count += int(n0 or 0)
+                        except Exception:
+                            pass
                         async def _collect_for_seed(s: dict):
+                            """Collect crawl evidence and ACRA SSIC anchoring for each seed.
+                            Do BOTH when possible so we still get SSIC evidence even if crawl yields 0.
+                            Returns tuple: (evidence_rows_added, acra_rows_added)
+                            """
                             name = (s.get("seed_name") or "").strip()
                             dom = (s.get("domain") or "").strip()
+                            ev_added = 0
+                            acra_added = 0
+                            # Crawl evidence (best effort)
                             if _icp_collect_evidence_for_domain and dom:
                                 try:
                                     n = await _icp_collect_evidence_for_domain(tid, None, dom)
                                     logger.info("[confirm] Evidence rows for domain=%s: %s", dom, n)
-                                    return (n, 0)
+                                    ev_added += int(n or 0)
                                 except Exception:
-                                    return (0, 0)
+                                    pass
+                            # Always attempt ACRA anchoring from seed name as well
                             if _icp_acra_anchor_seed and name:
                                 try:
                                     acra = await asyncio.to_thread(_icp_acra_anchor_seed, tid, name, None)
-                                    logger.info("[confirm] ACRA anchored name=%s uen=%s ssic=%s", name, (acra or {}).get("uen"), (acra or {}).get("primary_ssic_code"))
-                                    return (0, 1 if acra else 0)
+                                    logger.info(
+                                        "[confirm] ACRA anchored name=%s uen=%s ssic=%s",
+                                        name,
+                                        (acra or {}).get("uen"),
+                                        (acra or {}).get("primary_ssic_code"),
+                                    )
+                                    if acra:
+                                        acra_added += 1
                                 except Exception:
-                                    return (0, 0)
-                            return (0, 0)
+                                    pass
+                            return (ev_added, acra_added)
                         seeds_list = list(icp.get("seeds_list") or [])
                         for n, a in await asyncio.gather(*[_collect_for_seed(s) for s in seeds_list]):
                             ev_count += int(n)
@@ -2445,6 +2554,47 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     title = it.get("title") or it.get("id")
                                     ev = it.get("evidence_count") or 0
                                     lines.append(f"{i}) {title} (evidence: {ev})")
+                                # Also show industry titles for SSIC-based suggestions
+                                try:
+                                    codes = []
+                                    for it in items2:
+                                        sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                                        if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                                            codes.append(sid.split(":", 1)[1])
+                                    titles: list[str] = []
+                                    if codes:
+                                        # Lookup titles from ssic_ref
+                                        from src.database import get_conn as _get_conn
+                                        with _get_conn() as _c, _c.cursor() as _cur:
+                                            _cur.execute(
+                                                "SELECT code, title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                                                (codes,),
+                                            )
+                                            for r in _cur.fetchall() or []:
+                                                titles.append(f"{r[1]} (SSIC {r[0]})")
+                                    if titles:
+                                        lines.append("")
+                                        lines.append("Targeted industry preview:")
+                                        for t in titles[:3]:
+                                            lines.append(f"- {t}")
+                                    # ACRA total based on suggested SSIC codes
+                                    if codes:
+                                        try:
+                                            from src.icp import _count_acra_by_ssic_codes as _cnt_acra, _select_acra_by_ssic_codes as _sel_acra
+                                            total = await asyncio.to_thread(_cnt_acra, set(codes)) if _cnt_acra else 0
+                                            lines.append(f"Found ~{total} ACRA candidates matching suggested SSICs.")
+                                            if total:
+                                                rows = await asyncio.to_thread(_sel_acra, set(codes), 2)
+                                                for r in rows[:2]:
+                                                    uen = (r.get("uen") or "").strip()
+                                                    nm = (r.get("entity_name") or "").strip()
+                                                    code = (r.get("primary_ssic_code") or "").strip()
+                                                    status = (r.get("entity_status_description") or "").strip()
+                                                    lines.append(f"UEN: {uen} – {nm} – SSIC {code} – status: {status}")
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                                 state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
                                 chips.append("Suggestions ✓")
                                 state["micro_icp_suggestions"] = items2
@@ -2464,6 +2614,46 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 title = it.get("title") or it.get("id")
                                 ev = it.get("evidence_count") or 0
                                 lines.append(f"{i}) {title} (evidence: {ev})")
+                            # Titles for SSIC codes
+                            try:
+                                codes = []
+                                for it in items:
+                                    sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                                    if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                                        codes.append(sid.split(":", 1)[1])
+                                titles: list[str] = []
+                                if codes:
+                                    from src.database import get_conn as _get_conn
+                                    with _get_conn() as _c, _c.cursor() as _cur:
+                                        _cur.execute(
+                                            "SELECT code, title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                                            (codes,),
+                                        )
+                                        for r in _cur.fetchall() or []:
+                                            titles.append(f"{r[1]} (SSIC {r[0]})")
+                                if titles:
+                                    lines.append("")
+                                    lines.append("Targeted industry preview:")
+                                    for t in titles[:3]:
+                                        lines.append(f"- {t}")
+                                # ACRA total based on suggested SSIC codes
+                                if codes:
+                                    try:
+                                        from src.icp import _count_acra_by_ssic_codes as _cnt_acra, _select_acra_by_ssic_codes as _sel_acra
+                                        total = await asyncio.to_thread(_cnt_acra, set(codes)) if _cnt_acra else 0
+                                        lines.append(f"Found ~{total} ACRA candidates matching suggested SSICs.")
+                                        if total:
+                                            rows = await asyncio.to_thread(_sel_acra, set(codes), 2)
+                                            for r in rows[:2]:
+                                                uen = (r.get("uen") or "").strip()
+                                                nm = (r.get("entity_name") or "").strip()
+                                                code = (r.get("primary_ssic_code") or "").strip()
+                                                status = (r.get("entity_status_description") or "").strip()
+                                                lines.append(f"UEN: {uen} – {nm} – SSIC {code} – status: {status}")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
                             if "Suggestions ✓" not in chips:
                                 chips.append("Suggestions ✓")
@@ -3224,12 +3414,58 @@ def router(state: GraphState) -> str:
 
     text = _last_user_text(state).lower()
 
+    # Boot-session initialization: record current message count so we only honor
+    # commands after a NEW human message arrives post-boot.
+    try:
+        if state.get("boot_init_token") != BOOT_TOKEN:
+            state["boot_init_token"] = BOOT_TOKEN
+            state["boot_seen_messages_len"] = len(msgs)
+        else:
+            # On subsequent router cycles, if new messages appended and last is Human → mark as fresh user action
+            if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
+                last = msgs[-1] if msgs else None
+                def _is_human(m) -> bool:
+                    try:
+                        if isinstance(m, HumanMessage):
+                            return True
+                        if isinstance(m, dict):
+                            role = (m.get("type") or m.get("role") or "").lower()
+                            return role in {"human", "user"}
+                    except Exception:
+                        return False
+                    return False
+                if last and _is_human(last):
+                    state["last_user_boot_token"] = BOOT_TOKEN
+                state["boot_seen_messages_len"] = len(msgs)
+    except Exception:
+        pass
+
+    # Do not auto-run anything if assistant spoke last, unless user explicitly typed a new command.
+    # This prevents enrichment from resuming on server restart. Nightly jobs should invoke nodes directly.
+    if _last_is_ai(msgs) and "run enrichment" not in text and not re.search(r"\baccept\s+micro[- ]icp\b", text):
+        logger.info("router -> end (assistant last; no explicit user action)")
+        return "end"
+
+    # Enrichment gating: require required Fast-Start fields; otherwise route back to ICP Q&A
+    if (
+        "run enrichment" in text
+        and state.get("candidates")
+        and not state.get("results")
+    ):
+        icp_f = dict(state.get("icp") or {})
+        asks = dict(state.get("ask_counts") or {})
+        if ENABLE_ICP_INTAKE and not _icp_required_fields_done(icp_f, asks):
+            logger.info("router -> icp (ask remaining required Fast-Start fields before enrichment)")
+            return "icp"
+        logger.info("router -> enrich (explicit user override)")
+        return "enrich"
+
     # Accept micro‑ICP selection
     if re.search(r"\baccept\s+micro[- ]icp\b", text):
         logger.info("router -> accept (user accepted micro‑ICP)")
         return "accept"
 
-    # 1) Pipeline progression (allow auto-scoring even if assistant spoke last)
+    # 1) Pipeline progression
     # Finder gating: do NOT auto-advance to enrichment until micro-ICP suggestions are done
     if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
         # If we already have candidates but haven't finished Finder suggestions, hold and wait for user
@@ -3246,7 +3482,8 @@ def router(state: GraphState) -> str:
     has_scored = bool(state.get("scored"))
     enrichment_completed = bool(state.get("enrichment_completed"))
 
-    if has_candidates and not has_results:
+    # Only progress when a human spoke last. This stops auto-run after server restarts.
+    if has_candidates and not has_results and not _last_is_ai(msgs):
         logger.info("router -> enrich (have candidates, no enrichment)")
         return "enrich"
     if has_results and enrichment_completed and not has_scored:
@@ -3256,10 +3493,7 @@ def router(state: GraphState) -> str:
         logger.info("router -> end (enrichment not fully completed)")
         return "end"
 
-    # 2) If assistant spoke last and no pending work, wait for user input
-    if _last_is_ai(msgs):
-        logger.info("router -> end (assistant last, waiting on user)")
-        return "end"
+    # 2) If assistant spoke last and no pending work, wait for user input (covered by early guard)
 
     # 3) Fast-path: user requested enrichment
     if "run enrichment" in text:

@@ -94,7 +94,10 @@ def fuzzy_map_seed_to_acra(cur, seed_name: str, threshold: float = 0.35) -> Opti
 
 
 def map_seeds_to_evidence(tenant_id: int) -> int:
-    """Map seeds to companies and ACRA; insert evidence rows. Returns count of seeds processed."""
+    """Map seeds to companies and ACRA; insert evidence rows. Returns count of seeds processed.
+
+    Ensures a concrete company_id before inserting evidence to satisfy NOT NULL constraints.
+    """
     processed = 0
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT seed_name, domain FROM customer_seeds WHERE tenant_id=%s ORDER BY id ASC", (tenant_id,))
@@ -104,24 +107,51 @@ def map_seeds_to_evidence(tenant_id: int) -> int:
             dom = _norm_domain(row[1])
             if not name:
                 continue
+            # Resolve or create company_id
             company_id = _company_id_for_seed(cur, name, dom)
-            if company_id is None:
-                # Skip evidence without a resolved company for now
-                continue
-            # Try fuzzy ACRA mapping to derive SSIC evidence
+            # Fuzzy ACRA mapping to enrich and help ensure company row by UEN
             acra = fuzzy_map_seed_to_acra(cur, name)
-            if acra and acra.get("primary_ssic_code"):
-                cur.execute(
-                    """
-                    INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source)
-                    VALUES (%s,%s,'ssic', %s, 'acra')
-                    """,
-                    (tenant_id, company_id, Json({
-                        "ssic": acra.get("primary_ssic_code"),
-                        "uen": acra.get("uen"),
-                        "matched_name": acra.get("entity_name"),
-                    })),
-                )
+            if company_id is None and acra and acra.get("uen"):
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO companies(uen, name, industry_code, last_seen)
+                        VALUES (%s, %s, %s, NOW())
+                        ON CONFLICT (uen) DO UPDATE SET name=EXCLUDED.name, industry_code=COALESCE(EXCLUDED.industry_code, companies.industry_code), last_seen=NOW()
+                        RETURNING company_id
+                        """,
+                        (
+                            (acra.get("uen") or "").strip(),
+                            (acra.get("entity_name") or name)[:255],
+                            str(acra.get("primary_ssic_code")) if acra.get("primary_ssic_code") is not None else None,
+                        ),
+                    )
+                    r = cur.fetchone()
+                    if r and r[0] is not None:
+                        company_id = int(r[0])
+                except Exception as e:
+                    log.info("ensure company by ACRA failed: %s", e)
+            if acra and acra.get("primary_ssic_code") and company_id is not None:
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source)
+                        VALUES (%s,%s,'ssic', %s, 'acra')
+                        """,
+                        (
+                            tenant_id,
+                            company_id,
+                            Json(
+                                {
+                                    "ssic": acra.get("primary_ssic_code"),
+                                    "uen": acra.get("uen"),
+                                    "matched_name": acra.get("entity_name"),
+                                }
+                            ),
+                        ),
+                    )
+                except Exception as e:
+                    log.info("icp_evidence insert failed: %s", e)
             processed += 1
     return processed
 
@@ -176,12 +206,42 @@ def store_intake_evidence(tenant_id: int, answers: Dict[str, Any]) -> int:
             setattr(conn, "autocommit", True)
         except Exception:
             pass
+        # Ensure a concrete company_id to satisfy icp_evidence.company_id NOT NULL
+        company_id: Optional[int] = None
+        try:
+            site_url = (answers.get("website") or "").strip()
+            apex = None
+            if site_url:
+                try:
+                    from urllib.parse import urlparse
+                    apex = (urlparse(site_url).netloc or site_url).lower()
+                except Exception:
+                    apex = None
+            if apex:
+                cur.execute("SELECT company_id FROM companies WHERE website_domain=%s LIMIT 1", (apex,))
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    company_id = int(row[0])
+                else:
+                    # Insert minimal row for the tenant website
+                    cur.execute(
+                        "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                        (apex, apex),
+                    )
+                    rr = cur.fetchone()
+                    if rr and rr[0] is not None:
+                        company_id = int(rr[0])
+        except Exception as e:
+            log.info("ensure tenant website company failed: %s", e)
+
         def put(key: str, value: Any):
             nonlocal written
             try:
+                if company_id is None:
+                    return  # cannot insert due to NOT NULL schema
                 cur.execute(
-                    "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s, NULL, %s, %s, 'intake')",
-                    (tenant_id, key, Json(value)),
+                    "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s, %s, %s, %s, 'intake')",
+                    (tenant_id, company_id, key, Json(value)),
                 )
                 written += 1
             except Exception as e:

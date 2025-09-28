@@ -299,20 +299,64 @@ def acra_anchor_seed(
         acra = fuzzy_map_seed_to_acra(cur, seed_name)
         if not acra:
             return None
+        # Ensure we have a concrete company_id: prefer provided, else by UEN, else create minimal row
+        cid = company_id
         try:
-            cur.execute(
-                """
-                INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source)
-                VALUES (%s,%s,'ssic',%s,'acra')
-                """,
-                (tenant_id, company_id, Json({
-                    "ssic": acra.get("primary_ssic_code"),
-                    "uen": acra.get("uen"),
-                    "matched_name": acra.get("entity_name"),
-                })),
-            )
+            if cid is None:
+                uen = (acra.get("uen") or "").strip()
+                nm = (acra.get("entity_name") or seed_name or "").strip()
+                code = acra.get("primary_ssic_code")
+                ind_code = str(code) if code is not None else None
+                if uen:
+                    # Upsert by UEN
+                    cur.execute(
+                        """
+                        INSERT INTO companies(uen, name, industry_code, last_seen)
+                        VALUES (%s, %s, %s, NOW())
+                        ON CONFLICT (uen) DO UPDATE SET name=EXCLUDED.name, industry_code=COALESCE(EXCLUDED.industry_code, companies.industry_code), last_seen=NOW()
+                        RETURNING company_id
+                        """,
+                        (uen, nm, ind_code),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        cid = int(row[0])
+                else:
+                    # Try exact name match first
+                    cur.execute("SELECT company_id FROM companies WHERE LOWER(name)=LOWER(%s) LIMIT 1", (nm,))
+                    r = cur.fetchone()
+                    if r and r[0] is not None:
+                        cid = int(r[0])
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO companies(name, industry_code, last_seen)
+                            VALUES (%s, %s, NOW())
+                            RETURNING company_id
+                            """,
+                            (nm, ind_code),
+                        )
+                        rr = cur.fetchone()
+                        if rr and rr[0] is not None:
+                            cid = int(rr[0])
         except Exception as e:
-            log.info("acra evidence insert failed: %s", e)
+            log.info("acra ensure company failed: %s", e)
+        # Insert SSIC evidence only when we have a valid company_id to satisfy NOT NULL schema
+        if cid is not None:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source)
+                    VALUES (%s,%s,'ssic',%s,'acra')
+                    """,
+                    (tenant_id, cid, Json({
+                        "ssic": acra.get("primary_ssic_code"),
+                        "uen": acra.get("uen"),
+                        "matched_name": acra.get("entity_name"),
+                    })),
+                )
+            except Exception as e:
+                log.info("acra evidence insert failed: %s", e)
         return acra
 
 
