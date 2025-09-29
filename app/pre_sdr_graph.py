@@ -702,8 +702,29 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         enrich_now_limit = 10
     do_now = min(n, enrich_now_limit) if n else 0
     if n > 0:
+        # Prefer ACRA total by suggested SSICs, else by matched terms, else company total
+        nightly = 0
+        try:
+            # From micro‑ICP suggestions if present
+            sugg = state.get("micro_icp_suggestions") or []
+            codes_from_suggestions: list[str] = []
+            for it in sugg:
+                sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                    code = sid.split(":", 1)[1]
+                    if code and code.strip():
+                        codes_from_suggestions.append(code.strip())
+            if codes_from_suggestions and _count_acra_by_ssic_codes:
+                total = _count_acra_by_ssic_codes(set(codes_from_suggestions))
+                nightly = max(int(total) - do_now, 0)
+            elif 'total_acra' in locals():
+                nightly = max(int(total_acra) - do_now, 0)
+            else:
+                nightly = max(int(icp_total) - do_now, 0)
+        except Exception:
+            nightly = max(int(icp_total) - do_now, 0)
         msg_lines.append(
-            f"Ready to enrich {do_now} now; {max(icp_total - do_now, 0)} scheduled for nightly. Type 'run enrichment' after accepting a micro‑ICP."
+            f"Ready to enrich {do_now} now; {nightly} scheduled for nightly. Type 'run enrichment' after accepting a micro‑ICP."
         )
     else:
         msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -3497,10 +3518,11 @@ def router(state: GraphState) -> str:
 
     # 3) Fast-path: user requested enrichment
     if "run enrichment" in text:
-        # When ICP Finder is enabled and ICP is incomplete, continue Q&A first
-        if ENABLE_ICP_INTAKE and not _icp_complete(icp):
-            logger.info("router -> icp (Finder gating: need core ICP before enrichment)")
-            return "icp"
+        # Finder context: if suggestions not finished yet, hold until they are done
+        if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
+            logger.info("router -> end (Finder: hold until suggestions are done before run enrichment)")
+            return "end"
+        # Proceed with enrichment when candidates exist, regardless of ICP completeness
         if state.get("candidates"):
             logger.info("router -> enrich (user requested enrichment)")
             return "enrich"
