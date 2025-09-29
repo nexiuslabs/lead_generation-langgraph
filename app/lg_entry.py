@@ -128,6 +128,13 @@ def _extract_industry_terms(text: str) -> List[str]:
         "b2c",
         "confirm",
         "run enrichment",
+        # chat commands / control phrases
+        "accept micro-icp",
+        "accept micro‑icp",
+        "accept micro icp",
+        "accept a micro-icp",
+        "accept a micro‑icp",
+        "accept a micro icp",
         "industry",
         "industries",
         "sector",
@@ -538,16 +545,26 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                     logger.info("sync head upsert/enrich skipped: %s", e)
             # Enqueue remainder for nightly processing (best-effort)
             try:
-                from src.jobs import enqueue_staging_upsert
-                # Resolve tenant best-effort; allow None
-                tid = None
-                try:
-                    from app.odoo_connection_info import get_odoo_connection_info
-                    info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
-                    tid = info.get("tenant_id") if isinstance(info, dict) else None
-                except Exception:
+                from src.icp import _find_ssic_codes_by_terms as _resolve_ssic
+                resolved = _resolve_ssic(inds) if inds else []
+                if not resolved:
+                    logger.info(
+                        "Skip enqueue nightly: no SSIC codes resolved for terms=%s",
+                        inds,
+                    )
+                else:
+                    from src.jobs import enqueue_staging_upsert
+                    # Resolve tenant best-effort; allow None
                     tid = None
-                enqueue_staging_upsert(tid, inds)
+                    try:
+                        from app.odoo_connection_info import get_odoo_connection_info
+                        info = asyncio.run(
+                            get_odoo_connection_info(email=None, claim_tid=None)
+                        )
+                        tid = info.get("tenant_id") if isinstance(info, dict) else None
+                    except Exception:
+                        tid = None
+                    enqueue_staging_upsert(tid, inds)
             except Exception as _qe:
                 logger.info("enqueue nightly staging_upsert failed: %s", _qe)
     except Exception as _e:

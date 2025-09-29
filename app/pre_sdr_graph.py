@@ -879,6 +879,37 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         if store is None:
             logger.warning("odoo init skipped: %s", _init_exc)
 
+    # Best-effort: enqueue remainder for nightly based on accepted micro‑ICP SSIC titles (only once)
+    try:
+        if not state.get("nightly_enqueued"):
+            sugg = state.get("micro_icp_suggestions") or []
+            codes: list[str] = []
+            for it in (sugg if isinstance(sugg, list) else []):
+                sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                    code = sid.split(":", 1)[1]
+                    if code and code.strip():
+                        codes.append(code.strip())
+            titles: list[str] = []
+            if codes:
+                # Lookup human-readable titles for SSIC codes
+                from src.database import get_conn as _get_conn
+                with _get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                        (codes,),
+                    )
+                    titles = [r[0] for r in (_cur.fetchall() or []) if r and r[0]]
+            if titles:
+                try:
+                    from src.jobs import enqueue_staging_upsert as _enqueue
+                    _enqueue(None, titles)
+                    state["nightly_enqueued"] = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     async def _enrich_one(c: Dict[str, Any]) -> Dict[str, Any]:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional
+from typing import Optional, List
 
 from src.database import get_conn
 from src.jobs import run_staging_upsert
@@ -32,10 +32,36 @@ async def run_tenant_partial(tenant_id: int, max_now: int = 10) -> None:
     await run_queued_jobs(limit=max_now)
 
 
+async def run_all(limit: Optional[int] = None) -> int:
+    """Process all queued staging_upsert jobs.
+
+    This function is awaited by the scheduler. It simply dispatches to
+    run_queued_jobs with an optional limit.
+    """
+    return await run_queued_jobs(limit=limit)
+
+
+def list_active_tenants() -> List[int]:
+    """Return a list of active tenant IDs for post-run acceptance checks.
+
+    Falls back to an empty list if the mapping table is missing.
+    """
+    tenants: List[int] = []
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT tenant_id FROM odoo_connections WHERE active=TRUE ORDER BY tenant_id"
+            )
+            rows = cur.fetchall() or []
+            tenants = [int(r[0]) for r in rows if r and r[0] is not None]
+    except Exception:
+        tenants = []
+    return tenants
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Process queued staging_upsert jobs")
     ap.add_argument("--limit", type=int, default=None, help="Max number of jobs to process")
     args = ap.parse_args()
     asyncio.run(run_queued_jobs(limit=args.limit))
-
