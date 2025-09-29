@@ -683,6 +683,11 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                 rows = []
             if total_acra:
                 msg_lines.append(f"Found {total_acra} ACRA candidates. Sample:")
+                try:
+                    # Persist for later nightly planning across nodes
+                    state["acra_total_suggested"] = int(total_acra)
+                except Exception:
+                    pass
                 for r in rows[:2]:
                     uen = (r.get("uen") or "").strip()
                     nm = (r.get("entity_name") or "").strip()
@@ -696,33 +701,41 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         pass
 
     # Planned enrichment counts
-    try:
-        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
-    except Exception:
-        enrich_now_limit = 10
-    do_now = min(n, enrich_now_limit) if n else 0
-    if n > 0:
-        # Prefer ACRA total by suggested SSICs, else by matched terms, else company total
-        nightly = 0
         try:
-            # From micro‑ICP suggestions if present
-            sugg = state.get("micro_icp_suggestions") or []
-            codes_from_suggestions: list[str] = []
-            for it in sugg:
-                sid = (it.get("id") or "") if isinstance(it, dict) else ""
-                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
-                    code = sid.split(":", 1)[1]
-                    if code and code.strip():
-                        codes_from_suggestions.append(code.strip())
-            if codes_from_suggestions and _count_acra_by_ssic_codes:
-                total = _count_acra_by_ssic_codes(set(codes_from_suggestions))
-                nightly = max(int(total) - do_now, 0)
-            elif 'total_acra' in locals():
-                nightly = max(int(total_acra) - do_now, 0)
-            else:
-                nightly = max(int(icp_total) - do_now, 0)
+            enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
         except Exception:
-            nightly = max(int(icp_total) - do_now, 0)
+            enrich_now_limit = 10
+        do_now = min(n, enrich_now_limit) if n else 0
+        if n > 0:
+            # Prefer ACRA total by suggested SSICs, else by matched terms, else company total
+            nightly = 0
+            try:
+                # Prefer stored ACRA total from earlier SSIC probe
+                try:
+                    acra_total_state = int(state.get("acra_total_suggested") or 0)
+                except Exception:
+                    acra_total_state = 0
+                if acra_total_state:
+                    nightly = max(int(acra_total_state) - do_now, 0)
+                else:
+                    # From micro‑ICP suggestions if present
+                    sugg = state.get("micro_icp_suggestions") or []
+                    codes_from_suggestions: list[str] = []
+                    for it in sugg:
+                        sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                        if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                            code = sid.split(":", 1)[1]
+                            if code and code.strip():
+                                codes_from_suggestions.append(code.strip())
+                    if codes_from_suggestions and _count_acra_by_ssic_codes:
+                        total = _count_acra_by_ssic_codes(set(codes_from_suggestions))
+                        nightly = max(int(total) - do_now, 0)
+                    elif 'total_acra' in locals():
+                        nightly = max(int(total_acra) - do_now, 0)
+                    else:
+                        nightly = max(int(icp_total) - do_now, 0)
+            except Exception:
+                nightly = max(int(icp_total) - do_now, 0)
         msg_lines.append(
             f"Ready to enrich {do_now} now; {nightly} scheduled for nightly. Type 'run enrichment' after accepting a micro‑ICP."
         )
@@ -2279,6 +2292,10 @@ async def candidates_node(state: GraphState) -> GraphState:
                 total_acra = 0
             if total_acra:
                 lines.append(f"- Found {total_acra} ACRA candidates. Sample:")
+                try:
+                    state["acra_total_suggested"] = int(total_acra)
+                except Exception:
+                    pass
                 for r in rows[:2]:
                     uen = (r.get("uen") or "").strip()
                     nm = (r.get("entity_name") or "").strip()
@@ -2383,21 +2400,29 @@ async def candidates_node(state: GraphState) -> GraphState:
         # Prefer ACRA total for nightly planning using suggested SSIC codes when available
         scheduled = 0
         try:
-            sugg = state.get("micro_icp_suggestions") or []
-            codes_from_suggestions: list[str] = []
-            for it in sugg:
-                sid = (it.get("id") or "") if isinstance(it, dict) else ""
-                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
-                    code = sid.split(":", 1)[1]
-                    if code and code.strip():
-                        codes_from_suggestions.append(code.strip())
-            if codes_from_suggestions and _count_acra_by_ssic_codes:
-                acra_total = await asyncio.to_thread(_count_acra_by_ssic_codes, set(codes_from_suggestions))
-                scheduled = max(int(acra_total) - do_now, 0)
-            elif 'total_acra' in locals():
-                scheduled = max(int(total_acra) - do_now, 0)
+            # Prefer ACRA total stored from earlier probe/suggestions
+            try:
+                acra_total_state = int(state.get("acra_total_suggested") or 0)
+            except Exception:
+                acra_total_state = 0
+            if acra_total_state:
+                scheduled = max(int(acra_total_state) - do_now, 0)
             else:
-                scheduled = max(int(icp_total) - do_now, 0)
+                sugg = state.get("micro_icp_suggestions") or []
+                codes_from_suggestions: list[str] = []
+                for it in sugg:
+                    sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                    if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                        code = sid.split(":", 1)[1]
+                        if code and code.strip():
+                            codes_from_suggestions.append(code.strip())
+                if codes_from_suggestions and _count_acra_by_ssic_codes:
+                    acra_total = await asyncio.to_thread(_count_acra_by_ssic_codes, set(codes_from_suggestions))
+                    scheduled = max(int(acra_total) - do_now, 0)
+                elif 'total_acra' in locals():
+                    scheduled = max(int(total_acra) - do_now, 0)
+                else:
+                    scheduled = max(int(icp_total) - do_now, 0)
         except Exception:
             scheduled = max(int(icp_total) - do_now, 0)
         lines.append(
@@ -2604,6 +2629,10 @@ async def confirm_node(state: GraphState) -> GraphState:
                                             from src.icp import _count_acra_by_ssic_codes as _cnt_acra, _select_acra_by_ssic_codes as _sel_acra
                                             total = await asyncio.to_thread(_cnt_acra, set(codes)) if _cnt_acra else 0
                                             lines.append(f"Found ~{total} ACRA candidates matching suggested SSICs.")
+                                            try:
+                                                state["acra_total_suggested"] = int(total)
+                                            except Exception:
+                                                pass
                                             if total:
                                                 rows = await asyncio.to_thread(_sel_acra, set(codes), 2)
                                                 for r in rows[:2]:
@@ -2663,6 +2692,10 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         from src.icp import _count_acra_by_ssic_codes as _cnt_acra, _select_acra_by_ssic_codes as _sel_acra
                                         total = await asyncio.to_thread(_cnt_acra, set(codes)) if _cnt_acra else 0
                                         lines.append(f"Found ~{total} ACRA candidates matching suggested SSICs.")
+                                        try:
+                                            state["acra_total_suggested"] = int(total)
+                                        except Exception:
+                                            pass
                                         if total:
                                             rows = await asyncio.to_thread(_sel_acra, set(codes), 2)
                                             for r in rows[:2]:
@@ -2905,8 +2938,15 @@ async def confirm_node(state: GraphState) -> GraphState:
     # Plan enrichment counts: how many now vs later
     do_now = min(n, enrich_now_limit) if n else 0
     if n > 0:
-        # Compute nightly remainder from ACRA total when available
-        scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
+        # Compute nightly remainder from ACRA total when available; prefer stored value
+        try:
+            acra_total_state = int(state.get("acra_total_suggested") or 0)
+        except Exception:
+            acra_total_state = 0
+        if acra_total_state:
+            scheduled = max(int(acra_total_state) - do_now, 0)
+        else:
+            scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
         msg_lines.append(
             f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Accept a micro‑ICP, then type 'run enrichment' to proceed."
         )
@@ -3050,16 +3090,22 @@ async def enrich_node(state: GraphState) -> GraphState:
     state["enrichment_completed"] = all_done
 
     if all_done:
-        # Compose completion message; include ICP total and remainder planned for nightly if available
+        # Compose completion message; include ACRA/ICP totals and nightly remainder
         icp_total = 0
+        acra_total_state = 0
         try:
             icp_total = int(state.get("icp_match_total") or 0)
         except Exception:
             icp_total = 0
-        remaining = max(icp_total - len(results), 0) if icp_total else None
+        try:
+            acra_total_state = int(state.get("acra_total_suggested") or 0)
+        except Exception:
+            acra_total_state = 0
+        base_total = acra_total_state or icp_total
+        remaining = max(base_total - len(results), 0) if base_total else None
         suffix = (
-            f" ICP-matched total: {icp_total}. Remaining scheduled nightly: {remaining}."
-            if icp_total
+            f" Total candidates: {base_total}. Remaining scheduled nightly: {remaining}."
+            if base_total
             else " The enrichment pipeline will continue by nightly runner."
         )
         done_msg = f"Enrichment complete for {len(results)} companies." + suffix
