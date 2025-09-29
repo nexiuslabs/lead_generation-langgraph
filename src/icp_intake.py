@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from psycopg2.extras import Json
 from src.database import get_conn
+from src.obs import log_event
 
 log = logging.getLogger("icp_intake")
 
@@ -99,6 +100,9 @@ def map_seeds_to_evidence(tenant_id: int) -> int:
     Ensures a concrete company_id before inserting evidence to satisfy NOT NULL constraints.
     """
     processed = 0
+    mapped = 0
+    import time
+    t0 = time.perf_counter()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT seed_name, domain FROM customer_seeds WHERE tenant_id=%s ORDER BY id ASC", (tenant_id,))
         rows = cur.fetchall() or []
@@ -152,7 +156,20 @@ def map_seeds_to_evidence(tenant_id: int) -> int:
                     )
                 except Exception as e:
                     log.info("icp_evidence insert failed: %s", e)
+                else:
+                    mapped += 1
             processed += 1
+    # Observability: mapping SLA
+    try:
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        rate = 0.0
+        try:
+            rate = (mapped / processed) if processed else 0.0
+        except Exception:
+            rate = 0.0
+        log_event(0, tenant_id, stage="icp_intake_mapping", event="finish", status="ok", duration_ms=elapsed_ms, extra={"processed": processed, "mapped": mapped, "rate": rate})
+    except Exception:
+        pass
     return processed
 
 
@@ -192,6 +209,60 @@ def generate_suggestions(tenant_id: int, limit: int = 5) -> List[Dict[str, Any]]
         except Exception as e:
             log.info("suggestion generation failed: %s", e)
     return items
+
+
+def _derive_negative_icp_flags(answers: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Derive ≥3 negative-ICP themes from lost/churn reasons and anti-ICP inputs.
+
+    Rules: simple keyword grouping from reasons (budget, on-prem, fit/timing) and explicit anti-ICP.
+    """
+    themes: Dict[str, int] = {}
+    # Lost/churned reasons
+    for rec in (answers.get("lost") or answers.get("lost_or_churned") or []):
+        reason = (rec.get("reason") or "").lower()
+        if not reason:
+            continue
+        if "budget" in reason or "$" in reason:
+            themes["budget_too_low"] = themes.get("budget_too_low", 0) + 1
+        if "on-prem" in reason or "onprem" in reason or "on prem" in reason:
+            themes["on_prem_only"] = themes.get("on_prem_only", 0) + 1
+        if "security" in reason or "compliance" in reason:
+            themes["security_heavy_process"] = themes.get("security_heavy_process", 0) + 1
+        if "no fit" in reason or "poor fit" in reason:
+            themes["poor_fit"] = themes.get("poor_fit", 0) + 1
+        if "timing" in reason or "no timing" in reason or "priority" in reason:
+            themes["bad_timing_low_priority"] = themes.get("bad_timing_low_priority", 0) + 1
+    # Explicit anti-ICP fields
+    anti = (answers.get("anti_icp") or answers.get("never_target") or [])
+    for t in anti:
+        key = str(t).strip().lower().replace(" ", "_")
+        if not key:
+            continue
+        themes[key] = themes.get(key, 0) + 1
+    # Build top themes (at least 3 if possible)
+    if not themes:
+        return []
+    ranked = sorted(themes.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    return [{"theme": k, "count": v, "reason": "derived from lost/anti-icp"} for k, v in ranked[:3]]
+
+
+def build_targeting_pack(card: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a basic targeting pack for a suggestion card.
+
+    - ssic_filters: list of codes from card id if present
+    - technographic_filters: placeholder buckets (can be enriched from evidence later)
+    - pitch: short generated pitch
+    """
+    ssics: List[str] = []
+    cid = (card.get("id") or "").lower() if isinstance(card, dict) else ""
+    if cid.startswith("ssic:"):
+        ssics = [cid.split(":", 1)[1]]
+    pitch = f"Reach companies in SSIC {', '.join(ssics)} with fast ROI"
+    return {
+        "ssic_filters": ssics,
+        "technographic_filters": ["has_crm_or_analytics"],
+        "pitch": pitch,
+    }
 
 
 def store_intake_evidence(tenant_id: int, answers: Dict[str, Any]) -> int:

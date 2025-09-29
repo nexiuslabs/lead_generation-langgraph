@@ -2,7 +2,7 @@ import asyncio
 from typing import Optional, List
 
 from src.database import get_conn
-from src.jobs import run_staging_upsert
+from src.jobs import run_staging_upsert, run_enrich_candidates
 
 
 async def run_queued_jobs(limit: Optional[int] = None) -> int:
@@ -10,16 +10,22 @@ async def run_queued_jobs(limit: Optional[int] = None) -> int:
 
     Returns the number of jobs processed.
     """
-    jobs: list[int] = []
+    jobs: list[tuple[int, str]] = []
     with get_conn() as conn, conn.cursor() as cur:
-        sql = "SELECT job_id FROM background_jobs WHERE job_type='staging_upsert' AND status='queued' ORDER BY job_id ASC"
+        sql = "SELECT job_id, job_type FROM background_jobs WHERE status='queued' AND job_type IN ('staging_upsert','enrich_candidates','icp_intake_process') ORDER BY job_id ASC"
         if isinstance(limit, int) and limit > 0:
             sql += f" LIMIT {int(limit)}"
         cur.execute(sql)
         rows = cur.fetchall() or []
-        jobs = [int(r[0]) for r in rows if r and r[0] is not None]
-    for jid in jobs:
-        await run_staging_upsert(int(jid))
+        jobs = [(int(r[0]), str(r[1])) for r in rows if r and r[0] is not None]
+    for jid, jtype in jobs:
+        if jtype == 'staging_upsert':
+            await run_staging_upsert(int(jid))
+        elif jtype == 'enrich_candidates':
+            await run_enrich_candidates(int(jid))
+        elif jtype == 'icp_intake_process':
+            from src.jobs import run_icp_intake_process
+            await run_icp_intake_process(int(jid))
     return len(jobs)
 
 
