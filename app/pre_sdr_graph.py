@@ -515,9 +515,9 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
                         return state
                 else:
                     state["messages"].append(
-                        AIMessage(
-                            "Share 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
-                        )
+                            AIMessage(
+                                "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                            )
                     )
                     return state
             # Ready to confirm
@@ -1720,7 +1720,7 @@ async def icp_node(state: GraphState) -> GraphState:
                         state["ask_counts"] = asks
                     state["messages"] = add_messages(
                         state.get("messages") or [],
-                        [AIMessage("Share 5–15 best customers (Company — website). You can type 'skip' for optional fields later.")],
+                        [AIMessage("List 5–15 best customers (Company — website). You can type 'skip' for optional fields later.")],
                     )
                     state["icp"] = icp_f
                     return state
@@ -1806,11 +1806,12 @@ async def icp_node(state: GraphState) -> GraphState:
                 if asks.get("seeds", 0) == 0:
                     asks["seeds"] = 1
                     state["ask_counts"] = asks
+                    state["icp_last_focus"] = "seeds"
                     state["messages"] = add_messages(
                         state.get("messages") or [],
                         [
                             AIMessage(
-                                "Share 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                                "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
                             )
                         ],
                     )
@@ -1822,6 +1823,7 @@ async def icp_node(state: GraphState) -> GraphState:
                         if len(seeds) >= 5:
                             icp_f["seeds_list"] = seeds
                         else:
+                            state["icp_last_focus"] = "seeds"
                             state["messages"] = add_messages(
                                 state.get("messages") or [],
                                 [AIMessage(f"I need at least 5 best customers. You shared {len(seeds)}; please add a few more (Company — website).")],
@@ -1829,6 +1831,7 @@ async def icp_node(state: GraphState) -> GraphState:
                             state["icp"] = icp_f
                             return state
                     else:
+                        state["icp_last_focus"] = "seeds"
                         state["messages"] = add_messages(
                             state.get("messages") or [],
                             [AIMessage("Got it. Please list seeds as 'Company — domain' per line.")],

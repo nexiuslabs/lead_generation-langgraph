@@ -2,10 +2,21 @@ from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Header, 
 from typing import Optional, List, Dict, Any
 from psycopg2.extras import Json
 
-from app.auth import require_auth
+# Import the dependency and helpers at module scope so tests can monkeypatch ep.* symbols
+from app.auth import require_auth  # noqa: F401  # exposed for monkeypatching in tests
 from schemas.icp import IntakePayload, SuggestionCard, AcceptRequest
 from src.database import get_conn
-from src.icp_intake import save_icp_intake, generate_suggestions, refresh_icp_patterns
+from src.icp_intake import (
+    save_icp_intake,
+    generate_suggestions,
+    refresh_icp_patterns,
+    build_targeting_pack,  # re-export for tests to monkeypatch
+    _derive_negative_icp_flags,  # re-export for tests to monkeypatch
+)
+from src.jobs import (
+    enqueue_icp_intake_process,  # re-export for tests to monkeypatch
+    run_icp_intake_process,  # re-export for tests to monkeypatch
+)
 
 router = APIRouter(prefix="/icp", tags=["icp"])
 
@@ -39,12 +50,22 @@ def _save_icp_rule(tid: int, payload: Dict[str, Any], name: str = "Default ICP")
         )
 
 
+async def _auth_dep(request: Request):
+    """Delegate to current module's require_auth so monkeypatching ep.require_auth works.
+
+    FastAPI binds dependency callables at router registration time. By keeping this thin
+    wrapper and calling our module-level symbol, tests can replace `require_auth`
+    on this module and the wrapper will use the patched function at request time.
+    """
+    return await require_auth(request)  # type: ignore[misc]
+
+
 @router.post("/intake")
 async def post_intake(
     payload: IntakePayload,
     bg: BackgroundTasks,
     req: Request,
-    user=Depends(require_auth),
+    user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
 ):
     tid = _resolve_tenant_id(req, x_tenant_id)
@@ -54,7 +75,7 @@ async def post_intake(
 
     # Enqueue full intake pipeline job and also attempt to run it immediately in background
     try:
-        from src.jobs import enqueue_icp_intake_process, run_icp_intake_process
+        # Use module-scoped symbols so tests can monkeypatch ep.enqueue_icp_intake_process
         job = enqueue_icp_intake_process(tid)
 
         async def _run_now():
@@ -89,21 +110,20 @@ async def post_intake(
 @router.get("/suggestions", response_model=List[SuggestionCard])
 async def get_suggestions(
     req: Request,
-    user=Depends(require_auth),
+    user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
 ):
     tid = _resolve_tenant_id(req, x_tenant_id)
     if tid is None:
         raise HTTPException(status_code=400, detail="tenant_id is required")
     items = generate_suggestions(tid)
-    # Optionally add targeting pack
+    # Optionally add targeting pack and negative ICP using module-scoped helpers
     try:
-        from src.icp_intake import build_targeting_pack
         # Derive negative ICP themes from latest intake answers
         neg: Optional[list] = None
         try:
-            from src.icp_intake import _derive_negative_icp_flags
-            with get_conn() as conn, conn.cursor() as cur:
+            with get_conn() as conn:
+                cur = conn.cursor()
                 cur.execute(
                     "SELECT answers_jsonb FROM icp_intake_responses WHERE tenant_id=%s ORDER BY submitted_at DESC LIMIT 1",
                     (tid,),
@@ -127,7 +147,7 @@ async def get_suggestions(
 async def post_accept(
     body: AcceptRequest,
     req: Request,
-    user=Depends(require_auth),
+    user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
 ):
     tid = _resolve_tenant_id(req, x_tenant_id)

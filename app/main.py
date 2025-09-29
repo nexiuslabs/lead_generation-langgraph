@@ -423,6 +423,19 @@ def _collect_industry_terms(messages: list[BaseMessage] | None) -> list[str]:
         return []
     # Use only last human message to avoid assistant prompts
     text = _last_human_text(messages)
+    # If the input looks like a URL or bare domain, do not treat it as industry terms
+    try:
+        t = (text or "").strip()
+        if not t:
+            return []
+        # URL or www.*
+        if re.match(r"^(https?://|www\.)", t, flags=re.IGNORECASE):
+            return []
+        # Bare domain like example.com or sub.example.co.uk
+        if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", t):
+            return []
+    except Exception:
+        pass
     return _extract_industry_terms(text)
 
 
