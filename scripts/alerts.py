@@ -117,6 +117,34 @@ def check_last_run_alerts() -> None:
                 if rate < qa_min_pass:
                     _post(f"⚠️ QA pass rate {rate:.0%} (<{qa_min_pass:.0%}) for tenant {tid} run {run_id}")
 
+        # New: seeds→ACRA mapping success rate and SLA (last 24h)
+        try:
+            min_rate = float(os.getenv("ALERT_SEED_MAPPING_MIN_RATE", "0.80") or 0.80)
+            max_elapsed_ms = int(os.getenv("ALERT_SEED_MAPPING_SLA_MS", "300000") or 300000)
+        except Exception:
+            min_rate = 0.80
+            max_elapsed_ms = 300000
+        cur.execute(
+            """
+            SELECT tenant_id,
+                   AVG(COALESCE((extra->>'rate')::numeric, 0.0)) AS avg_rate,
+                   AVG(COALESCE(duration_ms, 0)) AS avg_ms
+            FROM run_event_logs
+            WHERE stage='icp_intake_mapping' AND event='finish' AND ts >= NOW() - INTERVAL '1 day'
+            GROUP BY tenant_id
+            """
+        )
+        for tid, avg_rate, avg_ms in cur.fetchall() or []:
+            try:
+                r = float(avg_rate or 0.0)
+                m = int(avg_ms or 0)
+            except Exception:
+                r, m = 0.0, 0
+            if r < min_rate:
+                _post(f"⚠️ Seed→ACRA mapping rate {r:.0%} (<{min_rate:.0%}) tenant {tid} (last 24h)")
+            if m > max_elapsed_ms:
+                _post(f"⚠️ Seed→ACRA mapping avg time {m}ms (>{max_elapsed_ms}ms) tenant {tid} (last 24h)")
+
 
 if __name__ == "__main__":
     check_last_run_alerts()

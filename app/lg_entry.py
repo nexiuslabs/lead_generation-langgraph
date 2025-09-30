@@ -94,6 +94,11 @@ def _to_message(msg: dict | BaseMessage) -> BaseMessage:
 def _extract_industry_terms(text: str) -> List[str]:
     if not text:
         return []
+    # Strip URLs to avoid misclassifying them as industry tokens
+    try:
+        text = re.sub(r"https?://\S+", " ", text)
+    except Exception:
+        pass
     chunks = re.split(r"[,\n;:=]+|\band\b|\bor\b|/|\\\\|\|", text, flags=re.IGNORECASE)
     terms: List[str] = []
     # Extract explicit key-value patterns like "industry = technology" or "industries: fintech"
@@ -123,6 +128,13 @@ def _extract_industry_terms(text: str) -> List[str]:
         "b2c",
         "confirm",
         "run enrichment",
+        # chat commands / control phrases
+        "accept micro-icp",
+        "accept micro‑icp",
+        "accept micro icp",
+        "accept a micro-icp",
+        "accept a micro‑icp",
+        "accept a micro icp",
         "industry",
         "industries",
         "sector",
@@ -139,6 +151,10 @@ def _extract_industry_terms(text: str) -> List[str]:
         "small",
         "medium",
         "large",
+        # URL/common web tokens
+        "http",
+        "https",
+        "www",
     }
     for c in chunks:
         s = (c or "").strip()
@@ -146,6 +162,12 @@ def _extract_industry_terms(text: str) -> List[str]:
             continue
         if not re.search(r"[a-zA-Z]", s):
             continue
+        # Skip bare domains (e.g., example.com) — not industries
+        try:
+            if re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", s, flags=re.IGNORECASE):
+                continue
+        except Exception:
+            pass
         # Drop bullets/parentheticals and obvious question fragments
         if s.strip().startswith("-"):
             continue
@@ -491,36 +513,58 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     elif "companies" in data:
         state["candidates"] = data["companies"]
 
-    # Feature 18: Upsert up to 10 synchronously (no enrichment); enqueue remainder for nightly
+    # Feature 18: Upsert up to 10 synchronously and kick off enrichment immediately; enqueue remainder for nightly
     try:
         inds = _collect_industry_terms(state.get("messages"))
         if inds and STAGING_UPSERT_MODE != "off":
+            # Gate staging upsert/enrichment while ICP Finder intake is active to prevent early runs
+            try:
+                from src.settings import ENABLE_ICP_INTAKE as _FINDER_ON  # type: ignore
+            except Exception:
+                _FINDER_ON = False  # type: ignore
+            if _FINDER_ON:
+                # Only proceed if the user explicitly asked to run enrichment
+                txt = " ".join([(m.content or "") for m in norm_msgs if isinstance(m, HumanMessage)])
+                if not re.search(r"\brun enrichment\b", txt, flags=re.IGNORECASE):
+                    logger.info("Deferring staging upsert/enrich while ICP Finder is active; inds=%s", inds)
+                    return state
             head = max(0, int(UPSERT_SYNC_LIMIT))
             if head > 0:
                 try:
-                    # Reuse helper from app.main to perform head upsert only and capture IDs
-                    from app.main import upsert_by_industries_head
+                    # Reuse helper from app.main to perform head upsert and enrichment
+                    from app.main import upsert_by_industries_head, _trigger_enrichment_async
                     ids = upsert_by_industries_head(inds, limit=head)
                     if ids:
                         logger.info(
-                            "Upserted(head=%d) %d companies for industries=%s",
+                            "Upserted+enriching(head=%d) %d companies for industries=%s",
                             head, len(ids), inds,
                         )
                         state["sync_head_company_ids"] = ids
+                        _trigger_enrichment_async(ids)
                 except Exception as e:
-                    logger.info("sync head upsert skipped: %s", e)
+                    logger.info("sync head upsert/enrich skipped: %s", e)
             # Enqueue remainder for nightly processing (best-effort)
             try:
-                from src.jobs import enqueue_staging_upsert
-                # Resolve tenant best-effort; allow None
-                tid = None
-                try:
-                    from app.odoo_connection_info import get_odoo_connection_info
-                    info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
-                    tid = info.get("tenant_id") if isinstance(info, dict) else None
-                except Exception:
+                from src.icp import _find_ssic_codes_by_terms as _resolve_ssic
+                resolved = _resolve_ssic(inds) if inds else []
+                if not resolved:
+                    logger.info(
+                        "Skip enqueue nightly: no SSIC codes resolved for terms=%s",
+                        inds,
+                    )
+                else:
+                    from src.jobs import enqueue_staging_upsert
+                    # Resolve tenant best-effort; allow None
                     tid = None
-                enqueue_staging_upsert(tid, inds)
+                    try:
+                        from app.odoo_connection_info import get_odoo_connection_info
+                        info = asyncio.run(
+                            get_odoo_connection_info(email=None, claim_tid=None)
+                        )
+                        tid = info.get("tenant_id") if isinstance(info, dict) else None
+                    except Exception:
+                        tid = None
+                    enqueue_staging_upsert(tid, inds)
             except Exception as _qe:
                 logger.info("enqueue nightly staging_upsert failed: %s", _qe)
     except Exception as _e:

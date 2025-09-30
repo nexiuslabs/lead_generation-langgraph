@@ -1,0 +1,7 @@
+# Example cron entry: run queued staging_upsert jobs at 01:00 daily
+# Ensure your venv or system Python has project deps installed
+0 1 * * * cd /path/to/lead_generation-main && /usr/bin/env python -m scripts.run_nightly >> /var/log/leadgen-nightly.log 2>&1
+
+# Optional: apply app migrations on deploy/startup
+# @reboot cd /path/to/lead_generation-main && /usr/bin/env python scripts/run_app_migrations.py >> /var/log/leadgen-migrations.log 2>&1
+

@@ -14,8 +14,18 @@ REFRESH_COOKIE = os.getenv("REFRESH_COOKIE_NAME", "nx_refresh")
 
 
 def _cookie_secure() -> bool:
-    val = (os.getenv("COOKIE_SECURE", "true") or "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    """Decide if cookies should be marked secure.
+
+    Default: secure in non-dev; in local_dev default to False so localhost HTTP can receive cookies.
+    Override with COOKIE_SECURE explicitly.
+    """
+    env_val = os.getenv("COOKIE_SECURE")
+    if env_val is not None:
+        val = env_val.strip().lower()
+        return val in ("1", "true", "yes", "on")
+    # No explicit override; infer from runtime variant
+    variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower()
+    return not (variant == "local_dev")
 
 
 def _token_url() -> str:

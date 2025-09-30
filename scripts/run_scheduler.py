@@ -34,6 +34,13 @@ async def main_async():
     async def job():
         try:
             await run_all()
+            # Refresh ICP patterns MV after nightly completes so suggestions stay current
+            try:
+                from src.icp_intake import refresh_icp_patterns as _refresh_icp_patterns
+                await asyncio.to_thread(_refresh_icp_patterns)
+                logging.getLogger("nightly").info("icp_patterns materialized view refreshed")
+            except Exception as exc:
+                logging.getLogger("nightly").warning("icp_patterns refresh failed: %s", exc)
             # After nightly completes, run acceptance checks per tenant and log results
             try:
                 from scripts import acceptance_check as _acc

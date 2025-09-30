@@ -215,3 +215,19 @@ ENRICH_SKIP_IF_ANY_HISTORY = os.getenv("ENRICH_SKIP_IF_ANY_HISTORY", "false").lo
     "yes",
     "on",
 )
+
+# --- Feature 17: ICP Finder flags -------------------------------------------
+# Gate the ICP Finder endpoints and chat flow; default off until enabled.
+ENABLE_ICP_INTAKE = os.getenv("ENABLE_ICP_INTAKE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# When true, keep intake to minimal website + seeds; advanced A–H captured only if volunteered.
+ICP_WIZARD_FAST_START_ONLY = os.getenv("ICP_WIZARD_FAST_START_ONLY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
