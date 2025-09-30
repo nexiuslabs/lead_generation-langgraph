@@ -693,6 +693,20 @@ def normalize_input(payload: dict) -> dict:
                 if re.search(r"\brun enrichment\b", text, flags=re.IGNORECASE):
                     logger.info("ICP Finder override: running enrichment for inds=%s", inds)
                 else:
+                    # Enqueue nightly upsert of the full set while deferring immediate run
+                    try:
+                        from src.jobs import enqueue_staging_upsert
+                        # Resolve tenant best-effort; OK to be None
+                        tid = None
+                        try:
+                            info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
+                            tid = info.get("tenant_id") if isinstance(info, dict) else None
+                        except Exception:
+                            tid = None
+                        enqueue_staging_upsert(tid, inds)
+                        logger.info("Queued nightly staging_upsert for inds=%s (Finder deferral)", inds)
+                    except Exception as _qe:
+                        logger.info("enqueue nightly staging_upsert failed: %s", _qe)
                     logger.info("Deferring staging upsert/enrich while ICP Finder is active; inds=%s", inds)
                     return state
             # Upsert only the first `head` records synchronously (no enrichment yet)

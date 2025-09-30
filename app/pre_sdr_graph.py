@@ -3052,6 +3052,57 @@ async def enrich_node(state: GraphState) -> GraphState:
         enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
     except Exception:
         enrich_now_limit = 10
+    # If we have fewer than the desired head count, try to top up from ACRA by SSIC codes
+    if len(candidates) < enrich_now_limit:
+        try:
+            # Derive SSIC codes from selected suggestions
+            sugg = state.get("micro_icp_suggestions") or []
+            codes: list[str] = []
+            for it in (sugg if isinstance(sugg, list) else []):
+                sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                    code = sid.split(":", 1)[1]
+                    if code and code.strip():
+                        codes.append(code.strip())
+            # Fallback: infer SSIC from ICP industries
+            if not codes and (state.get("icp") or {}).get("industries"):
+                try:
+                    terms = [str(t).strip().lower() for t in (state.get("icp") or {}).get("industries") or [] if str(t).strip()]
+                    matches = _find_ssic_codes_by_terms(terms)
+                    codes = [c for (c, _t, _s) in matches]
+                except Exception:
+                    codes = []
+            if codes:
+                # Fetch ACRA rows and ensure company rows to top up count
+                try:
+                    rows = await asyncio.to_thread(_select_acra_by_ssic_codes, set(codes), enrich_now_limit * 3)
+                except Exception:
+                    rows = []
+                if rows:
+                    pool = await get_pg_pool()
+                    needed = enrich_now_limit - len(candidates)
+                    added: list[dict] = []
+                    have_ids = {c.get("id") for c in candidates if isinstance(c, dict)}
+                    for r in rows:
+                        if needed <= 0:
+                            break
+                        nm = (r.get("entity_name") or "").strip()
+                        if not nm:
+                            continue
+                        try:
+                            cid = await _ensure_company_row(pool, nm)
+                            if cid in have_ids:
+                                continue
+                            added.append({"id": cid, "name": nm, "uen": (r.get("uen") or "").strip() or None})
+                            have_ids.add(cid)
+                            needed -= 1
+                        except Exception:
+                            continue
+                    if added:
+                        candidates = (state.get("candidates") or []) + added
+                        state["candidates"] = candidates
+        except Exception:
+            pass
     if len(candidates) > enrich_now_limit:
         candidates = candidates[:enrich_now_limit]
         state["candidates"] = candidates
@@ -3181,6 +3232,87 @@ async def enrich_node(state: GraphState) -> GraphState:
                 await lead_scoring_agent.ainvoke(scoring_initial_state)
                 # Immediately render scores into chat for better UX
                 state = await score_node(state)
+
+                # Nightly remainder scheduling: enqueue staging_upsert for the accepted micro‑ICP (or derived SSIC)
+                try:
+                    # Compute remainder based on ACRA/ICP totals vs run-now count
+                    run_now_count = len(results)
+                    # Prefer previously measured ACRA total
+                    total_candidates = int(state.get("acra_total_suggested") or state.get("icp_match_total") or 0)
+                    remainder = max(total_candidates - run_now_count, 0) if total_candidates else 0
+                except Exception:
+                    remainder = 0
+
+                # Enqueue when there is any clear targeting (titles/codes), even if remainder computed as 0
+                # because ACRA_total might be unknown at runtime. Guard duplicate enqueues with a state flag.
+                if not state.get("nightly_enqueued"):
+                    # Derive SSIC titles from selected micro‑ICP suggestion if present; else from dominant evidence
+                    titles: list[str] = []
+                    codes: list[str] = []
+                    try:
+                        sugg = state.get("micro_icp_suggestions") or []
+                        for it in (sugg if isinstance(sugg, list) else []):
+                            sid = (it.get("id") or "") if isinstance(it, dict) else ""
+                            if isinstance(sid, str) and sid.lower().startswith("ssic:"):
+                                code = sid.split(":", 1)[1]
+                                if code and code.strip():
+                                    codes.append(code.strip())
+                        if codes:
+                            with get_conn() as _c:
+                                cur = _c.cursor()
+                                cur.execute(
+                                    "SELECT title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                                    (codes,),
+                                )
+                                titles = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+                        # If we still have no titles, fall back to top SSIC from evidence
+                        if not titles:
+                            with get_conn() as _c:
+                                cur = _c.cursor()
+                                cur.execute(
+                                    """
+                                    SELECT s.title
+                                    FROM icp_evidence e
+                                    JOIN ssic_ref s
+                                      ON regexp_replace(s.code::text,'\D','','g') = regexp_replace((e.value->>'ssic')::text,'\D','','g')
+                                    WHERE e.signal_key='ssic'
+                                    GROUP BY s.title
+                                    ORDER BY COUNT(*) DESC
+                                    LIMIT 3
+                                    """
+                                )
+                                titles = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+                        # If still empty, attempt to resolve SSIC by ICP industries terms
+                        if not titles and (state.get("icp") or {}).get("industries"):
+                            try:
+                                terms = [str(t).strip().lower() for t in (state.get("icp") or {}).get("industries") or [] if str(t).strip()]
+                                matches = _find_ssic_codes_by_terms(terms)
+                                codes = [c for (c, _t, _s) in matches]
+                                if codes:
+                                    with get_conn() as _c:
+                                        cur = _c.cursor()
+                                        cur.execute(
+                                            "SELECT title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                                            (codes,),
+                                        )
+                                        titles = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+                            except Exception:
+                                pass
+                    except Exception:
+                        titles = []
+
+                    # Enqueue when we have any titles/codes or a positive remainder
+                    if titles or codes or remainder > 0:
+                        try:
+                            # Resolve tenant and enqueue a single staging_upsert job for the SSIC titles
+                            tid = await _resolve_tenant_id_for_write(state)
+                            from src.jobs import enqueue_staging_upsert
+                            upsert_terms = titles if titles else [f"SSIC {c}" for c in codes]
+                            enqueue_staging_upsert(int(tid) if isinstance(tid, int) else None, upsert_terms)
+                            state["nightly_enqueued"] = True
+                            logger.info("nightly remainder queued: titles/codes=%s remainder=%s", upsert_terms, remainder)
+                        except Exception as _qexc:
+                            logger.warning("nightly remainder enqueue failed: %s", _qexc)
 
                 # Best-effort Odoo sync for completed companies (skip ones we skipped enriching)
                 try:

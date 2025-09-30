@@ -165,7 +165,61 @@ async def post_accept(
     if not payload:
         raise HTTPException(status_code=400, detail="Invalid accept payload")
     _save_icp_rule(tid, payload, name=name)
-    return {"ok": True}
+
+    # Enrich a small head now, and enqueue remainder for nightly
+    try:
+        # Resolve SSIC codes and human titles
+        ssic_codes: list[str] = []
+        titles: list[str] = []
+        if payload.get("ssic_codes"):
+            ssic_codes = [str(c).strip() for c in payload.get("ssic_codes") or [] if str(c).strip()]
+            # Lookup titles for those codes
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                    (ssic_codes,),
+                )
+                titles = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+        # Immediate head upsert + enrich
+        head = 10
+        try:
+            import os as _os
+            head = int(_os.getenv("RUN_NOW_LIMIT", "10") or 10)
+        except Exception:
+            head = 10
+        try:
+            from app.main import upsert_by_industries_head as _upsert_head  # uses staging by SSIC via resolver
+            from app.main import _trigger_enrichment_async as _enrich_async
+            inds = titles if titles else [f"SSIC {c}" for c in ssic_codes]
+            if inds:
+                ids = _upsert_head(inds, limit=head)
+                if ids:
+                    _enrich_async(ids)
+        except Exception:
+            pass
+        # Enqueue remainder for nightly (staging upsert → enrich)
+        try:
+            from src.jobs import enqueue_staging_upsert as _enqueue_upsert
+            if titles:
+                _enqueue_upsert(tid, titles)
+            elif ssic_codes:
+                # Fallback: resolve titles from codes and enqueue
+                with get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT DISTINCT title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = ANY(%s::text[])",
+                        (ssic_codes,),
+                    )
+                    trows = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+                if trows:
+                    _enqueue_upsert(tid, trows)
+        except Exception:
+            pass
+    except Exception:
+        # Non-blocking: acceptance persists even if scheduling fails
+        pass
+    return {"ok": True, "scheduled": True, "run_now": min(head, len(ssic_codes) if ssic_codes else head)}
 
 
 @router.get("/patterns")
