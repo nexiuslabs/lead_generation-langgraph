@@ -70,6 +70,9 @@ class RobotsCache:
 
 ROBOTS = RobotsCache()
 
+# Allow disabling robots.txt gate for ICP process via env (default: disabled per request)
+IGNORE_ROBOTS = str(os.getenv("CRAWLER_IGNORE_ROBOTS", "1")).lower() in ("1", "true", "yes", "on")
+
 
 def _extract_emails(text: str) -> List[str]:
     return sorted(
@@ -340,18 +343,23 @@ def _rule_score(signals: Dict[str, Any], derived: Dict[str, Any]) -> Dict[str, A
 async def crawl_site(url: str, max_pages: int = MAX_PAGES) -> Dict[str, Any]:
     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
     async with httpx.AsyncClient() as client:
-        if not await ROBOTS.allowed(client, url):
-            raise RuntimeError("Blocked by robots.txt")
+        # Robots.txt bypass for ICP crawling when enabled
+        if not IGNORE_ROBOTS:
+            if not await ROBOTS.allowed(client, url):
+                raise RuntimeError("Blocked by robots.txt")
         _, html = await _fetch(client, url)
         signals = _extract_signals(html, base)
         links = _discover_links(html, base)[: max_pages - 1]
         allowed = []
-        for u in links:
-            try:
-                if await ROBOTS.allowed(client, u):
-                    allowed.append(u)
-            except Exception:
-                continue
+        if IGNORE_ROBOTS:
+            allowed = list(links)
+        else:
+            for u in links:
+                try:
+                    if await ROBOTS.allowed(client, u):
+                        allowed.append(u)
+                except Exception:
+                    continue
         # Respect basic rate limiting between internal page fetches as a floor
         pages: List[Tuple[str, str]] = []
         for u in allowed:

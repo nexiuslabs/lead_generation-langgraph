@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Header, Request
+import asyncio
+import os
 from typing import Optional, List, Dict, Any
 from psycopg2.extras import Json
 
 # Import the dependency and helpers at module scope so tests can monkeypatch ep.* symbols
 from app.auth import require_auth  # noqa: F401  # exposed for monkeypatching in tests
 from schemas.icp import IntakePayload, SuggestionCard, AcceptRequest
+from schemas.research import ResearchImportRequest, ResearchImportResult
 from src.database import get_conn
 from src.icp_intake import (
     save_icp_intake,
@@ -220,6 +223,30 @@ async def post_accept(
         # Non-blocking: acceptance persists even if scheduling fails
         pass
     return {"ok": True, "scheduled": True, "run_now": min(head, len(ssic_codes) if ssic_codes else head)}
+
+
+@router.post("/research/import", response_model=ResearchImportResult)
+async def post_research_import(
+    body: ResearchImportRequest,
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    if int(body.tenant_id) != int(tid):
+        raise HTTPException(status_code=403, detail="tenant mismatch")
+    # Only allow server-side scanning by path for now
+    root = body.root or os.getenv("DOCS_ROOT") or "./docs"
+    try:
+        from src.research_import import import_docs_for_tenant
+
+        result = await asyncio.to_thread(import_docs_for_tenant, tid, root)
+        # Coerce to schema
+        return ResearchImportResult(**result)
+    except Exception as e:  # noqa: F841
+        raise HTTPException(status_code=500, detail="import failed")
 
 
 @router.get("/patterns")

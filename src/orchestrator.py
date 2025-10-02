@@ -15,6 +15,20 @@ from src.enrichment import enrich_company_with_tavily
 import psycopg2
 import json
 from src.settings import POSTGRES_DSN
+from typing import Dict, Any, List
+
+def agent_discovery_domains(icp_profile: Dict[str, Any]) -> List[str]:
+    """Use LLM agents to plan discovery queries and return candidate domains.
+
+    Safe helper that falls back to an empty list if agents are unavailable.
+    """
+    try:
+        from src.agents_icp import discovery_planner as _agent_plan  # type: ignore
+        st = {"icp_profile": icp_profile or {}}
+        out = _agent_plan(st)
+        return list(out.get("discovery_candidates") or [])
+    except Exception:
+        return []
 
 def fetch_companies(company_ids):
     conn = psycopg2.connect(dsn=POSTGRES_DSN)

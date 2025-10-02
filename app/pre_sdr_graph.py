@@ -58,6 +58,17 @@ except Exception:  # pragma: no cover
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
 try:
+    from src.settings import ENABLE_AGENT_DISCOVERY  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_AGENT_DISCOVERY = False  # type: ignore
+try:
+    # Optional LLM agents (PRD19 §6)
+    from src.agents_icp import icp_synthesizer as _agent_icp_synth  # type: ignore
+    from src.agents_icp import discovery_planner as _agent_plan_discovery  # type: ignore
+except Exception:  # pragma: no cover
+    _agent_icp_synth = None  # type: ignore
+    _agent_plan_discovery = None  # type: ignore
+try:
     from src.settings import ENABLE_ICP_INTAKE  # type: ignore
 except Exception:  # pragma: no cover
     ENABLE_ICP_INTAKE = False  # type: ignore
@@ -65,6 +76,15 @@ try:
     from src.settings import ICP_WIZARD_FAST_START_ONLY  # type: ignore
 except Exception:  # pragma: no cover
     ICP_WIZARD_FAST_START_ONLY = True  # type: ignore
+try:
+    from src.settings import ENABLE_ACRA_IN_CHAT  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_ACRA_IN_CHAT = False  # type: ignore
+try:
+    # Lead‑gen conversational Q&A helpers
+    from src.conversation_agent import answer_leadgen_question as _qa_answer  # type: ignore
+except Exception:  # pragma: no cover
+    _qa_answer = None  # type: ignore
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -520,40 +540,46 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
                             )
                     )
                     return state
+            # Optionally run LLM ICP synthesizer to augment inferred profile
+            try:
+                if ENABLE_AGENT_DISCOVERY and _agent_icp_synth is not None:
+                    s = {
+                        "icp_profile": dict(state.get("icp") or {}),
+                        "seeds": [{"url": u, "snippet": ""} for u in (icp.get("seeds_list") or [])],
+                    }
+                    icp_prof = _agent_icp_synth(s).get("icp_profile")
+                    if icp_prof:
+                        state["icp_profile"] = icp_prof
+                        # Inform the user in chat once the AI agents have synthesized the ICP
+                        try:
+                            ind = ", ".join((icp_prof.get("industries") or [])[:3]) or "n/a"
+                            titles = ", ".join((icp_prof.get("buyer_titles") or [])[:3]) or "n/a"
+                            sizes = ", ".join((icp_prof.get("size_bands") or [])[:3]) or "n/a"
+                            sigs = ", ".join((icp_prof.get("integrations") or [])[:3]) or "n/a"
+                            trig = ", ".join((icp_prof.get("triggers") or [])[:3]) or "n/a"
+                            lines = [
+                                "ICP profile ready.",
+                                f"- Industries: {ind}",
+                                f"- Buyer titles: {titles}",
+                                f"- Size bands: {sizes}",
+                                f"- Integrations/signals: {sigs}",
+                                f"- Triggers: {trig}",
+                                "Reply confirm to proceed or edit any field.",
+                            ]
+                            state["messages"].append(AIMessage("\n".join(lines)))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             # Ready to confirm
             state["messages"].append(
                 AIMessage(
-                    "Thanks! I’ll crawl your site + seed sites, map to ACRA/SSIC, and propose micro‑ICPs with evidence. Reply confirm to proceed, or add more seeds."
+                    "Thanks! I’ll crawl your site + seed sites, plan web discovery, and propose a Top‑10 with evidence. ACRA is only used later in the nightly SG pass. Reply confirm to proceed, or add more seeds."
                 )
             )
             return state
     except Exception:
         pass
-
-    # Legacy prompts only when Finder is disabled
-    if not ENABLE_ICP_INTAKE:
-        if "industry" not in icp:
-            state["messages"].append(
-                AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)")
-            )
-            icp["industry"] = True
-            return state
-        if "employees" not in icp:
-            state["messages"].append(
-                AIMessage("Typical company size? (e.g., 10–200 employees)")
-            )
-            icp["employees"] = True
-            return state
-        if "geo" not in icp:
-            state["messages"].append(AIMessage("Primary geographies? (SG, SEA, global)"))
-            icp["geo"] = True
-            return state
-        if "signals" not in icp:
-            state["messages"].append(
-                AIMessage("Buying signals? (hiring, stack, certifications)")
-            )
-            icp["signals"] = True
-            return state
 
     state["messages"].append(
         AIMessage("Great. Reply **confirm** to save, or tell me what to change.")
@@ -657,47 +683,99 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
     except Exception:
         icp_total = n
 
+    # Optionally plan agent-driven discovery candidates for preview (non-blocking)
+    try:
+        if ENABLE_AGENT_DISCOVERY and _agent_plan_discovery is not None:
+            s = {"icp_profile": state.get("icp_profile") or {}}
+            acand = _agent_plan_discovery(s).get("discovery_candidates") or []
+            if acand:
+                state["agent_candidates"] = acand
+    except Exception:
+        pass
     msg_lines: list[str] = []
     msg_lines.append(f"Got {n} companies.")
 
-    # SSIC resolution and ACRA totals
-    ssic_matches = []
+    # Web discovery Top‑10 (agent-driven) — present to the user; move ACRA to nightly
     try:
-        if terms:
-            ssic_matches = _find_ssic_codes_by_terms(terms)
-            if ssic_matches:
-                top_code, top_title, _ = ssic_matches[0]
-                msg_lines.append(f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)")
-            else:
-                msg_lines.append("Matched 0 SSIC codes")
-            # ACRA total and sample
-            codes = {c for (c, _t, _s) in ssic_matches}
-            total_acra = 0
-            rows = []
-            try:
-                if _count_acra_by_ssic_codes:
-                    total_acra = _count_acra_by_ssic_codes(codes)  # type: ignore[arg-type]
-                rows = _select_acra_by_ssic_codes(codes, 10)
-            except Exception:
-                total_acra = 0
-                rows = []
-            if total_acra:
-                msg_lines.append(f"Found {total_acra} ACRA candidates. Sample:")
+        web_cand = state.get("agent_candidates") or []
+        if isinstance(web_cand, list) and web_cand:
+            msg_lines.append(f"Planned web discovery: found {len(web_cand)} candidate domains.")
+            show = web_cand[:10]
+            for i, dom in enumerate(show, 1):
                 try:
-                    # Persist for later nightly planning across nodes
-                    state["acra_total_suggested"] = int(total_acra)
+                    d = dom if isinstance(dom, str) else str(dom)
+                    msg_lines.append(f"{i}) {d}")
                 except Exception:
-                    pass
-                for r in rows[:2]:
-                    uen = (r.get("uen") or "").strip()
-                    nm = (r.get("entity_name") or "").strip()
-                    code = (r.get("primary_ssic_code") or "").strip()
-                    status = (r.get("entity_status_description") or "").strip()
-                    msg_lines.append(f"UEN: {uen} – {nm} – SSIC {code} – status: {status}")
-            else:
-                msg_lines.append("Found 0 ACRA candidates.")
+                    continue
+            msg_lines.append("I’ll use these to extract evidence and score fit.")
     except Exception:
-        # Non-blocking
+        pass
+
+    # Compute and display Top‑10 with "why" lines
+    try:
+        if ENABLE_AGENT_DISCOVERY:
+            try:
+                from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+            except Exception:
+                _agent_top10 = None  # type: ignore
+            if _agent_top10 is not None:
+                top = _agent_top10(state.get("icp_profile") or {}, state.get("tenant_id"))
+                if top:
+                    state["agent_top10"] = top
+                    msg_lines.append("Top‑10 lookalikes (with why):")
+                    for i, row in enumerate(top, 1):
+                        dom = row.get("domain")
+                        why = row.get("why") or "signal match"
+                        score = int(row.get("score") or 0)
+                        snip = row.get("snippet") or ""
+                        try:
+                            snip = (" ".join((snip or "").split()))[:160]
+                        except Exception:
+                            snip = ""
+                        if snip:
+                            msg_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                        else:
+                            msg_lines.append(f"{i}) {dom} — {why} (score {score})")
+                    # Before showing ICP, enrich from r.jina+ddg if sparse
+                    try:
+                        from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
+                        try:
+                            out = _icp_enrich({"icp_profile": state.get("icp_profile") or {}})
+                            if isinstance(out.get("icp_profile"), dict):
+                                state["icp_profile"] = out.get("icp_profile")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    # After showing results, show a detailed ICP Profile summary for the user
+                    try:
+                        icp_prof = state.get("icp_profile") or {}
+                        inds = (icp_prof.get("industries") or [])
+                        titles_l = (icp_prof.get("buyer_titles") or [])
+                        sizes_l = (icp_prof.get("size_bands") or [])
+                        ints = (icp_prof.get("integrations") or [])
+                        trigs = (icp_prof.get("triggers") or [])
+                        msg_lines.append("ICP Profile")
+                        if inds:
+                            msg_lines.append("- Industries we’ll target: " + ", ".join(inds[:6]))
+                        else:
+                            msg_lines.append("- Industries we’ll target: n/a (will refine during discovery)")
+                        if titles_l:
+                            msg_lines.append("- Typical buyer titles: " + ", ".join(titles_l[:6]))
+                        else:
+                            msg_lines.append("- Typical buyer titles: n/a (will refine from site evidence)")
+                        if sizes_l:
+                            msg_lines.append("- Company sizes we’ll prioritize: " + ", ".join(sizes_l[:6]))
+                        else:
+                            msg_lines.append("- Company sizes we’ll prioritize: n/a")
+                        sigs_arr = ints + trigs
+                        if sigs_arr:
+                            msg_lines.append("- Key signals from target sites: " + ", ".join(sigs_arr[:8]))
+                        else:
+                            msg_lines.append("- Key signals from target sites: n/a (pricing/case studies/careers/integrations cues)")
+                    except Exception:
+                        msg_lines.append("ICP Profile")
+    except Exception:
         pass
 
     # Planned enrichment counts
@@ -1699,6 +1777,11 @@ def _extract_icp_industries_from_text(text: str) -> list[str]:
 
 
 async def icp_node(state: GraphState) -> GraphState:
+    # Mark that we are in the ICP intake flow so router can keep sending user replies here
+    try:
+        state["icp_in_progress"] = True
+    except Exception:
+        pass
     # If the user already confirmed but ICP is incomplete, proactively ask the next question
     # to avoid router loops where the last message remains the user's "confirm".
     if _user_just_confirmed(state):
@@ -1826,7 +1909,7 @@ async def icp_node(state: GraphState) -> GraphState:
                             state["icp_last_focus"] = "seeds"
                             state["messages"] = add_messages(
                                 state.get("messages") or [],
-                                [AIMessage(f"I need at least 5 best customers. You shared {len(seeds)}; please add a few more (Company — website).")],
+                                [AIMessage(f"That doesn’t quite answer my question yet — I need at least 5 best customers. You shared {len(seeds)}; please add a few more (format: Company — website).")],
                             )
                             state["icp"] = icp_f
                             return state
@@ -1834,22 +1917,33 @@ async def icp_node(state: GraphState) -> GraphState:
                         state["icp_last_focus"] = "seeds"
                         state["messages"] = add_messages(
                             state.get("messages") or [],
-                            [AIMessage("Got it. Please list seeds as 'Company — domain' per line.")],
+                            [AIMessage("That doesn’t seem to answer my question about best customers. Please list seeds as 'Company — domain' per line, one per line. Thanks!")],
                         )
                         state["icp"] = icp_f
                         return state
-            # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation
-            if ICP_WIZARD_FAST_START_ONLY and not icp_f.get("fast_start_explained"):
-                expl = [
-                    "I will infer industries from evidence instead of asking.",
-                    "What I will crawl:",
-                    "- Your site: Industries served, Customers/Case Studies, Integrations, Pricing (ACV hints), Careers (buyer/team clues), Partners, blog topics.",
-                    "- Seed and anti-customer sites: industry labels, product lines, About text, Careers (roles/scale), Integrations pages, locations.",
-                    "I'll map seeds → SSIC codes via ssic_ref → ACRA (primary_ssic_code) to learn which SSICs and bands dominate winners.",
-                ]
-                state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
-                icp_f["fast_start_explained"] = True
+            # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation immediately
+            if ICP_WIZARD_FAST_START_ONLY:
+                if not icp_f.get("fast_start_explained"):
+                    expl = [
+                        "I will infer industries from evidence instead of asking.",
+                        "What I will crawl:",
+                        "- Your site: Industries served, Customers/Case Studies, Integrations, Pricing (ACV hints), Careers (buyer/team clues), Partners, blog topics.",
+                        "- Seed and anti-customer sites: industry labels, product lines, About text, Careers (roles/scale), Integrations pages, locations.",
+                        "Then I’ll run web discovery to propose a Top‑10 lookalikes list with evidence. ACRA is only used later in the nightly SG pass.",
+                    ]
+                    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
+                    icp_f["fast_start_explained"] = True
+                # Go straight to confirmation prompt
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [
+                        AIMessage(
+                            "Thanks! I’ll crawl your site + seed sites, run web discovery, extract evidence, and propose a Top‑10 with why‑us fit. ACRA is used later during the SG nightly pass. Reply confirm to proceed, or adjust any detail."
+                        )
+                    ],
+                )
                 state["icp"] = icp_f
+                return state
 
             # Collect core ICP points before confirmation: industries -> employees -> geos -> (optional) signals
             # 1) Industries (skip when fast-start is enabled; we infer from evidence)
@@ -2138,100 +2232,19 @@ async def icp_node(state: GraphState) -> GraphState:
                 state.get("messages") or [],
                 [
                     AIMessage(
-                        "Thanks! I’ll crawl your site + seed sites, map to ACRA/SSIC, enrich evidence, mine patterns, and propose micro‑ICPs. Reply confirm to proceed, or adjust any detail."
+                        "Thanks! I’ll crawl your site + seed sites, run web discovery, extract evidence, and propose a Top‑10 with why‑us fit. ACRA is used later during the SG nightly pass. Reply confirm to proceed, or adjust any detail."
                     )
                 ],
             )
             state["icp"] = icp_f
             return state
     except Exception:
-        # Non-blocking: fall through to legacy questions if anything goes wrong
-        pass
-
-    # Legacy Q&A path (industries, size, geos, signals)
-    # 1) Extract structured update
-    update = await extract_update_from_text(text)
-
-    icp = dict(state.get("icp") or {})
-
-    # 2) Merge extractor output into ICP (prefer precise phrases from user text)
-    if True:
-        human_terms = _extract_icp_industries_from_text(text)
-        llm_terms = [s.strip() for s in (update.industries or []) if s and s.strip()]
-        merged: list[str] = []
-        # human phrases first, preserve order
-        for t in human_terms:
-            if t not in merged:
-                merged.append(t)
-        # then LLM terms if new (case-insensitive dedupe)
-        low = {t.lower(): t for t in merged}
-        for t in llm_terms:
-            tl = t.lower()
-            if tl not in low:
-                merged.append(t)
-                low[tl] = t
-        # Prefer multiword phrases: drop single-word generics contained in multiwords
-        multi = [t for t in merged if " " in t]
-        if multi:
-            singles = {t for t in merged if " " not in t}
-            singles = {s for s in singles if any(s.lower() in m.split() for m in multi)}
-            merged = [t for t in merged if not (" " not in t and t in singles)]
-        if merged:
-            icp["industries"] = merged
-    if update.employees_min is not None:
-        icp["employees_min"] = update.employees_min
-    if update.employees_max is not None:
-        icp["employees_max"] = update.employees_max
-    # New: revenue_bucket and incorporation year
-    if getattr(update, "revenue_bucket", None):
-        # normalize to lowercase canonical values if possible
-        rb = (update.revenue_bucket or "").strip().lower()
-        if rb in ("small", "medium", "large"):
-            icp["revenue_bucket"] = rb
-    if getattr(update, "year_min", None) is not None:
-        icp["year_min"] = update.year_min
-    if getattr(update, "year_max", None) is not None:
-        icp["year_max"] = update.year_max
-    if update.geos:
-        icp["geos"] = sorted(set([s.strip() for s in update.geos if s.strip()]))
-    if update.signals:
-        icp["signals"] = sorted(set([s.strip() for s in update.signals if s.strip()]))
-
-    # 3) Treat explicit “none/skip/any” as signals_done
-    if _says_none(text) or getattr(update, "signals_done", False):
-        icp["signals"] = []
-        icp["signals_done"] = True
-
-    new_msgs: List[BaseMessage] = []
-
-    # If user pasted companies, preserve previous behavior
-    if update.pasted_companies:
-        state["candidates"] = [{"name": n} for n in update.pasted_companies]
-        new_msgs.append(
-            AIMessage(
-                content=f"Got {len(update.pasted_companies)} companies. Type **run enrichment** to start."
-            )
+        # Non-blocking: simplify to confirmation to keep PRD19 minimal flow
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage("Great. Reply **confirm** to save, or tell me what to change.")],
         )
-
-    # 4) Back-off: if we already asked about 'signals' once and still don't have them, stop asking
-    ask_counts = dict(state.get("ask_counts") or {})
-    q, focus = next_icp_question(icp)
-    if (
-        focus == "signals"
-        and ask_counts.get("signals", 0) >= 1
-        and not icp.get("signals")
-    ):
-        icp["signals_done"] = True
-        q, focus = next_icp_question(icp)
-
-    ask_counts[focus] = ask_counts.get(focus, 0) + 1
-    state["ask_counts"] = ask_counts
-
-    new_msgs.append(AIMessage(content=q))
-
-    state["icp"] = icp
-    state["messages"] = add_messages(state.get("messages") or [], new_msgs)
-    return state
+        return state
 
 
 async def candidates_node(state: GraphState) -> GraphState:
@@ -2473,6 +2486,11 @@ async def candidates_node(state: GraphState) -> GraphState:
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
     logger.info("[confirm] Entered confirm_node")
+    try:
+        from src.settings import ENABLE_AGENT_DISCOVERY as _ead  # type: ignore
+        logger.info("[confirm] ENABLE_AGENT_DISCOVERY=%s", _ead)
+    except Exception:
+        logger.info("[confirm] ENABLE_AGENT_DISCOVERY unavailable (default False)")
     # Persist ICP captured in the dynamic graph flow
     try:
         icp = dict(state.get("icp") or {})
@@ -2538,29 +2556,35 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     facts = []
                                     ff = c.fast_facts or {}
                                     if ff.get("industry_guess"):
-                                        facts.append(f"industry={ff.get('industry_guess')}")
+                                        facts.append(f"Industry: {ff.get('industry_guess')}")
                                     if ff.get("size_band_guess"):
-                                        facts.append(f"size={ff.get('size_band_guess')}")
+                                        facts.append(f"Size: {ff.get('size_band_guess')}")
                                     if ff.get("geo_guess"):
-                                        facts.append(f"geo={ff.get('geo_guess')}")
+                                        facts.append(f"Geo: {ff.get('geo_guess')}")
                                     buyers = ", ".join(ff.get("buyer_titles") or [])
                                     if buyers:
-                                        facts.append(f"buyers={buyers}")
+                                        facts.append(f"Buyers: {buyers}")
                                     integ = ", ".join(ff.get("integrations_mentions") or [])
                                     if integ:
-                                        facts.append(f"integrations={integ}")
-                                    fact_str = f" ({'; '.join(facts)})" if facts else ""
-                                    lines.append(f"{i}) {c.seed_name} → {c.domain} [{c.confidence}] — {c.why}{fact_str}")
+                                        facts.append(f"Integrations: {integ}")
+                                    fact_str = f" — {'; '.join(facts)}" if facts else ""
+                                    lines.append(
+                                        f"{i}) Seed: {c.seed_name} — Domain: {c.domain} — Confidence: {c.confidence} — Reason: {c.why}{fact_str}"
+                                    )
                                     if (c.confidence or "").lower() == "low":
                                         low_conf += 1
                                 if low_conf:
                                     lines.append(f"{low_conf} low‑confidence matches. Reply with edits if any domain looks off.")
-                        state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+                        # Do not show resolver results in chat; log instead
+                        try:
+                            logger.info("[confirm] Resolver preview (suppressed in chat):\n%s", "\n".join(lines))
+                        except Exception:
+                            pass
                         chips.append("Domain resolve ✓")
                     except Exception:
                         pass
 
-                    # Evidence collection (Step 4) and ACRA anchoring (Step 5) — best‑effort batch
+                    # Evidence collection (Step 4) — best‑effort batch (ACRA anchoring disabled by default per PRD19)
                     try:
                         ev_count = 0
                         acra_count = 0
@@ -2578,8 +2602,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                         except Exception:
                             pass
                         async def _collect_for_seed(s: dict):
-                            """Collect crawl evidence and ACRA SSIC anchoring for each seed.
-                            Do BOTH when possible so we still get SSIC evidence even if crawl yields 0.
+                            """Collect crawl evidence for each seed; ACRA anchoring only when enabled.
                             Returns tuple: (evidence_rows_added, acra_rows_added)
                             """
                             name = (s.get("seed_name") or "").strip()
@@ -2594,8 +2617,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     ev_added += int(n or 0)
                                 except Exception:
                                     pass
-                            # Always attempt ACRA anchoring from seed name as well
-                            if _icp_acra_anchor_seed and name:
+                            # Optional: ACRA anchoring from seed name
+                            if ENABLE_ACRA_IN_CHAT and _icp_acra_anchor_seed and name:
                                 try:
                                     acra = await asyncio.to_thread(_icp_acra_anchor_seed, tid, name, None)
                                     logger.info(
@@ -2616,13 +2639,107 @@ async def confirm_node(state: GraphState) -> GraphState:
                         logger.info("[confirm] Evidence total=%s ACRA total=%s", ev_count, acra_count)
                         if seeds_list:
                             chips.append("Evidence ✓")
-                            chips.append("ACRA ✓")
+                            if ENABLE_ACRA_IN_CHAT and acra_count:
+                                chips.append("ACRA ✓")
                     except Exception:
                         pass
 
-                    # Pattern mining + Micro‑ICPs (Step 6–8)
+                    # Agent-driven discovery Top-10 with "why" + Jina snippets (PRD19)
                     try:
-                        if _icp_winner_profile and _icp_micro_suggestions:
+                        if ENABLE_AGENT_DISCOVERY:
+                            logger.info("[confirm] Agent discovery enabled — importing agents_icp")
+                            try:
+                                from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+                                from src.agents_icp import icp_synthesizer as _agent_synth  # type: ignore
+                                logger.info("[confirm] agents_icp import ok")
+                            except Exception as e:
+                                logger.warning("[confirm] agents_icp import failed: %s", e)
+                                _agent_top10 = None  # type: ignore
+                                _agent_synth = None  # type: ignore
+                            if _agent_top10 is not None:
+                                icp_prof = state.get("icp_profile") or {}
+                                # If empty, synthesize from seeds quickly
+                                if not icp_prof and _agent_synth is not None:
+                                    try:
+                                        seeds_ev = [{"url": s.get("domain"), "snippet": s.get("seed_name")} for s in (icp.get("seeds_list") or [])]
+                                        sstate = {"icp_profile": {}, "seeds": seeds_ev}
+                                        logger.info("[confirm] invoking icp_synthesizer on %d seeds", len(seeds_ev))
+                                        out = await asyncio.to_thread(_agent_synth, sstate)
+                                        icp_prof = out.get("icp_profile") or {}
+                                        state["icp_profile"] = icp_prof
+                                    except Exception as e:
+                                        logger.warning("[confirm] icp_synthesizer failed: %s", e)
+                                        icp_prof = {}
+                                # Best-effort tenant id
+                                tnet = None
+                                try:
+                                    tnet = int(tid) if tid is not None else None
+                                except Exception:
+                                    tnet = None
+                                logger.info("[confirm] invoking plan_top10_with_reasons; have_icp=%s", bool(icp_prof))
+                                top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
+                                logger.info("[confirm] agent top10 count=%d", len(top or []))
+                                if top:
+                                    lines = ["Top‑10 lookalikes (with why):"]
+                                    for i, row in enumerate(top, 1):
+                                        dom = row.get("domain")
+                                        why = row.get("why") or "signal match"
+                                        score = int(row.get("score") or 0)
+                                        snip = row.get("snippet") or ""
+                                        try:
+                                            snip = (" ".join((snip or "").split()))[:160]
+                                        except Exception:
+                                            snip = ""
+                                        if snip:
+                                            lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                                        else:
+                                            lines.append(f"{i}) {dom} — {why} (score {score})")
+                                    # Enrich ICP from r.jina+ddg if sparse, then show a detailed profile summary
+                                    try:
+                                        from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
+                                        try:
+                                            out = _icp_enrich({"icp_profile": state.get("icp_profile") or {}})
+                                            if isinstance(out.get("icp_profile"), dict):
+                                                state["icp_profile"] = out.get("icp_profile")
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    try:
+                                        icp_prof = state.get("icp_profile") or {}
+                                        inds = (icp_prof.get("industries") or [])
+                                        titles_l = (icp_prof.get("buyer_titles") or [])
+                                        sizes_l = (icp_prof.get("size_bands") or [])
+                                        ints = (icp_prof.get("integrations") or [])
+                                        trigs = (icp_prof.get("triggers") or [])
+                                        lines.append("ICP Profile")
+                                        if inds:
+                                            lines.append("- Industries we’ll target: " + ", ".join(inds[:6]))
+                                        else:
+                                            lines.append("- Industries we’ll target: n/a (will refine during discovery)")
+                                        if titles_l:
+                                            lines.append("- Typical buyer titles: " + ", ".join(titles_l[:6]))
+                                        else:
+                                            lines.append("- Typical buyer titles: n/a (will refine from site evidence)")
+                                        if sizes_l:
+                                            lines.append("- Company sizes we’ll prioritize: " + ", ".join(sizes_l[:6]))
+                                        else:
+                                            lines.append("- Company sizes we’ll prioritize: n/a")
+                                        sigs_arr = ints + trigs
+                                        if sigs_arr:
+                                            lines.append("- Key signals from target sites: " + ", ".join(sigs_arr[:8]))
+                                        else:
+                                            lines.append("- Key signals from target sites: n/a (pricing/case studies/careers/integrations cues)")
+                                    except Exception:
+                                        lines.append("ICP Profile")
+                                    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+                                    chips.append("Top‑10 ✓")
+                    except Exception as e:
+                        logger.warning("[confirm] agent discovery block failed: %s", e)
+
+                    # Pattern mining + Micro‑ICPs (Step 6–8) — disabled in chat when ACRA is off (nightly only)
+                    try:
+                        if ENABLE_ACRA_IN_CHAT and _icp_winner_profile and _icp_micro_suggestions:
                             logger.info("[confirm] Building winners profile")
                             prof = await asyncio.to_thread(_icp_winner_profile, tid)
                             items2 = await asyncio.to_thread(_icp_micro_suggestions, prof)
@@ -2686,8 +2803,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                     except Exception:
                         pass
 
-                    # Synchronously map seeds and refresh patterns for fast suggestions
-                    if _icp_map_seeds and _icp_refresh_patterns and _icp_generate_suggestions:
+                    # Synchronously map seeds and refresh patterns — disabled in chat by default (nightly only)
+                    if ENABLE_ACRA_IN_CHAT and _icp_map_seeds and _icp_refresh_patterns and _icp_generate_suggestions:
                         logger.info("[confirm] Map seeds to evidence + refresh patterns + generate suggestions")
                         await asyncio.to_thread(_icp_map_seeds, tid)
                         await asyncio.to_thread(_icp_refresh_patterns)
@@ -2796,39 +2913,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                     state["candidates"] = cand[:enrich_now_limit]
         except Exception:
             pass
-    # If still fewer than limit and we have SSIC codes, top up from ACRA by ensuring rows
+    # If still fewer than limit, do not top up from ACRA in chat (PRD19); leave to nightly
     n = len(state.get("candidates") or [])
-    if n < enrich_now_limit:
-        try:
-            icp = state.get("icp") or {}
-            terms = [
-                s.strip().lower() for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()
-            ]
-            if terms:
-                ssic_matches = _find_ssic_codes_by_terms(terms)
-                codes = {c for (c, _t, _s) in ssic_matches}
-                if codes:
-                    rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, enrich_now_limit)
-                    pool = await get_pg_pool()
-                    added: list[dict] = []
-                    needed = enrich_now_limit - n
-                    for r in rows:
-                        if needed <= 0:
-                            break
-                        nm = (r.get("entity_name") or "").strip()
-                        if not nm:
-                            continue
-                        try:
-                            cid = await _ensure_company_row(pool, nm)
-                        except Exception:
-                            continue
-                        added.append({"id": cid, "name": nm, "uen": (r.get("uen") or "").strip() or None})
-                        needed -= 1
-                    if added:
-                        state["candidates"] = (state.get("candidates") or []) + added
-                        n = len(state["candidates"])  # refresh
-        except Exception:
-            pass
     # Cap to limit
     if n > enrich_now_limit:
         state["candidates"] = (state.get("candidates") or [])[:enrich_now_limit]
@@ -2918,56 +3004,7 @@ async def confirm_node(state: GraphState) -> GraphState:
     # Start with candidate count
     msg_lines.append(f"Got {n} companies. ")
 
-    try:
-        if terms:
-            ssic_matches = _find_ssic_codes_by_terms(terms)
-            if ssic_matches:
-                top_code, top_title, _ = ssic_matches[0]
-                msg_lines.append(
-                    f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)"
-                )
-            else:
-                msg_lines.append("Matched 0 SSIC codes")
-
-            # Fetch ACRA sample
-            try:
-                codes = {c for (c, _t, _s) in ssic_matches}
-                # Count all candidates and fetch a small sample for display
-                from src.icp import _count_acra_by_ssic_codes
-                total_acra = await asyncio.to_thread(_count_acra_by_ssic_codes, codes)
-                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 10)
-            except Exception:
-                rows = []
-                total_acra = 0
-            if total_acra:
-                msg_lines.append(f"- Found {total_acra} ACRA candidates. Sample:")
-                for r in rows[:2]:
-                    uen = (r.get("uen") or "").strip()
-                    nm = (r.get("entity_name") or "").strip()
-                    code = (r.get("primary_ssic_code") or "").strip()
-                    status = (r.get("entity_status_description") or "").strip()
-                    msg_lines.append(
-                        f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
-                    )
-                # Fallback: seed candidates directly from ACRA when none exist
-                if n == 0 and not state.get("candidates"):
-                    try:
-                        derived = []
-                        for r in rows[:20]:
-                            nm = (r.get("entity_name") or "").strip()
-                            if not nm:
-                                continue
-                            derived.append({"name": nm, "uen": (r.get("uen") or "").strip() or None})
-                        if derived:
-                            state["candidates"] = derived
-                            n = len(derived)
-                    except Exception:
-                        pass
-            else:
-                msg_lines.append("- Found 0 ACRA candidates.")
-    except Exception:
-        # Don’t block on SSIC/ACRA preview errors
-        pass
+    # PRD19: hide SSIC/ACRA preview in chat; ACRA is for nightly SG pass only
 
     # Plan enrichment counts: how many now vs later
     do_now = min(n, enrich_now_limit) if n else 0
@@ -3669,15 +3706,78 @@ def router(state: GraphState) -> str:
                     return False
                 if last and _is_human(last):
                     state["last_user_boot_token"] = BOOT_TOKEN
+                    # New human input: allow routing again by clearing last_routed_text
+                    try:
+                        if "last_routed_text" in state:
+                            del state["last_routed_text"]
+                    except Exception:
+                        pass
                 state["boot_seen_messages_len"] = len(msgs)
     except Exception:
         pass
 
-    # Do not auto-run anything if assistant spoke last, unless user explicitly typed a new command.
-    # This prevents enrichment from resuming on server restart. Nightly jobs should invoke nodes directly.
-    if _last_is_ai(msgs) and "run enrichment" not in text and not re.search(r"\baccept\s+micro[- ]icp\b", text):
-        logger.info("router -> end (assistant last; no explicit user action)")
+    # If we've already routed for this exact human text, wait for new input to avoid loops
+    try:
+        if (state.get("last_routed_text") or "") == text and text.strip():
+            logger.info("router -> end (duplicate command; waiting for new user input)")
+            return "end"
+    except Exception:
+        pass
+
+    # If the assistant spoke last, do not route again until a NEW human message arrives.
+    # This prevents loops where the router keeps re-reading the same last human text.
+    if _last_is_ai(msgs):
+        logger.info("router -> end (assistant last)")
         return "end"
+
+    # Intent detection: only begin ICP when the user explicitly asks for lead generation
+    lead_intent = False
+    try:
+        if re.search(r"\brun\s+enrichment\b", text):
+            lead_intent = True
+        # phrases like: start lead gen, start lead generation, start discovery, start prospecting
+        if re.search(r"\bstart\s+(lead(\s*gen|\s*generation)?|prospect(ing)?|discovery|enrich(ment)?)\b", text):
+            lead_intent = True
+        # commands like: find/generate/prospect/discover leads/companies
+        if re.search(r"\b(find|generate|prospect|discover)\s+(leads?|companies)\b", text):
+            lead_intent = True
+    except Exception:
+        lead_intent = False
+
+    if lead_intent:
+        logger.info("router -> icp (explicit lead-gen intent)")
+        try:
+            state["last_routed_text"] = text
+            state["icp_in_progress"] = True
+        except Exception:
+            pass
+        return "icp"
+
+    # Greetings: acknowledge and explain how to start lead-gen, without auto-starting
+    if re.search(r"\b(hello|hi|hey|howdy)\b", text) and not bool(state.get("welcomed")):
+        logger.info("router -> welcome (greeting)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        return "welcome"
+
+    # If user pasted a website/domain and Finder is enabled, treat it as starting/continuing ICP
+    try:
+        url = _parse_website(text)
+    except Exception:
+        url = None
+    if url:
+        logger.info("router -> icp (website/domain provided)")
+        try:
+            state["last_routed_text"] = text
+            state["icp_in_progress"] = True
+            # Initialize icp dict if missing so icp node can store website
+            if not state.get("icp"):
+                state["icp"] = {}
+        except Exception:
+            pass
+        return "icp"
 
     # Enrichment gating: require required Fast-Start fields; otherwise route back to ICP Q&A
     if (
@@ -3689,16 +3789,28 @@ def router(state: GraphState) -> str:
         asks = dict(state.get("ask_counts") or {})
         if ENABLE_ICP_INTAKE and not _icp_required_fields_done(icp_f, asks):
             logger.info("router -> icp (ask remaining required Fast-Start fields before enrichment)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
             return "icp"
         logger.info("router -> enrich (explicit user override)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
         return "enrich"
 
     # Accept micro‑ICP selection
     if re.search(r"\baccept\s+micro[- ]icp\b", text):
         logger.info("router -> accept (user accepted micro‑ICP)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
         return "accept"
 
-    # 1) Pipeline progression
+    # 1) Pipeline progression (explicit only)
     # Finder gating: do NOT auto-advance to enrichment until micro-ICP suggestions are done
     if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
         # If we already have candidates but haven't finished Finder suggestions, hold and wait for user
@@ -3715,10 +3827,7 @@ def router(state: GraphState) -> str:
     has_scored = bool(state.get("scored"))
     enrichment_completed = bool(state.get("enrichment_completed"))
 
-    # Only progress when a human spoke last. This stops auto-run after server restarts.
-    if has_candidates and not has_results and not _last_is_ai(msgs):
-        logger.info("router -> enrich (have candidates, no enrichment)")
-        return "enrich"
+    # Do not auto-progress; enrichment only runs on explicit command handled below.
     if has_results and enrichment_completed and not has_scored:
         logger.info("router -> score (have enrichment, no scores, all completed)")
         return "score"
@@ -3737,8 +3846,16 @@ def router(state: GraphState) -> str:
         # Proceed with enrichment when candidates exist, regardless of ICP completeness
         if state.get("candidates"):
             logger.info("router -> enrich (user requested enrichment)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
             return "enrich"
         logger.info("router -> candidates (prepare candidates before enrichment)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
         return "candidates"
 
     # 4) If user pasted an explicit company list, jump to candidates
@@ -3748,37 +3865,92 @@ def router(state: GraphState) -> str:
     if pasted and any(("." in n) or (" " in n) for n in pasted):
         if ENABLE_ICP_INTAKE and not _icp_complete(icp):
             logger.info("router -> icp (Finder gating: ignore explicit list until ICP set)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
             return "icp"
         logger.info("router -> candidates (explicit company list)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
         return "candidates"
 
-    # 5) User said confirm: proceed forward once (avoid loops)
+    # 5) Free‑form lead‑gen Q&A: if the user asked a general question, answer it directly.
+    # Avoid hijacking explicit commands.
+    try:
+        if (
+            _qa_answer is not None
+            and not any(k in text for k in ("run enrichment", "accept micro", "accept micro-icp"))
+            and ("?" in text or re.match(r"\b(how|what|why|when|where|which|tips|best|increase|improve)\b", text))
+            and (state.get("last_answered_text") != text)
+        ):
+            logger.info("router -> leadgen_qa (free‑form question detected)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "leadgen_qa"
+    except Exception:
+        pass
+
+    # 6) User said confirm: proceed forward once (avoid loops)
     if _user_just_confirmed(state):
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
         if ENABLE_ICP_INTAKE:
             has_minimal = bool(icp.get("website_url")) and bool(icp.get("seeds_list"))
             if has_minimal:
                 logger.info("router -> confirm (Finder minimal intake present; proceeding to confirm pipeline)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
                 return "confirm"
             # Otherwise continue asking for missing pieces
             if not _icp_complete(icp):
                 logger.info("router -> icp (Finder gating: need website + seeds before confirm)")
                 return "icp"
-        # If we already derived candidates, move ahead to enrichment; else collect candidates first.
-        if state.get("candidates"):
-            logger.info("router -> enrich (user confirmed ICP; have candidates)")
-            return "enrich"
-        logger.info("router -> candidates (user confirmed ICP)")
-        return "candidates"
+        # After confirm, do not auto-run enrichment. Hold for explicit 'run enrichment'.
+        if not state.get("candidates"):
+            logger.info("router -> candidates (user confirmed ICP; prepare candidates)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "candidates"
+        logger.info("router -> end (confirmed; waiting for 'run enrichment')")
+        return "end"
 
-    # 6) If ICP is not complete yet, continue ICP Q&A
-    if not _icp_complete(icp):
-        logger.info("router -> icp (need more ICP)")
-        return "icp"
+    # 6) ICP intake progression: if ICP is in progress and incomplete, route to ICP to parse the user's reply
+    try:
+        asks = dict(state.get("ask_counts") or {})
+    except Exception:
+        asks = {}
+    try:
+        if ENABLE_ICP_INTAKE:
+            if bool(state.get("icp_in_progress")) and not _icp_required_fields_done(icp or {}, asks):
+                logger.info("router -> icp (continue ICP intake)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "icp"
+        else:
+            # Non-Finder mode: continue asking until basic ICP is complete
+            if (icp and not _icp_complete(icp)):
+                logger.info("router -> icp (continue ICP basics)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "icp"
+    except Exception:
+        pass
 
-    # 7) Default
-    logger.info("router -> icp (default)")
-    return "icp"
+    # 7) Default: do nothing until explicit intent
+    logger.info("router -> end (no explicit lead‑gen intent)")
+    return "end"
 
 
 def router_entry(state: GraphState) -> GraphState:
@@ -3838,6 +4010,56 @@ def build_graph():
     g.add_node("confirm", confirm_node)
     g.add_node("enrich", enrich_node)
     g.add_node("score", score_node)
+    # Welcome node for greetings without kicking off lead-gen automatically
+    def welcome(state: GraphState) -> GraphState:
+        try:
+            msg = (
+                "Hi! I can answer questions about lead generation. "
+                "When you’re ready to begin, say ‘start lead gen’, ‘find leads’, or ‘run enrichment’."
+            )
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(msg)])
+            state["welcomed"] = True
+        except Exception:
+            pass
+        return state
+    g.add_node("welcome", welcome)
+    # Lead‑gen Q&A node for free‑form questions
+    def leadgen_qa(state: GraphState) -> GraphState:
+        try:
+            q = _last_user_text(state)
+            # Build a richer runtime context for smart, system-only answers
+            try:
+                run_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+            except Exception:
+                run_now_limit = 10
+            ctx = {
+                "icp": state.get("icp") or {},
+                "candidates_count": (len(state.get("candidates") or []) if isinstance(state.get("candidates"), list) else 0),
+                "results_count": (len(state.get("results") or []) if isinstance(state.get("results"), list) else 0),
+                "scored_count": (len(state.get("scored") or []) if isinstance(state.get("scored"), list) else 0),
+                "ENABLE_ICP_INTAKE": bool(ENABLE_ICP_INTAKE),
+                "ENABLE_AGENT_DISCOVERY": bool(ENABLE_AGENT_DISCOVERY),
+                "ENABLE_ACRA_IN_CHAT": bool(ENABLE_ACRA_IN_CHAT),
+                "finder_suggestions_done": bool(state.get("finder_suggestions_done")),
+                "micro_icp_selected": bool(state.get("micro_icp_selected")),
+                "icp_match_total": state.get("icp_match_total"),
+                "acra_total_suggested": state.get("acra_total_suggested"),
+                "enrich_now_planned": state.get("enrich_now_planned"),
+                "RUN_NOW_LIMIT": run_now_limit,
+            }
+            if _qa_answer is not None:
+                ans = _qa_answer(q, context=ctx)
+            else:
+                ans = "I can answer lead‑gen questions once the LLM is configured."
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(ans)])
+            state["last_answered_text"] = (q or "").strip().lower()
+        except Exception as e:
+            try:
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(f"I hit an error answering that: {e}")])
+            except Exception:
+                pass
+        return state
+    g.add_node("leadgen_qa", leadgen_qa)
     # Accept micro‑ICP selection node
     g.add_node("accept", accept_micro_icp)
     # Central router: every node returns here so we can advance the workflow
@@ -3848,12 +4070,15 @@ def build_graph():
         "accept": "accept",
         "enrich": "enrich",
         "score": "score",
+        "leadgen_qa": "leadgen_qa",
+        "welcome": "welcome",
         "end": END,
     }
     # Start in the router so we always decide the right first step
     g.set_entry_point("router")
     g.add_conditional_edges("router", router, mapping)
     # Every worker node loops back to the router
+    # Route all worker nodes back to router EXCEPT welcome, which should end the run
     for node in ("icp", "candidates", "confirm", "accept", "enrich", "score"):
         g.add_edge(node, "router")
     return g.compile()

@@ -3,11 +3,11 @@ Agents Guide — lead_generation-main
 Purpose
 - Pre-SDR pipeline: normalize → ICP candidates → deterministic crawl + Tavily/Apify → ZeroBounce verify → scoring + rationale → export → optional Odoo sync.
 
-Run API (LangGraph server)
+Run API
 - python -m venv .venv && source .venv/bin/activate
 - pip install -r requirements.txt
 - uvicorn app.main:app --host 0.0.0.0 --port 2024
-- Endpoints: /agent (LangServe), /export/latest_scores.csv, /docs
+- Endpoints: /export/latest_scores.csv, /docs
 
 Run Orchestrator (one-off)
 - source .venv/bin/activate

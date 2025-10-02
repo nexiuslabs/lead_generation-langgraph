@@ -3,7 +3,6 @@ from typing import Dict, Any, List, Union
 import os
 import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
 from app.pre_sdr_graph import build_graph, GraphState  # new dynamic builder
 from src.database import get_conn

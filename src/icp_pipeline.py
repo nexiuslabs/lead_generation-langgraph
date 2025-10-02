@@ -282,6 +282,51 @@ async def collect_evidence_for_domain(
     for r in recs:
         if appears >= 2:
             r["confidence"] = min(0.95, float(r.get("confidence") or 0.5) + 0.25)
+    # Optional LLM normalization of evidence (PRD19 §6 Evidence Extractor)
+    try:
+        from src.agents_icp import evidence_extractor as _agent_evidence_extractor  # type: ignore
+        import json as _json  # local alias to avoid shadowing
+        st = {"evidence": [{"summary": _json.dumps(summary)[:4000]}]}
+        out = _agent_evidence_extractor(st)
+        ev = (out.get("evidence") or [{}])[0]
+        # Map normalized fields into recs where helpful
+        if isinstance(ev.get("integrations"), list) and ev.get("integrations"):
+            recs.append({
+                "signal_key": "integrations",
+                "value": ev.get("integrations"),
+                "confidence": 0.5,
+                "why": "LLM extraction",
+            })
+        if isinstance(ev.get("buyer_titles"), list) and ev.get("buyer_titles"):
+            recs.append({
+                "signal_key": "buyer_titles",
+                "value": ev.get("buyer_titles"),
+                "confidence": 0.5,
+                "why": "LLM extraction",
+            })
+        if isinstance(ev.get("hiring_open_roles"), int) and ev.get("hiring_open_roles"):
+            recs.append({
+                "signal_key": "hiring_open_roles",
+                "value": {"count": ev.get("hiring_open_roles")},
+                "confidence": 0.5,
+                "why": "LLM extraction",
+            })
+        if isinstance(ev.get("has_case_studies"), bool):
+            recs.append({
+                "signal_key": "has_case_studies",
+                "value": ev.get("has_case_studies"),
+                "confidence": 0.5,
+                "why": "LLM extraction",
+            })
+        if isinstance(ev.get("has_pricing"), bool):
+            recs.append({
+                "signal_key": "has_pricing",
+                "value": ev.get("has_pricing"),
+                "confidence": 0.5,
+                "why": "LLM extraction",
+            })
+    except Exception:
+        pass
     # Only persist when we have a concrete company_id
     if company_id is None:
         return 0

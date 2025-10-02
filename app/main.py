@@ -1,7 +1,6 @@
 # app/main.py
 from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
 from app.odoo_connection_info import get_odoo_connection_info
@@ -69,8 +68,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lazily enable /agent routes only when LLM is configured to avoid import-time errors
-graph = None
+# Note: LangServe routes removed; chat/graph execution is handled internally without mounting /agent
 
 # Mount auth cookie routes
 try:
@@ -737,22 +735,7 @@ def normalize_input(payload: dict) -> dict:
 
     return state
 
-ENABLE_LANGSERVE_IN_APP = os.getenv("ENABLE_LANGSERVE_IN_APP", "false").lower() in ("1", "true", "yes", "on")
-try:
-    if ENABLE_LANGSERVE_IN_APP and OPENAI_API_KEY:
-        # Import inside conditional to avoid loading langserve when mounted into LangGraph Server
-        from langserve import add_routes  # type: ignore
-        from app.pre_sdr_graph import build_graph  # type: ignore
-
-        graph = build_graph()
-        ui_adapter = RunnableLambda(normalize_input) | graph
-        add_routes(app, ui_adapter, path="/agent")
-        logger.info("/agent routes enabled (LLM configured)")
-    else:
-        logger.info("Skipping /agent routes (ENABLE_LANGSERVE_IN_APP is false or OPENAI_API_KEY missing)")
-except Exception as e:
-    # Never block API/docs if LangServe wiring fails; just log and continue
-    logger.warning("Skipping /agent routes due to initialization error: %s", e)
+# LangServe setup removed: previously mounted /agent when ENABLE_LANGSERVE_IN_APP was true.
 
 @app.get("/info")
 async def info(_: dict = Depends(require_auth)):
