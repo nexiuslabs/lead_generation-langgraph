@@ -3731,10 +3731,11 @@ def router(state: GraphState) -> str:
         return "end"
 
     # Intent detection: only begin ICP when the user explicitly asks for lead generation
+    # Note: do NOT treat 'run enrichment' as generic lead-intent here; it has an
+    # explicit branch later that routes to enrichment. Including it here would
+    # misroute to the ICP node and block enrichment.
     lead_intent = False
     try:
-        if re.search(r"\brun\s+enrichment\b", text):
-            lead_intent = True
         # phrases like: start lead gen, start lead generation, start discovery, start prospecting
         if re.search(r"\bstart\s+(lead(\s*gen|\s*generation)?|prospect(ing)?|discovery|enrich(ment)?)\b", text):
             lead_intent = True
@@ -3779,22 +3780,15 @@ def router(state: GraphState) -> str:
             pass
         return "icp"
 
-    # Enrichment gating: require required Fast-Start fields; otherwise route back to ICP Q&A
+    # Explicit enrichment command: honor user intent when candidates exist.
+    # Finder-specific gating (like waiting for suggestions) is handled later; do not
+    # force ICP completeness here — 'run enrichment' is an explicit override.
     if (
         "run enrichment" in text
         and state.get("candidates")
         and not state.get("results")
     ):
-        icp_f = dict(state.get("icp") or {})
-        asks = dict(state.get("ask_counts") or {})
-        if ENABLE_ICP_INTAKE and not _icp_required_fields_done(icp_f, asks):
-            logger.info("router -> icp (ask remaining required Fast-Start fields before enrichment)")
-            try:
-                state["last_routed_text"] = text
-            except Exception:
-                pass
-            return "icp"
-        logger.info("router -> enrich (explicit user override)")
+        logger.info("router -> enrich (explicit user command)")
         try:
             state["last_routed_text"] = text
         except Exception:
