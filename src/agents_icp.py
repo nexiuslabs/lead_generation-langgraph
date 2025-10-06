@@ -10,17 +10,28 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Any, Dict, List, Optional
+import html as html_lib
 
 from langchain_openai import ChatOpenAI
 import logging
 import requests
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urljoin, parse_qs, unquote
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
-try:
-    from ddgs import DDGS  # type: ignore
-except Exception:  # pragma: no cover
-    DDGS = None  # type: ignore
+# Strict DuckDuckGo-only mode: do not aggregate from other engines
+DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html"
+DDG_HTML_GET = "https://duckduckgo.com/html/"
+DDG_LITE_GET = "https://lite.duckduckgo.com/lite/"
+
+# Optional seed hints passed in by the caller (confirm flow) to improve queries
+SEED_HINTS: List[str] = []
+
+def set_seed_hints(hints: List[str] | None):
+    global SEED_HINTS
+    try:
+        SEED_HINTS = [h.strip().lower() for h in (hints or []) if isinstance(h, str) and h.strip()][:10]
+    except Exception:
+        SEED_HINTS = []
 
 from src.icp_pipeline import collect_evidence_for_domain
 from src.crawler import crawl_site
@@ -38,6 +49,105 @@ def _uniq(seq: List[str]) -> List[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _ddg_search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
+    """Perform a DuckDuckGo HTML search and extract external result domains.
+
+    - Uses only DuckDuckGo (`html.duckduckgo.com/html`).
+    - Parses redirect links (`/l/?uddg=...`) and extracts the target domain.
+    - Filters obvious search/CDN/wiki hosts.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116 Safari/537.36",
+        "Accept-Language": (lang or "en-US,en;q=0.9"),
+    }
+    def _extract_domains_from_html(raw_html: str) -> List[str]:
+        text = raw_html or ""
+        text = html_lib.unescape(text)
+        found: List[str] = []
+        # 1) Extract via explicit DDG redirect pattern `/l/?uddg=` (covers html + standard pages)
+        for m in re.findall(r"/l/\?[^\s\"']*uddg=([^&\"']+)", text):
+            try:
+                target_url = unquote(m)
+                host = (urlparse(target_url).netloc or "").lower()
+                if host:
+                    found.append(host)
+            except Exception:
+                continue
+        # 2) Fallback: collect anchor hrefs and take external hosts directly
+        for href in re.findall(r'href=[\"\']([^\"\']+)[\"\']', text):
+            try:
+                href = href.strip()
+                if href.startswith("/"):
+                    href_abs = urljoin("https://duckduckgo.com", href)
+                else:
+                    href_abs = href
+                u = urlparse(href_abs)
+                host = (u.netloc or "").lower()
+                if not host:
+                    continue
+                if (host.endswith("duckduckgo.com") or host.endswith("r.duckduckgo.com")) and u.path.startswith("/l/"):
+                    q = parse_qs(u.query)
+                    target = q.get("uddg", [None])[0]
+                    if target:
+                        target_url = unquote(str(target))
+                        host = (urlparse(target_url).netloc or "").lower()
+                        if not host:
+                            continue
+                found.append(host)
+            except Exception:
+                continue
+        # Normalize and filter noisy/search/CDN/wiki hosts
+        out: List[str] = []
+        for h in _uniq(found):
+            if any(x in h for x in (
+                "duckduckgo.", "google.", "bing.", "brave.", "yahoo.", "yandex.", "mojeek.",
+                "cloudflare.", "wikipedia.", "wikimedia.", "github.", "stackexchange.",
+            )):
+                continue
+            out.append(h)
+            if len(out) >= max_results:
+                break
+        return out
+
+    domains: List[str] = []
+    # Attempt 1: html.duckduckgo.com via POST (classic HTML endpoint)
+    try:
+        r = requests.post(DDG_HTML_ENDPOINT, data={"q": query}, headers=headers, timeout=15)
+        r.raise_for_status()
+        domains = _extract_domains_from_html(r.text)
+        if domains:
+            log.info("[ddg] POST parsed domains=%d for query=%s", len(domains), query)
+            return domains
+    except Exception as e:
+        log.info("[ddg] POST search failed: %s", e)
+
+    # Attempt 2: duckduckgo.com/html via GET
+    try:
+        url = DDG_HTML_GET + "?q=" + quote(query)
+        r2 = requests.get(url, headers=headers, timeout=15)
+        r2.raise_for_status()
+        domains = _extract_domains_from_html(r2.text)
+        if domains:
+            log.info("[ddg] GET parsed domains=%d for query=%s", len(domains), query)
+            return domains
+    except Exception as e2:
+        log.info("[ddg] GET fallback failed: %s", e2)
+
+    # Attempt 3: lite.duckduckgo.com page which often bypasses heavy markup
+    try:
+        url = DDG_LITE_GET + "?q=" + quote(query)
+        r3 = requests.get(url, headers=headers, timeout=15)
+        r3.raise_for_status()
+        domains = _extract_domains_from_html(r3.text)
+        if domains:
+            log.info("[ddg] LITE parsed domains=%d for query=%s", len(domains), query)
+            return domains
+    except Exception as e3:
+        log.info("[ddg] LITE fallback failed: %s", e3)
+
+    return _uniq(domains)
 
 
 log = logging.getLogger("agents.icp")
@@ -190,32 +300,54 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     msgs = prompt.format_messages(inds=inds, sigs=sigs, titles=titles)
     log.info("[plan] building queries from ICP; inds=%s sigs=%s titles=%s", inds, sigs, titles)
     text = llm.invoke(msgs).content or ""
-    queries = [ln.split(" — ", 1)[0].strip() for ln in text.splitlines() if ln.strip()]
+    # Extract queries (strip trailing explanations) and sanitize numbering like '1. '
+    raw_queries = [ln.split(" — ", 1)[0] for ln in text.splitlines() if ln.strip()]
+    queries: List[str] = []
+    for q in raw_queries:
+        q = re.sub(r"^\s*\d+\.\s*", "", q or "").strip()
+        # Strip surrounding quotes that tend to reduce recall on DDG
+        if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
+            q = q[1:-1].strip()
+        if q:
+            queries.append(q)
     domains: List[str] = []
-    for q in queries[:3]:
+    for q in queries[:6]:
         try:
-            log.info("[plan] ddg query: %s", q)
-            if DDGS is None:
-                raise RuntimeError("ddgs package not available")
-            with DDGS() as ddg:
-                for item in ddg.text(q, max_results=25):
-                    href = (item.get("href") or "").strip()
-                    if not href:
-                        continue
-                    try:
-                        dom = (urlparse(href).netloc or "").lower()
-                    except Exception:
-                        continue
-                    if not dom:
-                        continue
-                    # Drop obvious search/CDN/non-target domains
-                    if any(x in dom for x in ("duckduckgo.", "google.", "bing.", "cloudflare.", "wikipedia.")):
-                        continue
-                    domains.append(dom)
+            log.info("[plan] ddg-only query: %s", q)
+            for dom in _ddg_search_domains(q, max_results=25):
+                domains.append(dom)
         except Exception as e:
             log.info("[plan] ddg fail: %s", e)
             continue
     uniq = _uniq(domains)
+    if not uniq:
+        # Deterministic fallback query pack to improve recall while staying DDG-only
+        fb: List[str] = [
+            "foodservice distributors",
+            "broadline foodservice distributors",
+            "restaurant supply distributors",
+            "food & beverage wholesale distributors",
+        ]
+        # Region hint: if any seed ends with .sg, prefer .sg-specific queries
+        try:
+            seeds = list(SEED_HINTS)
+        except Exception:
+            seeds = []
+        if any(str(s).endswith('.sg') for s in seeds):
+            fb = [
+                "site:.sg foodservice distributor",
+                "site:.sg food & beverage distributor",
+                "site:.sg fmcg distributor",
+            ] + fb
+        for q in fb:
+            try:
+                log.info("[plan] ddg-only fallback query: %s", q)
+                for dom in _ddg_search_domains(q, max_results=25):
+                    domains.append(dom)
+            except Exception as e:
+                log.info("[plan] ddg fail: %s", e)
+                continue
+        uniq = _uniq(domains)
     log.info("[plan] ddg domains found=%d (uniq=%d)", len(domains), len(uniq))
     # Optional Jina Reader fetch for quick homepage snippets of first few domains
     jina_snips: Dict[str, str] = {}
@@ -425,6 +557,80 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         return top
     except Exception as e:
         log.info("[top10] failed: %s", e)
+        return []
+
+
+def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fallback Top‑10 planner that does not require LLMs.
+
+    - Builds simple queries from industries/titles/triggers.
+    - Uses strict DuckDuckGo HTML search for domains.
+    - Fetches homepage text via r.jina.ai for snippets.
+    - Scores heuristically based on keyword signals.
+    """
+    try:
+        icp = dict(icp_profile or {})
+        inds = [s.strip() for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()]
+        titles = [s.strip() for s in (icp.get("buyer_titles") or []) if isinstance(s, str) and s.strip()]
+        sigs = [s.strip() for s in ((icp.get("integrations") or []) + (icp.get("triggers") or [])) if isinstance(s, str) and s.strip()]
+        queries: List[str] = []
+        if inds:
+            queries.append(f"B2B companies in {', '.join(inds[:2])}")
+        if sigs:
+            queries.append(f"B2B solutions {', '.join(sigs[:2])}")
+        if titles:
+            queries.append(f"companies hiring {', '.join(titles[:2])}")
+        if not queries:
+            queries = ["B2B SaaS companies", "B2B platforms", "enterprise software vendors"]
+
+        # Discover domains strictly via DDG
+        domains: List[str] = []
+        for q in queries[:3]:
+            for dom in _ddg_search_domains(q, max_results=25):
+                domains.append(dom)
+        uniq = _uniq(domains)[:20]
+        if not uniq:
+            return []
+
+        # Fetch snippets via Jina Reader and score heuristically
+        out: List[Dict[str, Any]] = []
+        for d in uniq[:10]:
+            try:
+                reader = f"https://r.jina.ai/http://{d}"
+                r = requests.get(reader, timeout=10)
+                txt = (r.text or "")[:8000]
+                clean = " ".join((txt or "").split())
+                snip = clean[:180]
+                # Heuristic scoring
+                low = clean.lower()
+                score = 0
+                why_bits: List[str] = []
+                if "integrat" in low:
+                    score += 35
+                    why_bits.append("integrations signals")
+                if "pricing" in low or "plans" in low:
+                    score += 15
+                    why_bits.append("pricing page found")
+                if "case stud" in low or "customers" in low:
+                    score += 10
+                    why_bits.append("case studies")
+                if "careers" in low or "jobs" in low or "hiring" in low:
+                    score += 5
+                    why_bits.append("hiring")
+                bucket = "A" if score >= 70 else ("B" if score >= 50 else "C")
+                out.append({
+                    "domain": d,
+                    "score": score,
+                    "bucket": bucket,
+                    "why": "; ".join(why_bits) if why_bits else "signal match",
+                    "snippet": snip,
+                })
+            except Exception:
+                continue
+        out = sorted(out, key=lambda x: int(x.get("score") or 0), reverse=True)[:10]
+        return out
+    except Exception as e:
+        log.info("[top10-fallback] failed: %s", e)
         return []
 
 

@@ -146,6 +146,7 @@ def _icp_required_fields_done(icp: dict, ask_counts: dict | None = None) -> bool
 # ---------- DB table names (env-overridable) ----------
 COMPANY_TABLE = os.getenv("COMPANY_TABLE", "companies")
 LEAD_SCORES_TABLE = os.getenv("LEAD_SCORES_TABLE", "lead_scores")
+STAGING_GLOBAL_TABLE = os.getenv("STAGING_GLOBAL_TABLE", "staging_global_companies")
 
 
 class PreSDRState(TypedDict, total=False):
@@ -295,6 +296,145 @@ def _last_text(msgs) -> str:
     if isinstance(m, dict):
         return m.get("content") or ""
     return str(m)
+
+
+def _persist_web_candidates_to_staging(domains: list[str], tenant_id: Optional[int] = None) -> int:
+    """Persist discovered global (non‑SG) candidate domains into a lightweight staging table.
+
+    Table: staging_global_companies(id PK, tenant_id, domain, source, created_at)
+    Idempotent on (tenant_id, domain, source) via ON CONFLICT DO NOTHING.
+    """
+    if not domains:
+        return 0
+    ds = [str(d).strip().lower() for d in domains if isinstance(d, str) and d.strip()]
+    ds = sorted(set(ds))
+    if not ds:
+        return 0
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            # Ensure table exists (dev-safe)
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {STAGING_GLOBAL_TABLE} (
+                  id BIGSERIAL PRIMARY KEY,
+                  tenant_id BIGINT NULL,
+                  domain TEXT NOT NULL,
+                  source TEXT NOT NULL DEFAULT 'web_discovery',
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  UNIQUE (tenant_id, domain, source)
+                )
+                """
+            )
+            rows = 0
+            for d in ds:
+                try:
+                    cur.execute(
+                        f"INSERT INTO {STAGING_GLOBAL_TABLE}(tenant_id, domain, source) VALUES (%s,%s,'web_discovery') ON CONFLICT DO NOTHING",
+                        (tenant_id, d),
+                    )
+                    rows += cur.rowcount if isinstance(cur.rowcount, int) else 0
+                except Exception:
+                    # continue best-effort
+                    pass
+            return rows
+    except Exception:
+        return 0
+
+
+def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
+    """Persist Top‑10 preview into staging, companies, icp_evidence, and lead_scores."""
+    try:
+        # Staging
+        _ = _persist_web_candidates_to_staging([str(it.get("domain")) for it in top if isinstance(it, dict) and it.get("domain")], int(tid) if isinstance(tid, int) else None)
+    except Exception:
+        pass
+    try:
+        with get_conn() as _c, _c.cursor() as _cur:
+            for it in (top or [])[:10]:
+                dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                if not dom:
+                    continue
+                _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                r = _cur.fetchone()
+                if r and r[0] is not None:
+                    cid = int(r[0])
+                else:
+                    _cur.execute(
+                        "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                        (dom, dom),
+                    )
+                    cid = int((_cur.fetchone() or [None])[0])
+                why = it.get("why") or ""
+                snip = it.get("snippet") or ""
+                try:
+                    _cur.execute(
+                        "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s,%s,%s,%s,'web_preview')",
+                        (int(tid) if isinstance(tid, int) else None, cid, "top10_preview", Json({"why": why, "snippet": snip})),
+                    )
+                except Exception:
+                    pass
+                try:
+                    score = float(it.get("score") or 0)
+                except Exception:
+                    score = 0.0
+                bucket = it.get("bucket") or ("A" if score >= 70 else ("B" if score >= 50 else "C"))
+                rationale = why or snip
+                try:
+                    _cur.execute(
+                        """
+                        INSERT INTO lead_scores(company_id, score, bucket, rationale, cache_key)
+                        VALUES (%s,%s,%s,%s,NULL)
+                        ON CONFLICT (company_id) DO UPDATE SET
+                          score = EXCLUDED.score,
+                          bucket = EXCLUDED.bucket,
+                          rationale = EXCLUDED.rationale
+                        """,
+                        (cid, score, bucket, rationale),
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _load_persisted_top10(tid: Optional[int]) -> list[dict]:
+    """Load recently persisted Top‑10 preview from icp_evidence/lead_scores for a tenant."""
+    if not isinstance(tid, int):
+        return []
+    try:
+        with get_conn() as _c, _c.cursor() as _cur:
+            _cur.execute(
+                """
+                SELECT c.website_domain AS domain,
+                       COALESCE(ls.score,0) AS score,
+                       COALESCE(ls.bucket,'C') AS bucket,
+                       (ev.value->>'why') AS why,
+                       (ev.value->>'snippet') AS snippet
+                  FROM icp_evidence ev
+                  JOIN companies c ON c.company_id = ev.company_id
+                  LEFT JOIN lead_scores ls ON ls.company_id = ev.company_id
+                 WHERE ev.tenant_id = %s
+                   AND ev.signal_key = 'top10_preview'
+                 ORDER BY ev.created_at DESC
+                 LIMIT 10
+                """,
+                (tid,),
+            )
+            rows = _cur.fetchall() or []
+            out: list[dict] = []
+            for r in rows:
+                d = {
+                    "domain": (r[0] or "").strip().lower(),
+                    "score": float(r[1] or 0),
+                    "bucket": r[2] or "C",
+                    "why": r[3] or "",
+                    "snippet": r[4] or "",
+                }
+                if d["domain"]:
+                    out.append(d)
+            return out
+    except Exception:
+        return []
 
 
 def _parse_website(text: str) -> Optional[str]:
@@ -690,6 +830,18 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
             acand = _agent_plan_discovery(s).get("discovery_candidates") or []
             if acand:
                 state["agent_candidates"] = acand
+                # Persist all discovered domains into global staging for audit/queueing
+                try:
+                    tid = _resolve_tenant_id_for_write_sync(state)
+                    added = _persist_web_candidates_to_staging([str(d) for d in acand if isinstance(d, str)], tid)
+                    state["web_discovery_total"] = len(acand)
+                    if added:
+                        logger.info("[candidates] persisted %d web candidates to %s", added, STAGING_GLOBAL_TABLE)
+                except Exception as _pe:
+                    try:
+                        logger.info("[candidates] staging persist skipped: %s", _pe)
+                    except Exception:
+                        pass
     except Exception:
         pass
     msg_lines: list[str] = []
@@ -722,6 +874,12 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                 top = _agent_top10(state.get("icp_profile") or {}, state.get("tenant_id"))
                 if top:
                     state["agent_top10"] = top
+                    # Persist preview so later runs reuse the same Top‑10
+                    try:
+                        tid = _resolve_tenant_id_for_write_sync(state)
+                    except Exception:
+                        tid = None
+                    _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top)
                     msg_lines.append("Top‑10 lookalikes (with why):")
                     for i, row in enumerate(top, 1):
                         dom = row.get("domain")
@@ -857,6 +1015,75 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         pass
 
     candidates = state.get("candidates") or []
+    # Ensure: if a Top‑10 list from web discovery exists, enrich exactly those first.
+    if isinstance(state.get("agent_top10"), list) and state.get("agent_top10"):
+        try:
+            from src.database import get_conn as _get_conn
+            with _get_conn() as _c, _c.cursor() as _cur:
+                cand: list[dict] = []
+                for it in (state.get("agent_top10") or [])[:10]:
+                    dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                    if not dom:
+                        continue
+                    _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                    row = _cur.fetchone()
+                    if row and row[0] is not None:
+                        cid = int(row[0])
+                        name = (row[1] or dom)
+                    else:
+                        _cur.execute(
+                            "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                            (dom, dom),
+                        )
+                        cid = int((_cur.fetchone() or [None])[0])
+                        name = dom
+                    cand.append({"id": cid, "name": name})
+                if cand:
+                    candidates = cand
+                    state["candidates"] = cand
+                    state["strict_top10"] = True
+        except Exception:
+            pass
+    # If Top‑10 was shown earlier but agent_top10 is missing in this state (new cycle/thread),
+    # load the last persisted Top‑10 preview and use it strictly for enrichment.
+    if not candidates:
+        try:
+            tid = _resolve_tenant_id_for_write_sync(state)
+        except Exception:
+            tid = None
+        try:
+            persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
+        except Exception:
+            persisted_top = []
+        if persisted_top:
+            try:
+                from src.database import get_conn as _get_conn
+                with _get_conn() as _c, _c.cursor() as _cur:
+                    cand: list[dict] = []
+                    for it in persisted_top[:10]:
+                        dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                        if not dom:
+                            continue
+                        _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                        row = _cur.fetchone()
+                        if row and row[0] is not None:
+                            cid = int(row[0])
+                            name = (row[1] or dom)
+                        else:
+                            _cur.execute(
+                                "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                                (dom, dom),
+                            )
+                            cid = int((_cur.fetchone() or [None])[0])
+                            name = dom
+                        cand.append({"id": cid, "name": name})
+                    if cand:
+                        candidates = cand
+                        state["candidates"] = cand
+                        state["strict_top10"] = True
+                        _persist_top10_preview(int(tid) if isinstance(tid, int) else None, persisted_top)
+            except Exception:
+                pass
     # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
     if not candidates:
         try:
@@ -2486,6 +2713,14 @@ async def candidates_node(state: GraphState) -> GraphState:
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
     logger.info("[confirm] Entered confirm_node")
+    # Emit a quick progress note so the user sees immediate feedback
+    try:
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(content="Confirm received. Gathering evidence and planning Top‑10…")],
+        )
+    except Exception:
+        pass
     try:
         from src.settings import ENABLE_AGENT_DISCOVERY as _ead  # type: ignore
         logger.info("[confirm] ENABLE_AGENT_DISCOVERY=%s", _ead)
@@ -2676,10 +2911,47 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     tnet = int(tid) if tid is not None else None
                                 except Exception:
                                     tnet = None
+                                # Pass seed domains as discovery hints for DDG
+                                try:
+                                    seed_domains = []
+                                    for s in (icp.get("seeds_list") or []):
+                                        dom = (s.get("domain") or "").strip().lower() if isinstance(s, dict) else ""
+                                        if dom:
+                                            seed_domains.append(dom)
+                                    if seed_domains:
+                                        from src.agents_icp import set_seed_hints as _set_seed_hints  # type: ignore
+                                        try:
+                                            _set_seed_hints(seed_domains)
+                                            logger.info("[confirm] set %d seed hints for discovery", len(seed_domains))
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                                 logger.info("[confirm] invoking plan_top10_with_reasons; have_icp=%s", bool(icp_prof))
                                 top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
                                 logger.info("[confirm] agent top10 count=%d", len(top or []))
+                                if not top:
+                                    # Fallback: build Top‑10 without LLMs (strict DDG + Jina heuristics)
+                                    try:
+                                        from src.agents_icp import plan_top10_with_reasons_fallback as _top10_fb  # type: ignore
+                                        top = await asyncio.to_thread(_top10_fb, icp_prof)
+                                        logger.info("[confirm] fallback top10 count=%d", len(top or []))
+                                    except Exception as _fb_e:
+                                        logger.warning("[confirm] top10 fallback failed: %s", _fb_e)
                                 if top:
+                                    # Persist and stash for reuse during 'run enrichment'
+                                    try:
+                                        tid2 = await _resolve_tenant_id_for_write(state)
+                                    except Exception:
+                                        tid2 = None
+                                    try:
+                                        _persist_top10_preview(int(tid2) if isinstance(tid2, int) else None, top)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        state["agent_top10"] = top
+                                    except Exception:
+                                        pass
                                     lines = ["Top‑10 lookalikes (with why):"]
                                     for i, row in enumerate(top, 1):
                                         dom = row.get("domain")
@@ -2734,6 +3006,15 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         lines.append("ICP Profile")
                                     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
                                     chips.append("Top‑10 ✓")
+                                else:
+                                    # No Top‑10 from web discovery; advise user to adjust ICP rather than echo seeds
+                                    try:
+                                        state["messages"] = add_messages(
+                                            state.get("messages") or [],
+                                            [AIMessage("Web discovery returned no lookalikes. Try broadening industries or adding signals (integrations, buyer titles).")],
+                                        )
+                                    except Exception:
+                                        pass
                     except Exception as e:
                         logger.warning("[confirm] agent discovery block failed: %s", e)
 
@@ -3048,6 +3329,95 @@ async def enrich_node(state: GraphState) -> GraphState:
         pass
 
     text = _last_user_text(state)
+
+    # Strict Top‑10 enrichment: if a Top‑10 list from web discovery exists,
+    # build candidates from those domains and do not mix with ACRA/top-ups.
+    try:
+        top10 = state.get("agent_top10") or []
+    except Exception:
+        top10 = []
+    # Try loading last persisted Top‑10 preview for this tenant if not present in memory
+    if not (isinstance(top10, list) and top10):
+        try:
+            tid = await _resolve_tenant_id_for_write(state)
+        except Exception:
+            tid = None
+        persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
+        if persisted_top:
+            top10 = persisted_top
+    # If Top‑10 is missing (e.g., new thread/session), recompute from latest ICP profile
+    if not (isinstance(top10, list) and top10):
+        try:
+            # Load icp_profile from latest icp_rules for this tenant when not present in state
+            icp_prof = state.get("icp_profile") or {}
+            if not icp_prof:
+                try:
+                    tid = await _resolve_tenant_id_for_write(state)
+                except Exception:
+                    tid = None
+                if isinstance(tid, int):
+                    with get_conn() as _c, _c.cursor() as _cur:
+                        _cur.execute(
+                            "SELECT payload FROM icp_rules WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 1",
+                            (tid,),
+                        )
+                        row = _cur.fetchone()
+                        payload = (row and row[0]) or {}
+                        if isinstance(payload, dict):
+                            icp_prof = payload
+                            state["icp_profile"] = icp_prof
+            # Re-plan Top‑10 using agents if available
+            try:
+                from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+            except Exception:
+                _agent_top10 = None  # type: ignore
+            if _agent_top10 is not None and (icp_prof or state.get("icp")):
+                # Use icp_profile if present; otherwise derive from basic icp state
+                prof = icp_prof or _icp_payload_from_state_icp(state.get("icp") or {})
+                try:
+                    tid = await _resolve_tenant_id_for_write(state)
+                except Exception:
+                    tid = None
+                top10 = await asyncio.to_thread(_agent_top10, prof, int(tid) if isinstance(tid, int) else None)
+                if isinstance(top10, list) and top10:
+                    state["agent_top10"] = top10
+                    _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top10)
+        except Exception:
+            top10 = []
+    if isinstance(top10, list) and top10:
+        try:
+            from src.database import get_conn as _get_conn
+            with _get_conn() as _c, _c.cursor() as _cur:
+                cand: list[dict] = []
+                for it in top10[:10]:
+                    dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                    if not dom:
+                        continue
+                    _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                    row = _cur.fetchone()
+                    if row and row[0] is not None:
+                        cid = int(row[0])
+                        name = (row[1] or dom)
+                    else:
+                        _cur.execute(
+                            "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                            (dom, dom),
+                        )
+                        cid = int((_cur.fetchone() or [None])[0])
+                        name = dom
+                    cand.append({"id": cid, "name": name})
+            if cand:
+                state["candidates"] = cand
+                state["strict_top10"] = True
+        except Exception:
+            # Non-fatal; fall back to existing selection logic
+            pass
+        # Persist preview if tenant known
+        try:
+            tid = await _resolve_tenant_id_for_write(state)
+        except Exception:
+            tid = None
+        _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top10 if isinstance(top10, list) else [])
     if not state.get("candidates"):
         # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
         try:
@@ -3090,7 +3460,8 @@ async def enrich_node(state: GraphState) -> GraphState:
     except Exception:
         enrich_now_limit = 10
     # If we have fewer than the desired head count, try to top up from ACRA by SSIC codes
-    if len(candidates) < enrich_now_limit:
+    # Skip top-ups when strict Top‑10 is active
+    if len(candidates) < enrich_now_limit and not state.get("strict_top10"):
         try:
             # Derive SSIC codes from selected suggestions
             sugg = state.get("micro_icp_suggestions") or []
