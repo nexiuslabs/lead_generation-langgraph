@@ -24,6 +24,17 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
             "SELECT company_id, employees_est, revenue_bucket, sg_registered, incorporation_year FROM companies WHERE company_id = ANY($1)",
             state['candidate_ids']
         )
+        # ResearchOps evidence counts for manual bonus (DevPlan19)
+        ev_counts = await conn.fetch(
+            """
+            SELECT company_id, COUNT(*) AS cnt
+            FROM icp_evidence
+            WHERE company_id = ANY($1) AND source IN ('research','web_preview')
+            GROUP BY company_id
+            """,
+            state['candidate_ids']
+        )
+        by_ev = {r['company_id']: int(r['cnt']) for r in ev_counts}
     features: List[Dict[str, Any]] = []
     for row in rows:
         features.append({
@@ -31,7 +42,8 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
             'employees_est': row['employees_est'],
             'revenue_bucket': row['revenue_bucket'],
             'sg_registered': row['sg_registered'],
-            'incorporation_year': row['incorporation_year']
+            'incorporation_year': row['incorporation_year'],
+            'research_ev_count': by_ev.get(row['company_id'], 0),
         })
     state['lead_features'] = features
     return state
@@ -95,10 +107,24 @@ async def train_and_score(state: LeadScoringState) -> LeadScoringState:
         # Predict probabilities
         probs = model.predict_proba(X)[:, 1]
     lead_scores: List[Dict[str, Any]] = []
+    # DevPlan19: apply ManualResearch bonus (cap) and map to A/B/C buckets on 0-100 scale
+    bonus_cap = 20
+    try:
+        bonus_cap = int(os.getenv("MANUAL_RESEARCH_BONUS_MAX", "20") or 20)
+    except Exception:
+        bonus_cap = 20
     for feat, p in zip(state['lead_features'], probs):
+        base = max(0.0, min(1.0, float(p)))
+        base100 = int(round(base * 100))
+        ev_cnt = int(feat.get('research_ev_count') or 0)
+        bonus = min(bonus_cap, ev_cnt * 5) if ev_cnt > 0 else 0
+        final = max(0, min(100, base100 + bonus))
+        # A/B/C thresholds per DevPlan19
+        bucket = 'A' if final >= 70 else ('B' if final >= 50 else 'C')
         lead_scores.append({
             'company_id': feat['company_id'],
-            'score': float(p)
+            'score': float(final),
+            'bucket': bucket,
         })
     state['lead_scores'] = lead_scores
     return state
@@ -129,7 +155,7 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
         cache_key = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
         prompt = (
             f"Given the features {feat} with score {score['score']:.2f}, "
-            "provide a concise 2-sentence justification referencing the top signals."
+            "provide a concise 2-sentence justification referencing the top signals and research evidence if present."
         )
         rationale = await generate_rationale(prompt)
         score['rationale'] = rationale

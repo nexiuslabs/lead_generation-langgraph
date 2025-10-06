@@ -210,6 +210,7 @@ def import_docs_for_tenant(tenant_id: int, root: str) -> Dict[str, Any]:
                 errors.append(f"profile parse failed: {p.name}")
 
     # Upsert artifacts and write evidence
+    company_ids_enqueued: List[int] = []
     for art in artifacts:
         try:
             company_id = _resolve_company_id(tenant_id, art.get("company_hint"), art.get("website"))
@@ -239,6 +240,7 @@ def import_docs_for_tenant(tenant_id: int, root: str) -> Dict[str, Any]:
                 )
             _write_evidence(tenant_id, company_id, art)
             leads_upserted += 1
+            company_ids_enqueued.append(int(company_id))
         except Exception as e:  # noqa: F841
             errors.append(f"artifact upsert failed: {art.get('company_hint')}")
 
@@ -253,5 +255,12 @@ def import_docs_for_tenant(tenant_id: int, root: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    return {"files_scanned": files_scanned, "leads_upserted": leads_upserted, "errors": errors}
+    # Enqueue a manual_research_enrich job for imported companies
+    try:
+        if company_ids_enqueued:
+            from src.jobs import enqueue_manual_research_enrich
+            enqueue_manual_research_enrich(tenant_id, company_ids_enqueued[:200])
+    except Exception:
+        pass
 
+    return {"files_scanned": files_scanned, "leads_upserted": leads_upserted, "errors": errors}

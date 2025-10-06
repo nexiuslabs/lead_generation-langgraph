@@ -815,7 +815,7 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
             except Exception:
                 nightly = max(int(icp_total) - do_now, 0)
         msg_lines.append(
-            f"Ready to enrich {do_now} now; {nightly} scheduled for nightly. Type 'run enrichment' after accepting a micro‑ICP."
+            f"We can enrich {do_now} companies now. The nightly runner will process the remaining ICP companies. Type 'run enrichment' after accepting a micro‑ICP."
         )
     else:
         msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -2473,7 +2473,7 @@ async def candidates_node(state: GraphState) -> GraphState:
         except Exception:
             scheduled = max(int(icp_total) - do_now, 0)
         lines.append(
-            f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Accept a micro‑ICP, then type 'run enrichment' to proceed."
+            f"We can enrich {do_now} companies now. The nightly runner will process the remaining ICP companies. Accept a micro‑ICP, then type 'run enrichment' to proceed."
         )
     else:
         lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -3019,7 +3019,7 @@ async def confirm_node(state: GraphState) -> GraphState:
         else:
             scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
         msg_lines.append(
-            f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Accept a micro‑ICP, then type 'run enrichment' to proceed."
+            f"We can enrich {do_now} companies now. The nightly runner will process the remaining ICP companies. Accept a micro‑ICP, then type 'run enrichment' to proceed."
         )
     else:
         msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -3223,14 +3223,10 @@ async def enrich_node(state: GraphState) -> GraphState:
             acra_total_state = int(state.get("acra_total_suggested") or 0)
         except Exception:
             acra_total_state = 0
-        base_total = acra_total_state or icp_total
-        remaining = max(base_total - len(results), 0) if base_total else None
-        suffix = (
-            f" Total candidates: {base_total}. Remaining scheduled nightly: {remaining}."
-            if base_total
-            else " The enrichment pipeline will continue by nightly runner."
+        # Do not surface counts; keep a simple nightly note
+        done_msg = (
+            f"Enrichment complete for {len(results)} companies. The nightly runner will process the remaining ICP companies."
         )
-        done_msg = f"Enrichment complete for {len(results)} companies." + suffix
         state["messages"] = add_messages(
             state.get("messages") or [],
             [AIMessage(content=done_msg)],

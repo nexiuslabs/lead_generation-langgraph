@@ -225,6 +225,118 @@ async def post_accept(
     return {"ok": True, "scheduled": True, "run_now": min(head, len(ssic_codes) if ssic_codes else head)}
 
 
+@router.get("/top10")
+async def get_top10(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Return Top‑10 lookalikes with why/snippets using DDG+Jina discovery.
+
+    Also persists lightweight preview evidence and scores to DB for auditability.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    # Build a minimal icp_profile from latest icp_rules payload when available
+    icp_profile: Dict[str, Any] = {}
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM icp_rules WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 1",
+                (tid,),
+            )
+            row = cur.fetchone()
+            payload = (row and row[0]) or {}
+            # Map simple keys if present
+            if isinstance(payload, dict):
+                if isinstance(payload.get("industries"), list):
+                    icp_profile["industries"] = payload.get("industries")
+                if isinstance(payload.get("integrations"), list):
+                    icp_profile["integrations"] = payload.get("integrations")
+                if isinstance(payload.get("buyer_titles"), list):
+                    icp_profile["buyer_titles"] = payload.get("buyer_titles")
+                if isinstance(payload.get("triggers"), list):
+                    icp_profile["triggers"] = payload.get("triggers")
+    except Exception:
+        icp_profile = {}
+    # Run agents Top‑10
+    try:
+        from src.agents_icp import plan_top10_with_reasons as _top10
+    except Exception:
+        raise HTTPException(status_code=500, detail="agents unavailable")
+    top = await asyncio.to_thread(_top10, icp_profile, tid)
+    items: List[Dict[str, Any]] = []
+    # Persist preview evidence and ensure company rows
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            for it in (top or [])[:10]:
+                dom = (it.get("domain") or "").strip().lower()
+                name = dom  # placeholder until crawl/enrichment fills real name
+                if not dom:
+                    continue
+                # Ensure company row by domain if missing
+                cur.execute(
+                    "SELECT company_id, name FROM companies WHERE website_domain=%s",
+                    (dom,),
+                )
+                r = cur.fetchone()
+                if r and r[0] is not None:
+                    cid = int(r[0])
+                else:
+                    cur.execute(
+                        "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s, NOW()) RETURNING company_id",
+                        (name, dom),
+                    )
+                    cid = int(cur.fetchone()[0])
+                # Write preview evidence (why/snippet) for auditability
+                why = it.get("why") or ""
+                snip = it.get("snippet") or ""
+                try:
+                    cur.execute(
+                        "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s,%s,%s,%s,'web_preview')",
+                        (tid, cid, "top10_preview", Json({"why": why, "snippet": snip})),
+                    )
+                except Exception:
+                    pass
+                # Upsert into lead_scores with preview fields
+                try:
+                    score = float(it.get("score") or 0)
+                except Exception:
+                    score = 0.0
+                bucket = it.get("bucket") or "C"
+                rationale = why or snip
+                cur.execute(
+                    """
+                    INSERT INTO lead_scores(company_id, score, bucket, rationale, cache_key)
+                    VALUES (%s,%s,%s,%s,NULL)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                      score = EXCLUDED.score,
+                      bucket = EXCLUDED.bucket,
+                      rationale = EXCLUDED.rationale
+                    """,
+                    (cid, score, bucket, rationale),
+                )
+                items.append({"company_id": cid, **it})
+    except Exception:
+        # Non-fatal: still return top list
+        items = [{**it} for it in (top or [])]
+    return {"items": items}
+
+
+@router.post("/run")
+async def post_icp_run(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Shortcut endpoint: generate Top‑10 and persist preview artifacts.
+
+    Returns the same payload as GET /icp/top10.
+    """
+    return await get_top10(req, user, x_tenant_id)  # type: ignore[misc]
+
+
 @router.post("/research/import", response_model=ResearchImportResult)
 async def post_research_import(
     body: ResearchImportRequest,

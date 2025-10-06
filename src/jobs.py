@@ -188,6 +188,75 @@ async def run_icp_intake_process(job_id: int) -> None:
     log.info("{\"job\":\"icp_intake_process\",\"phase\":\"finish\",\"job_id\":%s,\"duration_ms\":%s}", job_id, dur_ms)
 
 
+def enqueue_manual_research_enrich(tenant_id: Optional[int], company_ids: List[int]) -> dict:
+    """Queue enrichment for a set of company IDs sourced from ResearchOps import.
+
+    This is a lightweight per-company enrichment runner used to prioritize
+    manual_research candidates per DevPlan19.
+    """
+    ids = [int(i) for i in (company_ids or []) if str(i).strip()]
+    if not ids:
+        return {"job_id": 0}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'manual_research_enrich','queued', %s) RETURNING job_id",
+            (tenant_id, Json({"company_ids": ids})),
+        )
+        row = cur.fetchone()
+        return {"job_id": int(row[0]) if row and row[0] is not None else 0}
+
+
+async def run_manual_research_enrich(job_id: int) -> None:
+    """Process a list of company_ids and run enrichment for each.
+
+    Uses the same enrich function as other flows (Tavily/Apify pipeline),
+    but scoped to the provided IDs.
+    """
+    import time
+    t0 = time.perf_counter()
+    log.info("{\"job\":\"manual_research_enrich\",\"phase\":\"start\",\"job_id\":%s}", job_id)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE background_jobs SET status='running', started_at=now() WHERE job_id=%s", (job_id,))
+        cur.execute("SELECT params FROM background_jobs WHERE job_id=%s", (job_id,))
+        row = cur.fetchone()
+        params = (row and row[0]) or {}
+        ids = [int(i) for i in (params.get('company_ids') or []) if str(i).strip()]
+    processed = 0
+    try:
+        if not ids:
+            raise RuntimeError("company_ids required")
+        if enrich_company_with_tavily is None:
+            raise RuntimeError("enrich unavailable")
+        # Fetch names/uen for display and vendor input
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT company_id, name, uen FROM companies WHERE company_id = ANY(%s)",
+                (ids,),
+            )
+            rows = cur.fetchall() or []
+        for cid, name, uen in rows:
+            try:
+                await enrich_company_with_tavily(int(cid), name, uen)
+                processed += 1
+            except Exception:
+                continue
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                (processed, len(ids), job_id),
+            )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"manual_research_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
+    except Exception as e:  # pragma: no cover
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE background_jobs SET status='error', error=%s, processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                (str(e), processed, len(ids) if 'ids' in locals() else 0, job_id),
+            )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"manual_research_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
+
+
 def enqueue_enrich_candidates(tenant_id: Optional[int], ssic_codes: List[str]) -> dict:
     """Queue an enrich_candidates job keyed by SSIC codes (normalized numeric strings)."""
     params: Dict[str, Any] = {"ssic_codes": [str(c) for c in (ssic_codes or []) if str(c).strip()]}

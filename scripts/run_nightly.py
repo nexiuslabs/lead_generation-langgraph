@@ -12,7 +12,18 @@ async def run_queued_jobs(limit: Optional[int] = None) -> int:
     """
     jobs: list[tuple[int, str]] = []
     with get_conn() as conn, conn.cursor() as cur:
-        sql = "SELECT job_id, job_type FROM background_jobs WHERE status='queued' AND job_type IN ('staging_upsert','enrich_candidates','icp_intake_process') ORDER BY job_id ASC"
+        # Include manual_research_enrich and apply a simple priority ordering
+        # Priority: manual_research_enrich (1) → staging_upsert (2) → enrich_candidates (3) → icp_intake_process (4)
+        sql = (
+            "SELECT job_id, job_type FROM background_jobs "
+            "WHERE status='queued' AND job_type IN ('manual_research_enrich','staging_upsert','enrich_candidates','icp_intake_process') "
+            "ORDER BY CASE job_type "
+            "WHEN 'manual_research_enrich' THEN 1 "
+            "WHEN 'staging_upsert' THEN 2 "
+            "WHEN 'enrich_candidates' THEN 3 "
+            "WHEN 'icp_intake_process' THEN 4 "
+            "ELSE 5 END, job_id ASC"
+        )
         if isinstance(limit, int) and limit > 0:
             sql += f" LIMIT {int(limit)}"
         cur.execute(sql)
@@ -26,6 +37,9 @@ async def run_queued_jobs(limit: Optional[int] = None) -> int:
         elif jtype == 'icp_intake_process':
             from src.jobs import run_icp_intake_process
             await run_icp_intake_process(int(jid))
+        elif jtype == 'manual_research_enrich':
+            from src.jobs import run_manual_research_enrich
+            await run_manual_research_enrich(int(jid))
     return len(jobs)
 
 
