@@ -14,6 +14,10 @@ import html as html_lib
 
 from langchain_openai import ChatOpenAI
 from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
+try:
+    from src.settings import STRICT_INDUSTRY_QUERY_ONLY  # type: ignore
+except Exception:  # pragma: no cover
+    STRICT_INDUSTRY_QUERY_ONLY = True  # type: ignore
 import logging
 import requests
 from urllib.parse import quote, urlparse, urljoin, parse_qs, unquote
@@ -57,6 +61,8 @@ def _is_probable_domain(host: str) -> bool:
             "webp", "jpg", "jpeg", "png", "gif", "svg", "bmp", "ico",
             "pdf", "txt", "json", "xml", "csv", "zip", "gz", "tar",
             "mp4", "mp3", "mov", "avi", "css", "js", "html", "htm",
+            # add text/doctype/file-like pseudo-TLDs often seen in scraped text
+            "dtd",
         }
         if tld in bad_tlds:
             return False
@@ -209,6 +215,25 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 out.append(h)
             if len(out) >= max_results:
                 break
+        # If no domains extracted via hrefs/redirects, fall back to text-based domain scanning
+        if not out:
+            try:
+                text_domains = _extract_domains_from_text(text)
+                # Preserve order and cap
+                tmp: List[str] = []
+                for d in text_domains:
+                    if any(x in d for x in (
+                        "duckduckgo.", "cloudflare.", "wikipedia.", "wikimedia.",
+                    )):
+                        continue
+                    if _is_probable_domain(d) and d not in tmp:
+                        tmp.append(d)
+                    if len(tmp) >= max_results:
+                        break
+                if tmp:
+                    return tmp
+            except Exception:
+                pass
         return out
 
     # Use a requests session with retries disabled to avoid noisy repeated attempts
@@ -238,19 +263,25 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             country_hint = 'sg'
     except Exception:
         country_hint = None
-    # Single endpoint: html.duckduckgo.com/html/?q=...
-    try:
-        params = {"q": query}
-        if (DDG_KL or kl):
-            params["kl"] = (DDG_KL or kl)
-        r = _get("https://html.duckduckgo.com/html/", params=params)
-        r.raise_for_status()
-        domains = _extract_domains_from_html(r.text)
-        if domains:
-            log.info("[ddg] HTML_GET parsed domains=%d for query=%s", len(domains), query)
-            return domains
-    except Exception as e:
-        log.info("[ddg] HTML_GET failed: %s", e)
+    # Try multiple DDG endpoints for robustness
+    params = {"q": query}
+    if (DDG_KL or kl):
+        params["kl"] = (DDG_KL or kl)
+    endpoints = [
+        DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html
+        DDG_LITE_GET,       # lite.duckduckgo.com/lite
+        DDG_HTML_GET,       # duckduckgo.com/html
+    ]
+    for ep in endpoints:
+        try:
+            r = _get(ep, params=params)
+            r.raise_for_status()
+            domains = _extract_domains_from_html(r.text)
+            if domains:
+                log.info("[ddg] parsed domains=%d via %s for query=%s", len(domains), ep, query)
+                return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+        except Exception as e:
+            log.info("[ddg] endpoint fail %s: %s", ep, e)
 
     return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
 
@@ -871,8 +902,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             if extra:
                 extra = sorted(extra, key=lambda x: int(x.get("score") or 0), reverse=True)
                 top = (top + extra)
-            # 4b) Seeds fallback if still less than 10
-            if len(top) < 10:
+            # 4b) Optional seeds-based competitor queries are disabled when STRICT_INDUSTRY_QUERY_ONLY
+            if (len(top) < 10) and (not STRICT_INDUSTRY_QUERY_ONLY):
                 try:
                     seeds = list(SEED_HINTS)
                 except Exception:
@@ -926,17 +957,15 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
     try:
         icp = dict(icp_profile or {})
         inds = [s.strip() for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()]
-        titles = [s.strip() for s in (icp.get("buyer_titles") or []) if isinstance(s, str) and s.strip()]
-        sigs = [s.strip() for s in ((icp.get("integrations") or []) + (icp.get("triggers") or [])) if isinstance(s, str) and s.strip()]
+        # Strict industry-only DDG query composition
+        titles: List[str] = []
+        sigs: List[str] = []
         queries: List[str] = []
         if inds:
             queries.append(f"B2B companies in {', '.join(inds[:2])}")
-        if sigs:
-            queries.append(f"B2B solutions {', '.join(sigs[:2])}")
-        if titles:
-            queries.append(f"companies hiring {', '.join(titles[:2])}")
         if not queries:
-            queries = ["B2B SaaS companies", "B2B platforms", "enterprise software vendors"]
+            # minimal generic industry-only fallbacks
+            queries = ["B2B distributors", "B2B companies"]
 
         # Discover domains strictly via DDG
         domains: List[str] = []
@@ -1115,6 +1144,116 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
         log.info("[top10-seeds-fallback] failed: %s", e)
         return []
 
+
+def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fallback that avoids DDG entirely by mining outbound domains from seed homepages via r.jina.ai.
+
+    - Fetch each seed's homepage snapshot (r.jina.ai)
+    - Extract domain mentions from the text
+    - Filter out social/CDN/seeds; prefer same-region TLDs (e.g., .sg) when present
+    - Fetch a short snippet for each candidate and score heuristically using ICP cues
+    - Return Top‑10 [{domain, score, bucket, why, snippet}]
+    """
+    try:
+        seeds = [d.strip().lower() for d in (seed_domains or []) if isinstance(d, str) and d.strip()]
+        if not seeds:
+            return []
+        seed_apex = {_apex_domain(s) for s in seeds}
+        prefer_sg = any(s.endswith(".sg") for s in seeds)
+        # Collect outlink domains from seed pages
+        cand: List[str] = []
+        for s in seeds[:6]:
+            try:
+                reader = f"https://r.jina.ai/http://{_normalize_host(s)}"
+                log.info("[jina] GET %s", reader)
+                r = requests.get(reader, timeout=10)
+                raw = (r.text or "")[:10000]
+                from src.jina_reader import clean_jina_text as _clean
+                clean = _clean(raw)
+                for h in _extract_domains_from_text(clean):
+                    cand.append(h)
+            except Exception as e:
+                log.info("[jina] seed read fail %s err=%s", s, e)
+                continue
+        uniq: List[str] = []
+        seen = set()
+        for h in cand:
+            try:
+                if not _is_probable_domain(h):
+                    continue
+                apex = _apex_domain(h)
+                if apex in seed_apex:
+                    continue
+                if apex not in seen:
+                    seen.add(apex)
+                    uniq.append(apex)
+            except Exception:
+                continue
+        # Prefer same-region TLDs first
+        if prefer_sg:
+            sg = [d for d in uniq if d.endswith(".sg")]
+            non = [d for d in uniq if not d.endswith(".sg")]
+            uniq = sg + non
+        uniq = uniq[:50]
+        if not uniq:
+            return []
+        # Score candidates using lightweight homepage snippets
+        def _ind_terms4(icp_prof: Dict[str, Any]) -> list[str]:
+            try:
+                raw = [s for s in (icp_prof.get("industries") or []) if isinstance(s, str)]
+                toks: list[str] = []
+                for s in raw:
+                    for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                        t = t.strip(" &").strip()
+                        if len(t) >= 3:
+                            toks.append(t)
+                return sorted(set(toks))
+            except Exception:
+                return []
+        ind_toks = _ind_terms4(icp_profile)
+        out: List[Dict[str, Any]] = []
+        for d in uniq[:20]:
+            try:
+                try:
+                    reader = f"https://r.jina.ai/http://{d}"
+                    r = requests.get(reader, timeout=10)
+                    from src.jina_reader import clean_jina_text as _clean
+                    clean = _clean((r.text or "")[:8000])
+                except Exception:
+                    clean = _fallback_home_snippet(d) or d
+                low = (clean or "").lower()
+                if ind_toks and not any(tok in low for tok in ind_toks):
+                    continue
+                score = 0
+                why_bits: List[str] = []
+                if "integrat" in low:
+                    score += 35
+                    why_bits.append("integrations signals")
+                if "pricing" in low or "plans" in low:
+                    score += 15
+                    why_bits.append("pricing page found")
+                if "case stud" in low or "customers" in low:
+                    score += 10
+                    why_bits.append("case studies")
+                if "careers" in low or "jobs" in low or "hiring" in low:
+                    score += 5
+                    why_bits.append("hiring")
+                snip = (clean or "")[:180]
+                bucket = "A" if score >= 70 else ("B" if score >= 50 else "C")
+                out.append({
+                    "domain": d,
+                    "score": score,
+                    "bucket": bucket,
+                    "why": "; ".join(why_bits) if why_bits else "signal match",
+                    "snippet": snip,
+                })
+            except Exception:
+                continue
+        out = sorted(out, key=lambda x: int(x.get("score") or 0), reverse=True)[:10]
+        return out
+    except Exception as e:
+        log.info("[top10-seed-outlinks] failed: %s", e)
+        return []
 
 def build_icp_agents_graph():
     """Build a small LangGraph with the core nodes described in PRD19 §6.

@@ -81,6 +81,10 @@ try:
 except Exception:  # pragma: no cover
     ENABLE_ACRA_IN_CHAT = False  # type: ignore
 try:
+    from src.settings import STRICT_DDG_ONLY  # type: ignore
+except Exception:  # pragma: no cover
+    STRICT_DDG_ONLY = True  # type: ignore
+try:
     # Lead‑gen conversational Q&A helpers
     from src.conversation_agent import answer_leadgen_question as _qa_answer  # type: ignore
 except Exception:  # pragma: no cover
@@ -3261,21 +3265,40 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
                                 logger.info("[confirm] agent top10 count=%d", len(top or []))
                                 if not top:
-                                    # Fallback 1: single-endpoint DDG-free seeds expansion via Jina reader
+                                    # Seeds-based competitor query fallback is disabled when STRICT_INDUSTRY_QUERY_ONLY
                                     try:
-                                        from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
+                                        from src.settings import STRICT_INDUSTRY_QUERY_ONLY as _strict  # type: ignore
+                                    except Exception:
+                                        _strict = True
+                                    if not _strict:
+                                        try:
+                                            from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
+                                            seed_domains = []
+                                            for s in (icp.get("seeds_list") or []):
+                                                dom = (s.get("domain") or "").strip().lower()
+                                                if dom:
+                                                    seed_domains.append(dom)
+                                            if seed_domains:
+                                                top = await asyncio.to_thread(_fb_seeds, seed_domains, icp_prof)
+                                                logger.info("[confirm] seeds-fallback top10 count=%d", len(top or []))
+                                        except Exception as _fb1_e:
+                                            logger.warning("[confirm] seeds-fallback failed: %s", _fb1_e)
+                                if not top and not STRICT_DDG_ONLY:
+                                    # Fallback 2: Jina outlinks from seeds (no DDG) — disabled when STRICT_DDG_ONLY
+                                    try:
+                                        from src.agents_icp import fallback_top10_via_seed_outlinks as _fb_outlinks  # type: ignore
                                         seed_domains = []
                                         for s in (icp.get("seeds_list") or []):
                                             dom = (s.get("domain") or "").strip().lower()
                                             if dom:
                                                 seed_domains.append(dom)
                                         if seed_domains:
-                                            top = await asyncio.to_thread(_fb_seeds, seed_domains, icp_prof)
-                                            logger.info("[confirm] seeds-fallback top10 count=%d", len(top or []))
-                                    except Exception as _fb1_e:
-                                        logger.warning("[confirm] seeds-fallback failed: %s", _fb1_e)
+                                            top = await asyncio.to_thread(_fb_outlinks, seed_domains, icp_prof)
+                                            logger.info("[confirm] seeds-outlinks fallback top10 count=%d", len(top or []))
+                                    except Exception as _fb2_e:
+                                        logger.warning("[confirm] seeds-outlinks fallback failed: %s", _fb2_e)
                                 if not top:
-                                    # Fallback 2: legacy DDG+Jina heuristic (may be disabled by env)
+                                    # Fallback 3: legacy DDG+Jina heuristic (may be disabled by env)
                                     try:
                                         from src.agents_icp import plan_top10_with_reasons_fallback as _top10_fb  # type: ignore
                                         top = await asyncio.to_thread(_top10_fb, icp_prof)
@@ -4505,24 +4528,12 @@ def router(state: GraphState) -> str:
 
     # 3) Fast-path: user requested enrichment
     if "run enrichment" in text:
-        # Finder context: if suggestions not finished yet, hold until they are done
-        if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
-            logger.info("router -> end (Finder: hold until suggestions are done before run enrichment)")
-            return "end"
-        # Proceed with enrichment when candidates exist, regardless of ICP completeness
-        if state.get("candidates"):
-            logger.info("router -> enrich (user requested enrichment)")
-            try:
-                state["last_routed_text"] = text
-            except Exception:
-                pass
-            return "enrich"
-        logger.info("router -> candidates (prepare candidates before enrichment)")
+        logger.info("router -> enrich (user requested enrichment)")
         try:
             state["last_routed_text"] = text
         except Exception:
             pass
-        return "candidates"
+        return "enrich"
 
     # 4) If user pasted an explicit company list, jump to candidates
     # Avoid misclassifying comma-separated industry/geo lists as companies.

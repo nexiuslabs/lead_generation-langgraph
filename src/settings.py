@@ -260,6 +260,21 @@ ENABLE_DDG_DISCOVERY = os.getenv("ENABLE_DDG_DISCOVERY", "true").lower() in (
     "yes",
     "on",
 )
+# When true, domain discovery must use DuckDuckGo only (no non-DDG outlink mining for discovery)
+STRICT_DDG_ONLY = os.getenv("STRICT_DDG_ONLY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# When true, do not generate competitor/brand-based DDG queries from seeds
+STRICT_INDUSTRY_QUERY_ONLY = os.getenv("STRICT_INDUSTRY_QUERY_ONLY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 try:
     DDG_TIMEOUT_S = float(os.getenv("DDG_TIMEOUT_S", "5") or 5)
 except Exception:
