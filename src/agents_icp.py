@@ -531,6 +531,12 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         s = {"icp_profile": dict(icp_profile or {})}
         s = discovery_planner(s)
         cand: List[str] = s.get("discovery_candidates") or []
+        # Exclude seed domains from discovery candidates
+        try:
+            seed_set = {str(h).strip().lower() for h in (SEED_HINTS or [])}
+        except Exception:
+            seed_set = set()
+        cand = [d for d in cand if str(d).strip().lower() not in seed_set]
         jina_snips: Dict[str, str] = s.get("jina_snippets") or {}
         if not cand:
             return []
@@ -588,8 +594,79 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                 "why": "; ".join(why_bits) if why_bits else "signal match",
                 "snippet": snip,
             })
-        # Sort by score desc and return top 10
-        top = sorted(top, key=lambda x: int(x.get("score") or 0), reverse=True)[:10]
+        # Sort by score desc
+        top = sorted(top, key=lambda x: int(x.get("score") or 0), reverse=True)
+        # If fewer than 10, backfill using additional candidates (heuristic scoring) and seeds fallback
+        if len(top) < 10:
+            # 4a) Heuristic backfill from remaining discovery candidates
+            seen = {str((it.get("domain") or "").strip().lower()) for it in top}
+            extra: List[Dict[str, Any]] = []
+            for d in cand[10:30]:
+                try:
+                    if not d:
+                        continue
+                    dn = str(d).strip().lower()
+                    if dn in seen or dn in seed_set:
+                        continue
+                    url = f"https://{d}"
+                    body = jina_read(url, timeout=8) or ""
+                    if not body:
+                        continue
+                    clean = " ".join((body or "").split())
+                    low = clean.lower()
+                    score = 0
+                    why_bits: List[str] = []
+                    if "integrat" in low:
+                        score += 35
+                        why_bits.append("integrations signals")
+                    if "pricing" in low or "plans" in low:
+                        score += 15
+                        why_bits.append("pricing page found")
+                    if "case stud" in low or "customers" in low:
+                        score += 10
+                        why_bits.append("case studies")
+                    if "careers" in low or "jobs" in low or "hiring" in low:
+                        score += 5
+                        why_bits.append("hiring")
+                    snip = clean[:180]
+                    bucket = "A" if score >= 70 else ("B" if score >= 50 else "C")
+                    extra.append({
+                        "domain": d,
+                        "score": score,
+                        "bucket": bucket,
+                        "why": "; ".join(why_bits) if why_bits else "signal match",
+                        "snippet": snip,
+                    })
+                    seen.add(dn)
+                    if len(top) + len(extra) >= 12:
+                        # safety cap to avoid long loops
+                        break
+                except Exception:
+                    continue
+            if extra:
+                extra = sorted(extra, key=lambda x: int(x.get("score") or 0), reverse=True)
+                top = (top + extra)
+            # 4b) Seeds fallback if still less than 10
+            if len(top) < 10:
+                try:
+                    seeds = list(SEED_HINTS)
+                except Exception:
+                    seeds = []
+                if seeds:
+                    try:
+                        fb = fallback_top10_from_seeds(seeds, dict(icp_profile or {}))
+                    except Exception:
+                        fb = []
+                    if fb:
+                        for it in fb:
+                            dom = (it.get("domain") or "").strip().lower()
+                            if dom and dom not in seen and dom not in seed_set:
+                                top.append(it)
+                                seen.add(dom)
+                            if len(top) >= 10:
+                                break
+        # Return at most 10
+        top = top[:10]
         log.info("[confirm] agent top10 count=%d", len(top))
         # Display message after analysis for backend logs
         log.info("ICP Profile")
@@ -701,12 +778,6 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
     try:
         seeds = [d.strip().lower() for d in (seed_domains or []) if isinstance(d, str) and d.strip()]
         candidates: List[str] = []
-        # Add seeds first
-        for d in seeds:
-            if d.startswith("http"):
-                from urllib.parse import urlparse
-                d = (urlparse(d).netloc or d).lower()
-            candidates.append(d)
         # Expand from each seed via r.jina
         for d in seeds:
             try:
@@ -719,7 +790,9 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
             except Exception as e:
                 log.info("[jina-fb] seed expand fail domain=%s err=%s", d, e)
                 continue
-        uniq = _uniq(candidates)[:60]
+        # Exclude seed domains from the pool; we only want lookalikes discovered from web references
+        seed_set = set(seeds)
+        uniq = [c for c in _uniq(candidates) if c not in seed_set][:60]
         if not uniq:
             return []
         inds = ", ".join([s for s in (icp_profile.get("industries") or []) if isinstance(s, str)])

@@ -1165,6 +1165,14 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         except Exception:
             pass
     if not candidates:
+        # Strict policy: do not enrich arbitrary companies when Top‑10 is missing
+        try:
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [AIMessage(content="I couldn’t find the last Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate and lock a Top‑10, then try 'run enrichment' again.")],
+            )
+        except Exception:
+            pass
         return state
 
     pool = await get_pg_pool()
@@ -3466,45 +3474,37 @@ async def enrich_node(state: GraphState) -> GraphState:
         persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
         if persisted_top:
             top10 = persisted_top
-    # If Top‑10 is missing (e.g., new thread/session), recompute from latest ICP profile
+    # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
+    # Strict policy: reuse persisted Top‑10 or fall back to Jina-only seeds expansion.
     if not (isinstance(top10, list) and top10):
+        # Attempt a DDG-free fallback from seeds in state
         try:
-            # Load icp_profile from latest icp_rules for this tenant when not present in state
-            icp_prof = state.get("icp_profile") or {}
-            if not icp_prof:
-                try:
-                    tid = await _resolve_tenant_id_for_write(state)
-                except Exception:
-                    tid = None
-                if isinstance(tid, int):
-                    with get_conn() as _c, _c.cursor() as _cur:
-                        _cur.execute(
-                            "SELECT payload FROM icp_rules WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 1",
-                            (tid,),
-                        )
-                        row = _cur.fetchone()
-                        payload = (row and row[0]) or {}
-                        if isinstance(payload, dict):
-                            icp_prof = payload
-                            state["icp_profile"] = icp_prof
-            # Re-plan Top‑10 using agents if available
+            seeds_list = list((state.get("icp") or {}).get("seeds_list") or [])
+        except Exception:
+            seeds_list = []
+        seed_domains: list[str] = []
+        for s in seeds_list:
             try:
-                from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+                dom = (s.get("domain") or "").strip().lower()
+                if dom:
+                    seed_domains.append(dom)
             except Exception:
-                _agent_top10 = None  # type: ignore
-            if _agent_top10 is not None and (icp_prof or state.get("icp")):
-                # Use icp_profile if present; otherwise derive from basic icp state
-                prof = icp_prof or _icp_payload_from_state_icp(state.get("icp") or {})
-                try:
-                    tid = await _resolve_tenant_id_for_write(state)
-                except Exception:
-                    tid = None
-                top10 = await asyncio.to_thread(_agent_top10, prof, int(tid) if isinstance(tid, int) else None)
+                continue
+        if seed_domains:
+            try:
+                from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
+            except Exception:
+                _fb_seeds = None  # type: ignore
+            if _fb_seeds is not None:
+                icp_prof = state.get("icp_profile") or {}
+                top10 = await asyncio.to_thread(_fb_seeds, seed_domains, icp_prof)
                 if isinstance(top10, list) and top10:
                     state["agent_top10"] = top10
+                    try:
+                        tid = await _resolve_tenant_id_for_write(state)
+                    except Exception:
+                        tid = None
                     _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top10)
-        except Exception:
-            top10 = []
     if isinstance(top10, list) and top10:
         try:
             from src.database import get_conn as _get_conn
