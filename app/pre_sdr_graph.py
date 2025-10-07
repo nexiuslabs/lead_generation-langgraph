@@ -424,6 +424,12 @@ def _persist_web_candidates_to_staging(
         return 0
     try:
         with get_conn() as conn, conn.cursor() as cur:
+            # Set tenant GUC for RLS consistency (even if staging has no RLS, keep uniform)
+            try:
+                if isinstance(tenant_id, int):
+                    cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tenant_id),))
+            except Exception:
+                pass
             # Ensure table exists (dev-safe) including ai_metadata column
             cur.execute(
                 f"""
@@ -493,6 +499,12 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
         pass
     try:
         with get_conn() as _c, _c.cursor() as _cur:
+            # Ensure tenant GUC is set for RLS writes
+            try:
+                if isinstance(tid, int):
+                    _cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
+            except Exception:
+                pass
             for it in (top or [])[:10]:
                 dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
                 if not dom:
@@ -546,6 +558,12 @@ def _load_persisted_top10(tid: Optional[int]) -> list[dict]:
         return []
     try:
         with get_conn() as _c, _c.cursor() as _cur:
+            # Set tenant GUC for RLS reads
+            try:
+                if isinstance(tid, int):
+                    _cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
+            except Exception:
+                pass
             _cur.execute(
                 """
                 SELECT c.website_domain AS domain,
@@ -575,7 +593,40 @@ def _load_persisted_top10(tid: Optional[int]) -> list[dict]:
                 }
                 if d["domain"]:
                     out.append(d)
-            return out
+            if out:
+                return out
+            # Fallback: read from staging_global_companies ai_metadata preview
+            try:
+                _cur.execute(
+                    f"""
+                    SELECT domain,
+                           COALESCE((ai_metadata->>'score')::float, 0) AS score,
+                           COALESCE((ai_metadata->>'bucket'), 'C') AS bucket,
+                           (ai_metadata->>'why') AS why,
+                           (ai_metadata->>'snippet') AS snippet
+                      FROM {STAGING_GLOBAL_TABLE}
+                     WHERE (tenant_id = %s OR %s IS NULL)
+                       AND COALESCE((ai_metadata->>'preview')::boolean, false) = true
+                     ORDER BY created_at DESC
+                     LIMIT 10
+                    """,
+                    (tid, None if tid is None else tid),
+                )
+                rows2 = _cur.fetchall() or []
+                out2: list[dict] = []
+                for r in rows2:
+                    d = {
+                        "domain": (r[0] or "").strip().lower(),
+                        "score": float(r[1] or 0),
+                        "bucket": r[2] or "C",
+                        "why": r[3] or "",
+                        "snippet": r[4] or "",
+                    }
+                    if d["domain"]:
+                        out2.append(d)
+                return out2
+            except Exception:
+                return []
     except Exception:
         return []
 
