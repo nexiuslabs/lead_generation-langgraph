@@ -1271,10 +1271,15 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
             tid = _resolve_tenant_id_for_write_sync(state)
         except Exception:
             tid = None
+        tid_int = int(tid) if isinstance(tid, int) else None
         try:
-            persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
+            persisted_top = _load_persisted_top10(tid_int)
         except Exception:
             persisted_top = []
+        if not persisted_top:
+            regenerated_top = await _regenerate_top10_if_missing(state, tid_int)
+            if regenerated_top:
+                persisted_top = regenerated_top
         if persisted_top:
             try:
                 from src.database import get_conn as _get_conn
@@ -1301,7 +1306,7 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                         candidates = cand
                         state["candidates"] = cand
                         state["strict_top10"] = True
-                        _persist_top10_preview(int(tid) if isinstance(tid, int) else None, persisted_top)
+                        _persist_top10_preview(tid_int, persisted_top)
             except Exception:
                 pass
     # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
@@ -1666,6 +1671,49 @@ def _last_user_text(state: GraphState) -> str:
         if isinstance(msg, HumanMessage):
             return _to_text(msg.content).strip()
     return _to_text((state.get("messages") or [AIMessage("")])[-1].content).strip()
+
+
+def _top10_preview_was_sent(state: GraphState) -> bool:
+    """Return True if an AI message already presented a Top-10 lookalike table."""
+    try:
+        for msg in reversed(state.get("messages") or []):
+            if not isinstance(msg, AIMessage):
+                continue
+            text = _to_text(getattr(msg, "content", "") or "").strip().lower()
+            if not text:
+                continue
+            if "top-10 lookalikes" in text or "top‑10 lookalikes" in text:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _regenerate_top10_if_missing(
+    state: GraphState, tenant_id: Optional[int]
+) -> List[Dict[str, Any]]:
+    """Rebuild the Top-10 list when the preview was shown but persistence missed it."""
+    if not _top10_preview_was_sent(state):
+        return []
+    try:
+        from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+    except Exception as _imp_err:  # pragma: no cover - import edge case
+        logger.info("[top10] regeneration skipped: %s", _imp_err)
+        return []
+    icp_prof = dict(state.get("icp_profile") or {})
+    try:
+        regenerated = await asyncio.to_thread(_agent_top10, icp_prof, tenant_id)
+    except Exception as _regen_exc:
+        logger.info("[top10] regeneration failed: %s", _regen_exc)
+        return []
+    if isinstance(regenerated, list) and regenerated:
+        state["agent_top10"] = regenerated
+        try:
+            _persist_top10_preview(tenant_id, regenerated)
+        except Exception:
+            pass
+        return regenerated
+    return []
 
 
 # None/skip/any detector for buying signals
