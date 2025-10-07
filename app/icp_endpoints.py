@@ -48,7 +48,13 @@ def _resolve_tenant_id(req: Request, x_tenant_id: Optional[str]) -> Optional[int
 def _save_icp_rule(tid: int, payload: Dict[str, Any], name: str = "Default ICP") -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO icp_rules(tenant_id, name, payload) VALUES (%s,%s,%s)",
+            """
+            INSERT INTO icp_rules(tenant_id, name, payload)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              created_at = NOW()
+            """,
             (tid, name, Json(payload)),
         )
 
@@ -258,6 +264,8 @@ async def get_top10(
                     icp_profile["buyer_titles"] = payload.get("buyer_titles")
                 if isinstance(payload.get("triggers"), list):
                     icp_profile["triggers"] = payload.get("triggers")
+                if isinstance(payload.get("size_bands"), list):
+                    icp_profile["size_bands"] = payload.get("size_bands")
     except Exception:
         icp_profile = {}
     # Run agents Top‑10

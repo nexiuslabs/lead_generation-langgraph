@@ -42,6 +42,34 @@ from src.jina_reader import read_url as jina_read
 # Core state keys (subset)
 # tenant_id, seeds[], icp_profile, discovery_candidates[], research_artifacts[], evidence[], scores[], queue[], errors[]
 
+def _is_probable_domain(host: str) -> bool:
+    try:
+        h = (host or "").strip().lower()
+        if not h:
+            return False
+        # Must contain at least one dot and valid labels
+        import re as _re
+        if not _re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", h):
+            return False
+        # Block common file extensions posing as TLDs
+        tld = h.rsplit(".", 1)[-1]
+        bad_tlds = {
+            "webp", "jpg", "jpeg", "png", "gif", "svg", "bmp", "ico",
+            "pdf", "txt", "json", "xml", "csv", "zip", "gz", "tar",
+            "mp4", "mp3", "mov", "avi", "css", "js", "html", "htm",
+        }
+        if tld in bad_tlds:
+            return False
+        # Label length checks
+        if not (2 <= len(tld) <= 24):
+            return False
+        # Exclude common shorteners/infrastructure
+        if h in {"wa.me", "bit.ly", "t.co", "goo.gl", "tinyurl.com"}:
+            return False
+        return True
+    except Exception:
+        return False
+
 
 def _uniq(seq: List[str]) -> List[str]:
     seen = set()
@@ -51,6 +79,54 @@ def _uniq(seq: List[str]) -> List[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _normalize_host(h: str) -> str:
+    try:
+        h = (h or "").strip().lower()
+        if not h:
+            return ""
+        # strip protocol and path
+        if h.startswith("http://"):
+            h = h[7:]
+        elif h.startswith("https://"):
+            h = h[8:]
+        for sep in ["/", "?", "#"]:
+            if sep in h:
+                h = h.split(sep, 1)[0]
+        if h.startswith("www."):
+            h = h[4:]
+        return h
+    except Exception:
+        return (h or "").lower()
+
+
+_MULTI_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk",
+    "com.sg", "net.sg", "org.sg", "edu.sg",
+    "com.au", "net.au", "org.au",
+    "co.jp", "ne.jp", "or.jp",
+    "co.in", "net.in", "org.in",
+}
+
+
+def _apex_domain(h: str) -> str:
+    try:
+        host = _normalize_host(h)
+        if not host:
+            return ""
+        parts = host.split(".")
+        if len(parts) <= 2:
+            return host
+        last2 = ".".join(parts[-2:])
+        last3 = ".".join(parts[-3:])
+        if last2 in _MULTI_TLDS and len(parts) >= 3:
+            return ".".join(parts[-3:])
+        if last3 in _MULTI_TLDS and len(parts) >= 4:
+            return ".".join(parts[-4:])
+        return last2
+    except Exception:
+        return _normalize_host(h)
 
 
 def _ddg_search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
@@ -129,7 +205,8 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 "cloudflare.", "wikipedia.", "wikimedia.", "github.", "stackexchange.",
             )):
                 continue
-            out.append(h)
+            if _is_probable_domain(h):
+                out.append(h)
             if len(out) >= max_results:
                 break
         return out
@@ -175,7 +252,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
     except Exception as e:
         log.info("[ddg] HTML_GET failed: %s", e)
 
-    return _uniq(domains)
+    return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
 
 
 log = logging.getLogger("agents.icp")
@@ -272,6 +349,41 @@ def ensure_icp_enriched_with_jina(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def _fallback_home_snippet(domain: str) -> str:
+    """Fetch a lightweight homepage title/description when Jina is unavailable.
+
+    Returns a short string combining <title> and meta description if found.
+    """
+    try:
+        host = _normalize_host(domain)
+        if not host:
+            return ""
+        url = f"https://{host}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        r = requests.get(url, headers=headers, timeout=6)
+        html = r.text or ""
+        if not html:
+            return host
+        # Extract <title>
+        m_title = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I|re.S)
+        title = (m_title.group(1).strip() if m_title else "")
+        # Extract meta description
+        m_desc = re.search(r"<meta[^>]+name=\"description\"[^>]+content=\"([^\"]+)\"", html, flags=re.I)
+        desc = (m_desc.group(1).strip() if m_desc else "")
+        text = " - ".join([t for t in [title, desc] if t]) or host
+        # normalize whitespace and cap length
+        text = " ".join(text.split())
+        return text[:400]
+    except Exception:
+        return (domain or "").strip()
+
+
 def icp_synthesizer(state: Dict[str, Any]) -> Dict[str, Any]:
     """LLM agent that synthesizes a micro‑ICP from seed snippets and prior ICP.
 
@@ -328,15 +440,47 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             country_hint = 'sg'
     except Exception:
         country_hint = None
-    # Build one query from extracted signals (customer + user sites reflected in icp_profile)
-    terms: List[str] = []
-    for arr in [icp.get("industries") or [], icp.get("integrations") or [], icp.get("buyer_titles") or [], icp.get("triggers") or []]:
-        for v in arr:
+    # Compose one concise DDG query from ICP via LLM (fallback to heuristic terms join)
+    def _llm_compose_ddg_query() -> Optional[str]:
+        try:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            inds = ", ".join([s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()])
+            site = "site:.sg" if (country_hint == 'sg') else ""
+            sys = (
+                "Compose ONE effective DuckDuckGo query to find companies in the TARGET INDUSTRY only. "
+                "Use industry terms only (no buyer titles, no triggers, no integrator/vendor names). "
+                "Keep it concise (<= 12 words), prefer noun phrases. Include the site filter verbatim if provided. "
+                "Output JUST the query line."
+            )
+            human = (
+                f"industries: {inds}\n"
+                f"site_filter: {site}\n"
+                f"examples: food & beverage distributors; consumer goods wholesale; logistics distributors"
+            )
+            from langchain_core.messages import SystemMessage, HumanMessage
+            messages = [SystemMessage(content=sys), HumanMessage(content=human)]
+            out = llm.invoke(messages)
+            q = (getattr(out, "content", None) or "").strip().replace("\n", " ")
+            # Guard rails: ensure site filter is present if required
+            if country_hint == 'sg' and "site:.sg" not in q:
+                q = (q + " site:.sg").strip()
+            return q if len(q) >= 4 else None
+        except Exception as e:
+            log.info("[plan] llm-query fail: %s", e)
+            return None
+
+    q_llm = _llm_compose_ddg_query()
+    queries: List[str] = [q_llm] if q_llm else []
+    # Heuristic fallback: industry-only join if LLM not available
+    if not queries:
+        terms: List[str] = []
+        for v in (icp.get("industries") or []):
             if isinstance(v, str) and v.strip():
                 terms.append(v.strip())
-    inline_site = "site:.sg" if (country_hint == 'sg') else ""
-    base_query = " ".join(_uniq([*terms, inline_site])).strip()
-    queries: List[str] = [base_query] if base_query else []
+        inline_site = "site:.sg" if (country_hint == 'sg') else ""
+        base_query = " ".join(_uniq([*terms, inline_site])).strip()
+        if base_query:
+            queries = [base_query]
     if not queries:
         # Minimal fallback when ICP is empty
         fallback = " ".join([s for s in [inds, titles, sigs] if s]).strip()
@@ -358,7 +502,13 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.info("[plan] ddg fail: %s", e)
             continue
-    uniq = _uniq(domains)
+    uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+    # Exclude seed domains (by apex) from discovery set to avoid reprocessing submitted customers
+    try:
+        seed_apex = {_apex_domain(s) for s in (SEED_HINTS or [])}
+        uniq = [d for d in uniq if _apex_domain(d) not in seed_apex]
+    except Exception:
+        pass
     if not uniq:
         # Slim fallback query pack (max 1) to reduce network churn
         fb: List[str] = []
@@ -382,9 +532,23 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as e:
                 log.info("[plan] ddg fail: %s", e)
                 continue
-        uniq = _uniq(domains)
+        uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
     log.info("[plan] ddg domains found=%d (uniq=%d)", len(domains), len(uniq))
     # Optional Jina Reader fetch for quick homepage snippets of first few domains
+    # Industry-based filter: keep only candidates whose snippets mention industry terms
+    def _industry_terms(profile: Dict[str, Any]) -> list[str]:
+        try:
+            raw = [s for s in (profile.get("industries") or []) if isinstance(s, str)]
+            toks: list[str] = []
+            for s in raw:
+                for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                    t = t.strip(" &").strip()
+                    if len(t) >= 3:
+                        toks.append(t)
+            return sorted(set(toks))
+        except Exception:
+            return []
+    ind_toks = _industry_terms(icp)
     jina_snips: Dict[str, str] = {}
     for d in uniq[:10]:
         try:
@@ -401,6 +565,11 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             ]
             clean = " ".join(filtered) if filtered else " ".join((txt or "").split())
             snip = clean[:400]
+            low = clean.lower()
+            if ind_toks:
+                if not any(tok in low for tok in ind_toks):
+                    # Skip off-industry candidates early
+                    continue
             jina_snips[d] = snip
             log.info("[jina] ok len=%d domain=%s", len(txt), d)
         except Exception as e:
@@ -530,18 +699,32 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         # 1) plan
         s = {"icp_profile": dict(icp_profile or {})}
         s = discovery_planner(s)
-        cand: List[str] = s.get("discovery_candidates") or []
-        # Exclude seed domains from discovery candidates
+        cand: List[str] = [d for d in (s.get("discovery_candidates") or []) if _is_probable_domain(str(d))]
+        # Exclude seed domains from discovery candidates (by apex)
         try:
-            seed_set = {str(h).strip().lower() for h in (SEED_HINTS or [])}
+            seed_apex = {_apex_domain(h) for h in (SEED_HINTS or [])}
         except Exception:
-            seed_set = set()
-        cand = [d for d in cand if str(d).strip().lower() not in seed_set]
+            seed_apex = set()
+        cand = [d for d in cand if _apex_domain(str(d)) not in seed_apex]
         jina_snips: Dict[str, str] = s.get("jina_snippets") or {}
         if not cand:
             return []
         # 2) Jina reader snapshot (top 10)
         ev_list: List[Dict[str, Any]] = []
+        # Industry filter helpers
+        def _ind_terms(icp_prof: Dict[str, Any]) -> list[str]:
+            try:
+                raw = [s for s in (icp_prof.get("industries") or []) if isinstance(s, str)]
+                toks: list[str] = []
+                for s in raw:
+                    for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                        t = t.strip(" &").strip()
+                        if len(t) >= 3:
+                            toks.append(t)
+                return sorted(set(toks))
+            except Exception:
+                return []
+        ind_toks = _ind_terms(icp_profile)
         for d in cand[:10]:
             url = f"https://{d}"
             try:
@@ -552,13 +735,37 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                 log.info("[mini] jina-read domain=%s", d)
                 summ = jina_read(url, timeout=10)
                 if not summ:
-                    continue
-                ev_list.append({"domain": d, "summary": str(summ)[:4000]})
+                    # Fallback: fetch homepage title/description when Jina is rate limited
+                    try:
+                        fb_txt = _fallback_home_snippet(d)
+                    except Exception:
+                        fb_txt = ""
+                    if not fb_txt:
+                        # Still record a minimal placeholder to keep candidate in flow
+                        fb_txt = d
+                    low = str(fb_txt).lower()
+                    # Apply industry gating only when we have non-trivial text; otherwise allow for backfill
+                    if ind_toks and len(fb_txt) > 10 and not any(tok in low for tok in ind_toks):
+                        continue
+                    ev_list.append({"domain": d, "summary": str(fb_txt)[:4000]})
+                else:
+                    low = str(summ).lower()
+                    if ind_toks and not any(tok in low for tok in ind_toks):
+                        # Skip off-industry entries
+                        continue
+                    ev_list.append({"domain": d, "summary": str(summ)[:4000]})
             except Exception as e:
                 log.info("[mini] jina fail domain=%s err=%s", d, e)
                 continue
         if not ev_list:
-            return []
+            # Final guard: build minimal evidence from homepage titles to avoid empty Top‑10
+            for d in cand[:10]:
+                try:
+                    fb = _fallback_home_snippet(d)
+                except Exception:
+                    fb = d
+                if fb:
+                    ev_list.append({"domain": d, "summary": str(fb)[:4000]})
         # 3) extract
         st2 = {"evidence": ev_list}
         st2 = evidence_extractor(st2)
@@ -596,7 +803,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             })
         # Sort by score desc
         top = sorted(top, key=lambda x: int(x.get("score") or 0), reverse=True)
-        # If fewer than 10, backfill using additional candidates (heuristic scoring) and seeds fallback
+        # If fewer than 10, backfill using additional candidates (heuristic scoring) and seeds/legacy fallbacks
         if len(top) < 10:
             # 4a) Heuristic backfill from remaining discovery candidates
             seen = {str((it.get("domain") or "").strip().lower()) for it in top}
@@ -606,7 +813,9 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                     if not d:
                         continue
                     dn = str(d).strip().lower()
-                    if dn in seen or dn in seed_set:
+                    if dn in seen or (not _is_probable_domain(dn)):
+                        continue
+                    if _apex_domain(dn) in seed_apex:
                         continue
                     url = f"https://{d}"
                     body = jina_read(url, timeout=8) or ""
@@ -614,6 +823,22 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                         continue
                     clean = " ".join((body or "").split())
                     low = clean.lower()
+                    # Industry gating
+                    def _ind_terms2(icp_prof: Dict[str, Any]) -> list[str]:
+                        try:
+                            raw = [s for s in (icp_prof.get("industries") or []) if isinstance(s, str)]
+                            toks: list[str] = []
+                            for s in raw:
+                                for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                                    t = t.strip(" &").strip()
+                                    if len(t) >= 3:
+                                        toks.append(t)
+                            return sorted(set(toks))
+                        except Exception:
+                            return []
+                    ind_toks2 = _ind_terms2(icp_profile)
+                    if ind_toks2 and not any(tok in low for tok in ind_toks2):
+                        continue
                     score = 0
                     why_bits: List[str] = []
                     if "integrat" in low:
@@ -660,11 +885,25 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                     if fb:
                         for it in fb:
                             dom = (it.get("domain") or "").strip().lower()
-                            if dom and dom not in seen and dom not in seed_set:
+                            if dom and dom not in seen and _apex_domain(dom) not in seed_apex:
                                 top.append(it)
                                 seen.add(dom)
                             if len(top) >= 10:
                                 break
+            # 4c) Legacy heuristic fallback if still short, even without seeds
+            if len(top) < 10:
+                try:
+                    fb2 = plan_top10_with_reasons_fallback(dict(icp_profile or {}))
+                except Exception:
+                    fb2 = []
+                if fb2:
+                    for it in fb2:
+                        dom = (it.get("domain") or "").strip().lower()
+                        if dom and dom not in seen and _apex_domain(dom) not in seed_apex:
+                            top.append(it)
+                            seen.add(dom)
+                        if len(top) >= 10:
+                            break
         # Return at most 10
         top = top[:10]
         log.info("[confirm] agent top10 count=%d", len(top))
@@ -704,7 +943,7 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         for q in queries[:3]:
             for dom in _ddg_search_domains(q, max_results=25):
                 domains.append(dom)
-        uniq = _uniq(domains)[:20]
+        uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))][:20]
         if not uniq:
             return []
 
@@ -715,7 +954,8 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
                 reader = f"https://r.jina.ai/http://{d}"
                 r = requests.get(reader, timeout=10)
                 txt = (r.text or "")[:8000]
-                clean = " ".join((txt or "").split())
+                from src.jina_reader import clean_jina_text as _clean
+                clean = _clean(txt)
                 snip = clean[:180]
                 # Heuristic scoring
                 low = clean.lower()
@@ -761,51 +1001,86 @@ def _extract_domains_from_text(text: str) -> List[str]:
                 "facebook.", "linkedin.", "twitter.", "x.com", "instagram.", "youtube.",
             )):
                 continue
-            outs.append(h)
-        return outs
+            if _is_probable_domain(h):
+                outs.append(h)
+        return [d for d in outs if _is_probable_domain(d)]
     except Exception:
         return []
 
 
 def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """DDG-free fallback: expand candidates from r.jina snapshots of seeds + user signals, then score.
+    """Seeds fallback without crawling seed sites.
 
-    - Fetch r.jina for each seed domain
-    - Extract referenced domains from the text; add the seeds themselves
+    Strategy:
+    - For each seed, derive 1–2 compact DDG queries (e.g., "<seed_label> competitor", "b2b distributor similar to <seed_label>")
+    - Aggregate DDG domains, exclude seeds, validate, dedupe
     - Fetch r.jina snippets for candidates; score heuristically using ICP cues
     - Return Top‑10 [{domain, score, bucket, why, snippet}]
     """
     try:
         seeds = [d.strip().lower() for d in (seed_domains or []) if isinstance(d, str) and d.strip()]
-        candidates: List[str] = []
-        # Expand from each seed via r.jina
-        for d in seeds:
-            try:
-                reader = f"https://r.jina.ai/http://{d}"
-                log.info("[jina-fb] GET %s", reader)
-                r = requests.get(reader, timeout=10)
-                txt = (r.text or "")[:16000]
-                for h in _extract_domains_from_text(txt):
-                    candidates.append(h)
-            except Exception as e:
-                log.info("[jina-fb] seed expand fail domain=%s err=%s", d, e)
-                continue
-        # Exclude seed domains from the pool; we only want lookalikes discovered from web references
+        if not seeds:
+            return []
         seed_set = set(seeds)
-        uniq = [c for c in _uniq(candidates) if c not in seed_set][:60]
+        # Create a small query set using seed labels (no seed crawling)
+        qset: List[str] = []
+        for d in seeds[:5]:
+            # Derive brand label from apex domain (avoid 'www')
+            try:
+                apex = _apex_domain(d)
+                parts = [p for p in apex.split('.') if p]
+                label = parts[0] if parts else (d.split('.')[0])
+                if label == 'www' and len(parts) >= 2:
+                    label = parts[0]
+            except Exception:
+                label = d.split('.')[0]
+            # lightweight, concise variants
+            if label and label != 'www':
+                qset.append(f"{label} competitors")
+                qset.append(f"similar to {label} distributor")
+        # Region hint: prefer .sg if any seed endswith .sg
+        use_sg = any(s.endswith(".sg") for s in seeds)
+        if use_sg:
+            qset = [q + " site:.sg" for q in qset]
+        # Run DDG for each query (cap)
+        cand: List[str] = []
+        for q in qset[:6]:
+            for dom in _ddg_search_domains(q, max_results=25):
+                cand.append(dom)
+        uniq = [h for h in _uniq(cand) if _is_probable_domain(h) and h not in seed_set][:60]
         if not uniq:
             return []
         inds = ", ".join([s for s in (icp_profile.get("industries") or []) if isinstance(s, str)])
-        # Score candidates by fetching a short Jina snippet
         out: List[Dict[str, Any]] = []
+        # Industry tokens for gating
+        def _ind_terms3(icp_prof: Dict[str, Any]) -> list[str]:
+            try:
+                raw = [s for s in (icp_prof.get("industries") or []) if isinstance(s, str)]
+                toks: list[str] = []
+                for s in raw:
+                    for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                        t = t.strip(" &").strip()
+                        if len(t) >= 3:
+                            toks.append(t)
+                return sorted(set(toks))
+            except Exception:
+                return []
+        ind_toks3 = _ind_terms3(icp_profile)
         for d in uniq[:30]:
             try:
-                reader = f"https://r.jina.ai/http://{d}"
-                r = requests.get(reader, timeout=10)
-                raw = (r.text or "")[:8000]
-                clean = " ".join((raw or "").split())
-                snip = clean[:180]
-                low = clean.lower()
+                # Prefer Jina but fall back to direct homepage title/description on 429/network errors
+                try:
+                    reader = f"https://r.jina.ai/http://{d}"
+                    r = requests.get(reader, timeout=10)
+                    raw = (r.text or "")[:8000]
+                    from src.jina_reader import clean_jina_text as _clean
+                    clean = _clean(raw)
+                except Exception:
+                    clean = _fallback_home_snippet(d) or d
+                snip = (clean or "")[:180]
+                low = (clean or "").lower()
+                if ind_toks3 and not any(tok in low for tok in ind_toks3):
+                    continue
                 score = 0
                 why_bits: List[str] = []
                 if "integrat" in low:

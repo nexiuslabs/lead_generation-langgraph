@@ -278,8 +278,40 @@ def _ensure_company_by_domain(domain: str) -> int | None:
         return None
 
 
+def _clean_snippet(s: str) -> str:
+    try:
+        t = (s or "").strip()
+        if not t:
+            return ""
+        import re as _re
+        # Drop common r.jina metadata and JSON-y fragments
+        t = _re.sub(r"\b(Title:|URL Source:|Published Time:|Markdown Content:|Warning:)\b.*?\s+", "", t, flags=_re.I)
+        t = _re.sub(r"\{[^}]{0,200}\}", " ", t)  # small JSON blobs
+        t = " ".join(t.split())
+        return t[:180]
+    except Exception:
+        return (s or "")[:180]
+
+
+def _fmt_top10_md(rows: list[dict]) -> str:
+    if not rows:
+        return "No lookalikes found."
+    hdr = ["#", "Domain", "Score", "Why", "Snippet"]
+    out = [
+        "| " + " | ".join(hdr) + " |",
+        "|" + "|".join(["---"] * len(hdr)) + "|",
+    ]
+    for idx, r in enumerate(rows, 1):
+        dom = str(r.get("domain") or "")
+        score = str(int(r.get("score") or 0))
+        why = str(r.get("why") or "")
+        snip = _clean_snippet(str(r.get("snippet") or ""))
+        out.append(f"| {idx} | {dom} | {score} | {why} | {snip} |")
+    return "\n".join(out)
+
+
 def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> None:
-    # Insert a new ICP rule row for this tenant; rely on RLS via GUC
+    # Upsert an ICP rule row for this tenant; rely on RLS via GUC
     with get_conn() as conn, conn.cursor() as cur:
         try:
             cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
@@ -289,9 +321,35 @@ def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> N
             """
             INSERT INTO icp_rules(tenant_id, name, payload)
             VALUES (%s, %s, %s)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              created_at = NOW()
             """,
             (tid, name, Json(payload)),
         )
+
+
+def _upsert_icp_profile_sync(tid: int, icp_profile: dict, name: str = "Default ICP") -> None:
+    """Merge/update icp_profile fields into current icp_rules payload for tenant.
+
+    Keys merged: industries, integrations, buyer_titles, size_bands, triggers.
+    """
+    try:
+        base: dict = {}
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM icp_rules WHERE tenant_id=%s AND name=%s ORDER BY created_at DESC LIMIT 1",
+                (tid, name),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                if isinstance(row[0], dict):
+                    base = dict(row[0])
+        merged = _merge_icp_profile_into_payload(base, dict(icp_profile or {}))
+        _save_icp_rule_sync(tid, merged, name=name)
+    except Exception:
+        # Non-fatal; ignore if table missing or RLS blocks
+        pass
 
 
 def _resolve_tenant_id_for_write_sync(state: dict) -> Optional[int]:
@@ -346,11 +404,17 @@ def _last_text(msgs) -> str:
     return str(m)
 
 
-def _persist_web_candidates_to_staging(domains: list[str], tenant_id: Optional[int] = None) -> int:
+def _persist_web_candidates_to_staging(
+    domains: list[str],
+    tenant_id: Optional[int] = None,
+    ai_metadata: Optional[dict] = None,
+    per_domain_meta: Optional[dict[str, dict]] = None,
+) -> int:
     """Persist discovered global (non‑SG) candidate domains into a lightweight staging table.
 
-    Table: staging_global_companies(id PK, tenant_id, domain, source, created_at)
-    Idempotent on (tenant_id, domain, source) via ON CONFLICT DO NOTHING.
+    - Table: staging_global_companies(id PK, tenant_id, domain, source, created_at, ai_metadata JSONB)
+    - Idempotent on (tenant_id, domain, source) via ON CONFLICT DO NOTHING.
+    - Accepts a single `ai_metadata` blob (applied to all) and/or a per-domain metadata map.
     """
     if not domains:
         return 0
@@ -360,7 +424,7 @@ def _persist_web_candidates_to_staging(domains: list[str], tenant_id: Optional[i
         return 0
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            # Ensure table exists (dev-safe)
+            # Ensure table exists (dev-safe) including ai_metadata column
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {STAGING_GLOBAL_TABLE} (
@@ -369,6 +433,7 @@ def _persist_web_candidates_to_staging(domains: list[str], tenant_id: Optional[i
                   domain TEXT NOT NULL,
                   source TEXT NOT NULL DEFAULT 'web_discovery',
                   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  ai_metadata JSONB NOT NULL DEFAULT '{{}}',
                   UNIQUE (tenant_id, domain, source)
                 )
                 """
@@ -376,9 +441,19 @@ def _persist_web_candidates_to_staging(domains: list[str], tenant_id: Optional[i
             rows = 0
             for d in ds:
                 try:
+                    meta = (per_domain_meta or {}).get(d) if isinstance(per_domain_meta, dict) else None
+                    if not isinstance(meta, dict):
+                        meta = dict(ai_metadata or {}) if isinstance(ai_metadata, dict) else {}
+                    # Ensure a small provenance trail at minimum
+                    if "provenance" not in meta:
+                        meta["provenance"] = {"agent": "agents_icp.discovery", "stage": "staging"}
                     cur.execute(
-                        f"INSERT INTO {STAGING_GLOBAL_TABLE}(tenant_id, domain, source) VALUES (%s,%s,'web_discovery') ON CONFLICT DO NOTHING",
-                        (tenant_id, d),
+                        f"""
+                        INSERT INTO {STAGING_GLOBAL_TABLE}(tenant_id, domain, source, ai_metadata)
+                        VALUES (%s,%s,'web_discovery',%s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (tenant_id, d, Json(meta)),
                     )
                     rows += cur.rowcount if isinstance(cur.rowcount, int) else 0
                 except Exception:
@@ -392,8 +467,28 @@ def _persist_web_candidates_to_staging(domains: list[str], tenant_id: Optional[i
 def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
     """Persist Top‑10 preview into staging, companies, icp_evidence, and lead_scores."""
     try:
-        # Staging
-        _ = _persist_web_candidates_to_staging([str(it.get("domain")) for it in top if isinstance(it, dict) and it.get("domain")], int(tid) if isinstance(tid, int) else None)
+        # Staging with per-domain ai_metadata (score/why/snippet provenance)
+        per_meta: dict[str, dict] = {}
+        for it in (top or [])[:10]:
+            if not isinstance(it, dict):
+                continue
+            dom = (it.get("domain") or "").strip().lower()
+            if not dom:
+                continue
+            per_meta[dom] = {
+                "preview": True,
+                "score": it.get("score"),
+                "bucket": it.get("bucket"),
+                "why": it.get("why"),
+                "snippet": (it.get("snippet") or "")[:200],
+                "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
+            }
+        _ = _persist_web_candidates_to_staging(
+            [str(it.get("domain")) for it in top if isinstance(it, dict) and it.get("domain")],
+            int(tid) if isinstance(tid, int) else None,
+            ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
+            per_domain_meta=per_meta,
+        )
     except Exception:
         pass
     try:
@@ -885,10 +980,13 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
             acand = _agent_plan_discovery(s).get("discovery_candidates") or []
             if acand:
                 state["agent_candidates"] = acand
-                # Persist all discovered domains into global staging for audit/queueing
+                # Persist all discovered domains into global staging for audit/queueing (with provenance ai_metadata)
                 try:
                     tid = _resolve_tenant_id_for_write_sync(state)
-                    added = _persist_web_candidates_to_staging([str(d) for d in acand if isinstance(d, str)], tid)
+                    icp_prof = dict(state.get("icp_profile") or {})
+                    icp_keys = sorted([k for k, v in icp_prof.items() if v])
+                    meta = {"provenance": {"agent": "agents_icp.discovery_planner", "stage": "plan"}, "icp_profile_keys": icp_keys[:8]}
+                    added = _persist_web_candidates_to_staging([str(d) for d in acand if isinstance(d, str)], tid, ai_metadata=meta)
                     state["web_discovery_total"] = len(acand)
                     if added:
                         logger.info("[candidates] persisted %d web candidates to %s", added, STAGING_GLOBAL_TABLE)
@@ -935,20 +1033,28 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                     except Exception:
                         tid = None
                     _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top)
-                    msg_lines.append("Top‑10 lookalikes (with why):")
-                    for i, row in enumerate(top, 1):
-                        dom = row.get("domain")
-                        why = row.get("why") or "signal match"
-                        score = int(row.get("score") or 0)
-                        snip = row.get("snippet") or ""
-                        try:
-                            snip = (" ".join((snip or "").split()))[:160]
-                        except Exception:
-                            snip = ""
-                        if snip:
-                            msg_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
-                        else:
-                            msg_lines.append(f"{i}) {dom} — {why} (score {score})")
+                    # Also persist the icp_profile we just used/derived so it evolves over time
+                    try:
+                        if isinstance(tid, int):
+                            _upsert_icp_profile_sync(tid, state.get("icp_profile") or {}, name="Default ICP")
+                    except Exception:
+                        pass
+                    # Pretty Top‑10 table
+                    try:
+                        table = _fmt_top10_md(top)
+                        msg_lines.append("Top‑10 lookalikes (with why):\n\n" + table)
+                    except Exception:
+                        # Fallback to simple lines
+                        msg_lines.append("Top‑10 lookalikes (with why):")
+                        for i, row in enumerate(top, 1):
+                            dom = row.get("domain")
+                            why = row.get("why") or "signal match"
+                            score = int(row.get("score") or 0)
+                            snip = _clean_snippet(row.get("snippet") or "")
+                            if snip:
+                                msg_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                            else:
+                                msg_lines.append(f"{i}) {dom} — {why} (score {score})")
                     # Avoid a second discovery pass: skip ensure_icp_enriched_with_jina here.
                     # Discovery just ran to produce Top‑10; calling enrichment would re-trigger DDG.
                     try:
@@ -964,23 +1070,11 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                         ints = (icp_prof.get("integrations") or [])
                         trigs = (icp_prof.get("triggers") or [])
                         msg_lines.append("ICP Profile")
-                        if inds:
-                            msg_lines.append("- Industries we’ll target: " + ", ".join(inds[:6]))
-                        else:
-                            msg_lines.append("- Industries we’ll target: n/a (will refine during discovery)")
-                        if titles_l:
-                            msg_lines.append("- Typical buyer titles: " + ", ".join(titles_l[:6]))
-                        else:
-                            msg_lines.append("- Typical buyer titles: n/a (will refine from site evidence)")
-                        if sizes_l:
-                            msg_lines.append("- Company sizes we’ll prioritize: " + ", ".join(sizes_l[:6]))
-                        else:
-                            msg_lines.append("- Company sizes we’ll prioritize: n/a")
-                        sigs_arr = ints + trigs
-                        if sigs_arr:
-                            msg_lines.append("- Key signals from target sites: " + ", ".join(sigs_arr[:8]))
-                        else:
-                            msg_lines.append("- Key signals from target sites: n/a (pricing/case studies/careers/integrations cues)")
+                        msg_lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
+                        msg_lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
+                        msg_lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
+                        sigs_arr = (ints or []) + (trigs or [])
+                        msg_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
                         # Persist ICP profile to icp_rules for reuse across threads/API
                         try:
                             if isinstance(tid, int):
@@ -997,10 +1091,18 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         pass
 
     # Planned enrichment counts
-        try:
-            enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
-        except Exception:
-            enrich_now_limit = 10
+    try:
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+    # If we have an agent Top‑10, prefer that count to set expectations accurately
+    try:
+        top_for_count = state.get("agent_top10") or []
+        if isinstance(top_for_count, list) and top_for_count:
+            do_now = min(len(top_for_count), enrich_now_limit)
+        else:
+            do_now = min(n, enrich_now_limit) if n else 0
+    except Exception:
         do_now = min(n, enrich_now_limit) if n else 0
         if n > 0:
             # Prefer ACRA total by suggested SSICs, else by matched terms, else company total
@@ -1070,6 +1172,13 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         if payload:
             tid = _resolve_tenant_id_for_write_sync(state)  # basic flow uses sync helper
             if isinstance(tid, int):
+                # Merge any previously learned icp_profile fields as well
+                prof = dict(state.get("icp_profile") or {})
+                if prof:
+                    try:
+                        _upsert_icp_profile_sync(tid, prof, name="Default ICP")
+                    except Exception:
+                        pass
                 _save_icp_rule_sync(tid, payload, name="Default ICP")
     except Exception:
         pass
@@ -1167,6 +1276,13 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
     if not candidates:
         # Strict policy: do not enrich arbitrary companies when Top‑10 is missing
         try:
+            # Helpful diagnostics for operators (logs only)
+            try:
+                _tid_dbg = _resolve_tenant_id_for_write_sync(state)
+                _dbg_top = _load_persisted_top10(int(_tid_dbg) if isinstance(_tid_dbg, int) else None)
+                logger.info("[enrich] strict Top-10 missing; tenant_id=%s persisted_top=%d", _tid_dbg, len(_dbg_top or []))
+            except Exception:
+                pass
             state["messages"] = add_messages(
                 state.get("messages") or [],
                 [AIMessage(content="I couldn’t find the last Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate and lock a Top‑10, then try 'run enrichment' again.")],
@@ -3081,20 +3197,21 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         state["agent_top10"] = top
                                     except Exception:
                                         pass
-                                    lines = ["Top‑10 lookalikes (with why):"]
-                                    for i, row in enumerate(top, 1):
-                                        dom = row.get("domain")
-                                        why = row.get("why") or "signal match"
-                                        score = int(row.get("score") or 0)
-                                        snip = row.get("snippet") or ""
-                                        try:
-                                            snip = (" ".join((snip or "").split()))[:160]
-                                        except Exception:
-                                            snip = ""
-                                        if snip:
-                                            lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
-                                        else:
-                                            lines.append(f"{i}) {dom} — {why} (score {score})")
+                                    # Pretty Top‑10 table
+                                    try:
+                                        table = _fmt_top10_md(top)
+                                        lines = ["Top‑10 lookalikes (with why):\n\n" + table]
+                                    except Exception:
+                                        lines = ["Top‑10 lookalikes (with why):"]
+                                        for i, row in enumerate(top, 1):
+                                            dom = row.get("domain")
+                                            why = row.get("why") or "signal match"
+                                            score = int(row.get("score") or 0)
+                                            snip = _clean_snippet(row.get("snippet") or "")
+                                            if snip:
+                                                lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                                            else:
+                                                lines.append(f"{i}) {dom} — {why} (score {score})")
                                     # Enrich ICP from r.jina+ddg if sparse, then show a detailed profile summary
                                     try:
                                         from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
@@ -3114,23 +3231,11 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         ints = (icp_prof.get("integrations") or [])
                                         trigs = (icp_prof.get("triggers") or [])
                                         lines.append("ICP Profile")
-                                        if inds:
-                                            lines.append("- Industries we’ll target: " + ", ".join(inds[:6]))
-                                        else:
-                                            lines.append("- Industries we’ll target: n/a (will refine during discovery)")
-                                        if titles_l:
-                                            lines.append("- Typical buyer titles: " + ", ".join(titles_l[:6]))
-                                        else:
-                                            lines.append("- Typical buyer titles: n/a (will refine from site evidence)")
-                                        if sizes_l:
-                                            lines.append("- Company sizes we’ll prioritize: " + ", ".join(sizes_l[:6]))
-                                        else:
-                                            lines.append("- Company sizes we’ll prioritize: n/a")
-                                        sigs_arr = ints + trigs
-                                        if sigs_arr:
-                                            lines.append("- Key signals from target sites: " + ", ".join(sigs_arr[:8]))
-                                        else:
-                                            lines.append("- Key signals from target sites: n/a (pricing/case studies/careers/integrations cues)")
+                                        lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
+                                        lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
+                                        lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
+                                        sigs_arr = (ints or []) + (trigs or [])
+                                        lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
                                     except Exception:
                                         lines.append("ICP Profile")
                                     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
@@ -3475,36 +3580,16 @@ async def enrich_node(state: GraphState) -> GraphState:
         if persisted_top:
             top10 = persisted_top
     # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
-    # Strict policy: reuse persisted Top‑10 or fall back to Jina-only seeds expansion.
+    # Strict policy: reuse persisted Top‑10. If unavailable, ask user to regenerate.
     if not (isinstance(top10, list) and top10):
-        # Attempt a DDG-free fallback from seeds in state
         try:
-            seeds_list = list((state.get("icp") or {}).get("seeds_list") or [])
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [AIMessage(content="I can’t find the Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate it, then use 'run enrichment'.")],
+            )
         except Exception:
-            seeds_list = []
-        seed_domains: list[str] = []
-        for s in seeds_list:
-            try:
-                dom = (s.get("domain") or "").strip().lower()
-                if dom:
-                    seed_domains.append(dom)
-            except Exception:
-                continue
-        if seed_domains:
-            try:
-                from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
-            except Exception:
-                _fb_seeds = None  # type: ignore
-            if _fb_seeds is not None:
-                icp_prof = state.get("icp_profile") or {}
-                top10 = await asyncio.to_thread(_fb_seeds, seed_domains, icp_prof)
-                if isinstance(top10, list) and top10:
-                    state["agent_top10"] = top10
-                    try:
-                        tid = await _resolve_tenant_id_for_write(state)
-                    except Exception:
-                        tid = None
-                    _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top10)
+            pass
+        return state
     if isinstance(top10, list) and top10:
         try:
             from src.database import get_conn as _get_conn
