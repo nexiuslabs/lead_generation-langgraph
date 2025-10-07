@@ -230,6 +230,54 @@ def _icp_payload_from_state_icp(icp: dict) -> dict:
     return payload
 
 
+def _merge_icp_profile_into_payload(payload: dict, icp_profile: dict) -> dict:
+    """Merge LLM-derived icp_profile keys into icp_rules payload structure.
+
+    Adds: industries, integrations, buyer_titles, triggers, size_bands (if present).
+    """
+    out = dict(payload or {})
+    prof = dict(icp_profile or {})
+    def _arr(key: str) -> list[str]:
+        vals = prof.get(key) or []
+        if not isinstance(vals, list):
+            return []
+        return [str(v).strip() for v in vals if isinstance(v, str) and v.strip()]
+    for k in ("industries", "integrations", "buyer_titles", "triggers", "size_bands"):
+        arr = _arr(k)
+        if arr:
+            out[k] = sorted(set(arr))
+    return out
+
+
+def _ensure_company_by_domain(domain: str) -> int | None:
+    """Ensure a companies row exists for an apex domain; return company_id or None."""
+    try:
+        dom = (domain or "").strip().lower()
+        if not dom:
+            return None
+        # strip protocol and path
+        import re as _re
+        dom = dom.replace("http://", "").replace("https://", "")
+        if dom.startswith("www."):
+            dom = dom[4:]
+        for sep in ["/", "?", "#"]:
+            if sep in dom:
+                dom = dom.split(sep, 1)[0]
+        with get_conn() as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT company_id FROM companies WHERE website_domain=%s", (dom,))
+            r = _cur.fetchone()
+            if r and r[0] is not None:
+                return int(r[0])
+            _cur.execute(
+                "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                (dom, dom),
+            )
+            rr = _cur.fetchone()
+            return int(rr[0]) if rr and rr[0] is not None else None
+    except Exception:
+        return None
+
+
 def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> None:
     # Insert a new ICP rule row for this tenant; rely on RLS via GUC
     with get_conn() as conn, conn.cursor() as cur:
@@ -762,6 +810,13 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         # Legacy flow persistence
         icp = dict(state.get("icp") or {})
         payload = _icp_payload_from_state_icp(icp)
+        # Merge any synthesized icp_profile fields into payload before persist
+        try:
+            prof = dict(state.get("icp_profile") or {})
+            if prof:
+                payload = _merge_icp_profile_into_payload(payload, prof)
+        except Exception:
+            pass
         if payload:
             tid = _resolve_tenant_id_for_write_sync(state)
             if isinstance(tid, int):
@@ -894,15 +949,10 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                             msg_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
                         else:
                             msg_lines.append(f"{i}) {dom} — {why} (score {score})")
-                    # Before showing ICP, enrich from r.jina+ddg if sparse
+                    # Avoid a second discovery pass: skip ensure_icp_enriched_with_jina here.
+                    # Discovery just ran to produce Top‑10; calling enrichment would re-trigger DDG.
                     try:
-                        from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
-                        try:
-                            out = _icp_enrich({"icp_profile": state.get("icp_profile") or {}})
-                            if isinstance(out.get("icp_profile"), dict):
-                                state["icp_profile"] = out.get("icp_profile")
-                        except Exception:
-                            pass
+                        logger.info("[confirm] Skipping ICP enrichment-from-discovery to prevent duplicate DDG runs")
                     except Exception:
                         pass
                     # After showing results, show a detailed ICP Profile summary for the user
@@ -931,6 +981,16 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                             msg_lines.append("- Key signals from target sites: " + ", ".join(sigs_arr[:8]))
                         else:
                             msg_lines.append("- Key signals from target sites: n/a (pricing/case studies/careers/integrations cues)")
+                        # Persist ICP profile to icp_rules for reuse across threads/API
+                        try:
+                            if isinstance(tid, int):
+                                base = _icp_payload_from_state_icp(state.get("icp") or {})
+                                merged = _merge_icp_profile_into_payload(base, icp_prof)
+                                if merged:
+                                    _save_icp_rule_sync(int(tid), merged, name="Default ICP")
+                                    logger.info("[confirm] Persisted ICP profile (icp_rules) with keys=%s", list(merged.keys()))
+                        except Exception:
+                            pass
                     except Exception:
                         msg_lines.append("ICP Profile")
     except Exception:
@@ -2785,6 +2845,41 @@ async def confirm_node(state: GraphState) -> GraphState:
                             cards = await _icp_build_resolver_cards(seeds_in)
                             if cards:
                                 logger.info("[confirm] Resolver cards built: %d", len(cards))
+                                # Merge resolver fast-facts into icp_profile to avoid 'n/a' later
+                                try:
+                                    prof = dict(state.get("icp_profile") or {})
+                                    inds: list[str] = []
+                                    titles: list[str] = []
+                                    sizes: list[str] = []
+                                    integrs: list[str] = []
+                                    for c in cards:
+                                        ff = c.fast_facts or {}
+                                        if ff.get("industry_guess"):
+                                            inds.append(str(ff.get("industry_guess")).strip().lower())
+                                        if ff.get("size_band_guess"):
+                                            sizes.append(str(ff.get("size_band_guess")).strip().lower())
+                                        for t in (ff.get("buyer_titles") or []) or []:
+                                            if isinstance(t, str) and t.strip():
+                                                titles.append(t.strip().lower())
+                                        for it in (ff.get("integrations_mentions") or []) or []:
+                                            if isinstance(it, str) and it.strip():
+                                                integrs.append(it.strip().lower())
+                                    # de-dupe & assign only when present
+                                    if inds:
+                                        prof.setdefault("industries", [])
+                                        prof["industries"] = sorted(set((prof.get("industries") or []) + inds))
+                                    if titles:
+                                        prof.setdefault("buyer_titles", [])
+                                        prof["buyer_titles"] = sorted(set((prof.get("buyer_titles") or []) + titles))
+                                    if sizes:
+                                        prof.setdefault("size_bands", [])
+                                        prof["size_bands"] = sorted(set((prof.get("size_bands") or []) + sizes))
+                                    if integrs:
+                                        prof.setdefault("integrations", [])
+                                        prof["integrations"] = sorted(set((prof.get("integrations") or []) + integrs))
+                                    state["icp_profile"] = prof
+                                except Exception:
+                                    pass
                                 lines = ["Domain resolver preview:"]
                                 low_conf = 0
                                 for i, c in enumerate(cards, 1):
@@ -2831,7 +2926,12 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 from urllib.parse import urlparse
                                 _apex = (urlparse(site_url).netloc or site_url).lower()
                                 if _apex:
-                                    n0 = await _icp_collect_evidence_for_domain(tid, None, _apex)
+                                    # Ensure companies row exists so evidence persists
+                                    try:
+                                        _cid = await asyncio.to_thread(_ensure_company_by_domain, _apex)
+                                    except Exception:
+                                        _cid = None
+                                    n0 = await _icp_collect_evidence_for_domain(tid, _cid, _apex)
                                     logger.info("[confirm] Evidence rows for tenant website=%s: %s", _apex, n0)
                                     ev_count += int(n0 or 0)
                         except Exception:
@@ -2844,10 +2944,17 @@ async def confirm_node(state: GraphState) -> GraphState:
                             dom = (s.get("domain") or "").strip()
                             ev_added = 0
                             acra_added = 0
+                            # Ensure company row for seed domain so evidence can persist
+                            cid = None
+                            try:
+                                if dom:
+                                    cid = await asyncio.to_thread(_ensure_company_by_domain, dom)
+                            except Exception:
+                                cid = None
                             # Crawl evidence (best effort)
                             if _icp_collect_evidence_for_domain and dom:
                                 try:
-                                    n = await _icp_collect_evidence_for_domain(tid, None, dom)
+                                    n = await _icp_collect_evidence_for_domain(tid, cid, dom)
                                     logger.info("[confirm] Evidence rows for domain=%s: %s", dom, n)
                                     ev_added += int(n or 0)
                                 except Exception:
@@ -2931,13 +3038,27 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
                                 logger.info("[confirm] agent top10 count=%d", len(top or []))
                                 if not top:
-                                    # Fallback: build Top‑10 without LLMs (strict DDG + Jina heuristics)
+                                    # Fallback 1: single-endpoint DDG-free seeds expansion via Jina reader
+                                    try:
+                                        from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
+                                        seed_domains = []
+                                        for s in (icp.get("seeds_list") or []):
+                                            dom = (s.get("domain") or "").strip().lower()
+                                            if dom:
+                                                seed_domains.append(dom)
+                                        if seed_domains:
+                                            top = await asyncio.to_thread(_fb_seeds, seed_domains, icp_prof)
+                                            logger.info("[confirm] seeds-fallback top10 count=%d", len(top or []))
+                                    except Exception as _fb1_e:
+                                        logger.warning("[confirm] seeds-fallback failed: %s", _fb1_e)
+                                if not top:
+                                    # Fallback 2: legacy DDG+Jina heuristic (may be disabled by env)
                                     try:
                                         from src.agents_icp import plan_top10_with_reasons_fallback as _top10_fb  # type: ignore
                                         top = await asyncio.to_thread(_top10_fb, icp_prof)
-                                        logger.info("[confirm] fallback top10 count=%d", len(top or []))
+                                        logger.info("[confirm] legacy fallback top10 count=%d", len(top or []))
                                     except Exception as _fb_e:
-                                        logger.warning("[confirm] top10 fallback failed: %s", _fb_e)
+                                        logger.warning("[confirm] top10 legacy fallback failed: %s", _fb_e)
                                 if top:
                                     # Persist and stash for reuse during 'run enrichment'
                                     try:

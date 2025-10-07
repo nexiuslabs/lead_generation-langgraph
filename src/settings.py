@@ -252,3 +252,20 @@ ICP_WIZARD_FAST_START_ONLY = os.getenv("ICP_WIZARD_FAST_START_ONLY", "true").low
     "yes",
     "on",
 )
+
+# DuckDuckGo discovery controls
+ENABLE_DDG_DISCOVERY = os.getenv("ENABLE_DDG_DISCOVERY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    DDG_TIMEOUT_S = float(os.getenv("DDG_TIMEOUT_S", "5") or 5)
+except Exception:
+    DDG_TIMEOUT_S = 5.0
+try:
+    DDG_MAX_CALLS = int(os.getenv("DDG_MAX_CALLS", "1") or 1)
+except Exception:
+    DDG_MAX_CALLS = 2
+DDG_KL = os.getenv("DDG_KL", "")  # e.g., 'sg-en', 'us-en'

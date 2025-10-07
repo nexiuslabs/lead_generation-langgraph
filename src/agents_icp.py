@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import html as html_lib
 
 from langchain_openai import ChatOpenAI
+from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
 import logging
 import requests
 from urllib.parse import quote, urlparse, urljoin, parse_qs, unquote
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html"
 DDG_HTML_GET = "https://duckduckgo.com/html/"
 DDG_LITE_GET = "https://lite.duckduckgo.com/lite/"
+DDG_STD_LITE = "https://duckduckgo.com/lite/"
 
 # Optional seed hints passed in by the caller (confirm flow) to improve queries
 SEED_HINTS: List[str] = []
@@ -34,7 +36,7 @@ def set_seed_hints(hints: List[str] | None):
         SEED_HINTS = []
 
 from src.icp_pipeline import collect_evidence_for_domain
-from src.crawler import crawl_site
+from src.jina_reader import read_url as jina_read
 
 
 # Core state keys (subset)
@@ -58,10 +60,31 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
     - Parses redirect links (`/l/?uddg=...`) and extracts the target domain.
     - Filters obvious search/CDN/wiki hosts.
     """
+    if not ENABLE_DDG_DISCOVERY:
+        return []
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
         "Accept-Language": (lang or "en-US,en;q=0.9"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://duckduckgo.com/",
+        "Cache-Control": "no-cache",
     }
+    # Region hint to improve results (e.g., 'sg-en' when .sg seeds present)
+    kl = None
+    try:
+        if country:
+            country = country.lower()
+            if country in {"sg", "singapore"}:
+                kl = "sg-en"
+            elif country in {"us", "usa", "united states"}:
+                kl = "us-en"
+            elif country in {"uk", "gb", "united kingdom"}:
+                kl = "uk-en"
+    except Exception:
+        kl = None
     def _extract_domains_from_html(raw_html: str) -> List[str]:
         text = raw_html or ""
         text = html_lib.unescape(text)
@@ -111,41 +134,46 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 break
         return out
 
-    domains: List[str] = []
-    # Attempt 1: html.duckduckgo.com via POST (classic HTML endpoint)
+    # Use a requests session with retries disabled to avoid noisy repeated attempts
+    session = requests.Session()
     try:
-        r = requests.post(DDG_HTML_ENDPOINT, data={"q": query}, headers=headers, timeout=15)
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(max_retries=0)
+        for h in ("https://", "http://"):
+            session.mount(h, adapter)
+    except Exception:
+        pass
+
+    def _get(url: str, params: dict | None = None, data: dict | None = None, method: str = "GET"):
+        try:
+            if method == "POST":
+                return session.post(url, data=(data or {}), headers=headers, timeout=float(DDG_TIMEOUT_S))
+            return session.get(url, params=(params or {}), headers=headers, timeout=float(DDG_TIMEOUT_S))
+        except Exception as e:
+            raise e
+
+    domains: List[str] = []
+    # Country hint from seed hints (e.g., .sg)
+    country_hint = None
+    try:
+        seeds = list(SEED_HINTS)
+        if any(str(s).endswith('.sg') for s in seeds):
+            country_hint = 'sg'
+    except Exception:
+        country_hint = None
+    # Single endpoint: html.duckduckgo.com/html/?q=...
+    try:
+        params = {"q": query}
+        if (DDG_KL or kl):
+            params["kl"] = (DDG_KL or kl)
+        r = _get("https://html.duckduckgo.com/html/", params=params)
         r.raise_for_status()
         domains = _extract_domains_from_html(r.text)
         if domains:
-            log.info("[ddg] POST parsed domains=%d for query=%s", len(domains), query)
+            log.info("[ddg] HTML_GET parsed domains=%d for query=%s", len(domains), query)
             return domains
     except Exception as e:
-        log.info("[ddg] POST search failed: %s", e)
-
-    # Attempt 2: duckduckgo.com/html via GET
-    try:
-        url = DDG_HTML_GET + "?q=" + quote(query)
-        r2 = requests.get(url, headers=headers, timeout=15)
-        r2.raise_for_status()
-        domains = _extract_domains_from_html(r2.text)
-        if domains:
-            log.info("[ddg] GET parsed domains=%d for query=%s", len(domains), query)
-            return domains
-    except Exception as e2:
-        log.info("[ddg] GET fallback failed: %s", e2)
-
-    # Attempt 3: lite.duckduckgo.com page which often bypasses heavy markup
-    try:
-        url = DDG_LITE_GET + "?q=" + quote(query)
-        r3 = requests.get(url, headers=headers, timeout=15)
-        r3.raise_for_status()
-        domains = _extract_domains_from_html(r3.text)
-        if domains:
-            log.info("[ddg] LITE parsed domains=%d for query=%s", len(domains), query)
-            return domains
-    except Exception as e3:
-        log.info("[ddg] LITE fallback failed: %s", e3)
+        log.info("[ddg] HTML_GET failed: %s", e)
 
     return _uniq(domains)
 
@@ -292,57 +320,64 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     sig_list = (icp.get("integrations") or []) + (icp.get("triggers") or [])
     sigs = ", ".join(sig_list)
     titles = ", ".join(icp.get("buyer_titles") or [])
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You write 3 web search queries to find B2B companies matching a micro‑ICP. Keep concise. Cite which ICP fields influenced each query. Return as lines: query — because ..."),
-        ("human", "Industries: {inds}\nSignals: {sigs}\nTitles: {titles}")
-    ])
-    msgs = prompt.format_messages(inds=inds, sigs=sigs, titles=titles)
-    log.info("[plan] building queries from ICP; inds=%s sigs=%s titles=%s", inds, sigs, titles)
-    text = llm.invoke(msgs).content or ""
-    # Extract queries (strip trailing explanations) and sanitize numbering like '1. '
-    raw_queries = [ln.split(" — ", 1)[0] for ln in text.splitlines() if ln.strip()]
-    queries: List[str] = []
-    for q in raw_queries:
-        q = re.sub(r"^\s*\d+\.\s*", "", q or "").strip()
-        # Strip surrounding quotes that tend to reduce recall on DDG
-        if (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'")):
-            q = q[1:-1].strip()
-        if q:
-            queries.append(q)
+    # Derive a coarse country hint for DDG (e.g., 'sg') from seed domains
+    country_hint: Optional[str] = None
+    try:
+        seeds = list(SEED_HINTS)
+        if any(str(s).endswith('.sg') for s in seeds):
+            country_hint = 'sg'
+    except Exception:
+        country_hint = None
+    # Build one query from extracted signals (customer + user sites reflected in icp_profile)
+    terms: List[str] = []
+    for arr in [icp.get("industries") or [], icp.get("integrations") or [], icp.get("buyer_titles") or [], icp.get("triggers") or []]:
+        for v in arr:
+            if isinstance(v, str) and v.strip():
+                terms.append(v.strip())
+    inline_site = "site:.sg" if (country_hint == 'sg') else ""
+    base_query = " ".join(_uniq([*terms, inline_site])).strip()
+    queries: List[str] = [base_query] if base_query else []
+    if not queries:
+        # Minimal fallback when ICP is empty
+        fallback = " ".join([s for s in [inds, titles, sigs] if s]).strip()
+        if country_hint == 'sg':
+            fallback = (fallback + " site:.sg").strip()
+        if fallback:
+            queries = [fallback]
     domains: List[str] = []
-    for q in queries[:6]:
+    ddg_calls = 0
+    budget = max(1, int(DDG_MAX_CALLS))
+    for q in queries[:budget]:
         try:
             log.info("[plan] ddg-only query: %s", q)
-            for dom in _ddg_search_domains(q, max_results=25):
+            if ddg_calls >= budget:
+                break
+            ddg_calls += 1
+            for dom in _ddg_search_domains(q, max_results=20, country=country_hint):
                 domains.append(dom)
         except Exception as e:
             log.info("[plan] ddg fail: %s", e)
             continue
     uniq = _uniq(domains)
     if not uniq:
-        # Deterministic fallback query pack to improve recall while staying DDG-only
-        fb: List[str] = [
-            "foodservice distributors",
-            "broadline foodservice distributors",
-            "restaurant supply distributors",
-            "food & beverage wholesale distributors",
-        ]
+        # Slim fallback query pack (max 1) to reduce network churn
+        fb: List[str] = []
         # Region hint: if any seed ends with .sg, prefer .sg-specific queries
         try:
             seeds = list(SEED_HINTS)
         except Exception:
             seeds = []
         if any(str(s).endswith('.sg') for s in seeds):
-            fb = [
-                "site:.sg foodservice distributor",
-                "site:.sg food & beverage distributor",
-                "site:.sg fmcg distributor",
-            ] + fb
-        for q in fb:
+            fb = ["site:.sg foodservice distributor"]
+        else:
+            fb = ["foodservice distributors"]
+        for q in fb[:1]:
             try:
                 log.info("[plan] ddg-only fallback query: %s", q)
-                for dom in _ddg_search_domains(q, max_results=25):
+                if ddg_calls >= budget:
+                    break
+                ddg_calls += 1
+                for dom in _ddg_search_domains(q, max_results=20, country=country_hint):
                     domains.append(dom)
             except Exception as e:
                 log.info("[plan] ddg fail: %s", e)
@@ -378,24 +413,26 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def mini_crawl_worker(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Tool-based: crawl a small bundle per candidate domain and attach evidence payloads.
+    """Jina-based: read homepage snapshots per candidate domain and attach text evidence.
 
     Inputs: state['tenant_id'], state['discovery_candidates']
-    Outputs: state['evidence'] = [{domain, summary, signals?}, ...]
+    Outputs: state['evidence'] = [{domain, summary}, ...] where summary is plain text
     """
-    tenant_id = int(state.get("tenant_id") or 0)
     out: List[Dict[str, Any]] = []
     cand = (state.get("discovery_candidates") or [])
-    log.info("[mini] crawl start count=%d", len(cand[:10]))
+    log.info("[mini] jina-read start count=%d", len(cand[:10]))
     for dom in (state.get("discovery_candidates") or [])[:10]:
         url = f"https://{dom}"
         try:
-            summary = await crawl_site(url, max_pages=4)
-            out.append({"domain": dom, "summary": summary})
+            txt = jina_read(url, timeout=10)
+            if not txt:
+                log.info("[mini] jina empty domain=%s", dom)
+                continue
+            out.append({"domain": dom, "summary": txt[:4000]})
         except Exception as e:
-            log.info("[mini] crawl fail domain=%s err=%s", dom, e)
+            log.info("[mini] jina fail domain=%s err=%s", dom, e)
             continue
-    log.info("[mini] crawl done ok=%d", len(out))
+    log.info("[mini] jina-read done ok=%d", len(out))
     state["evidence"] = out
     return state
 
@@ -497,7 +534,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         jina_snips: Dict[str, str] = s.get("jina_snippets") or {}
         if not cand:
             return []
-        # 2) mini crawl (top 10)
+        # 2) Jina reader snapshot (top 10)
         ev_list: List[Dict[str, Any]] = []
         for d in cand[:10]:
             url = f"https://{d}"
@@ -506,11 +543,13 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             except Exception:
                 t = 0
             try:
-                log.info("[mini] crawl domain=%s", d)
-                summ = asyncio.run(crawl_site(url, max_pages=4))
-                ev_list.append({"domain": d, "summary": summ})
+                log.info("[mini] jina-read domain=%s", d)
+                summ = jina_read(url, timeout=10)
+                if not summ:
+                    continue
+                ev_list.append({"domain": d, "summary": str(summ)[:4000]})
             except Exception as e:
-                log.info("[mini] crawl fail domain=%s err=%s", d, e)
+                log.info("[mini] jina fail domain=%s err=%s", d, e)
                 continue
         if not ev_list:
             return []
@@ -631,6 +670,101 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         return out
     except Exception as e:
         log.info("[top10-fallback] failed: %s", e)
+        return []
+
+
+def _extract_domains_from_text(text: str) -> List[str]:
+    try:
+        pats = re.findall(r"\b((?:[a-z0-9-]+\.)+[a-z]{2,})(?:/|\b)", text, flags=re.I)
+        outs: List[str] = []
+        for h in _uniq([p.lower() for p in pats]):
+            if any(x in h for x in (
+                "duckduckgo.", "google.", "bing.", "brave.", "yahoo.", "yandex.",
+                "cloudflare.", "wikipedia.", "wikimedia.", "github.", "stackexchange.",
+                "facebook.", "linkedin.", "twitter.", "x.com", "instagram.", "youtube.",
+            )):
+                continue
+            outs.append(h)
+        return outs
+    except Exception:
+        return []
+
+
+def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """DDG-free fallback: expand candidates from r.jina snapshots of seeds + user signals, then score.
+
+    - Fetch r.jina for each seed domain
+    - Extract referenced domains from the text; add the seeds themselves
+    - Fetch r.jina snippets for candidates; score heuristically using ICP cues
+    - Return Top‑10 [{domain, score, bucket, why, snippet}]
+    """
+    try:
+        seeds = [d.strip().lower() for d in (seed_domains or []) if isinstance(d, str) and d.strip()]
+        candidates: List[str] = []
+        # Add seeds first
+        for d in seeds:
+            if d.startswith("http"):
+                from urllib.parse import urlparse
+                d = (urlparse(d).netloc or d).lower()
+            candidates.append(d)
+        # Expand from each seed via r.jina
+        for d in seeds:
+            try:
+                reader = f"https://r.jina.ai/http://{d}"
+                log.info("[jina-fb] GET %s", reader)
+                r = requests.get(reader, timeout=10)
+                txt = (r.text or "")[:16000]
+                for h in _extract_domains_from_text(txt):
+                    candidates.append(h)
+            except Exception as e:
+                log.info("[jina-fb] seed expand fail domain=%s err=%s", d, e)
+                continue
+        uniq = _uniq(candidates)[:60]
+        if not uniq:
+            return []
+        inds = ", ".join([s for s in (icp_profile.get("industries") or []) if isinstance(s, str)])
+        # Score candidates by fetching a short Jina snippet
+        out: List[Dict[str, Any]] = []
+        for d in uniq[:30]:
+            try:
+                reader = f"https://r.jina.ai/http://{d}"
+                r = requests.get(reader, timeout=10)
+                raw = (r.text or "")[:8000]
+                clean = " ".join((raw or "").split())
+                snip = clean[:180]
+                low = clean.lower()
+                score = 0
+                why_bits: List[str] = []
+                if "integrat" in low:
+                    score += 35
+                    why_bits.append("integrations signals")
+                if "pricing" in low or "plans" in low:
+                    score += 15
+                    why_bits.append("pricing page found")
+                if "case stud" in low or "customers" in low:
+                    score += 10
+                    why_bits.append("case studies")
+                if "careers" in low or "jobs" in low or "hiring" in low:
+                    score += 5
+                    why_bits.append("hiring")
+                if any(w in low for w in ["food service", "foodservice", "distribution", "distributor"]):
+                    score += 10
+                if inds and any(w.strip().lower() in low for w in inds.split(",")):
+                    score += 10
+                bucket = "A" if score >= 70 else ("B" if score >= 50 else "C")
+                out.append({
+                    "domain": d,
+                    "score": score,
+                    "bucket": bucket,
+                    "why": "; ".join(why_bits) if why_bits else "signal match",
+                    "snippet": snip,
+                })
+            except Exception:
+                continue
+        out = sorted(out, key=lambda x: int(x.get("score") or 0), reverse=True)[:10]
+        return out
+    except Exception as e:
+        log.info("[top10-seeds-fallback] failed: %s", e)
         return []
 
 
