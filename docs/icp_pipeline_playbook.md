@@ -77,3 +77,42 @@ ICP Finder: Intake → Candidate Generation (Tools & Quality Gates)
 - Actions: Propose 3–5 micro‑ICPs; show evidence counts; flag low‑density segments.
 - Output: Segments ready to confirm/tweak or drive enrichment batch.
 
+### Chat Flow: Intake → Confirmation → Enrichment
+
+The LangGraph chat orchestrator (`app/pre_sdr_graph.py`) wires these stages into the
+end-to-end user flow:
+
+1. **Kick-off / Intake questions.** `start lead gen` (or similar intent) routes the
+   turn into the ICP node, which gathers website and seed customers before allowing a
+   `confirm`. (`router` guards around lines 4360–4510) 【F:app/pre_sdr_graph.py†L4365-L4526】
+2. **`confirm` processing.** When the user responds `confirm`, the graph
+   - saves the intake payload and evidence (if persistence helpers are available),
+   - crawls the tenant site + seeds for structured signals, and
+   - calls `plan_top10_with_reasons` to generate the Top‑10 table while caching it on
+     `state["agent_top10"]` and persisting a preview per tenant. 【F:app/pre_sdr_graph.py†L3008-L3329】【F:app/pre_sdr_graph.py†L1048-L1108】
+3. **Micro‑ICP gating.** If Finder mode is on, the router keeps the conversation on
+   hold until micro‑ICP suggestions are generated and the user accepts one with
+   `accept micro-icp N`. This unlocks enrichment commands while preventing premature
+   runs. 【F:app/pre_sdr_graph.py†L4439-L4499】
+4. **`run enrichment`.** The enrichment node persists the active ICP rule, then loads
+   the shortlist to enrich. It first prefers the in-memory Top‑10 (`state["agent_top10"]`),
+   falls back to the persisted preview, and finally reuses any synchronous head
+   upserts from intake normalization. If no shortlist is available, it refuses to run
+   and asks the user to rerun `confirm` to regenerate it. 【F:app/pre_sdr_graph.py†L1239-L1336】
+
+#### Why "run enrichment" can fail after showing a Top‑10
+
+`run_enrichment` performs strict guarding before it touches vendor credits. Even if a
+Top‑10 table was displayed earlier, the shortlist must still be present in the current
+state (or reloadable from persistence) so the agent knows exactly which domains to
+enrich. If the conversation state was reset (e.g., reconnect, tenant change, or
+`agent_top10` cleared) and the persisted preview could not be read, the node returns
+the message observed in the chat transcript:
+
+> “I couldn’t find the last Top‑10 shortlist to enrich. Please type ‘confirm’ to
+> regenerate and lock a Top‑10, then try 'run enrichment' again.”
+
+This protects against accidentally enriching stale or unrelated companies. The remedy
+is to rerun `confirm` so the pipeline rebuilds evidence, persists a fresh Top‑10, and
+then retry `run enrichment` once the shortlist is back in scope. 【F:app/pre_sdr_graph.py†L1239-L1336】
+
