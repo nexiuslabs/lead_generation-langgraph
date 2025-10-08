@@ -321,16 +321,32 @@ def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> N
             cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
         except Exception:
             pass
-        cur.execute(
-            """
-            INSERT INTO icp_rules(tenant_id, name, payload)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (tenant_id, name) DO UPDATE SET
-              payload = EXCLUDED.payload,
-              created_at = NOW()
-            """,
-            (tid, name, Json(payload)),
-        )
+        try:
+            keys = list((payload or {}).keys())
+            logger.info("[icp_rules] upsert → tenant_id=%s name=%s keys=%s", tid, name, keys[:8])
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                """
+                INSERT INTO icp_rules(tenant_id, name, payload)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (tenant_id, name) DO UPDATE SET
+                  payload = EXCLUDED.payload,
+                  created_at = NOW()
+                """,
+                (tid, name, Json(payload)),
+            )
+        except Exception as _up_e:
+            try:
+                logger.warning("[icp_rules] upsert failed tenant_id=%s name=%s err=%s", tid, name, _up_e)
+            except Exception:
+                pass
+            raise
+        try:
+            logger.info("[icp_rules] upsert OK → tenant_id=%s name=%s", tid, name)
+        except Exception:
+            pass
 
 
 def _upsert_icp_profile_sync(tid: int, icp_profile: dict, name: str = "Default ICP") -> None:
@@ -339,6 +355,15 @@ def _upsert_icp_profile_sync(tid: int, icp_profile: dict, name: str = "Default I
     Keys merged: industries, integrations, buyer_titles, size_bands, triggers.
     """
     try:
+        try:
+            logger.info(
+                "[icp_rules] merge profile → tenant_id=%s name=%s icp_profile_keys=%s",
+                tid,
+                name,
+                list((icp_profile or {}).keys())[:8],
+            )
+        except Exception:
+            pass
         base: dict = {}
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
@@ -350,6 +375,15 @@ def _upsert_icp_profile_sync(tid: int, icp_profile: dict, name: str = "Default I
                 if isinstance(row[0], dict):
                     base = dict(row[0])
         merged = _merge_icp_profile_into_payload(base, dict(icp_profile or {}))
+        try:
+            logger.info(
+                "[icp_rules] merged payload keys → tenant_id=%s name=%s keys=%s",
+                tid,
+                name,
+                list(merged.keys())[:8],
+            )
+        except Exception:
+            pass
         _save_icp_rule_sync(tid, merged, name=name)
     except Exception:
         # Non-fatal; ignore if table missing or RLS blocks
@@ -3225,8 +3259,48 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 logger.warning("[confirm] agents_icp import failed: %s", e)
                                 _agent_top10 = None  # type: ignore
                                 _agent_synth = None  # type: ignore
-                            if _agent_top10 is not None:
+                        if _agent_top10 is not None:
                                 icp_prof = state.get("icp_profile") or {}
+                                # If no profile yet, derive minimal profile from current ICP answers
+                                if not icp_prof:
+                                    try:
+                                        _icp = dict(state.get("icp") or {})
+                                        prof0: dict[str, list[str]] = {}
+                                        inds = []
+                                        if isinstance(_icp.get("industries"), list):
+                                            inds = [str(s).strip() for s in _icp.get("industries") if isinstance(s, str) and s.strip()]
+                                        elif isinstance(_icp.get("industry"), str) and _icp.get("industry").strip():
+                                            inds = [str(_icp.get("industry")).strip()]
+                                        if inds:
+                                            prof0["industries"] = inds
+                                        titles = []
+                                        if isinstance(_icp.get("champion_titles"), list):
+                                            titles = [str(s).strip() for s in _icp.get("champion_titles") if isinstance(s, str) and s.strip()]
+                                        if titles:
+                                            prof0["buyer_titles"] = titles
+                                        sizes = []
+                                        if isinstance(_icp.get("size_bands"), list):
+                                            sizes = [str(s).strip() for s in _icp.get("size_bands") if isinstance(s, str) and s.strip()]
+                                        if sizes:
+                                            prof0["size_bands"] = sizes
+                                        signals = []
+                                        if isinstance(_icp.get("signals"), list):
+                                            signals.extend([str(s).strip() for s in _icp.get("signals") if isinstance(s, str) and s.strip()])
+                                        if isinstance(_icp.get("integrations_required"), list):
+                                            signals.extend([str(s).strip() for s in _icp.get("integrations_required") if isinstance(s, str) and s.strip()])
+                                        if signals:
+                                            prof0["integrations"] = list({s.lower(): s for s in signals}.values())
+                                        trigs = []
+                                        if isinstance(_icp.get("triggers"), list):
+                                            trigs = [str(s).strip() for s in _icp.get("triggers") if isinstance(s, str) and s.strip()]
+                                        if trigs:
+                                            prof0["triggers"] = trigs
+                                        if prof0:
+                                            icp_prof = prof0
+                                            state["icp_profile"] = icp_prof
+                                            logger.info("[confirm] Derived icp_profile from ICP answers keys=%s", list(prof0.keys()))
+                                    except Exception:
+                                        pass
                                 # If empty, synthesize from seeds quickly
                                 if not icp_prof and _agent_synth is not None:
                                     try:
@@ -3373,6 +3447,31 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         pass
                     except Exception as e:
                         logger.warning("[confirm] agent discovery block failed: %s", e)
+
+                    # Ensure ICP profile is persisted even if Top‑10 is empty
+                    try:
+                        icp_prof2 = dict(state.get("icp_profile") or {})
+                        if icp_prof2:
+                            try:
+                                tid3 = await _resolve_tenant_id_for_write(state)
+                            except Exception:
+                                tid3 = None
+                            if isinstance(tid3, int):
+                                try:
+                                    base_payload: dict = {}
+                                except Exception:
+                                    base_payload = {}
+                                try:
+                                    merged_payload = _merge_icp_profile_into_payload(base_payload, icp_prof2)
+                                except Exception:
+                                    merged_payload = icp_prof2
+                                try:
+                                    _save_icp_rule_sync(int(tid3), merged_payload, name="Default ICP")
+                                    logger.info("[confirm] Persisted ICP profile fallback (icp_rules) keys=%s", list((merged_payload or {}).keys())[:8])
+                                except Exception as _pf_e:
+                                    logger.warning("[confirm] ICP profile persist fallback failed: %s", _pf_e)
+                    except Exception:
+                        pass
 
                     # Pattern mining + Micro‑ICPs (Step 6–8) — disabled in chat when ACRA is off (nightly only)
                     try:
