@@ -257,6 +257,68 @@ async def run_manual_research_enrich(job_id: int) -> None:
         log.info("{\"job\":\"manual_research_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
 
 
+def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int]) -> dict:
+    """Queue background enrichment for next‑40 web_discovery preview companies.
+
+    Stores the company_ids list in background_jobs.params for processing by the nightly dispatcher.
+    """
+    ids = [int(i) for i in (company_ids or []) if str(i).strip()]
+    if not ids:
+        return {"job_id": 0}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'web_discovery_bg_enrich','queued', %s) RETURNING job_id",
+            (tenant_id, Json({"company_ids": ids})),
+        )
+        row = cur.fetchone()
+        return {"job_id": int(row[0]) if row and row[0] is not None else 0}
+
+
+async def run_web_discovery_bg_enrich(job_id: int) -> None:
+    """Process a list of company_ids for Non‑SG next‑40 background enrichment.
+
+    Uses the same enrich function as other flows (Tavily/Apify pipeline), scoped to provided IDs.
+    """
+    import time
+    t0 = time.perf_counter()
+    log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"start\",\"job_id\":%s}", job_id)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE background_jobs SET status='running', started_at=now() WHERE job_id=%s", (job_id,))
+        cur.execute("SELECT tenant_id, params FROM background_jobs WHERE job_id=%s", (job_id,))
+        row = cur.fetchone()
+        tenant_id = int(row[0]) if row and row[0] is not None else None
+        params = (row and row[1]) or {}
+        ids = [int(i) for i in (params.get('company_ids') or []) if str(i).strip()]
+    processed = 0
+    try:
+        if not ids:
+            raise RuntimeError("company_ids required")
+        if enrich_company_with_tavily is None:
+            raise RuntimeError("enrich unavailable")
+        for cid in ids:
+            try:
+                await enrich_company_with_tavily(int(cid))
+                processed += 1
+            except Exception:
+                # continue best-effort
+                pass
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                (processed, len(ids), job_id),
+            )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
+    except Exception as e:  # pragma: no cover
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE background_jobs SET status='error', error=%s, processed=%s, ended_at=now() WHERE job_id=%s",
+                (str(e), processed, job_id),
+            )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
+
+
 def enqueue_enrich_candidates(tenant_id: Optional[int], ssic_codes: List[str]) -> dict:
     """Queue an enrich_candidates job keyed by SSIC codes (normalized numeric strings)."""
     params: Dict[str, Any] = {"ssic_codes": [str(c) for c in (ssic_codes or []) if str(c).strip()]}

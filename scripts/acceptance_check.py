@@ -17,6 +17,9 @@ DEFAULTS = {
     "max_bucket_dominance": 0.70,
 }
 
+# Default SLA for Top-10 immediate enrichment (ms)
+DEFAULT_MAX_TOP10_MS = 300_000
+
 
 async def table_has_column(conn: asyncpg.Connection, table: str, column: str) -> bool:
     try:
@@ -159,6 +162,72 @@ async def compute_metrics(conn: asyncpg.Connection) -> Dict[str, Any]:
     return metrics
 
 
+async def compute_top10_enrich_metrics(conn: asyncpg.Connection) -> Dict[str, Any]:
+    """Return metrics for the latest strict Top‑10 enrichment run.
+
+    Uses enrichment_runs + run_summaries + run_manifests + run_event_logs.
+    """
+    out: Dict[str, Any] = {"run_id": None, "duration_ms": None, "stage_p95_ms": {}, "bucket_counts_top10": {}}
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT er.run_id, er.started_at, er.ended_at, rs.candidates, rs.processed
+            FROM enrichment_runs er
+            JOIN run_summaries rs USING(run_id)
+            WHERE er.ended_at IS NOT NULL
+              AND rs.candidates = 10
+            ORDER BY er.ended_at DESC
+            LIMIT 1
+            """
+        )
+    except Exception:
+        row = None
+    if not row:
+        return out
+    out["run_id"] = int(row["run_id"]) if row["run_id"] else None
+    try:
+        dur_ms = int((row["ended_at"] - row["started_at"]).total_seconds() * 1000)
+    except Exception:
+        dur_ms = None
+    out["duration_ms"] = dur_ms
+    # p95 per stage for this run
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT stage, percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95
+            FROM run_event_logs
+            WHERE run_id = $1 AND duration_ms IS NOT NULL
+            GROUP BY stage
+            """,
+            out["run_id"],
+        )
+        out["stage_p95_ms"] = {str(r["stage"]): int(r["p95"] or 0) for r in rows}
+    except Exception:
+        out["stage_p95_ms"] = {}
+    # A/B/C counts among the Top‑10 manifest
+    try:
+        ids = await conn.fetchval("SELECT selected_ids FROM run_manifests WHERE run_id=$1", out["run_id"])
+        if ids:
+            rows = await conn.fetch(
+                """
+                SELECT s.bucket, COUNT(*) AS c
+                FROM lead_scores s
+                WHERE s.company_id = ANY($1::bigint[])
+                GROUP BY s.bucket
+                """,
+                ids,
+            )
+            out["bucket_counts_top10"] = {str(r["bucket"]): int(r["c"]) for r in rows}
+    except Exception:
+        out["bucket_counts_top10"] = {}
+    return out
+
+
+def evaluate_top10_sla(m: Dict[str, Any], max_ms: int = DEFAULT_MAX_TOP10_MS) -> Tuple[bool, int]:
+    dur = int(m.get("duration_ms") or 0)
+    return (dur <= max_ms and dur > 0), dur
+
+
 def evaluate(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Tuple[bool, Dict[str, Any]]:
     # Compute dominance from bucket counts
     counts = metrics.get("bucket_counts") or {}
@@ -178,7 +247,7 @@ def evaluate(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> Tuple[boo
 async def main() -> int:
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="Acceptance check for Feature 14")
+    parser = argparse.ArgumentParser(description="Acceptance check for Feature 14 + PRD19 Top-10 SLA")
     parser.add_argument("--tenant", type=int, default=None, help="Tenant ID for RLS scoping (sets request.tenant_id)")
     parser.add_argument("--dsn", type=str, default=os.getenv("POSTGRES_DSN") or os.getenv("DATABASE_URL"), help="Postgres DSN")
     parser.add_argument("--min-domain-rate", type=float, default=float(os.getenv("MIN_DOMAIN_RATE", DEFAULTS["min_domain_rate"])))
@@ -186,6 +255,7 @@ async def main() -> int:
     parser.add_argument("--min-email-rate", type=float, default=float(os.getenv("MIN_EMAIL_RATE", DEFAULTS["min_email_rate"])))
     parser.add_argument("--max-bucket-dominance", type=float, default=float(os.getenv("MAX_BUCKET_DOMINANCE", DEFAULTS["max_bucket_dominance"])))
     parser.add_argument("--json", action="store_true", help="Print JSON output")
+    parser.add_argument("--max-top10-ms", type=int, default=int(os.getenv("MAX_TOP10_MS", str(DEFAULT_MAX_TOP10_MS)) or DEFAULT_MAX_TOP10_MS), help="SLA for Top-10 enrich (ms)")
     args = parser.parse_args()
 
     if not args.dsn:
@@ -212,19 +282,24 @@ async def main() -> int:
                 pass
 
         metrics = await compute_metrics(conn)
+        top10 = await compute_top10_enrich_metrics(conn)
         passed, results = evaluate(metrics, thresholds)
+        sla_ok, top10_ms = evaluate_top10_sla(top10, args.max_top10_ms)
+        results["top10_sla_ok"] = sla_ok
 
         out = {
             "tenant_id": args.tenant,
             "metrics": metrics,
             "thresholds": thresholds,
+            "top10": top10,
+            "max_top10_ms": args.max_top10_ms,
             "results": results,
-            "passed": passed,
+            "passed": passed and sla_ok,
         }
         if args.json:
             print(json.dumps(out, indent=2, default=str))
         else:
-            print("Acceptance Check (Feature 14)")
+            print("Acceptance Check (Feature 14 + PRD19)")
             print(f"  tenant_id: {out['tenant_id']}")
             print(f"  mv_candidates: {metrics['mv_candidates']}")
             print(f"  shortlisted: {metrics['shortlisted']}")
@@ -234,7 +309,10 @@ async def main() -> int:
             print(f"  bucket_counts: {metrics['bucket_counts']}")
             print(f"  bucket_dominance: {results['bucket_dominance']:.2%} (<= {thresholds['max_bucket_dominance']:.0%}) -> { 'OK' if results['bucket_dominance_ok'] else 'FAIL' }")
             print(f"  rationale_rate: {metrics['rationale_rate']:.2%}")
-            print(f"  PASSED: {passed}")
+            print(f"  top10_sla: {top10_ms} ms (<= {args.max_top10_ms} ms) -> { 'OK' if sla_ok else 'FAIL' }")
+            print(f"  top10_stage_p95_ms: {top10.get('stage_p95_ms')}")
+            print(f"  top10_bucket_counts: {top10.get('bucket_counts_top10')}")
+            print(f"  PASSED: {passed and sla_ok}")
 
         return 0 if passed else 1
     finally:
@@ -246,4 +324,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
-

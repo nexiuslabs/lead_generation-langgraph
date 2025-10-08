@@ -105,6 +105,26 @@ logger.setLevel(_level)
 # Session-boot token: used to gate explicit actions after server restarts
 BOOT_TOKEN = os.getenv("LG_SERVER_BOOT_TOKEN") or str(uuid4())
 
+
+def _is_non_sg_active_profile(state: Dict[str, Any]) -> bool:
+    """Heuristic to decide Non‑SG based on icp_profile geos/hq_country.
+
+    Returns True if we cannot positively detect Singapore as an active geo.
+    """
+    try:
+        prof = dict(state.get("icp_profile") or {})
+        geos = prof.get("geos") or []
+        if isinstance(geos, list):
+            for g in geos:
+                if isinstance(g, str) and g.strip().lower() == "singapore":
+                    return False
+        hq = (prof.get("hq_country") or "").strip().lower()
+        if hq == "singapore":
+            return False
+    except Exception:
+        pass
+    return True
+
 # --- Helper: ensure required Fast-Start fields are present (asked and captured) ---
 def _icp_required_fields_done(icp: dict, ask_counts: dict | None = None) -> bool:
     """Return True when all required Fast-Start fields have been captured.
@@ -591,49 +611,58 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
 
 
 def _load_persisted_top10(tid: Optional[int]) -> list[dict]:
-    """Load recently persisted Top‑10 preview from icp_evidence/lead_scores for a tenant."""
-    if not isinstance(tid, int):
-        return []
+    """Load recently persisted Top‑10 preview.
+
+    Preference:
+    1) If tenant_id is known, read from `icp_evidence` + `lead_scores` for that tenant (RLS requires tenant).
+    2) If nothing found (or tenant unknown), read from `staging_global_companies` where ai_metadata.preview=true,
+       filtered by tenant when available; otherwise read the latest preview rows (dev-safe fallback).
+    """
     try:
         with get_conn() as _c, _c.cursor() as _cur:
-            # Set tenant GUC for RLS reads
-            try:
-                if isinstance(tid, int):
+            # 1) Tenant-scoped evidence table (requires tenant for RLS)
+            if isinstance(tid, int):
+                try:
                     _cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
-            except Exception:
-                pass
-            _cur.execute(
-                """
-                SELECT c.website_domain AS domain,
-                       COALESCE(ls.score,0) AS score,
-                       COALESCE(ls.bucket,'C') AS bucket,
-                       (ev.value->>'why') AS why,
-                       (ev.value->>'snippet') AS snippet
-                  FROM icp_evidence ev
-                  JOIN companies c ON c.company_id = ev.company_id
-                  LEFT JOIN lead_scores ls ON ls.company_id = ev.company_id
-                 WHERE ev.tenant_id = %s
-                   AND ev.signal_key = 'top10_preview'
-                 ORDER BY ev.created_at DESC
-                 LIMIT 10
-                """,
-                (tid,),
-            )
-            rows = _cur.fetchall() or []
-            out: list[dict] = []
-            for r in rows:
-                d = {
-                    "domain": (r[0] or "").strip().lower(),
-                    "score": float(r[1] or 0),
-                    "bucket": r[2] or "C",
-                    "why": r[3] or "",
-                    "snippet": r[4] or "",
-                }
-                if d["domain"]:
-                    out.append(d)
-            if out:
-                return out
-            # Fallback: read from staging_global_companies ai_metadata preview
+                except Exception:
+                    pass
+                try:
+                    _cur.execute(
+                        """
+                        SELECT c.website_domain AS domain,
+                               COALESCE(ls.score,0) AS score,
+                               COALESCE(ls.bucket,'C') AS bucket,
+                               (ev.value->>'why') AS why,
+                               (ev.value->>'snippet') AS snippet
+                          FROM icp_evidence ev
+                          JOIN companies c ON c.company_id = ev.company_id
+                          LEFT JOIN lead_scores ls ON ls.company_id = ev.company_id
+                         WHERE ev.tenant_id = %s
+                           AND ev.signal_key = 'top10_preview'
+                         ORDER BY ev.created_at DESC
+                         LIMIT 10
+                        """,
+                        (tid,),
+                    )
+                    rows = _cur.fetchall() or []
+                    out: list[dict] = []
+                    for r in rows:
+                        d = {
+                            "domain": (r[0] or "").strip().lower(),
+                            "score": float(r[1] or 0),
+                            "bucket": r[2] or "C",
+                            "why": r[3] or "",
+                            "snippet": r[4] or "",
+                        }
+                        if d["domain"]:
+                            out.append(d)
+                    if out:
+                        return out
+                except Exception:
+                    # fall through to staging fallback
+                    pass
+
+            # 2) Fallback: staging preview rows (dev-safe; may be global if tenant unknown)
             try:
                 _cur.execute(
                     f"""
@@ -648,7 +677,7 @@ def _load_persisted_top10(tid: Optional[int]) -> list[dict]:
                      ORDER BY created_at DESC
                      LIMIT 10
                     """,
-                    (tid, None if tid is None else tid),
+                    (tid if isinstance(tid, int) else None, None if tid is None else tid),
                 )
                 rows2 = _cur.fetchall() or []
                 out2: list[dict] = []
@@ -1300,6 +1329,70 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                     candidates = cand
                     state["candidates"] = cand
                     state["strict_top10"] = True
+                    # Non‑SG: enqueue background next‑40 enrichment and inform user (best effort)
+                    try:
+                        if not _is_non_sg_active_profile(state):
+                            raise RuntimeError("active profile is SG; skip next-40 background")
+                        from src.database import get_conn as __get_conn
+                        from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
+                        bg_limit = 40
+                        try:
+                            import os as __os
+                            bg_limit = int(__os.getenv("BG_NEXT_COUNT", "40") or 40)
+                        except Exception:
+                            bg_limit = 40
+                        # Load next‑40 preview domains from staging (ordered by preview score)
+                        doms: list[str] = []
+                        with __get_conn() as __c2, __c2.cursor() as __cur2:
+                            try:
+                                # Resolve tenant id for scoping (reuse DEFAULT_TENANT_ID or first active mapping)
+                                _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                                _tidv = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                            except Exception:
+                                _tidv = None
+                            if _tidv is None:
+                                try:
+                                    __cur2.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                    _r = __cur2.fetchone()
+                                    _tidv = int(_r[0]) if _r and _r[0] is not None else None
+                                except Exception:
+                                    _tidv = None
+                            if _tidv is not None:
+                                __cur2.execute(
+                                    """
+                                    SELECT domain
+                                    FROM staging_global_companies
+                                    WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                                    ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                                    OFFSET 10 LIMIT %s
+                                    """,
+                                    (_tidv, bg_limit),
+                                )
+                                _r2 = __cur2.fetchall() or []
+                                doms = [str(r[0]) for r in _r2 if r and r[0]]
+                        # Map to company_ids
+                        bg_ids: list[int] = []
+                        if doms:
+                            with __get_conn() as __c3, __c3.cursor() as __cur3:
+                                __cur3.execute(
+                                    "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                                    ([d.lower() for d in doms],),
+                                )
+                                _rows = __cur3.fetchall() or []
+                                _map = {str((r[1] or "").lower()): int(r[0]) for r in _rows if r and r[0] is not None}
+                                for d in doms:
+                                    _cid = _map.get(str(d.lower()))
+                                    if _cid:
+                                        bg_ids.append(_cid)
+                        if bg_ids and _tidv is not None:
+                            _job = __enqueue_bg(int(_tidv), bg_ids)
+                            _jid = (_job or {}).get("job_id")
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage(content=f"Enriching the next {min(len(bg_ids), bg_limit)} in the background (job {_jid}). I will reply here when it finishes. You can also check status via /jobs/{_jid}.")],
+                            )
+                    except Exception:
+                        pass
         except Exception:
             pass
     # If Top‑10 was shown earlier but agent_top10 is missing in this state (new cycle/thread),
@@ -3772,6 +3865,19 @@ async def confirm_node(state: GraphState) -> GraphState:
 
 
 async def enrich_node(state: GraphState) -> GraphState:
+    # Mark the last routed human command so the router's duplicate-guard
+    # can halt re-entry loops (e.g., repeated "run enrichment").
+    try:
+        state["last_routed_text"] = (_last_user_text(state) or "").strip().lower()
+    except Exception:
+        pass
+    try:
+        # Concise trace to correlate start of enrichment in logs
+        strict = bool(state.get("strict_top10"))
+        cand_n = len(state.get("candidates") or []) if isinstance(state.get("candidates"), list) else 0
+        logger.info("[enrich] begin strict_top10=%s candidates=%d", strict, cand_n)
+    except Exception:
+        pass
     # Persist current ICP immediately when enrichment is requested, even if user skipped explicit confirm
     try:
         icp_cur = dict(state.get("icp") or {})
@@ -4518,6 +4624,10 @@ def router(state: GraphState) -> str:
     except Exception:
         pass
 
+    # Note: Do not route to enrichment here. We intentionally handle
+    # explicit 'run enrichment' after the assistant-last guard below to
+    # avoid loops when the assistant just spoke.
+
     # If the assistant spoke last, do not route again until a NEW human message arrives.
     # This prevents loops where the router keeps re-reading the same last human text.
     if _last_is_ai(msgs):
@@ -4574,20 +4684,7 @@ def router(state: GraphState) -> str:
             pass
         return "icp"
 
-    # Explicit enrichment command: honor user intent when candidates exist.
-    # Finder-specific gating (like waiting for suggestions) is handled later; do not
-    # force ICP completeness here — 'run enrichment' is an explicit override.
-    if (
-        "run enrichment" in text
-        and state.get("candidates")
-        and not state.get("results")
-    ):
-        logger.info("router -> enrich (explicit user command)")
-        try:
-            state["last_routed_text"] = text
-        except Exception:
-            pass
-        return "enrich"
+    # (Handled above) Explicit enrichment command routes immediately
 
     # Accept micro‑ICP selection
     if re.search(r"\baccept\s+micro[- ]icp\b", text):
@@ -4600,7 +4697,8 @@ def router(state: GraphState) -> str:
 
     # 1) Pipeline progression (explicit only)
     # Finder gating: do NOT auto-advance to enrichment until micro-ICP suggestions are done
-    if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
+    # Finder gating: allow explicit 'run enrichment' to override the hold
+    if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done") and ("run enrichment" not in text):
         # If we already have candidates but haven't finished Finder suggestions, hold and wait for user
         if state.get("candidates") and not state.get("results"):
             logger.info("router -> end (Finder: hold before enrichment until suggestions)")
@@ -4625,7 +4723,7 @@ def router(state: GraphState) -> str:
 
     # 2) If assistant spoke last and no pending work, wait for user input (covered by early guard)
 
-    # 3) Fast-path: user requested enrichment
+    # 3) Fast-path: user requested enrichment (only when last turn was human)
     if "run enrichment" in text:
         logger.info("router -> enrich (user requested enrichment)")
         try:

@@ -12,12 +12,13 @@ async def run_queued_jobs(limit: Optional[int] = None) -> int:
     """
     jobs: list[tuple[int, str]] = []
     with get_conn() as conn, conn.cursor() as cur:
-        # Include manual_research_enrich and apply a simple priority ordering
-        # Priority: manual_research_enrich (1) → staging_upsert (2) → enrich_candidates (3) → icp_intake_process (4)
+        # Include background enrich + manual_research_enrich and apply a simple priority ordering
+        # Priority: web_discovery_bg_enrich (0) → manual_research_enrich (1) → staging_upsert (2) → enrich_candidates (3) → icp_intake_process (4)
         sql = (
             "SELECT job_id, job_type FROM background_jobs "
-            "WHERE status='queued' AND job_type IN ('manual_research_enrich','staging_upsert','enrich_candidates','icp_intake_process') "
+            "WHERE status='queued' AND job_type IN ('web_discovery_bg_enrich','manual_research_enrich','staging_upsert','enrich_candidates','icp_intake_process') "
             "ORDER BY CASE job_type "
+            "WHEN 'web_discovery_bg_enrich' THEN 0 "
             "WHEN 'manual_research_enrich' THEN 1 "
             "WHEN 'staging_upsert' THEN 2 "
             "WHEN 'enrich_candidates' THEN 3 "
@@ -40,6 +41,9 @@ async def run_queued_jobs(limit: Optional[int] = None) -> int:
         elif jtype == 'manual_research_enrich':
             from src.jobs import run_manual_research_enrich
             await run_manual_research_enrich(int(jid))
+        elif jtype == 'web_discovery_bg_enrich':
+            from src.jobs import run_web_discovery_bg_enrich
+            await run_web_discovery_bg_enrich(int(jid))
     return len(jobs)
 
 

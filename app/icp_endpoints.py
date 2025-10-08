@@ -20,6 +20,7 @@ from src.jobs import (
     enqueue_icp_intake_process,  # re-export for tests to monkeypatch
     run_icp_intake_process,  # re-export for tests to monkeypatch
 )
+from src.enrichment import enrich_company_with_tavily  # async enrich by company_id
 
 router = APIRouter(prefix="/icp", tags=["icp"])
 
@@ -231,6 +232,131 @@ async def post_accept(
     return {"ok": True, "scheduled": True, "run_now": min(head, len(ssic_codes) if ssic_codes else head)}
 
 
+@router.post("/enrich/top10")
+async def enrich_top10(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Enrich the persisted Top‑10 preview strictly by tenant.
+
+    Looks up Top‑10 domains from staging_global_companies where ai_metadata.preview=true
+    ordered by preview score, maps to company_ids, and enriches them one by one.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    try:
+        run_now_limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
+    except Exception:
+        run_now_limit = 10
+    domains: list[str] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                SELECT domain
+                FROM staging_global_companies
+                WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                LIMIT %s
+                """,
+                (tid, run_now_limit),
+            )
+            rows = cur.fetchall() or []
+            domains = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            domains = []
+    if not domains:
+        raise HTTPException(status_code=412, detail="top10 preview not found; please confirm to regenerate")
+    # Map to company_ids
+    company_ids: list[int] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT company_id FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                ([d.lower() for d in domains],),
+            )
+            rows = cur.fetchall() or []
+            company_ids = [int(r[0]) for r in rows if r and r[0] is not None]
+        except Exception:
+            company_ids = []
+    processed = 0
+    for cid in company_ids:
+        try:
+            await enrich_company_with_tavily(int(cid))
+            processed += 1
+        except Exception:
+            # continue with best-effort behavior
+            pass
+    return {"ok": True, "requested": len(company_ids), "processed": processed}
+
+
+@router.post("/enrich/next40")
+async def enrich_next40(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Enqueue background enrichment for the next 40 preview domains (Non‑SG only).
+
+    Selects the next set of preview domains after the Top‑10 for the same tenant,
+    resolves to company_ids, and enqueues a background job to enrich them.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    try:
+        run_now_limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
+        bg_next_count = int(os.getenv("BG_NEXT_COUNT", "40") or 40)
+    except Exception:
+        run_now_limit, bg_next_count = 10, 40
+    domains: list[str] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                SELECT domain
+                FROM staging_global_companies
+                WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                OFFSET %s LIMIT %s
+                """,
+                (tid, run_now_limit, bg_next_count),
+            )
+            rows = cur.fetchall() or []
+            domains = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            domains = []
+    if not domains:
+        raise HTTPException(status_code=404, detail="no next40 preview domains found")
+    # Resolve to company_ids
+    company_ids: list[int] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                ([d.lower() for d in domains],),
+            )
+            rows = cur.fetchall() or []
+            found = {str((r[1] or "").lower()): int(r[0]) for r in rows if r and r[0] is not None}
+            for d in domains:
+                cid = found.get(str(d.lower()))
+                if cid:
+                    company_ids.append(cid)
+        except Exception:
+            company_ids = []
+    if not company_ids:
+        raise HTTPException(status_code=404, detail="no company_ids resolved for next40")
+    # Enqueue background job
+    try:
+        from src.jobs import enqueue_web_discovery_bg_enrich
+        job = enqueue_web_discovery_bg_enrich(int(tid), company_ids)
+        return {"ok": True, "job_id": job.get("job_id")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
+
+
 @router.get("/top10")
 async def get_top10(
     req: Request,
@@ -253,7 +379,7 @@ async def get_top10(
                 (tid,),
             )
             row = cur.fetchone()
-            payload = (row and row[0]) or {}
+    payload = (row and row[0]) or {}
             # Map simple keys if present
             if isinstance(payload, dict):
                 if isinstance(payload.get("industries"), list):
