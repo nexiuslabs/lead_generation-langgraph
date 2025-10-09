@@ -241,11 +241,10 @@ def _enqueue_next40_if_applicable(state) -> None:
         jid = (job or {}).get("job_id")
         try:
             logger.info(
-                "[next40] preview_total=%s enrich_now=%s queued_next=%s job_id=%s tenant_id=%s",
-                str(preview_total),
-                "10",
+                "[enrich] enqueue next40 count=%s job_id=%s (preview_total=%s tenant_id=%s)",
                 str(len(bg_ids)),
                 str(jid),
+                str(preview_total),
                 str(_tidv),
             )
         except Exception:
@@ -4111,14 +4110,21 @@ async def enrich_node(state: GraphState) -> GraphState:
         persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
         if persisted_top:
             top10 = persisted_top
-        # Last resort: if the chat previously showed Top‑10, attempt regeneration once
-        elif _top10_preview_was_sent(state):
-            try:
-                regen = await _regenerate_top10_if_missing(state, int(tid) if isinstance(tid, int) else None)
-                if regen:
-                    top10 = regen
-            except Exception:
-                pass
+        else:
+            # Strict mode: do not regenerate Top‑10 during enrichment; require user to confirm again
+            if bool(state.get("strict_top10")):
+                try:
+                    logger.info("[enrich] strict mode: no persisted Top‑10; aborting (no discovery)")
+                except Exception:
+                    pass
+            # Last resort (non-strict only): if the chat previously showed Top‑10, attempt regeneration once
+            elif _top10_preview_was_sent(state):
+                try:
+                    regen = await _regenerate_top10_if_missing(state, int(tid) if isinstance(tid, int) else None)
+                    if regen:
+                        top10 = regen
+                except Exception:
+                    pass
     # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
     # Strict policy: reuse persisted Top‑10. If unavailable, ask user to regenerate.
     if not (isinstance(top10, list) and top10):
@@ -4173,7 +4179,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                     state["candidates"] = cand
                     state["strict_top10"] = True
                     try:
-                        logger.info("[enrich] using top10 candidates=%d", len(cand))
+                        logger.info("[enrich] using persisted top10 count=%d", len(cand))
                     except Exception:
                         pass
         except Exception:
@@ -4981,6 +4987,9 @@ def router(state: GraphState) -> str:
         logger.info("router -> enrich (user requested enrichment)")
         try:
             state["last_routed_text"] = text
+            # Enrichment should strictly use the previously persisted Top‑10;
+            # never re-run discovery during this command.
+            state["strict_top10"] = True
         except Exception:
             pass
         return "enrich"
