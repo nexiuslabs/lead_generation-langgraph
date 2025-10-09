@@ -168,8 +168,8 @@ def _enqueue_next40_if_applicable(state) -> None:
         # Avoid duplicate enqueue within the same conversation thread
         if bool(state.get("next40_enqueued")):
             return
-        if not _is_non_sg_active_profile(state):
-            return
+        # Always attempt to enqueue the next 40 for background enrichment
+        # (no longer gated by Non‑SG only)
         from src.database import get_conn as __get_conn
         from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
         # Resolve tenant id from state/env/mapping
@@ -195,17 +195,35 @@ def _enqueue_next40_if_applicable(state) -> None:
             bg_limit = 40
         doms: list[str] = []
         preview_total = 0
+        preview_doms: list[str] = []
         with __get_conn() as __c2, __c2.cursor() as __cur2:
             try:
+                # Collect preview Top‑10 first (for total + exclusion)
                 __cur2.execute(
                     """
                     SELECT domain
                     FROM staging_global_companies
                     WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
                     ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
-                    OFFSET 10 LIMIT %s
+                    LIMIT 10
                     """,
-                    (_tidv, bg_limit),
+                    (_tidv,),
+                )
+                _p = __cur2.fetchall() or []
+                preview_doms = [str(r[0]) for r in _p if r and r[0]]
+                # Now select the next 40 from staged web discovery excluding preview
+                __cur2.execute(
+                    """
+                    SELECT domain
+                    FROM staging_global_companies
+                    WHERE tenant_id=%s
+                      AND source = 'web_discovery'
+                      AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                      AND LOWER(domain) <> ALL(%s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (_tidv, [d.lower() for d in preview_doms] or [''], bg_limit),
                 )
                 rows = __cur2.fetchall() or []
                 doms = [str(r[0]) for r in rows if r and r[0]]
@@ -230,9 +248,18 @@ def _enqueue_next40_if_applicable(state) -> None:
                 _rows = __cur3.fetchall() or []
                 _map = {str((r[1] or "").lower()): int(r[0]) for r in _rows if r and r[0] is not None}
                 for d in doms:
-                    _cid = _map.get(str(d.lower()))
+                    key = str(d.lower())
+                    _cid = _map.get(key)
                     if _cid:
                         bg_ids.append(_cid)
+                    else:
+                        # Ensure a companies row exists for this domain, then include it
+                        try:
+                            ensured = _ensure_company_by_domain(d)
+                            if ensured:
+                                bg_ids.append(int(ensured))
+                        except Exception:
+                            continue
             except Exception:
                 bg_ids = []
         if not bg_ids:
@@ -247,6 +274,18 @@ def _enqueue_next40_if_applicable(state) -> None:
                 str(preview_total),
                 str(_tidv),
             )
+        except Exception:
+            pass
+        # Optional immediate start: if BG_NEXT_IMMEDIATE=true, kick off the job now in a fire-and-forget task
+        try:
+            if str(os.getenv("BG_NEXT_IMMEDIATE", "false")).strip().lower() in ("1", "true", "yes", "on") and jid:
+                import asyncio as _asyncio
+                from src.jobs import run_web_discovery_bg_enrich as _run_bg
+                _asyncio.create_task(_run_bg(int(jid)))
+                try:
+                    logger.info("[enrich] next40 immediate start job_id=%s", str(jid))
+                except Exception:
+                    pass
         except Exception:
             pass
         # Track and inform user in chat
@@ -4355,6 +4394,13 @@ async def enrich_node(state: GraphState) -> GraphState:
     state["results"] = results
     state["enrichment_completed"] = all_done
 
+    # Always enqueue background for the next 40 preview candidates (once per thread),
+    # even if some of the head-of-line enrichments failed or were skipped.
+    try:
+        _enqueue_next40_if_applicable(state)
+    except Exception:
+        pass
+
     if all_done:
         # Compose completion message; include ACRA/ICP totals and nightly remainder
         icp_total = 0
@@ -4375,11 +4421,7 @@ async def enrich_node(state: GraphState) -> GraphState:
             state.get("messages") or [],
             [AIMessage(content=done_msg)],
         )
-        # Also enqueue Non‑SG next‑40 if applicable and not yet done (with chat notice)
-        try:
-            _enqueue_next40_if_applicable(state)
-        except Exception:
-            pass
+        # (Already enqueued next‑40 above if applicable)
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
             # Include all results for scoring, but export to Odoo only for non-skipped rows
