@@ -38,11 +38,10 @@ auth = Auth()
 @auth.authenticate
 async def authenticate(request: Request, authorization: str | None = None):
     cookie_name = os.getenv("ACCESS_COOKIE_NAME", "nx_access")
-    token = None
-    if authorization and authorization.lower().startswith("bearer "):
+    # Prefer cookie-based token for LangGraph streams so cookie rotation keeps sessions alive
+    token = request.cookies.get(cookie_name)
+    if not token and authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-    if not token:
-        token = request.cookies.get(cookie_name)
     allow_anon = _allow_anon_identity()
     if not token:
         if allow_anon:

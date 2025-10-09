@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Header, Request
+import logging
 import asyncio
 import os
 from typing import Optional, List, Dict, Any
@@ -23,6 +24,7 @@ from src.jobs import (
 from src.enrichment import enrich_company_with_tavily  # async enrich by company_id
 
 router = APIRouter(prefix="/icp", tags=["icp"])
+log = logging.getLogger("icp_endpoints")
 
 
 def _resolve_tenant_id(req: Request, x_tenant_id: Optional[str]) -> Optional[int]:
@@ -379,7 +381,7 @@ async def get_top10(
                 (tid,),
             )
             row = cur.fetchone()
-    payload = (row and row[0]) or {}
+            payload = (row and row[0]) or {}
             # Map simple keys if present
             if isinstance(payload, dict):
                 if isinstance(payload.get("industries"), list):
@@ -400,8 +402,12 @@ async def get_top10(
     except Exception:
         raise HTTPException(status_code=500, detail="agents unavailable")
     top = await asyncio.to_thread(_top10, icp_profile, tid)
+    try:
+        log.info("[top10] planned candidates count=%d tenant_id=%s", len(top or []), tid)
+    except Exception:
+        pass
     items: List[Dict[str, Any]] = []
-    # Persist preview evidence and ensure company rows
+    # Persist preview evidence and ensure company rows (Top‑10 only)
     try:
         with get_conn() as conn, conn.cursor() as cur:
             for it in (top or [])[:10]:

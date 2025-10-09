@@ -106,6 +106,165 @@ logger.setLevel(_level)
 BOOT_TOKEN = os.getenv("LG_SERVER_BOOT_TOKEN") or str(uuid4())
 
 
+# --- Helper: announce completion for queued background next-40 jobs ---
+def _announce_completed_bg_jobs(state) -> None:
+    try:
+        pend = list(state.get("pending_bg_jobs") or [])
+        if not pend:
+            return
+        done_ids: list[int] = []
+        msgs: list[str] = []
+        with get_conn() as conn, conn.cursor() as cur:
+            for jid in pend:
+                try:
+                    cur.execute(
+                        "SELECT status, processed, total, error, params FROM background_jobs WHERE job_id=%s",
+                        (int(jid),),
+                    )
+                    r = cur.fetchone()
+                    if not r:
+                        continue
+                    status, processed, total, error, params = r
+                    if str(status or "").lower() != "done":
+                        continue
+                    # Build A/B/C bucket summary from lead_scores for the job's company_ids
+                    ids = []
+                    try:
+                        ids = [int(i) for i in ((params or {}).get("company_ids") or []) if str(i).strip()]
+                    except Exception:
+                        ids = []
+                    counts: dict[str, int] = {"A": 0, "B": 0, "C": 0}
+                    if ids:
+                        cur.execute(
+                            "SELECT bucket, COUNT(*) FROM lead_scores WHERE company_id = ANY(%s) GROUP BY bucket",
+                            (ids,),
+                        )
+                        for br in cur.fetchall() or []:
+                            b, c = (br[0] or "C"), int(br[1] or 0)
+                            counts[str(b)] = c
+                    err_txt = f" error={error}" if error else ""
+                    msgs.append(
+                        f"Background enrichment finished (job {jid}). Processed {int(processed or 0)}/{int(total or 0)}. "
+                        f"Buckets: A={counts.get('A',0)}, B={counts.get('B',0)}, C={counts.get('C',0)}.{err_txt}"
+                    )
+                    done_ids.append(int(jid))
+                except Exception:
+                    continue
+        if msgs:
+            for m in msgs:
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=m)])
+        if done_ids:
+            try:
+                state["pending_bg_jobs"] = [j for j in pend if int(j) not in set(done_ids)]
+            except Exception:
+                state["pending_bg_jobs"] = [j for j in pend if j not in done_ids]
+    except Exception:
+        return
+
+
+# --- Helper: enqueue Non‑SG next‑40 after Top‑10 enrichment completes ---
+def _enqueue_next40_if_applicable(state) -> None:
+    try:
+        # Avoid duplicate enqueue within the same conversation thread
+        if bool(state.get("next40_enqueued")):
+            return
+        if not _is_non_sg_active_profile(state):
+            return
+        from src.database import get_conn as __get_conn
+        from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
+        # Resolve tenant id from state/env/mapping
+        try:
+            tid = _resolve_tenant_id_for_write_sync(state)
+        except Exception:
+            tid = None
+        _tidv = int(tid) if isinstance(tid, int) else None
+        if _tidv is None:
+            try:
+                with __get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                    _r = _cur.fetchone()
+                    _tidv = int(_r[0]) if _r and _r[0] is not None else None
+            except Exception:
+                _tidv = None
+        if _tidv is None:
+            return
+        bg_limit = 40
+        try:
+            bg_limit = int((os.getenv("BG_NEXT_COUNT") or "40")) or 40
+        except Exception:
+            bg_limit = 40
+        doms: list[str] = []
+        preview_total = 0
+        with __get_conn() as __c2, __c2.cursor() as __cur2:
+            try:
+                __cur2.execute(
+                    """
+                    SELECT domain
+                    FROM staging_global_companies
+                    WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                    ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                    OFFSET 10 LIMIT %s
+                    """,
+                    (_tidv, bg_limit),
+                )
+                rows = __cur2.fetchall() or []
+                doms = [str(r[0]) for r in rows if r and r[0]]
+                __cur2.execute(
+                    "SELECT COUNT(*) FROM staging_global_companies WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true",
+                    (_tidv,),
+                )
+                cr = __cur2.fetchone()
+                preview_total = int(cr[0] or 0) if cr else 0
+            except Exception:
+                doms = []
+        if not doms:
+            return
+        # Map to company_ids
+        bg_ids: list[int] = []
+        with __get_conn() as __c3, __c3.cursor() as __cur3:
+            try:
+                __cur3.execute(
+                    "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                    ([d.lower() for d in doms],),
+                )
+                _rows = __cur3.fetchall() or []
+                _map = {str((r[1] or "").lower()): int(r[0]) for r in _rows if r and r[0] is not None}
+                for d in doms:
+                    _cid = _map.get(str(d.lower()))
+                    if _cid:
+                        bg_ids.append(_cid)
+            except Exception:
+                bg_ids = []
+        if not bg_ids:
+            return
+        job = __enqueue_bg(int(_tidv), bg_ids)
+        jid = (job or {}).get("job_id")
+        try:
+            logger.info(
+                "[next40] preview_total=%s enrich_now=%s queued_next=%s job_id=%s tenant_id=%s",
+                str(preview_total),
+                "10",
+                str(len(bg_ids)),
+                str(jid),
+                str(_tidv),
+            )
+        except Exception:
+            pass
+        # Track and inform user in chat
+        pend = list(state.get("pending_bg_jobs") or [])
+        if jid:
+            pend.append(int(jid))
+        state["pending_bg_jobs"] = pend
+        state["next40_enqueued"] = True
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(content=f"I’m enriching the next {min(len(bg_ids), bg_limit)} in the background (job {jid}). I’ll reply here when it’s done. You can also check /jobs/{jid}.")],
+        )
+    except Exception:
+        # best-effort; do not block
+        return
+
+
 def _is_non_sg_active_profile(state: Dict[str, Any]) -> bool:
     """Heuristic to decide Non‑SG based on icp_profile geos/hq_country.
 
@@ -990,6 +1149,11 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
 
 @log_node("confirm")
 def icp_confirm(state: PreSDRState) -> PreSDRState:
+    # Announce any completed background jobs (next-40) from prior turns
+    try:
+        _announce_completed_bg_jobs(state)
+    except Exception:
+        pass
     # Persist ICP from the basic flow when user confirms
     try:
         # Feature 17: ICP Finder — save intake (website + seeds) and run mapping/suggestions
@@ -1106,8 +1270,12 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                     meta = {"provenance": {"agent": "agents_icp.discovery_planner", "stage": "plan"}, "icp_profile_keys": icp_keys[:8]}
                     added = _persist_web_candidates_to_staging([str(d) for d in acand if isinstance(d, str)], tid, ai_metadata=meta)
                     state["web_discovery_total"] = len(acand)
-                    if added:
-                        logger.info("[candidates] persisted %d web candidates to %s", added, STAGING_GLOBAL_TABLE)
+                    logger.info(
+                        "[discovery] found_total=%d persisted=%d table=%s",
+                        len(acand),
+                        int(added or 0),
+                        STAGING_GLOBAL_TABLE,
+                    )
                 except Exception as _pe:
                     try:
                         logger.info("[candidates] staging persist skipped: %s", _pe)
@@ -1370,6 +1538,18 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                                 )
                                 _r2 = __cur2.fetchall() or []
                                 doms = [str(r[0]) for r in _r2 if r and r[0]]
+                                try:
+                                    __cur2.execute(
+                                        """
+                                        SELECT COUNT(*) FROM staging_global_companies
+                                        WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                                        """,
+                                        (_tidv,),
+                                    )
+                                    _cnt_row = __cur2.fetchone()
+                                    _preview_total = int(_cnt_row[0] or 0) if _cnt_row else 0
+                                except Exception:
+                                    _preview_total = 0
                         # Map to company_ids
                         bg_ids: list[int] = []
                         if doms:
@@ -1387,6 +1567,25 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                         if bg_ids and _tidv is not None:
                             _job = __enqueue_bg(int(_tidv), bg_ids)
                             _jid = (_job or {}).get("job_id")
+                            try:
+                                logger.info(
+                                    "[next40] preview_total=%s enrich_now=%s queued_next=%s job_id=%s tenant_id=%s",
+                                    str(_preview_total if '_preview_total' in locals() else '?'),
+                                    "10",
+                                    str(len(bg_ids)),
+                                    str(_jid),
+                                    str(_tidv),
+                                )
+                            except Exception:
+                                pass
+                            # Track pending background job in state for later completion announcement
+                            try:
+                                pend = list(state.get("pending_bg_jobs") or [])
+                                if _jid:
+                                    pend.append(int(_jid))
+                                state["pending_bg_jobs"] = pend
+                            except Exception:
+                                pass
                             state["messages"] = add_messages(
                                 state.get("messages") or [],
                                 [AIMessage(content=f"Enriching the next {min(len(bg_ids), bg_limit)} in the background (job {_jid}). I will reply here when it finishes. You can also check status via /jobs/{_jid}.")],
@@ -3865,6 +4064,11 @@ async def confirm_node(state: GraphState) -> GraphState:
 
 
 async def enrich_node(state: GraphState) -> GraphState:
+    # Announce any completed background jobs (next-40) from prior turns
+    try:
+        _announce_completed_bg_jobs(state)
+    except Exception:
+        pass
     # Mark the last routed human command so the router's duplicate-guard
     # can halt re-entry loops (e.g., repeated "run enrichment").
     try:
@@ -4147,6 +4351,11 @@ async def enrich_node(state: GraphState) -> GraphState:
             state.get("messages") or [],
             [AIMessage(content=done_msg)],
         )
+        # Also enqueue Non‑SG next‑40 if applicable and not yet done (with chat notice)
+        try:
+            _enqueue_next40_if_applicable(state)
+        except Exception:
+            pass
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
             # Include all results for scoring, but export to Odoo only for non-skipped rows
@@ -4264,7 +4473,19 @@ async def enrich_node(state: GraphState) -> GraphState:
                             logger.warning("nightly remainder enqueue failed: %s", _qexc)
 
                 # Best-effort Odoo sync for completed companies (skip ones we skipped enriching)
+                # Guarded by env flag and readiness; skip in local dev unless explicitly enabled.
                 try:
+                    def _odoo_export_enabled() -> bool:
+                        try:
+                            v = (os.getenv("ODOO_EXPORT_ENABLED") or "").strip().lower()
+                            return v in ("1", "true", "yes", "on")
+                        except Exception:
+                            return False
+
+                    if not _odoo_export_enabled():
+                        logger.info("odoo export skipped: ODOO_EXPORT_ENABLED not set true")
+                        # Soft-skip export without raising; proceed with rest of flow
+                        raise StopIteration
                     pool = await get_pg_pool()
                     async with pool.acquire() as conn:
                         comp_rows = await conn.fetch(
@@ -4455,6 +4676,8 @@ async def enrich_node(state: GraphState) -> GraphState:
                                 logger.exception(
                                     "odoo sync failed for company_id=%s", cid
                                 )
+                except StopIteration:
+                    pass
                 except Exception as _odoo_exc:
                     logger.exception("odoo sync block failed")
         except Exception as _score_exc:

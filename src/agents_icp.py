@@ -521,14 +521,17 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             queries = [fallback]
     domains: List[str] = []
     ddg_calls = 0
-    budget = max(1, int(DDG_MAX_CALLS))
+    # Gather enough domains to plan up to 50 lookalikes.
+    # Default to at least 2 DDG calls unless explicitly lowered via env.
+    budget = max(2, int(DDG_MAX_CALLS))
     for q in queries[:budget]:
         try:
             log.info("[plan] ddg-only query: %s", q)
             if ddg_calls >= budget:
                 break
             ddg_calls += 1
-            for dom in _ddg_search_domains(q, max_results=20, country=country_hint):
+            # Increase per-query cap so a single query can yield many domains
+            for dom in _ddg_search_domains(q, max_results=50, country=country_hint):
                 domains.append(dom)
         except Exception as e:
             log.info("[plan] ddg fail: %s", e)
@@ -543,11 +546,11 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     if not uniq:
         # Slim fallback query pack (max 1) to reduce network churn
         fb: List[str] = []
-        # Region hint: if any seed ends with .sg, prefer .sg-specific queries
         try:
             seeds = list(SEED_HINTS)
         except Exception:
             seeds = []
+        # Region hint: if any seed ends with .sg, prefer .sg-specific queries
         if any(str(s).endswith('.sg') for s in seeds):
             fb = ["site:.sg foodservice distributor"]
         else:
@@ -558,12 +561,63 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 if ddg_calls >= budget:
                     break
                 ddg_calls += 1
-                for dom in _ddg_search_domains(q, max_results=20, country=country_hint):
+                for dom in _ddg_search_domains(q, max_results=50, country=country_hint):
                     domains.append(dom)
             except Exception as e:
                 log.info("[plan] ddg fail: %s", e)
                 continue
         uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+
+    # Top-up to target count (≤50): if uniq is still short, add broader, industry-only queries
+    TARGET = 50
+    if len(uniq) < TARGET:
+        try:
+            extra_queries: List[str] = []
+            inds_terms = [s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()]
+            # Build a richer set of synonym queries to broaden results
+            def _synonym_pack(term: str) -> List[str]:
+                base = term.strip()
+                return [
+                    f"{base} distributors",
+                    f"{base} distribution companies",
+                    f"{base} wholesale",
+                    f"{base} wholesaler",
+                    f"{base} suppliers",
+                    f"{base} importers",
+                    f"B2B {base} companies",
+                    f"{base} B2B distributors",
+                ]
+            if inds_terms:
+                # Use up to first 2 industry terms for breadth
+                for t in inds_terms[:2]:
+                    extra_queries.extend(_synonym_pack(t))
+            else:
+                extra_queries = [
+                    "B2B distributors",
+                    "B2B wholesale companies",
+                    "consumer goods distributors",
+                    "consumer goods wholesale",
+                    "foodservice distributors",
+                    "food & beverage distributors",
+                    "industrial supplies distributors",
+                ]
+            for q in extra_queries:
+                if len(uniq) >= TARGET:
+                    break
+                try:
+                    if ddg_calls >= budget:
+                        # permit a small overflow to reach target breadth once
+                        budget += 1
+                    log.info("[plan] ddg top-up query: %s", q)
+                    ddg_calls += 1
+                    for dom in _ddg_search_domains(q, max_results=50, country=None):
+                        uniq.append(dom)
+                    uniq = [d for d in _uniq(uniq) if _is_probable_domain(str(d))]
+                except Exception as e:
+                    log.info("[plan] ddg fail: %s", e)
+                    continue
+        except Exception:
+            pass
     log.info("[plan] ddg domains found=%d (uniq=%d)", len(domains), len(uniq))
     # Optional Jina Reader fetch for quick homepage snippets of first few domains
     # Industry-based filter: keep only candidates whose snippets mention industry terms
@@ -606,7 +660,12 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log.info("[jina] fail domain=%s err=%s", d, e)
             continue
+    # Final list of discovery candidates (cap at 50)
     state["discovery_candidates"] = uniq[:50]
+    try:
+        log.info("[plan] discovery candidates total=%d", len(state["discovery_candidates"]))
+    except Exception:
+        pass
     if jina_snips:
         state["jina_snippets"] = jina_snips
     return state
@@ -722,9 +781,10 @@ def scoring_and_gating(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None = None) -> List[Dict[str, Any]]:
-    """Convenience helper: discovery → mini-crawl → extract → score; returns Top‑10 with 'why'.
+    """Convenience helper: discovery → mini-crawl → extract → score.
 
-    Returns: [{domain, score, bucket, why}...]
+    Returns up to 50 candidates with fields: domain, score, bucket, why, snippet.
+    The UI presents Top‑10; the remainder (up to 40) is queued for background enrich.
     """
     try:
         # 1) plan
@@ -740,7 +800,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         jina_snips: Dict[str, str] = s.get("jina_snippets") or {}
         if not cand:
             return []
-        # 2) Jina reader snapshot (top 10)
+        # 2) Jina reader snapshot (head only to keep latency low)
         ev_list: List[Dict[str, Any]] = []
         # Industry filter helpers
         def _ind_terms(icp_prof: Dict[str, Any]) -> list[str]:
@@ -756,7 +816,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             except Exception:
                 return []
         ind_toks = _ind_terms(icp_profile)
-        for d in cand[:10]:
+        HEAD = 12  # analyze a slightly larger head to improve ranking quality
+        for d in cand[:HEAD]:
             url = f"https://{d}"
             try:
                 t = int(tenant_id or 0)
@@ -789,8 +850,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                 log.info("[mini] jina fail domain=%s err=%s", d, e)
                 continue
         if not ev_list:
-            # Final guard: build minimal evidence from homepage titles to avoid empty Top‑10
-            for d in cand[:10]:
+            # Final guard: build minimal evidence from homepage titles to avoid empty list
+            for d in cand[:HEAD]:
                 try:
                     fb = _fallback_home_snippet(d)
                 except Exception:
@@ -803,8 +864,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         # 4) score
         st3 = scoring_and_gating(st2)
         scores = st3.get("scores") or []
-        # Build reason lines
-        top = []
+        # Build reason lines for scored head
+        top: List[Dict[str, Any]] = []
         for srow in scores:
             why_bits = []
             r = srow.get("reason") or {}
@@ -834,12 +895,13 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             })
         # Sort by score desc
         top = sorted(top, key=lambda x: int(x.get("score") or 0), reverse=True)
-        # If fewer than 10, backfill using additional candidates (heuristic scoring) and seeds/legacy fallbacks
-        if len(top) < 10:
+        # If fewer than desired, backfill using additional candidates (heuristic scoring) and seeds/legacy fallbacks
+        DESIRED = 50
+        if len(top) < DESIRED:
             # 4a) Heuristic backfill from remaining discovery candidates
             seen = {str((it.get("domain") or "").strip().lower()) for it in top}
             extra: List[Dict[str, Any]] = []
-            for d in cand[10:30]:
+            for d in cand[HEAD:60]:
                 try:
                     if not d:
                         continue
@@ -894,8 +956,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                         "snippet": snip,
                     })
                     seen.add(dn)
-                    if len(top) + len(extra) >= 12:
-                        # safety cap to avoid long loops
+                    if len(top) + len(extra) >= DESIRED:
+                        # stop once we have enough
                         break
                 except Exception:
                     continue
@@ -903,7 +965,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                 extra = sorted(extra, key=lambda x: int(x.get("score") or 0), reverse=True)
                 top = (top + extra)
             # 4b) Optional seeds-based competitor queries are disabled when STRICT_INDUSTRY_QUERY_ONLY
-            if (len(top) < 10) and (not STRICT_INDUSTRY_QUERY_ONLY):
+            if (len(top) < DESIRED) and (not STRICT_INDUSTRY_QUERY_ONLY):
                 try:
                     seeds = list(SEED_HINTS)
                 except Exception:
@@ -919,10 +981,10 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                             if dom and dom not in seen and _apex_domain(dom) not in seed_apex:
                                 top.append(it)
                                 seen.add(dom)
-                            if len(top) >= 10:
+                            if len(top) >= DESIRED:
                                 break
             # 4c) Legacy heuristic fallback if still short, even without seeds
-            if len(top) < 10:
+            if len(top) < DESIRED:
                 try:
                     fb2 = plan_top10_with_reasons_fallback(dict(icp_profile or {}))
                 except Exception:
@@ -933,11 +995,18 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                         if dom and dom not in seen and _apex_domain(dom) not in seed_apex:
                             top.append(it)
                             seen.add(dom)
-                        if len(top) >= 10:
+                        if len(top) >= DESIRED:
                             break
-        # Return at most 10
-        top = top[:10]
-        log.info("[confirm] agent top10 count=%d", len(top))
+        # Return at most 50 for persistence (UI will only show Top‑10)
+        total_ret = min(DESIRED, len(top))
+        top = top[:total_ret]
+        try:
+            # Keep original Top‑10 log for backwards compatibility
+            log.info("[confirm] agent top10 count=%d", min(10, len(top)))
+            # New: log total planned count
+            log.info("[confirm] agent planned total=%d", len(top))
+        except Exception:
+            pass
         # Display message after analysis for backend logs
         log.info("ICP Profile")
         return top
