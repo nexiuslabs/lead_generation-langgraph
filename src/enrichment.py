@@ -119,6 +119,50 @@ else:
     tavily_crawl = None  # type: ignore[assignment]
     tavily_extract = None  # type: ignore[assignment]
 
+
+def _fallback_extract_from_text(text: str) -> dict:
+    """Lightweight, non-LLM extraction to salvage key fields when LLM times out.
+
+    Extracts:
+      - emails: simple regex
+      - phone_number: loose international formats
+      - website_domain: first URL/domain-like token
+      - about_text: first ~2 sentences
+    """
+    out: Dict[str, Any] = {}
+    try:
+        # emails
+        emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text or "")
+        if emails:
+            out["email"] = sorted(set(emails))[:5]
+    except Exception:
+        pass
+    try:
+        # phones (very loose)
+        phones = re.findall(r"\+?\d[\d\s().-]{6,}\d", text or "")
+        if phones:
+            out["phone_number"] = sorted(set([p.strip() for p in phones]))[:5]
+    except Exception:
+        pass
+    try:
+        # domain or URL
+        m = re.search(r"https?://[^\s]+", text or "")
+        if not m:
+            m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", text or "", re.I)
+        if m:
+            out["website_domain"] = m.group(0)
+    except Exception:
+        pass
+    try:
+        # about: first 2 sentences (approx)
+        s = (text or "").strip()
+        if s:
+            parts = re.split(r"(?<=[.!?])\s+", s)
+            out["about_text"] = " ".join(parts[:2])[:500]
+    except Exception:
+        pass
+    return out
+
 # ---- Run context and vendor counters/caps ----
 _RUN_CTX: dict[str, int | None] = {"run_id": None, "tenant_id": None}
 _VENDOR_COUNTERS: dict[str, int] = {
@@ -1749,6 +1793,39 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
                     continue
                 except Exception:
                     pass
+            # Handle slow model / timeout / cancellation similarly by trimming once,
+            # and fall back to regex extraction to salvage key fields.
+            elif isinstance(e, asyncio.TimeoutError) or isinstance(e, asyncio.CancelledError) or "timeout" in msg.lower():
+                try:
+                    trimmed = chunk[: int(len(chunk) * 0.6)]
+                    payload_trim2 = {
+                        "raw_content": f"Company: {company_name}\n\n{trimmed}",
+                        "schema_keys": schema_keys,
+                        "instructions": (
+                            "Return a single JSON object with only the above keys. Use null for unknown. "
+                            "For tech_stack, email, and phone_number return arrays of strings. "
+                            "Use integers for employees_est and incorporation_year when possible. "
+                            "website_domain should be the official domain for the company. "
+                            "about_text should be a concise 1-3 sentence summary of the company."
+                        ),
+                    }
+                    ai_output = await asyncio.wait_for(_do_llm(payload_trim2), timeout=float(LLM_CHUNK_TIMEOUT_S))
+                    m = re.search(r"\{.*\}", ai_output, re.S)
+                    piece = json.loads(m.group(0)) if m else json.loads(ai_output)
+                    data = _merge_extracted_records(data, piece)
+                    logger.info(f"   ↳ Chunk {i} retried after timeout with trimmed content")
+                    continue
+                except Exception:
+                    # Regex fallback to salvage some fields
+                    try:
+                        salvaged = _fallback_extract_from_text(chunk)
+                        if salvaged:
+                            data = _merge_extracted_records(data, salvaged)
+                            (state.setdefault("degraded_reasons", [])) .append("LLM_TIMEOUT_FALLBACK")
+                            logger.warning(f"   ↳ Chunk {i} timeout; applied regex fallback fields={list(salvaged.keys())}")
+                            continue
+                    except Exception:
+                        pass
             logger.warning(f"   ↳ Chunk {i} extraction parse failed", exc_info=True)
             continue
     for k in ["email", "phone_number", "tech_stack"]:

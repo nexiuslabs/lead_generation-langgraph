@@ -3906,6 +3906,14 @@ async def enrich_node(state: GraphState) -> GraphState:
         persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
         if persisted_top:
             top10 = persisted_top
+        # Last resort: if the chat previously showed Top‑10, attempt regeneration once
+        elif _top10_preview_was_sent(state):
+            try:
+                regen = await _regenerate_top10_if_missing(state, int(tid) if isinstance(tid, int) else None)
+                if regen:
+                    top10 = regen
+            except Exception:
+                pass
     # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
     # Strict policy: reuse persisted Top‑10. If unavailable, ask user to regenerate.
     if not (isinstance(top10, list) and top10):
@@ -3942,6 +3950,10 @@ async def enrich_node(state: GraphState) -> GraphState:
             if cand:
                 state["candidates"] = cand
                 state["strict_top10"] = True
+                try:
+                    logger.info("[enrich] using top10 candidates=%d", len(cand))
+                except Exception:
+                    pass
         except Exception:
             # Non-fatal; fall back to existing selection logic
             pass
