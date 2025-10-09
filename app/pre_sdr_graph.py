@@ -4097,6 +4097,7 @@ async def enrich_node(state: GraphState) -> GraphState:
 
     # Strict Top‑10 enrichment: if a Top‑10 list from web discovery exists,
     # build candidates from those domains and do not mix with ACRA/top-ups.
+    # Guard: do NOT override existing candidate list with a too-short Top‑10.
     try:
         top10 = state.get("agent_top10") or []
     except Exception:
@@ -4152,12 +4153,29 @@ async def enrich_node(state: GraphState) -> GraphState:
                         name = dom
                     cand.append({"id": cid, "name": name})
             if cand:
-                state["candidates"] = cand
-                state["strict_top10"] = True
+                # Only override existing candidates when Top‑10 has at least the immediate enrichment limit
                 try:
-                    logger.info("[enrich] using top10 candidates=%d", len(cand))
+                    enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
                 except Exception:
-                    pass
+                    enrich_now_limit = 10
+                existing = state.get("candidates") or []
+                if existing and len(cand) < enrich_now_limit:
+                    try:
+                        logger.info(
+                            "[enrich] keep existing candidates=%d; top10 too short=%d (limit=%d)",
+                            len(existing) if isinstance(existing, list) else 0,
+                            len(cand),
+                            enrich_now_limit,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    state["candidates"] = cand
+                    state["strict_top10"] = True
+                    try:
+                        logger.info("[enrich] using top10 candidates=%d", len(cand))
+                    except Exception:
+                        pass
         except Exception:
             # Non-fatal; fall back to existing selection logic
             pass
