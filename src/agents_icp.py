@@ -20,14 +20,32 @@ except Exception:  # pragma: no cover
     STRICT_INDUSTRY_QUERY_ONLY = True  # type: ignore
 import logging
 import requests
+import os
+import time
 from urllib.parse import quote, urlparse, urljoin, parse_qs, unquote
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 # Strict DuckDuckGo-only mode: do not aggregate from other engines
-DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html"
+# Ensure trailing slash so requests builds '/html/?q=...'
+DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 DDG_HTML_GET = "https://duckduckgo.com/html/"
 DDG_LITE_GET = "https://lite.duckduckgo.com/lite/"
 DDG_STD_LITE = "https://duckduckgo.com/lite/"
+
+# Optional: ddgs library fallback (if available)
+try:  # pragma: no cover
+    from ddgs import DDGS  # type: ignore
+except Exception:  # pragma: no cover
+    DDGS = None  # type: ignore
+
+# Enforce a minimum timeout for DDG endpoints (connect, read)
+try:
+    _DDG_TIMEOUT_MIN = 8.0
+    TIMEOUT_S = float(DDG_TIMEOUT_S)
+    if TIMEOUT_S < _DDG_TIMEOUT_MIN:
+        TIMEOUT_S = _DDG_TIMEOUT_MIN
+except Exception:
+    TIMEOUT_S = 8.0
 
 # Optional seed hints passed in by the caller (confirm flow) to improve queries
 SEED_HINTS: List[str] = []
@@ -247,12 +265,26 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         pass
 
     def _get(url: str, params: dict | None = None, data: dict | None = None, method: str = "GET"):
+        # Retry on transient connection/read issues with small backoff
         try:
-            if method == "POST":
-                return session.post(url, data=(data or {}), headers=headers, timeout=float(DDG_TIMEOUT_S))
-            return session.get(url, params=(params or {}), headers=headers, timeout=float(DDG_TIMEOUT_S))
-        except Exception as e:
-            raise e
+            tries = max(1, int(os.getenv("DDG_REQUEST_RETRIES", "3") or 3))
+        except Exception:
+            tries = 3
+        last_err = None
+        for attempt in range(1, tries + 1):
+            try:
+                if method == "POST":
+                    return session.post(url, data=(data or {}), headers=headers, timeout=(TIMEOUT_S, TIMEOUT_S))
+                return session.get(url, params=(params or {}), headers=headers, timeout=(TIMEOUT_S, TIMEOUT_S))
+            except Exception as e:
+                last_err = e
+                if attempt < tries:
+                    try:
+                        time.sleep(0.25 * attempt)
+                    except Exception:
+                        pass
+                    continue
+                raise last_err
 
     domains: List[str] = []
     # Country hint from seed hints (e.g., .sg)
@@ -267,10 +299,12 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
     params = {"q": query}
     if (DDG_KL or kl):
         params["kl"] = (DDG_KL or kl)
+    # Prefer main duckduckgo.com endpoints first; some networks block html.duckduckgo.com
     endpoints = [
-        DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html
-        DDG_LITE_GET,       # lite.duckduckgo.com/lite
-        DDG_HTML_GET,       # duckduckgo.com/html
+        DDG_HTML_GET,       # duckduckgo.com/html/
+        DDG_STD_LITE,       # duckduckgo.com/lite/
+        DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html/
+        DDG_LITE_GET,       # lite.duckduckgo.com/lite/
     ]
     for ep in endpoints:
         try:
@@ -282,6 +316,51 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
         except Exception as e:
             log.info("[ddg] endpoint fail %s: %s", ep, e)
+
+    # Final fallback: use ddgs library if available, which may succeed where direct HTTP is blocked
+    if not domains and DDGS is not None:
+        try:
+            region = (DDG_KL or kl) or "wt-wt"
+            parsed: List[str] = []
+            with DDGS() as ddg:
+                for res in ddg.text(query, region=region, safesearch="Off", max_results=max_results * 2):
+                    try:
+                        link = (res.get("href") or res.get("url") or res.get("link") or "").strip()
+                        if not link:
+                            continue
+                        host = (urlparse(link).netloc or "").lower()
+                        if host and _is_probable_domain(host):
+                            parsed.append(host)
+                        if len(parsed) >= max_results:
+                            break
+                    except Exception:
+                        continue
+            if parsed:
+                domains = parsed
+                log.info("[ddg] parsed domains=%d via ddgs for query=%s", len(domains), query)
+        except Exception as e:  # pragma: no cover
+            log.info("[ddg] ddgs fail: %s", e)
+
+    # Last-resort fallback: fetch DDG HTML via r.jina.ai and parse
+    if not domains:
+        try:
+            base_paths = [
+                "https://duckduckgo.com/html/",
+                "https://duckduckgo.com/lite/",
+            ]
+            q = f"q={quote(query)}"
+            kl_q = f"&kl={quote(DDG_KL or kl)}" if (DDG_KL or kl) else ""
+            for path in base_paths:
+                url = f"https://r.jina.ai/{path}?{q}{kl_q}"
+                r = session.get(url, timeout=(TIMEOUT_S, TIMEOUT_S))
+                if r.status_code >= 400:
+                    continue
+                domains = _extract_domains_from_html(r.text)
+                if domains:
+                    log.info("[ddg] parsed domains=%d via r.jina %s for query=%s", len(domains), path, query)
+                    return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+        except Exception as e:
+            log.info("[ddg] r.jina ddg fail: %s", e)
 
     return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
 
