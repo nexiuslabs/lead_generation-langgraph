@@ -4,6 +4,8 @@ import os
 from typing import List, Optional, Dict, Any
 
 from src.database import get_conn
+import psycopg2
+import asyncio as _asyncio
 from psycopg2.extras import Json
 import threading
 
@@ -295,26 +297,63 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
             raise RuntimeError("company_ids required")
         if enrich_company_with_tavily is None:
             raise RuntimeError("enrich unavailable")
+        # Resolve company names/uen for enrichment call signature
+        comp_map: dict[int, tuple[str, str | None]] = {}
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT company_id, name, uen FROM companies WHERE company_id = ANY(%s)",
+                    (ids,),
+                )
+                rows = cur.fetchall() or []
+                for r in rows:
+                    try:
+                        cid = int(r[0]) if r and r[0] is not None else None
+                        nm = (r[1] or "").strip() if len(r) > 1 else ""
+                        uen = (r[2] or None) if len(r) > 2 else None
+                        if cid and nm:
+                            comp_map[cid] = (nm, uen)
+                    except Exception:
+                        continue
+        except Exception:
+            comp_map = {}
         for cid in ids:
             try:
-                await enrich_company_with_tavily(int(cid))
+                name, uen = comp_map.get(int(cid), (str(cid), None))
+                await enrich_company_with_tavily(int(cid), name, uen)
                 processed += 1
             except Exception:
                 # continue best-effort
                 pass
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
-                (processed, len(ids), job_id),
-            )
+        # Robust status update with retry — avoid failing the job after work completes due to transient DB errors
+        for attempt in range(3):
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                        (processed, len(ids), job_id),
+                    )
+                break
+            except psycopg2.Error:
+                if attempt == 2:
+                    raise
+                await _asyncio.sleep(0.5 * (attempt + 1))
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:  # pragma: no cover
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE background_jobs SET status='error', error=%s, processed=%s, ended_at=now() WHERE job_id=%s",
-                (str(e), processed, job_id),
-            )
+        # Best-effort error write with retry as well
+        for attempt in range(3):
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE background_jobs SET status='error', error=%s, processed=%s, ended_at=now() WHERE job_id=%s",
+                        (str(e), processed, job_id),
+                    )
+                break
+            except psycopg2.Error:
+                if attempt == 2:
+                    break
+                await _asyncio.sleep(0.5 * (attempt + 1))
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
 

@@ -276,9 +276,9 @@ def _enqueue_next40_if_applicable(state) -> None:
             )
         except Exception:
             pass
-        # Optional immediate start: if BG_NEXT_IMMEDIATE=true, kick off the job now in a fire-and-forget task
+        # Immediate start: kick off the job now in a fire-and-forget task
         try:
-            if str(os.getenv("BG_NEXT_IMMEDIATE", "false")).strip().lower() in ("1", "true", "yes", "on") and jid:
+            if jid:
                 import asyncio as _asyncio
                 from src.jobs import run_web_discovery_bg_enrich as _run_bg
                 _asyncio.create_task(_run_bg(int(jid)))
