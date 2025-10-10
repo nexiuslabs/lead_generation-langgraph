@@ -7,6 +7,7 @@ from src.database import get_conn
 import psycopg2
 import asyncio as _asyncio
 from psycopg2.extras import Json
+import json
 import threading
 
 # Reuse the batched/streaming implementation from lg_entry
@@ -273,7 +274,16 @@ def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int]) -> d
             (tenant_id, Json({"company_ids": ids})),
         )
         row = cur.fetchone()
-        return {"job_id": int(row[0]) if row and row[0] is not None else 0}
+        jid = int(row[0]) if row and row[0] is not None else 0
+        # Notify listeners (bg worker) so they can pick it up immediately
+        try:
+            if jid:
+                payload = json.dumps({"job_id": jid, "type": "web_discovery_bg_enrich"})
+                cur.execute("NOTIFY bg_jobs, %s", (payload,))
+        except Exception:
+            # Best-effort: notification is optional
+            pass
+        return {"job_id": jid}
 
 
 async def run_web_discovery_bg_enrich(job_id: int) -> None:

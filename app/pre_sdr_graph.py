@@ -276,18 +276,6 @@ def _enqueue_next40_if_applicable(state) -> None:
             )
         except Exception:
             pass
-        # Immediate start: kick off the job now in a fire-and-forget task
-        try:
-            if jid:
-                import asyncio as _asyncio
-                from src.jobs import run_web_discovery_bg_enrich as _run_bg
-                _asyncio.create_task(_run_bg(int(jid)))
-                try:
-                    logger.info("[enrich] next40 immediate start job_id=%s", str(jid))
-                except Exception:
-                    pass
-        except Exception:
-            pass
         # Track and inform user in chat
         pend = list(state.get("pending_bg_jobs") or [])
         if jid:
