@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, List, Optional
 import json
 import html as html_lib
+from bs4 import BeautifulSoup
 
 from langchain_openai import ChatOpenAI
 from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
@@ -155,11 +156,12 @@ def _apex_domain(h: str) -> str:
 
 
 def _ddg_search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
-    """Perform domain discovery via Jina-proxied DDG and LLM extraction.
+    """Perform domain discovery by fetching DuckDuckGo HTML directly and parsing anchors.
 
-    - Fetch `html.duckduckgo.com/html?q=<query>` via `https://r.jina.ai/…` snapshot.
-    - Use an LLM to extract up to `max_results` domains from the snapshot.
-    - Fall back to regex extraction on failure; keep basic filtering/dedupe.
+    - Paginates up to 8 pages using the `s` offset, stops once `max_results` reached.
+    - Parses DDG redirect anchors (`/l/?uddg=...`) or direct external hrefs.
+    - Enforces `site:` filter (e.g., site:.sg) when present in the query.
+    - Falls back to r.jina DDG snapshot + regex extraction only if all direct endpoints fail.
     """
     if not ENABLE_DDG_DISCOVERY:
         return []
@@ -190,38 +192,55 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         text = raw_html or ""
         text = html_lib.unescape(text)
         found: List[str] = []
-        # 1) Extract via explicit DDG redirect pattern `/l/?uddg=` (covers html + standard pages)
-        for m in re.findall(r"/l/\?[^\s\"']*uddg=([^&\"']+)", text):
-            try:
-                target_url = unquote(m)
-                host = (urlparse(target_url).netloc or "").lower()
-                if host:
-                    found.append(host)
-            except Exception:
-                continue
-        # 2) Fallback: collect anchor hrefs and take external hosts directly
-        for href in re.findall(r'href=[\"\']([^\"\']+)[\"\']', text):
-            try:
-                href = href.strip()
-                if href.startswith("/"):
-                    href_abs = urljoin("https://duckduckgo.com", href)
-                else:
-                    href_abs = href
-                u = urlparse(href_abs)
-                host = (u.netloc or "").lower()
-                if not host:
+        try:
+            # Parse only anchor tags for performance
+            soup = BeautifulSoup(text, "html.parser")
+            for a in soup.find_all("a"):
+                href = (a.get("href") or "").strip()
+                if not href:
                     continue
-                if (host.endswith("duckduckgo.com") or host.endswith("r.duckduckgo.com")) and u.path.startswith("/l/"):
-                    q = parse_qs(u.query)
-                    target = q.get("uddg", [None])[0]
-                    if target:
-                        target_url = unquote(str(target))
-                        host = (urlparse(target_url).netloc or "").lower()
-                        if not host:
+                try:
+                    # Resolve relative to DDG
+                    href_abs = urljoin("https://duckduckgo.com", href)
+                    u = urlparse(href_abs)
+                    host = (u.netloc or "").lower()
+                    if not host:
+                        continue
+                    # Handle DDG redirect pattern
+                    if (host.endswith("duckduckgo.com") or host.endswith("r.duckduckgo.com")) and u.path.startswith("/l/"):
+                        q = parse_qs(u.query)
+                        target = q.get("uddg", [None])[0]
+                        if target:
+                            target_url = unquote(str(target))
+                            host = (urlparse(target_url).netloc or "").lower()
+                            if not host:
+                                continue
+                            found.append(host)
                             continue
-                found.append(host)
-            except Exception:
-                continue
+                    # External direct link
+                    found.append(host)
+                except Exception:
+                    continue
+        except Exception:
+            # Regex fallback
+            for m in re.findall(r"/l/\?[^\s\"']*uddg=([^&\"']+)", text):
+                try:
+                    target_url = unquote(m)
+                    host = (urlparse(target_url).netloc or "").lower()
+                    if host:
+                        found.append(host)
+                except Exception:
+                    continue
+            for href in re.findall(r'href=[\"\']([^\"\']+)[\"\']', text):
+                try:
+                    href_abs = urljoin("https://duckduckgo.com", href.strip())
+                    u = urlparse(href_abs)
+                    host = (u.netloc or "").lower()
+                    if not host:
+                        continue
+                    found.append(host)
+                except Exception:
+                    continue
         # Normalize and filter noisy/search/CDN/wiki hosts
         out: List[str] = []
         for h in _uniq(found):
@@ -287,7 +306,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     continue
                 raise last_err
 
-    # Helper: fetch DDG HTML snapshot via r.jina.ai
+    # Helper: fetch DDG HTML snapshot via r.jina.ai (fallback only)
     def _ddg_snapshot_via_jina(q: str, s_offset: int = 0) -> Optional[str]:
         try:
             kl_q = (DDG_KL or kl)
@@ -313,67 +332,102 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             log.info("[ddg] r.jina snapshot fail: %s", e)
         return None
 
-    # Helper: LLM-based extraction of domains from DDG snapshot
-    def _llm_extract_domains_from_snapshot(snapshot: str, cap: int) -> List[str]:
+    # Site filter handling: if query contains `site:<token>`, enforce it
+    def _site_filter(host: str) -> bool:
         try:
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-            sys_msg = (
-                "You are extracting candidate company domains from a DuckDuckGo search results page. "
-                "Return a JSON array of unique apex domains only (no paths, no schemes), up to the requested limit. "
-                "Ignore search engines, social networks, CDNs, and code/doc sites. Focus on B2B company sites relevant to the query."
-            )
-            user_msg = (
-                "Extract up to {cap} unique apex domains from the following DDG snapshot text. "
-                "Output strictly as a JSON array of strings.\n\nSNAPSHOT:\n" + (snapshot[:10000])
-            ).format(cap=cap)
-            from langchain_core.messages import SystemMessage, HumanMessage
-            out = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-            content = (getattr(out, "content", None) or "").strip()
-            # Attempt to locate JSON array in the output
-            start = content.find("[")
-            end = content.rfind("]")
-            raw_json = content[start:end+1] if start != -1 and end != -1 else content
-            items = json.loads(raw_json)
-            domains: List[str] = []
-            for it in items:
-                if not isinstance(it, str):
-                    continue
-                d = _apex_domain(it.strip().lower())
-                if d and _is_probable_domain(d):
-                    domains.append(d)
-                if len(domains) >= cap:
-                    break
-            return _uniq(domains)
-        except Exception as e:
-            log.info("[ddg] llm extract fail: %s", e)
-            return []
+            m = re.search(r"\bsite:([^\s]+)", query)
+            if not m:
+                return True
+            token = m.group(1).strip().lower()
+            h = (host or "").lower()
+            if not token:
+                return True
+            # site:.sg → require TLD endswith .sg
+            if token.startswith('.'):
+                return h.endswith(token)
+            # site:example.com → require endswith example.com
+            return h.endswith(token)
+        except Exception:
+            return True
 
-    # 1) Fetch up to 8 pages via Jina proxy, stop once we reach max_results
+    # 1) Fetch up to 8 pages directly from DDG endpoints; parse anchors
     collected: List[str] = []
     MAX_PAGES = 8
-    # DuckDuckGo html offset typically increments by 30 per page
     PAGE_SIZE_GUESS = 30
+    params_base = {"q": query}
+    if (DDG_KL or kl):
+        params_base["kl"] = (DDG_KL or kl)
+    endpoints = [
+        DDG_HTML_GET,       # duckduckgo.com/html/
+        DDG_STD_LITE,       # duckduckgo.com/lite/
+        DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html/
+        DDG_LITE_GET,       # lite.duckduckgo.com/lite/
+    ]
     for page in range(MAX_PAGES):
         if len(collected) >= max_results:
             break
         s_off = page * PAGE_SIZE_GUESS
-        snapshot = _ddg_snapshot_via_jina(query, s_offset=s_off)
-        if not snapshot:
-            # Stop if first page missing; otherwise continue to next variant
-            if page == 0:
-                return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
-            break
-        # 2) LLM extraction path per page
-        want = max_results - len(collected)
-        page_domains = _llm_extract_domains_from_snapshot(snapshot, max(want, 10))
-        if not page_domains:
-            # 3) Regex/HTML extraction fallback if LLM fails
-            page_domains = _extract_domains_from_html(snapshot)
-        # Merge and dedupe while preserving order
-        for d in page_domains:
-            if d and _is_probable_domain(str(d)) and d not in collected:
-                collected.append(d)
-            if len(collected) >= max_results:
+        page_ok = False
+        for ep in endpoints:
+            try:
+                params = dict(params_base)
+                if s_off:
+                    params["s"] = str(s_off)
+                r = _get(ep, params=params)
+                r.raise_for_status()
+                page_hosts = _extract_domains_from_html(r.text)
+                # Enforce site: filter and apex normalization
+                page_domains: List[str] = []
+                for h in page_hosts:
+                    d = _apex_domain(h)
+                    if d and _is_probable_domain(d) and _site_filter(d):
+                        page_domains.append(d)
+                # Log and merge
+                try:
+                    log.info(
+                        "[ddg] page %d domains: %s",
+                        page + 1,
+                        ", ".join([f"https://{d}" for d in page_domains[:min(25, len(page_domains))]]),
+                    )
+                except Exception:
+                    pass
+                for d in page_domains:
+                    if d not in collected:
+                        collected.append(d)
+                    if len(collected) >= max_results:
+                        break
+                page_ok = True
+                break  # move to next page after first successful endpoint
+            except Exception as e:
+                # Try next endpoint for this page
+                continue
+        if not page_ok:
+            # As a last resort, try r.jina snapshot for this page and parse via regex/text
+            snapshot = _ddg_snapshot_via_jina(query, s_offset=s_off)
+            if snapshot:
+                snap_hosts = _extract_domains_from_html(snapshot)
+                page_domains: List[str] = []
+                for h in snap_hosts:
+                    d = _apex_domain(h)
+                    if d and _is_probable_domain(d) and _site_filter(d):
+                        page_domains.append(d)
+                try:
+                    log.info(
+                        "[ddg] page %d domains: %s",
+                        page + 1,
+                        ", ".join([f"https://{d}" for d in page_domains[:min(25, len(page_domains))]]),
+                    )
+                except Exception:
+                    pass
+                for d in page_domains:
+                    if d not in collected:
+                        collected.append(d)
+                    if len(collected) >= max_results:
+                        break
+            else:
+                # If first page fails entirely, return what we have (likely empty)
+                if page == 0:
+                    return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
                 break
     return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
 
@@ -672,7 +726,10 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     # Final list of discovery candidates (cap at 50)
     state["discovery_candidates"] = uniq[:50]
     try:
-        log.info("[plan] discovery candidates total=%d", len(state["discovery_candidates"]))
+        urls = [f"https://{d}" for d in state["discovery_candidates"]]
+        log.info("[plan] discovery candidates total=%d", len(urls))
+        # Emit full list (up to 50) as URLs for auditability
+        log.info("[plan] discovery candidates urls=%s", ", ".join(urls))
     except Exception:
         pass
     if jina_snips:
@@ -973,39 +1030,9 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             if extra:
                 extra = sorted(extra, key=lambda x: int(x.get("score") or 0), reverse=True)
                 top = (top + extra)
-            # 4b) Optional seeds-based competitor queries are disabled when STRICT_INDUSTRY_QUERY_ONLY
-            if (len(top) < DESIRED) and (not STRICT_INDUSTRY_QUERY_ONLY):
-                try:
-                    seeds = list(SEED_HINTS)
-                except Exception:
-                    seeds = []
-                if seeds:
-                    try:
-                        fb = fallback_top10_from_seeds(seeds, dict(icp_profile or {}))
-                    except Exception:
-                        fb = []
-                    if fb:
-                        for it in fb:
-                            dom = (it.get("domain") or "").strip().lower()
-                            if dom and dom not in seen and _apex_domain(dom) not in seed_apex:
-                                top.append(it)
-                                seen.add(dom)
-                            if len(top) >= DESIRED:
-                                break
-            # 4c) Legacy heuristic fallback if still short, even without seeds
-            if len(top) < DESIRED:
-                try:
-                    fb2 = plan_top10_with_reasons_fallback(dict(icp_profile or {}))
-                except Exception:
-                    fb2 = []
-                if fb2:
-                    for it in fb2:
-                        dom = (it.get("domain") or "").strip().lower()
-                        if dom and dom not in seen and _apex_domain(dom) not in seed_apex:
-                            top.append(it)
-                            seen.add(dom)
-                        if len(top) >= DESIRED:
-                            break
+            # 4b) Disable any additional DDG-based fallbacks to enforce single-query discovery.
+            #     We intentionally do NOT run seed-competitor queries or legacy heuristic queries
+            #     that would trigger extra DDG calls. Only the first r.jina+DDG query is used.
         # Return at most 50 for persistence (UI will only show Top‑10)
         total_ret = min(DESIRED, len(top))
         top = top[:total_ret]
