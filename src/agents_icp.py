@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Any, Dict, List, Optional
+import json
 import html as html_lib
 
 from langchain_openai import ChatOpenAI
@@ -32,7 +33,7 @@ DDG_HTML_GET = "https://duckduckgo.com/html/"
 DDG_LITE_GET = "https://lite.duckduckgo.com/lite/"
 DDG_STD_LITE = "https://duckduckgo.com/lite/"
 
-# Optional: ddgs library fallback (if available)
+# Optional: ddgs library fallback (if available) — kept but no longer primary path
 try:  # pragma: no cover
     from ddgs import DDGS  # type: ignore
 except Exception:  # pragma: no cover
@@ -154,11 +155,11 @@ def _apex_domain(h: str) -> str:
 
 
 def _ddg_search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
-    """Perform a DuckDuckGo HTML search and extract external result domains.
+    """Perform domain discovery via Jina-proxied DDG and LLM extraction.
 
-    - Uses only DuckDuckGo (`html.duckduckgo.com/html`).
-    - Parses redirect links (`/l/?uddg=...`) and extracts the target domain.
-    - Filters obvious search/CDN/wiki hosts.
+    - Fetch `html.duckduckgo.com/html?q=<query>` via `https://r.jina.ai/…` snapshot.
+    - Use an LLM to extract up to `max_results` domains from the snapshot.
+    - Fall back to regex extraction on failure; keep basic filtering/dedupe.
     """
     if not ENABLE_DDG_DISCOVERY:
         return []
@@ -286,83 +287,95 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     continue
                 raise last_err
 
-    domains: List[str] = []
-    # Country hint from seed hints (e.g., .sg)
-    country_hint = None
-    try:
-        seeds = list(SEED_HINTS)
-        if any(str(s).endswith('.sg') for s in seeds):
-            country_hint = 'sg'
-    except Exception:
-        country_hint = None
-    # Try multiple DDG endpoints for robustness
-    params = {"q": query}
-    if (DDG_KL or kl):
-        params["kl"] = (DDG_KL or kl)
-    # Prefer main duckduckgo.com endpoints first; some networks block html.duckduckgo.com
-    endpoints = [
-        DDG_HTML_GET,       # duckduckgo.com/html/
-        DDG_STD_LITE,       # duckduckgo.com/lite/
-        DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html/
-        DDG_LITE_GET,       # lite.duckduckgo.com/lite/
-    ]
-    for ep in endpoints:
+    # Helper: fetch DDG HTML snapshot via r.jina.ai
+    def _ddg_snapshot_via_jina(q: str, s_offset: int = 0) -> Optional[str]:
         try:
-            r = _get(ep, params=params)
-            r.raise_for_status()
-            domains = _extract_domains_from_html(r.text)
-            if domains:
-                log.info("[ddg] parsed domains=%d via %s for query=%s", len(domains), ep, query)
-                return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+            kl_q = (DDG_KL or kl)
+            # Primary: html.duckduckgo.com via Jina proxy
+            url1 = f"https://r.jina.ai/https://html.duckduckgo.com/html/?q={quote(q)}" + (f"&kl={quote(kl_q)}" if kl_q else "") + (f"&s={s_offset}" if s_offset else "")
+            r = session.get(url1, timeout=(TIMEOUT_S, TIMEOUT_S))
+            if r.status_code < 400 and (r.text or "").strip():
+                log.info("[ddg] r.jina snapshot via html.duckduckgo.com ok for query=%s", q)
+                return r.text
+            # Fallback: duckduckgo.com/html via Jina proxy
+            url2 = f"https://r.jina.ai/https://duckduckgo.com/html/?q={quote(q)}" + (f"&kl={quote(kl_q)}" if kl_q else "") + (f"&s={s_offset}" if s_offset else "")
+            r = session.get(url2, timeout=(TIMEOUT_S, TIMEOUT_S))
+            if r.status_code < 400 and (r.text or "").strip():
+                log.info("[ddg] r.jina snapshot via duckduckgo.com/html ok for query=%s", q)
+                return r.text
+            # Last: duckduckgo.com/lite via Jina proxy
+            url3 = f"https://r.jina.ai/https://duckduckgo.com/lite/?q={quote(q)}" + (f"&kl={quote(kl_q)}" if kl_q else "") + (f"&s={s_offset}" if s_offset else "")
+            r = session.get(url3, timeout=(TIMEOUT_S, TIMEOUT_S))
+            if r.status_code < 400 and (r.text or "").strip():
+                log.info("[ddg] r.jina snapshot via duckduckgo.com/lite ok for query=%s", q)
+                return r.text
         except Exception as e:
-            log.info("[ddg] endpoint fail %s: %s", ep, e)
+            log.info("[ddg] r.jina snapshot fail: %s", e)
+        return None
 
-    # Final fallback: use ddgs library if available, which may succeed where direct HTTP is blocked
-    if not domains and DDGS is not None:
+    # Helper: LLM-based extraction of domains from DDG snapshot
+    def _llm_extract_domains_from_snapshot(snapshot: str, cap: int) -> List[str]:
         try:
-            region = (DDG_KL or kl) or "wt-wt"
-            parsed: List[str] = []
-            with DDGS() as ddg:
-                for res in ddg.text(query, region=region, safesearch="Off", max_results=max_results * 2):
-                    try:
-                        link = (res.get("href") or res.get("url") or res.get("link") or "").strip()
-                        if not link:
-                            continue
-                        host = (urlparse(link).netloc or "").lower()
-                        if host and _is_probable_domain(host):
-                            parsed.append(host)
-                        if len(parsed) >= max_results:
-                            break
-                    except Exception:
-                        continue
-            if parsed:
-                domains = parsed
-                log.info("[ddg] parsed domains=%d via ddgs for query=%s", len(domains), query)
-        except Exception as e:  # pragma: no cover
-            log.info("[ddg] ddgs fail: %s", e)
-
-    # Last-resort fallback: fetch DDG HTML via r.jina.ai and parse
-    if not domains:
-        try:
-            base_paths = [
-                "https://duckduckgo.com/html/",
-                "https://duckduckgo.com/lite/",
-            ]
-            q = f"q={quote(query)}"
-            kl_q = f"&kl={quote(DDG_KL or kl)}" if (DDG_KL or kl) else ""
-            for path in base_paths:
-                url = f"https://r.jina.ai/{path}?{q}{kl_q}"
-                r = session.get(url, timeout=(TIMEOUT_S, TIMEOUT_S))
-                if r.status_code >= 400:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            sys_msg = (
+                "You are extracting candidate company domains from a DuckDuckGo search results page. "
+                "Return a JSON array of unique apex domains only (no paths, no schemes), up to the requested limit. "
+                "Ignore search engines, social networks, CDNs, and code/doc sites. Focus on B2B company sites relevant to the query."
+            )
+            user_msg = (
+                "Extract up to {cap} unique apex domains from the following DDG snapshot text. "
+                "Output strictly as a JSON array of strings.\n\nSNAPSHOT:\n" + (snapshot[:10000])
+            ).format(cap=cap)
+            from langchain_core.messages import SystemMessage, HumanMessage
+            out = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
+            content = (getattr(out, "content", None) or "").strip()
+            # Attempt to locate JSON array in the output
+            start = content.find("[")
+            end = content.rfind("]")
+            raw_json = content[start:end+1] if start != -1 and end != -1 else content
+            items = json.loads(raw_json)
+            domains: List[str] = []
+            for it in items:
+                if not isinstance(it, str):
                     continue
-                domains = _extract_domains_from_html(r.text)
-                if domains:
-                    log.info("[ddg] parsed domains=%d via r.jina %s for query=%s", len(domains), path, query)
-                    return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+                d = _apex_domain(it.strip().lower())
+                if d and _is_probable_domain(d):
+                    domains.append(d)
+                if len(domains) >= cap:
+                    break
+            return _uniq(domains)
         except Exception as e:
-            log.info("[ddg] r.jina ddg fail: %s", e)
+            log.info("[ddg] llm extract fail: %s", e)
+            return []
 
-    return [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+    # 1) Fetch up to 8 pages via Jina proxy, stop once we reach max_results
+    collected: List[str] = []
+    MAX_PAGES = 8
+    # DuckDuckGo html offset typically increments by 30 per page
+    PAGE_SIZE_GUESS = 30
+    for page in range(MAX_PAGES):
+        if len(collected) >= max_results:
+            break
+        s_off = page * PAGE_SIZE_GUESS
+        snapshot = _ddg_snapshot_via_jina(query, s_offset=s_off)
+        if not snapshot:
+            # Stop if first page missing; otherwise continue to next variant
+            if page == 0:
+                return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
+            break
+        # 2) LLM extraction path per page
+        want = max_results - len(collected)
+        page_domains = _llm_extract_domains_from_snapshot(snapshot, max(want, 10))
+        if not page_domains:
+            # 3) Regex/HTML extraction fallback if LLM fails
+            page_domains = _extract_domains_from_html(snapshot)
+        # Merge and dedupe while preserving order
+        for d in page_domains:
+            if d and _is_probable_domain(str(d)) and d not in collected:
+                collected.append(d)
+            if len(collected) >= max_results:
+                break
+    return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
 
 
 log = logging.getLogger("agents.icp")
@@ -579,10 +592,11 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             log.info("[plan] llm-query fail: %s", e)
             return None
 
+    # Compose a single perfect query (LLM → heuristic fallback → minimal fallback)
     q_llm = _llm_compose_ddg_query()
-    queries: List[str] = [q_llm] if q_llm else []
-    # Heuristic fallback: industry-only join if LLM not available
-    if not queries:
+    if q_llm and len(q_llm) >= 4:
+        query = q_llm
+    else:
         terms: List[str] = []
         for v in (icp.get("industries") or []):
             if isinstance(v, str) and v.strip():
@@ -590,31 +604,22 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         inline_site = "site:.sg" if (country_hint == 'sg') else ""
         base_query = " ".join(_uniq([*terms, inline_site])).strip()
         if base_query:
-            queries = [base_query]
-    if not queries:
-        # Minimal fallback when ICP is empty
-        fallback = " ".join([s for s in [inds, titles, sigs] if s]).strip()
-        if country_hint == 'sg':
-            fallback = (fallback + " site:.sg").strip()
-        if fallback:
-            queries = [fallback]
+            query = base_query
+        else:
+            # Minimal fallback when ICP is empty
+            fallback = " ".join([s for s in [inds, titles, sigs] if s]).strip()
+            if country_hint == 'sg':
+                fallback = (fallback + " site:.sg").strip()
+            query = fallback or "b2b distributors"
+
+    # Single-query discovery: paginate up to 8 pages, stop at 50
+    log.info("[plan] ddg-only query: %s", query)
     domains: List[str] = []
-    ddg_calls = 0
-    # Gather enough domains to plan up to 50 lookalikes.
-    # Default to at least 2 DDG calls unless explicitly lowered via env.
-    budget = max(2, int(DDG_MAX_CALLS))
-    for q in queries[:budget]:
-        try:
-            log.info("[plan] ddg-only query: %s", q)
-            if ddg_calls >= budget:
-                break
-            ddg_calls += 1
-            # Increase per-query cap so a single query can yield many domains
-            for dom in _ddg_search_domains(q, max_results=50, country=country_hint):
-                domains.append(dom)
-        except Exception as e:
-            log.info("[plan] ddg fail: %s", e)
-            continue
+    try:
+        for dom in _ddg_search_domains(query, max_results=50, country=country_hint):
+            domains.append(dom)
+    except Exception as e:
+        log.info("[plan] ddg fail: %s", e)
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
     # Exclude seed domains (by apex) from discovery set to avoid reprocessing submitted customers
     try:
@@ -622,81 +627,6 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         uniq = [d for d in uniq if _apex_domain(d) not in seed_apex]
     except Exception:
         pass
-    if not uniq:
-        # Slim fallback query pack (max 1) to reduce network churn
-        fb: List[str] = []
-        try:
-            seeds = list(SEED_HINTS)
-        except Exception:
-            seeds = []
-        # Region hint: if any seed ends with .sg, prefer .sg-specific queries
-        if any(str(s).endswith('.sg') for s in seeds):
-            fb = ["site:.sg foodservice distributor"]
-        else:
-            fb = ["foodservice distributors"]
-        for q in fb[:1]:
-            try:
-                log.info("[plan] ddg-only fallback query: %s", q)
-                if ddg_calls >= budget:
-                    break
-                ddg_calls += 1
-                for dom in _ddg_search_domains(q, max_results=50, country=country_hint):
-                    domains.append(dom)
-            except Exception as e:
-                log.info("[plan] ddg fail: %s", e)
-                continue
-        uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
-
-    # Top-up to target count (≤50): if uniq is still short, add broader, industry-only queries
-    TARGET = 50
-    if len(uniq) < TARGET:
-        try:
-            extra_queries: List[str] = []
-            inds_terms = [s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()]
-            # Build a richer set of synonym queries to broaden results
-            def _synonym_pack(term: str) -> List[str]:
-                base = term.strip()
-                return [
-                    f"{base} distributors",
-                    f"{base} distribution companies",
-                    f"{base} wholesale",
-                    f"{base} wholesaler",
-                    f"{base} suppliers",
-                    f"{base} importers",
-                    f"B2B {base} companies",
-                    f"{base} B2B distributors",
-                ]
-            if inds_terms:
-                # Use up to first 2 industry terms for breadth
-                for t in inds_terms[:2]:
-                    extra_queries.extend(_synonym_pack(t))
-            else:
-                extra_queries = [
-                    "B2B distributors",
-                    "B2B wholesale companies",
-                    "consumer goods distributors",
-                    "consumer goods wholesale",
-                    "foodservice distributors",
-                    "food & beverage distributors",
-                    "industrial supplies distributors",
-                ]
-            for q in extra_queries:
-                if len(uniq) >= TARGET:
-                    break
-                try:
-                    if ddg_calls >= budget:
-                        # permit a small overflow to reach target breadth once
-                        budget += 1
-                    log.info("[plan] ddg top-up query: %s", q)
-                    ddg_calls += 1
-                    for dom in _ddg_search_domains(q, max_results=50, country=None):
-                        uniq.append(dom)
-                    uniq = [d for d in _uniq(uniq) if _is_probable_domain(str(d))]
-                except Exception as e:
-                    log.info("[plan] ddg fail: %s", e)
-                    continue
-        except Exception:
-            pass
     log.info("[plan] ddg domains found=%d (uniq=%d)", len(domains), len(uniq))
     # Optional Jina Reader fetch for quick homepage snippets of first few domains
     # Industry-based filter: keep only candidates whose snippets mention industry terms

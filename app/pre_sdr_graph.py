@@ -4873,26 +4873,40 @@ def router(state: GraphState) -> str:
 
     text = _last_user_text(state).lower()
 
-    # Boot-session initialization: record current message count so we only honor
-    # commands after a NEW human message arrives post-boot.
+    # Boot-session initialization: record current message count and STOP
+    # any resumed run immediately after server restart. We only honor commands
+    # after a NEW human message arrives post-boot.
     try:
+        def _is_human(m) -> bool:
+            try:
+                if isinstance(m, HumanMessage):
+                    return True
+                if isinstance(m, dict):
+                    role = (m.get("type") or m.get("role") or "").lower()
+                    return role in {"human", "user"}
+            except Exception:
+                return False
+            return False
+
         if state.get("boot_init_token") != BOOT_TOKEN:
             state["boot_init_token"] = BOOT_TOKEN
             state["boot_seen_messages_len"] = len(msgs)
+            last = msgs[-1] if msgs else None
+            # Only short-circuit if there isn't a fresh human message in this first pass
+            if not (last and _is_human(last)):
+                logger.info("router -> end (boot resume guard: waiting for new user input)")
+                return "end"
+            # Fresh human input present at first pass: mark and continue routing
+            state["last_user_boot_token"] = BOOT_TOKEN
+            try:
+                if "last_routed_text" in state:
+                    del state["last_routed_text"]
+            except Exception:
+                pass
         else:
             # On subsequent router cycles, if new messages appended and last is Human → mark as fresh user action
             if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
                 last = msgs[-1] if msgs else None
-                def _is_human(m) -> bool:
-                    try:
-                        if isinstance(m, HumanMessage):
-                            return True
-                        if isinstance(m, dict):
-                            role = (m.get("type") or m.get("role") or "").lower()
-                            return role in {"human", "user"}
-                    except Exception:
-                        return False
-                    return False
                 if last and _is_human(last):
                     state["last_user_boot_token"] = BOOT_TOKEN
                     # New human input: allow routing again by clearing last_routed_text
