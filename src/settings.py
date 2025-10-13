@@ -237,6 +237,20 @@ ENRICH_SKIP_IF_ANY_HISTORY = os.getenv("ENRICH_SKIP_IF_ANY_HISTORY", "false").lo
     "on",
 )
 
+# --- Agentic enrichment toggle -------------------------------------------------
+# When true, use a planner-driven agent loop instead of the fixed graph sequence.
+ENRICH_AGENTIC = os.getenv("ENRICH_AGENTIC", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Max number of planner steps per company to prevent runaway loops
+try:
+    ENRICH_AGENTIC_MAX_STEPS = int(os.getenv("ENRICH_AGENTIC_MAX_STEPS", "12") or 12)
+except Exception:
+    ENRICH_AGENTIC_MAX_STEPS = 12
+
 # --- Feature 17/19: ICP Finder flags ----------------------------------------
 # Gate the ICP Finder endpoints and chat flow; default ON to fully replace legacy.
 ENABLE_ICP_INTAKE = os.getenv("ENABLE_ICP_INTAKE", "true").lower() in (

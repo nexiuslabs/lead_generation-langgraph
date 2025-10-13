@@ -1910,14 +1910,95 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         except Exception as exc:
             logger.exception("odoo sync failed for company_id=%s", cid)
 
-    state["messages"].append(
-        AIMessage(f"Enrichment complete for {len(results)} companies.")
-    )
+    # Present a scored shortlist table in chat (top by score)
+    try:
+        scored_rows = [scores.get(cid) for cid in ids if scores.get(cid)]
+        scored_rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+        head = scored_rows[: min(10, len(scored_rows))]
+        if head:
+            lines = ["Lead Shortlist (top scored):", "", "| Company | Score | Bucket |", "|---|---:|:---:|"]
+            for r in head:
+                cid = int(r.get("company_id")) if r.get("company_id") is not None else None
+                comp = comps.get(cid, {}) if cid is not None else {}
+                nm = comp.get("name") or f"Company {cid}"
+                sc = f"{float(r.get('score') or 0):.1f}"
+                bk = (r.get("bucket") or "").strip() or "-"
+                lines.append(f"| {nm} | {sc} | {bk} |")
+            state["messages"].append(AIMessage("\n".join(lines)))
+        else:
+            state["messages"].append(
+                AIMessage(f"Enrichment complete for {len(results)} companies.")
+            )
+    except Exception:
+        state["messages"].append(
+            AIMessage(f"Enrichment complete for {len(results)} companies.")
+        )
     return state
 
 
+def _boot_guard_route(state: PreSDRState) -> bool:
+    """Return True if we should halt routing until a fresh human message after boot.
+
+    Mirrors the boot-resume guard used in the LLM router, so both simple and
+    LLM-driven graphs honor the same behavior across server restarts.
+    """
+    try:
+        msgs = state.get("messages") or []
+        def _is_human(m) -> bool:
+            try:
+                if isinstance(m, HumanMessage):
+                    return True
+                if isinstance(m, dict):
+                    role = (m.get("type") or m.get("role") or "").lower()
+                    return role in {"human", "user"}
+            except Exception:
+                return False
+            return False
+        if state.get("boot_init_token") != BOOT_TOKEN:
+            state["boot_init_token"] = BOOT_TOKEN
+            state["boot_seen_messages_len"] = len(msgs)
+            last = msgs[-1] if msgs else None
+            # Halt only if there isn't a fresh human message
+            if not (last and _is_human(last)):
+                logger.info("router -> end (boot resume guard: waiting for new user input)")
+                return True
+            # Fresh human: clear duplicate guard to allow routing
+            state["last_user_boot_token"] = BOOT_TOKEN
+            try:
+                if "last_routed_text" in state:
+                    del state["last_routed_text"]
+            except Exception:
+                pass
+        else:
+            if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
+                last = msgs[-1] if msgs else None
+                if last and _is_human(last):
+                    state["last_user_boot_token"] = BOOT_TOKEN
+                    try:
+                        if "last_routed_text" in state:
+                            del state["last_routed_text"]
+                    except Exception:
+                        pass
+                state["boot_seen_messages_len"] = len(msgs)
+    except Exception:
+        return False
+    return False
+
+
 def route(state: PreSDRState) -> str:
+    # Enforce boot-resume guard for the simple router as well
+    if _boot_guard_route(state):
+        return "end"
     text = _last_text(state.get("messages")).lower()
+    # Map common start intents to ICP intake
+    if re.search(r"\b(start\s+lead\s*gen|start\s+leadgen|start\s+lead\s+generation|find\s+leads)\b", text):
+        logger.info("router -> icp (explicit start intent)")
+        try:
+            state["last_routed_text"] = text
+            state["icp_in_progress"] = True
+        except Exception:
+            pass
+        return "icp"
     if "confirm" in text:
         dest = "confirm"
     elif "run enrichment" in text:
@@ -4892,11 +4973,11 @@ def router(state: GraphState) -> str:
             state["boot_init_token"] = BOOT_TOKEN
             state["boot_seen_messages_len"] = len(msgs)
             last = msgs[-1] if msgs else None
-            # Only short-circuit if there isn't a fresh human message in this first pass
+            # Halt only if there isn't a fresh human message
             if not (last and _is_human(last)):
                 logger.info("router -> end (boot resume guard: waiting for new user input)")
                 return "end"
-            # Fresh human input present at first pass: mark and continue routing
+            # Fresh human: clear duplicate guard to allow routing
             state["last_user_boot_token"] = BOOT_TOKEN
             try:
                 if "last_routed_text" in state:

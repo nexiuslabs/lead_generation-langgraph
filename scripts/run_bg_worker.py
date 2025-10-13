@@ -5,6 +5,7 @@ import signal
 from typing import Optional
 
 import asyncpg
+import re
 
 from src.settings import POSTGRES_DSN
 from src.jobs import run_web_discovery_bg_enrich
@@ -130,8 +131,44 @@ class BGWorker:
 
 
 async def main() -> None:
-    max_c = int(os.getenv("BG_WORKER_MAX_CONCURRENCY", "2") or 2)
-    interval = float(os.getenv("BG_WORKER_SWEEP_INTERVAL", "15") or 15)
+    def _parse_int(env: str, default: int) -> int:
+        val = os.getenv(env)
+        if val is None:
+            return default
+        try:
+            return int(val.strip())
+        except Exception:
+            # strip non-digits and retry
+            m = re.search(r"\d+", val)
+            return int(m.group(0)) if m else default
+
+    def _parse_interval(env: str, default: float) -> float:
+        raw = os.getenv(env)
+        if not raw:
+            return default
+        s = raw.strip().lower()
+        # Support suffix units: s, m, h (seconds/minutes/hours)
+        try:
+            if s.endswith("ms"):
+                return max(0.01, float(s[:-2]) / 1000.0)
+            if s.endswith("s"):
+                return max(0.01, float(s[:-1]))
+            if s.endswith("m"):
+                return max(0.01, float(s[:-1]) * 60.0)
+            if s.endswith("h"):
+                return max(0.01, float(s[:-1]) * 3600.0)
+            # Plain float
+            return max(0.01, float(s))
+        except Exception:
+            # Last resort: extract first float-like token
+            m = re.search(r"\d+(?:\.\d+)?", s)
+            try:
+                return max(0.01, float(m.group(0))) if m else default
+            except Exception:
+                return default
+
+    max_c = _parse_int("BG_WORKER_MAX_CONCURRENCY", 2)
+    interval = _parse_interval("BG_WORKER_SWEEP_INTERVAL", 15.0)
     worker = BGWorker(POSTGRES_DSN, max_concurrency=max_c, sweep_interval=interval)
 
     loop = asyncio.get_running_loop()
@@ -142,4 +179,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

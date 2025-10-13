@@ -368,6 +368,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             break
         s_off = page * PAGE_SIZE_GUESS
         page_ok = False
+        found_any_for_page = False
         for ep in endpoints:
             try:
                 params = dict(params_base)
@@ -391,17 +392,19 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     )
                 except Exception:
                     pass
-                for d in page_domains:
-                    if d not in collected:
-                        collected.append(d)
-                    if len(collected) >= max_results:
-                        break
-                page_ok = True
-                break  # move to next page after first successful endpoint
+                if page_domains:
+                    found_any_for_page = True
+                    for d in page_domains:
+                        if d not in collected:
+                            collected.append(d)
+                        if len(collected) >= max_results:
+                            break
+                    # Move to next page only after extracting some domains
+                    break
             except Exception as e:
                 # Try next endpoint for this page
                 continue
-        if not page_ok:
+        if not found_any_for_page:
             # As a last resort, try r.jina snapshot for this page and parse via regex/text
             snapshot = _ddg_snapshot_via_jina(query, s_offset=s_off)
             if snapshot:

@@ -34,6 +34,14 @@ def _ensure_logger(name: str, level: str = "INFO"):
 logger = _ensure_logger("input_norm")
 _ensure_logger("onboarding")
 _ensure_logger("app.odoo_store")
+# Reduce noise from upstream libraries during local_dev
+try:
+    logging.getLogger("langgraph_api.metadata").setLevel(logging.ERROR)
+    # Keep server logs, but avoid spamming warnings for 401/403 on health checks
+    if (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower() == "local_dev":
+        logging.getLogger("langgraph_api.server").setLevel(logging.INFO)
+except Exception:
+    pass
 
 # Ensure LangGraph checkpoint directory exists to prevent FileNotFoundError
 # e.g., '.langgraph_api/.langgraph_checkpoint.*.pckl.tmp'
@@ -738,7 +746,7 @@ def normalize_input(payload: dict) -> dict:
 # LangServe setup removed: previously mounted /agent when ENABLE_LANGSERVE_IN_APP was true.
 
 @app.get("/info")
-async def info(_: dict = Depends(require_auth)):
+async def info(_: dict = Depends(require_optional_identity)):
     # Expose capability hints and current auth mode (no secrets)
     checkpoint_enabled = True if CHECKPOINT_DIR else False
     dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")

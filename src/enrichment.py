@@ -72,6 +72,7 @@ from src.settings import (
     MERGE_DETERMINISTIC_TIMEOUT_S,
 )
 from src.settings import ENRICH_RECHECK_DAYS, ENRICH_SKIP_IF_ANY_HISTORY
+from src.settings import ENRICH_AGENTIC, ENRICH_AGENTIC_MAX_STEPS
 
 load_dotenv()
 
@@ -1207,7 +1208,10 @@ async def enrich_company_with_tavily(
         logger.info(
             f"[enrichment] start company_id={company_id}, name={company_name!r}"
         )
-        final_state = await enrichment_agent.ainvoke(initial_state)
+        if ENRICH_AGENTIC:
+            final_state = await run_enrichment_agentic(initial_state)  # planner-driven
+        else:
+            final_state = await enrichment_agent.ainvoke(initial_state)  # fixed graph
         logger.info(
             f"[enrichment] completed company_id={company_id}, extracted_pages={len(final_state.get('extracted_pages') or [])}, completed={final_state.get('completed')}"
         )
@@ -2311,6 +2315,185 @@ def _normalize_company_name(name: str) -> list[str]:
     core = [p for p in parts if p not in SUFFIXES]
     # Keep first 2-3 tokens for matching
     return core[:3] or parts[:2]
+
+
+# -------- Agentic planner (optional, feature-flagged) -------------------------
+
+def _summarize_state_for_agent(state: "EnrichmentState") -> str:
+    try:
+        have_domain = bool(state.get("home"))
+        pages = len(state.get("extracted_pages") or [])
+        urls = len(state.get("filtered_urls") or [])
+        data = state.get("data") or {}
+        keys = [k for k, v in (data or {}).items() if v]
+        parts = [
+            f"have_domain={have_domain}",
+            f"filtered_urls={urls}",
+            f"extracted_pages={pages}",
+            f"data_keys={keys[:8]}",
+        ]
+        return ", ".join(parts)
+    except Exception:
+        return "have_domain=?, filtered_urls=?, extracted_pages=?, data_keys=[]"
+
+
+AGENT_ACTIONS = [
+    # Domain
+    "use_existing_domain",  # rely on DB/company state
+    "search_domain",        # call node_find_domain
+    # Crawl and content
+    "deterministic_crawl",  # node_deterministic_crawl
+    "discover_urls",        # node_discover_urls
+    "expand_crawl",         # node_expand_crawl
+    "extract_pages",        # node_extract_pages
+    "build_chunks",         # node_build_chunks
+    "llm_extract",          # node_llm_extract
+    # Contacts
+    "apify_contacts",       # node_apify_contacts
+    # Persistence
+    "persist_core",         # node_persist_core
+    "persist_legacy",       # node_persist_legacy
+    # Stop
+    "finish",
+]
+
+
+async def _agent_execute(action: str, state: "EnrichmentState") -> "EnrichmentState":
+    # Route to existing nodes to avoid duplicating logic.
+    if action == "use_existing_domain":
+        # node_find_domain already checks DB first, so reuse it
+        return await node_find_domain(state)
+    if action == "search_domain":
+        return await node_find_domain(state)
+    if action == "deterministic_crawl":
+        return await node_deterministic_crawl(state)
+    if action == "discover_urls":
+        return await node_discover_urls(state)
+    if action == "expand_crawl":
+        return await node_expand_crawl(state)
+    if action == "extract_pages":
+        return await node_extract_pages(state)
+    if action == "build_chunks":
+        return await node_build_chunks(state)
+    if action == "llm_extract":
+        return await node_llm_extract(state)
+    if action == "apify_contacts":
+        return await node_apify_contacts(state)
+    if action == "persist_core":
+        return await node_persist_core(state)
+    if action == "persist_legacy":
+        return await node_persist_legacy(state)
+    return state
+
+
+def _agent_prompt(company_name: str, summary: str) -> str:
+    return (
+        "You are an enrichment planner agent. Your goal is to enrich a company with: "
+        "website domain, key firmographics (about_text, tech_stack, linkedin_url, phones, HQ), and contact persons (prefer decision-makers). "
+        "You have a set of actions. At each step, choose the best next action given the current summary, avoiding redundant work and respecting that vendor calls are capped.\n\n"
+        f"Company: {company_name}\n"
+        f"State: {summary}\n\n"
+        "Available actions (JSON only):\n"
+        "- use_existing_domain: rely on any existing domain (node_find_domain does this).\n"
+        "- search_domain: search for domain if missing.\n"
+        "- deterministic_crawl: fetch homepage + deterministic pages if domain exists.\n"
+        "- discover_urls: pick relevant site URLs.\n"
+        "- expand_crawl: add about/contact/careers pages.\n"
+        "- extract_pages: fetch pages for extraction.\n"
+        "- build_chunks: merge/trim content for LLM.\n"
+        "- llm_extract: extract fields from chunks.\n"
+        "- apify_contacts: discover contacts when emails/contacts are missing.\n"
+        "- persist_core: upsert core fields to DB.\n"
+        "- persist_legacy: write legacy projection and finish.\n"
+        "- finish: stop when data is sufficient or after persistence.\n\n"
+        "Return strictly JSON: {\"action\": <one of actions>, \"reason\": <short string>}\n"
+        "Prefer to finish after persist_legacy or when state.completed is true."
+    )
+
+
+async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
+    steps = 0
+    # Reuse global llm with low temperature for determinism
+    while steps < int(ENRICH_AGENTIC_MAX_STEPS):
+        # Stop if pipeline marked completed
+        if state.get("completed"):
+            logger.info("[agentic] state.completed=true; stopping")
+            break
+        summary = _summarize_state_for_agent(state)
+        prompt = _agent_prompt(state.get("company_name") or "", summary)
+        try:
+            out = llm.invoke(prompt)
+            # Extract content from ChatMessage if present
+            content = None
+            try:
+                content = getattr(out, "content", None)
+            except Exception:
+                content = None
+            if not content:
+                content = str(out) if out is not None else ""
+            # Try strict JSON parse first
+            parsed = {}
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                # Heuristic: find JSON substring
+                s = content
+                start = s.find("{")
+                end = s.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        parsed = json.loads(s[start : end + 1])
+                    except Exception:
+                        parsed = {}
+            action = (parsed or {}).get("action")
+            reason = (parsed or {}).get("reason") or ""
+        except Exception:
+            action = None
+            reason = "planner_exception"
+
+        # Choose safe default or override when parsing fails or action invalid/loops
+        have_domain = bool(state.get("home"))
+        have_pages = bool(state.get("extracted_pages") or [])
+        have_chunks = bool(state.get("chunks") or [])
+        have_data = bool(state.get("data") or {})
+        if not action or action not in AGENT_ACTIONS:
+            if not have_domain:
+                action = "search_domain"
+                reason = reason or "default_no_domain"
+            elif not have_pages:
+                action = "deterministic_crawl"
+                reason = reason or "default_need_pages"
+            elif not have_chunks:
+                action = "build_chunks"
+                reason = reason or "default_build_chunks"
+            elif not have_data:
+                action = "llm_extract"
+                reason = reason or "default_llm_extract"
+            else:
+                # Persist and finish by default once we have data
+                action = "persist_legacy"
+                reason = reason or "default_persist_finish"
+        else:
+            # Override repetitive crawl/expand suggestions to progress the pipeline
+            if have_pages and not have_chunks and action in ("expand_crawl", "deterministic_crawl"):
+                action = "build_chunks"
+                reason = "override_progress_build_chunks"
+            elif have_chunks and not have_data and action in ("expand_crawl", "deterministic_crawl"):
+                action = "llm_extract"
+                reason = "override_progress_llm_extract"
+            elif have_data and action in ("expand_crawl", "deterministic_crawl", "discover_urls"):
+                action = "persist_legacy"
+                reason = "override_progress_persist"
+
+        logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
+        if action == "finish":
+            break
+        try:
+            state = await _agent_execute(action, state)
+        except Exception:
+            logger.warning("[agentic] action execution failed; continuing", exc_info=True)
+        steps += 1
+    return state
 
 
 def find_domain(company_name: str) -> list[str]:
