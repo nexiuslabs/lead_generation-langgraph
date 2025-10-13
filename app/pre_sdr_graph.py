@@ -1309,8 +1309,18 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                         pass
     except Exception:
         pass
+    # Build a concise status message with correct totals
     msg_lines: list[str] = []
-    msg_lines.append(f"Got {n} companies.")
+    try:
+        # Prefer the total discovered via agent web discovery; else fall back to ICP-matched total in DB
+        total_web = int(state.get("web_discovery_total") or 0)
+    except Exception:
+        total_web = 0
+    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+    if display_total > 0:
+        msg_lines.append(f"Found {display_total} ICP candidates. Showing Top‑10 preview below.")
+    else:
+        msg_lines.append("Collecting ICP candidates…")
 
     # Web discovery Top‑10 (agent-driven) — present to the user; move ACRA to nightly
     try:
@@ -1354,10 +1364,13 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                     # Pretty Top‑10 table
                     try:
                         table = _fmt_top10_md(top)
-                        msg_lines.append("Top‑10 lookalikes (with why):\n\n" + table)
+                        # Include total so users see "10 of N"
+                        _tot = display_total if isinstance(display_total, int) and display_total > 0 else len(top)
+                        msg_lines.append(f"Top-listed lookalikes (with why) — showing 10 of {_tot}:\n\n" + table)
                     except Exception:
                         # Fallback to simple lines
-                        msg_lines.append("Top‑10 lookalikes (with why):")
+                        _tot = display_total if isinstance(display_total, int) and display_total > 0 else 10
+                        msg_lines.append(f"Top‑listed lookalikes (with why) — showing 10 of {_tot}:")
                         for i, row in enumerate(top, 1):
                             dom = row.get("domain")
                             why = row.get("why") or "signal match"
@@ -1496,6 +1509,43 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         pass
 
     candidates = state.get("candidates") or []
+    # Force strict Top‑10 when a persisted Top‑10 preview exists for this tenant
+    try:
+        tid_for_read = _resolve_tenant_id_for_write_sync(state)
+    except Exception:
+        tid_for_read = None
+    try:
+        if not state.get("strict_top10"):
+            persisted_top = _load_persisted_top10(int(tid_for_read) if isinstance(tid_for_read, int) else None)
+            if isinstance(persisted_top, list) and persisted_top:
+                # Map domains to company rows (create if missing)
+                from src.database import get_conn as __get_conn
+                mapped: list[dict] = []
+                with __get_conn() as _c2, _c2.cursor() as _cur2:
+                    for it in persisted_top[:10]:
+                        try:
+                            dom = (it.get("domain") or "").strip().lower()
+                            if not dom:
+                                continue
+                            _cur2.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                            r = _cur2.fetchone()
+                            if r and r[0] is not None:
+                                cid = int(r[0]); name = (r[1] or dom)
+                            else:
+                                _cur2.execute(
+                                    "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                                    (dom, dom),
+                                )
+                                cid = int((_cur2.fetchone() or [None])[0]); name = dom
+                            mapped.append({"id": cid, "name": name})
+                        except Exception:
+                            continue
+                if mapped:
+                    candidates = mapped
+                    state["candidates"] = mapped
+                    state["strict_top10"] = True
+    except Exception:
+        pass
     # Ensure: if a Top‑10 list from web discovery exists, enrich exactly those first.
     if isinstance(state.get("agent_top10"), list) and state.get("agent_top10"):
         try:
@@ -1913,6 +1963,22 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
     # Present a scored shortlist table in chat (top by score)
     try:
         scored_rows = [scores.get(cid) for cid in ids if scores.get(cid)]
+        # Fallback: if in-memory scores are empty, try DB lead_scores
+        if not scored_rows:
+            try:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id, score::float, bucket FROM lead_scores WHERE company_id = ANY($1::int[])",
+                        ids,
+                    )
+                for r in rows:
+                    scored_rows.append({
+                        "company_id": int(r["company_id"]),
+                        "score": float(r["score"] or 0.0),
+                        "bucket": (r["bucket"] or "").strip() or "-",
+                    })
+            except Exception:
+                scored_rows = []
         scored_rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
         head = scored_rows[: min(10, len(scored_rows))]
         if head:
@@ -1926,9 +1992,12 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 lines.append(f"| {nm} | {sc} | {bk} |")
             state["messages"].append(AIMessage("\n".join(lines)))
         else:
-            state["messages"].append(
-                AIMessage(f"Enrichment complete for {len(results)} companies.")
-            )
+            # Last fallback: present a simple table without scores
+            lines = ["Lead Shortlist:", "", "| Company |", "|---|"]
+            for cid in ids[: min(10, len(ids))]:
+                nm = (comps.get(cid, {}) or {}).get("name") or f"Company {cid}"
+                lines.append(f"| {nm} |")
+            state["messages"].append(AIMessage("\n".join(lines)))
     except Exception:
         state["messages"].append(
             AIMessage(f"Enrichment complete for {len(results)} companies.")
@@ -3792,21 +3861,22 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         state["agent_top10"] = top
                                     except Exception:
                                         pass
-                                    # Pretty Top‑10 table
+                                    # Pretty Top‑10 table (separate message from ICP Profile)
+                                    top_lines: list[str]
                                     try:
                                         table = _fmt_top10_md(top)
-                                        lines = ["Top‑10 lookalikes (with why):\n\n" + table]
+                                        top_lines = ["Top‑listed lookalikes (with why):\n\n" + table]
                                     except Exception:
-                                        lines = ["Top‑10 lookalikes (with why):"]
+                                        top_lines = ["Top‑listed lookalikes (with why):"]
                                         for i, row in enumerate(top, 1):
                                             dom = row.get("domain")
                                             why = row.get("why") or "signal match"
                                             score = int(row.get("score") or 0)
                                             snip = _clean_snippet(row.get("snippet") or "")
                                             if snip:
-                                                lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                                                top_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
                                             else:
-                                                lines.append(f"{i}) {dom} — {why} (score {score})")
+                                                top_lines.append(f"{i}) {dom} — {why} (score {score})")
                                     # Enrich ICP from r.jina+ddg if sparse, then show a detailed profile summary
                                     try:
                                         from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
@@ -3818,6 +3888,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                                             pass
                                     except Exception:
                                         pass
+                                    # Build ICP Profile as a separate message block
+                                    profile_lines: list[str] = []
                                     try:
                                         icp_prof = state.get("icp_profile") or {}
                                         inds = (icp_prof.get("industries") or [])
@@ -3825,15 +3897,19 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         sizes_l = (icp_prof.get("size_bands") or [])
                                         ints = (icp_prof.get("integrations") or [])
                                         trigs = (icp_prof.get("triggers") or [])
-                                        lines.append("ICP Profile")
-                                        lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
-                                        lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
-                                        lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
+                                        profile_lines.append("ICP Profile")
+                                        profile_lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
+                                        profile_lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
+                                        profile_lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
                                         sigs_arr = (ints or []) + (trigs or [])
-                                        lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
+                                        profile_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
                                     except Exception:
-                                        lines.append("ICP Profile")
-                                    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+                                        profile_lines.append("ICP Profile")
+                                    # Emit Top‑10 table and ICP Profile as two separate messages
+                                    state["messages"] = add_messages(
+                                        state.get("messages") or [],
+                                        [AIMessage("\n".join(top_lines)), AIMessage("\n".join(profile_lines))],
+                                    )
                                     chips.append("Top‑10 ✓")
                                 else:
                                     # No Top‑10 from web discovery; advise user to adjust ICP rather than echo seeds
@@ -4136,8 +4212,16 @@ async def confirm_node(state: GraphState) -> GraphState:
     ssic_matches = []
     msg_lines: list[str] = []
 
-    # Start with candidate count
-    msg_lines.append(f"Got {n} companies. ")
+    # Start with candidate count (prefer web discovery total, else DB ICP total, else local count)
+    try:
+        total_web = int(state.get("web_discovery_total") or 0)
+    except Exception:
+        total_web = 0
+    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+    if display_total > 0:
+        msg_lines.append(f"Found {display_total} ICP candidates.")
+    else:
+        msg_lines.append("Collecting ICP candidates…")
 
     # PRD19: hide SSIC/ACRA preview in chat; ACRA is for nightly SG pass only
 
@@ -4567,7 +4651,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                                     SELECT s.title
                                     FROM icp_evidence e
                                     JOIN ssic_ref s
-                                      ON regexp_replace(s.code::text,'\D','','g') = regexp_replace((e.value->>'ssic')::text,'\D','','g')
+                                      ON regexp_replace(s.code::text,'\\D','','g') = regexp_replace((e.value->>'ssic')::text,'\\D','','g')
                                     WHERE e.signal_key='ssic'
                                     GROUP BY s.title
                                     ORDER BY COUNT(*) DESC
