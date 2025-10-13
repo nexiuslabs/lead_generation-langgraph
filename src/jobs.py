@@ -17,9 +17,10 @@ except Exception:  # pragma: no cover
     upsert_batched = None  # type: ignore
 
 try:
-    from src.enrichment import enrich_company_with_tavily  # async
+    from src.enrichment import enrich_company_with_tavily, set_run_context as _enrich_set_ctx  # async
 except Exception:  # pragma: no cover
     enrich_company_with_tavily = None  # type: ignore
+    _enrich_set_ctx = None  # type: ignore
 
 UPSERT_MAX_PER_JOB = int(os.getenv("UPSERT_MAX_PER_JOB", "2000") or 2000)
 STAGING_BATCH_SIZE = int(os.getenv("STAGING_BATCH_SIZE", "500") or 500)
@@ -400,8 +401,70 @@ async def run_enrich_candidates(job_id: int) -> None:
         codes = [str(c).strip() for c in (params.get('ssic_codes') or []) if str(c).strip()]
         if not codes:
             raise RuntimeError("ssic_codes missing for enrich_candidates")
-        # Select candidate companies by SSIC
+        # Begin an observability run and set enrichment context for proper tenant scoping
+        run_id = None
+        try:
+            from src import obs as _obs
+            if tenant_id is not None:
+                run_id = _obs.begin_run(int(tenant_id))
+                try:
+                    _obs.set_run_context(int(run_id), int(tenant_id))
+                except Exception:
+                    pass
+                # Propagate context to enrichment module so company_enrichment_runs rows link to this run_id
+                try:
+                    if _enrich_set_ctx and run_id is not None:
+                        _enrich_set_ctx(int(run_id), int(tenant_id))
+                except Exception:
+                    pass
+        except Exception:
+            run_id = None
+
+        # Enforce per-tenant daily cap for ACRA nightly enrichment
+        try:
+            DAILY_CAP = int(os.getenv("ACRA_DAILY_ENRICH_LIMIT", "20") or 20)
+        except Exception:
+            DAILY_CAP = 20
+        remaining_today = DAILY_CAP
+        try:
+            if tenant_id is not None:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT COALESCE(COUNT(*),0) AS cnt
+                        FROM company_enrichment_runs cer
+                        JOIN enrichment_runs er ON er.run_id = cer.run_id
+                        WHERE er.tenant_id = %s
+                          AND er.started_at >= date_trunc('day', now())
+                        """,
+                        (int(tenant_id),),
+                    )
+                    r = cur.fetchone()
+                    already = int(r[0] or 0) if r else 0
+                    remaining_today = max(0, DAILY_CAP - already)
+        except Exception:
+            # If we cannot compute, fall back to the cap to avoid over-processing
+            remaining_today = DAILY_CAP
+
+        if remaining_today <= 0:
+            # Defer this job to the next nightly window
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE background_jobs SET status='queued', error=%s WHERE job_id=%s",
+                    ("deferred: daily cap reached", job_id),
+                )
+            # Finalize run header if we started one
+            try:
+                if run_id is not None:
+                    from src import obs as _obs
+                    _obs.finalize_run(int(run_id), status="succeeded")
+            except Exception:
+                pass
+            return
+
+        # Select candidate companies by SSIC, limited by daily remaining and batch cap
         batch_cap = int(os.getenv("ENRICH_BATCH_SIZE", "200") or 200)
+        effective_limit = min(batch_cap, max(0, int(remaining_today)))
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -411,7 +474,7 @@ async def run_enrich_candidates(job_id: int) -> None:
                 ORDER BY company_id
                 LIMIT %s
                 """,
-                (codes, batch_cap),
+                (codes, effective_limit),
             )
             rows = cur.fetchall() or []
         processed = 0
@@ -428,11 +491,27 @@ async def run_enrich_candidates(job_id: int) -> None:
 
             await _run()
             processed = len(rows)
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
-                (processed, processed, job_id),
-            )
+        # If we fully utilized today's quota, keep the job queued for the next night; else mark done
+        if processed >= effective_limit and effective_limit > 0:
+            # Re-queue for next window
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE background_jobs SET status='queued', processed=COALESCE(processed,0)+%s, total=COALESCE(total,0)+%s, ended_at=now() WHERE job_id=%s",
+                    (processed, processed, job_id),
+                )
+        else:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                    (processed, processed, job_id),
+                )
+        # Finalize the run header
+        try:
+            if run_id is not None:
+                from src import obs as _obs
+                _obs.finalize_run(int(run_id), status="succeeded")
+        except Exception:
+            pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"enrich_candidates\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:  # pragma: no cover
