@@ -2349,6 +2349,7 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
 # Build the LangGraph for enrichment
 enrichment_graph = StateGraph(EnrichmentState)
 enrichment_graph.add_node("find_domain", node_find_domain)
+ 
 enrichment_graph.add_node("deterministic_crawl", node_deterministic_crawl)
 enrichment_graph.add_node("discover_urls", node_discover_urls)
 enrichment_graph.add_node("expand_crawl", node_expand_crawl)
@@ -2451,6 +2452,7 @@ AGENT_ACTIONS = [
     "llm_extract",          # node_llm_extract
     # Contacts
     "apify_contacts",       # node_apify_contacts
+    # Company info via Apify
     # Persistence
     "persist_core",         # node_persist_core
     "persist_legacy",       # node_persist_legacy
@@ -2585,6 +2587,8 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
             elif have_data and action in ("expand_crawl", "deterministic_crawl", "discover_urls"):
                 action = "persist_legacy"
                 reason = "override_progress_persist"
+
+        # keep routing overrides minimal
 
         logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
         if action == "finish":
