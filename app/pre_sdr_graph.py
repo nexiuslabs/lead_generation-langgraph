@@ -219,7 +219,7 @@ def _enqueue_next40_if_applicable(state) -> None:
                     WHERE tenant_id=%s
                       AND source = 'web_discovery'
                       AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
-                      AND LOWER(domain) <> ALL(%s)
+                      AND NOT LOWER(domain) = ANY(%s)
                     ORDER BY created_at DESC
                     LIMIT %s
                     """,
@@ -266,13 +266,26 @@ def _enqueue_next40_if_applicable(state) -> None:
             return
         job = __enqueue_bg(int(_tidv), bg_ids)
         jid = (job or {}).get("job_id")
+        # Verify that the background job row exists for additional certainty
+        try:
+            with __get_conn() as _vc, _vc.cursor() as _vcur:
+                _vcur.execute(
+                    "SELECT job_type, status FROM background_jobs WHERE job_id=%s",
+                    (int(jid) if jid else -1,),
+                )
+                _v = _vcur.fetchone()
+                verified = bool(_v)
+        except Exception:
+            verified = False
         try:
             logger.info(
-                "[enrich] enqueue next40 count=%s job_id=%s (preview_total=%s tenant_id=%s)",
+                "[enrich] enqueue next40 count=%s job_id=%s (preview_total=%s tenant_id=%s verified=%s) ids_head=%s",
                 str(len(bg_ids)),
                 str(jid),
                 str(preview_total),
                 str(_tidv),
+                str(verified),
+                ",".join([str(i) for i in (bg_ids[:5] if isinstance(bg_ids, list) else [])]),
             )
         except Exception:
             pass
@@ -1915,6 +1928,9 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
             cid = row["company_id"]
             emails.setdefault(cid, row["email"])
 
+    odoo_upserts = 0
+    odoo_contacts = 0
+    odoo_leads = 0
     for cid in ids:
         comp = comps.get(cid, {})
         if not comp:
@@ -1931,10 +1947,15 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 incorporation_year=comp.get("incorporation_year"),
                 website_domain=comp.get("website_domain"),
             )
+            try:
+                odoo_upserts += 1 if isinstance(odoo_id, int) and odoo_id > 0 else 0
+            except Exception:
+                pass
             if email:
                 try:
                     await store.add_contact(odoo_id, email)
                     logger.info("odoo export: contact added email=%s for partner_id=%s", email, odoo_id)
+                    odoo_contacts += 1
                 except Exception as _contact_exc:
                     logger.warning("odoo export: add_contact failed email=%s err=%s", email, _contact_exc)
             try:
@@ -1955,12 +1976,17 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                         score.get("rationale", ""),
                         email,
                     )
+                    odoo_leads += 1
                 except Exception as _lead_exc:
                     logger.warning("odoo export: create_lead failed partner_id=%s err=%s", odoo_id, _lead_exc)
         except Exception as exc:
             logger.exception("odoo sync failed for company_id=%s", cid)
 
     # Present a scored shortlist table in chat (top by score)
+    try:
+        logger.info("[odoo] export summary upserts=%s contacts=%s leads=%s", odoo_upserts, odoo_contacts, odoo_leads)
+    except Exception:
+        pass
     try:
         scored_rows = [scores.get(cid) for cid in ids if scores.get(cid)]
         # Fallback: if in-memory scores are empty, try DB lead_scores
@@ -1982,6 +2008,10 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         scored_rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
         head = scored_rows[: min(10, len(scored_rows))]
         if head:
+            try:
+                logger.info("[shortlist] rendering scored table rows=%s", len(head))
+            except Exception:
+                pass
             lines = ["Lead Shortlist (top scored):", "", "| Company | Score | Bucket |", "|---|---:|:---:|"]
             for r in head:
                 cid = int(r.get("company_id")) if r.get("company_id") is not None else None
@@ -2253,8 +2283,27 @@ def _user_just_confirmed(state: dict) -> bool:
     msgs = state.get("messages") or []
     for m in reversed(msgs):
         if isinstance(m, HumanMessage):
-            txt = (getattr(m, "content", "") or "").strip().lower()
-            return txt in {"confirm", "yes", "y", "ok", "okay", "looks good", "lgtm"}
+            raw = (getattr(m, "content", "") or "").strip().lower()
+            # normalize punctuation
+            import re as _re
+            txt = _re.sub(r"[\s.!?]+$", "", raw)
+            # accept common confirmations
+            confirmed_set = {
+                "confirm",
+                "confirmed",
+                "yes",
+                "y",
+                "ok",
+                "okay",
+                "looks good",
+                "lgtm",
+                "go ahead",
+                "proceed",
+                "continue",
+                "sounds good",
+                "done",
+            }
+            return txt in confirmed_set
     return False
 
 
@@ -4551,8 +4600,11 @@ async def enrich_node(state: GraphState) -> GraphState:
     # even if some of the head-of-line enrichments failed or were skipped.
     try:
         _enqueue_next40_if_applicable(state)
-    except Exception:
-        pass
+    except Exception as _enq_exc:
+        try:
+            logger.warning("[next40] enqueue failed: %s", _enq_exc)
+        except Exception:
+            pass
 
     if all_done:
         # Compose completion message; include ACRA/ICP totals and nightly remainder
@@ -4695,14 +4747,31 @@ async def enrich_node(state: GraphState) -> GraphState:
                 # Guarded by env flag and readiness; skip in local dev unless explicitly enabled.
                 try:
                     def _odoo_export_enabled() -> bool:
+                        # Policy: if ODOO_EXPORT_ENABLED is explicitly set, honor it.
+                        # Otherwise, auto-enable when a mapping/DSN is present.
                         try:
-                            v = (os.getenv("ODOO_EXPORT_ENABLED") or "").strip().lower()
-                            return v in ("1", "true", "yes", "on")
+                            raw = os.getenv("ODOO_EXPORT_ENABLED")
+                            if raw is not None:
+                                v = raw.strip().lower()
+                                return v in ("1", "true", "yes", "on")
+                        except Exception:
+                            pass
+                        # Auto-enable if we can resolve any active mapping or DSN
+                        try:
+                            from src.settings import ODOO_POSTGRES_DSN as _ODSN
+                            if _ODSN:
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            with get_conn() as _c, _c.cursor() as _cur:
+                                _cur.execute("SELECT 1 FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                return bool(_cur.fetchone())
                         except Exception:
                             return False
 
                     if not _odoo_export_enabled():
-                        logger.info("odoo export skipped: ODOO_EXPORT_ENABLED not set true")
+                        logger.info("odoo export skipped: disabled by policy (no mapping/flag)")
                         # Soft-skip export without raising; proceed with rest of flow
                         raise StopIteration
                     pool = await get_pg_pool()
@@ -4902,15 +4971,141 @@ async def enrich_node(state: GraphState) -> GraphState:
         except Exception as _score_exc:
             logger.exception("lead scoring failed")
     else:
-        done = sum(1 for r in results if r.get("completed"))
+        # Partial completion: score and export the completed subset now; enqueue the remainder for background.
+        done = [r for r in results if r.get("completed")]
+        pending = [r for r in results if not r.get("completed")]
+        done_ids = [int(r.get("company_id")) for r in done if r.get("company_id") is not None]
+        pending_ids = [int(r.get("company_id")) for r in pending if r.get("company_id") is not None]
+
+        # Score the completed subset and render the table immediately
+        try:
+            if done_ids:
+                scoring_initial_state = {
+                    "candidate_ids": done_ids,
+                    "lead_features": [],
+                    "lead_scores": [],
+                    "icp_payload": {
+                        "employee_range": {
+                            "min": (state.get("icp") or {}).get("employees_min"),
+                            "max": (state.get("icp") or {}).get("employees_max"),
+                        },
+                        "revenue_bucket": (state.get("icp") or {}).get("revenue_bucket"),
+                        "incorporation_year": {
+                            "min": (state.get("icp") or {}).get("year_min"),
+                            "max": (state.get("icp") or {}).get("year_max"),
+                        },
+                    },
+                }
+                await lead_scoring_agent.ainvoke(scoring_initial_state)
+                # Filter candidates to the completed subset for display
+                try:
+                    cands = state.get("candidates") or []
+                    state["candidates"] = [c for c in cands if int(c.get("id") or 0) in set(done_ids)]
+                except Exception:
+                    pass
+                state = await score_node(state)
+        except Exception:
+            logger.exception("partial scoring failed")
+
+        # Attempt Odoo export for completed subset (best-effort)
+        try:
+            if done_ids:
+                from app.odoo_store import OdooStore
+                # Resolve tenant id, mirroring the all_done path
+                _tid_val = state.get("tenant_id") if isinstance(state, dict) else None
+                try:
+                    _tid = int(_tid_val) if _tid_val is not None else None
+                except Exception:
+                    _tid = None
+                if _tid is None:
+                    try:
+                        _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                        _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                    except Exception:
+                        _tid = None
+                store = None
+                try:
+                    store = OdooStore(tenant_id=_tid)
+                except Exception:
+                    store = None
+                if store is not None:
+                    async with pool.acquire() as conn:
+                        comp_rows = await conn.fetch(
+                            """
+                            SELECT company_id, name, uen, industry_norm, employees_est,
+                                   revenue_bucket, incorporation_year, website_domain
+                            FROM companies WHERE company_id = ANY($1::int[])
+                            """,
+                            done_ids,
+                        )
+                        comps = {r["company_id"]: dict(r) for r in comp_rows}
+                        email_rows = await conn.fetch(
+                            "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
+                            done_ids,
+                        )
+                        emails: Dict[int, str] = {}
+                        for row in email_rows:
+                            emails.setdefault(row["company_id"], row["email"])
+                        score_rows = await conn.fetch(
+                            "SELECT company_id, score, rationale FROM lead_scores WHERE company_id = ANY($1::int[])",
+                            done_ids,
+                        )
+                        scores = {r["company_id"]: dict(r) for r in score_rows}
+                    for cid in done_ids:
+                        comp = comps.get(cid) or {}
+                        email = emails.get(cid)
+                        try:
+                            odoo_id = await store.upsert_company(
+                                comp.get("name"),
+                                comp.get("uen"),
+                                industry_norm=comp.get("industry_norm"),
+                                employees_est=comp.get("employees_est"),
+                                revenue_bucket=comp.get("revenue_bucket"),
+                                incorporation_year=comp.get("incorporation_year"),
+                                website_domain=comp.get("website_domain"),
+                            )
+                            if email:
+                                try:
+                                    await store.add_contact(odoo_id, email)
+                                except Exception:
+                                    pass
+                            sc = scores.get(cid)
+                            if sc:
+                                try:
+                                    await store.create_lead_if_high(
+                                        odoo_id,
+                                        comp.get("name"),
+                                        float(sc.get("score") or 0.0),
+                                        {},
+                                        str(sc.get("rationale") or ""),
+                                        email,
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            logger.exception("odoo sync failed for company_id=%s", cid)
+        except Exception:
+            logger.exception("partial odoo export failed")
+
+        # Enqueue pending items for background enrichment if any
+        try:
+            if pending_ids:
+                tid = await _resolve_tenant_id_for_write(state)
+                if tid is not None:
+                    from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
+                    __enqueue_bg(int(tid), pending_ids)
+        except Exception as _bg_exc:
+            try:
+                logger.warning("[enqueue-pending] failed: %s", _bg_exc)
+            except Exception:
+                pass
+
+        # Notify user and continue
         total = len(results)
+        msg = f"Enrichment finished with issues ({len(done_ids)}/{total} completed). I scored and listed completed ones here; the rest are queued for background."
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [
-                AIMessage(
-                    content=f"Enrichment finished with issues ({done}/{total} completed). I’ll wait to score until all complete."
-                )
-            ],
+            [AIMessage(content=msg)],
         )
     return state
 
@@ -4960,6 +5155,13 @@ async def score_node(state: GraphState) -> GraphState:
         return state
 
     async with pool.acquire() as conn:
+        # Apply RLS tenant context if known so we can read tenant-scoped lead_scores
+        try:
+            tid = await _resolve_tenant_id_for_write(state)
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", str(tid))
+        except Exception:
+            pass
         # 1) Fetch latest scores for the candidate IDs
         score_rows = await conn.fetch(
             f"""

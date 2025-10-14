@@ -39,7 +39,31 @@ try:
     logging.getLogger("langgraph_api.metadata").setLevel(logging.ERROR)
     # Keep server logs, but avoid spamming warnings for 401/403 on health checks
     if (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower() == "local_dev":
-        logging.getLogger("langgraph_api.server").setLevel(logging.INFO)
+        srv_logger = logging.getLogger("langgraph_api.server")
+        srv_logger.setLevel(logging.INFO)
+
+        # Suppress extremely chatty access logs for specific health/poll endpoints
+        class _SkipAccessPath(logging.Filter):
+            def __init__(self, paths):
+                super().__init__()
+                # Match by substring in rendered log line
+                self.paths = tuple(paths)
+
+            def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+                try:
+                    msg = record.getMessage()
+                    if not isinstance(msg, str):
+                        msg = str(msg)
+                    # Drop logs that contain any of the noisy paths
+                    if any(p in msg for p in self.paths):
+                        return False
+                except Exception:
+                    # Fail-open: keep the record if anything goes wrong
+                    return True
+                return True
+
+        # Filter out /session/odoo_info access lines (frontend polls frequently)
+        srv_logger.addFilter(_SkipAccessPath(["/session/odoo_info"]))
 except Exception:
     pass
 

@@ -1129,43 +1129,144 @@ def update_company_core_fields(company_id: int, data: dict):
 
 
 async def _jina_snapshot_pages(company_id: int, url: str):
-    """Fetch homepage via r.jina and project minimal enrichment artifacts for downstream steps."""
+    """Fetch homepage and a few deterministic pages to seed initial data.
+
+    Order of attempts:
+      1) r.jina snapshot of homepage (fast, tolerant parser)
+      2) Direct HTTP GET of homepage with crawler UA
+      3) Direct HTTP GET of deterministic subpages (about/contact/careers, etc.)
+
+    Returns a tuple (summary_dict, pages) where pages is a list of
+    {url, html} or {url, raw_content} entries suitable for downstream
+    chunking and extraction.
+    """
+    # Normalize and derive roots/variants
     try:
-        text = jina_read(url, timeout=12) or ""
+        base = url
+        if not base:
+            return None, []
+        if not base.startswith("http"):
+            base = f"https://{base}"
+        u = urlparse(base)
+        root = f"{u.scheme}://{u.netloc}"
+        variants = [base]
+        # Add www variant if missing
+        try:
+            host = u.netloc or ""
+            if host and not host.lower().startswith("www."):
+                variants.append(f"{u.scheme}://www.{host}{u.path or ''}")
+        except Exception:
+            pass
+    except Exception:
+        return None, []
+
+    pages: list[dict] = []
+    summary_text = ""
+
+    # 1) Try r.jina for homepage
+    text = ""
+    try:
+        for v in variants:
+            text = jina_read(v, timeout=12) or ""
+            if text:
+                pages.append({"url": v, "html": text})
+                summary_text = text
+                break
     except Exception:
         text = ""
+
+    # 2) Direct HTTP GET fallback for homepage
     if not text:
+        try:
+            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                resp = await client.get(variants[0], follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                if getattr(resp, "text", ""):
+                    body = resp.text
+                    pages.append({"url": variants[0], "html": body})
+                    summary_text = body
+        except Exception:
+            pass
+
+    # 3) Deterministic subpages if homepage still empty or to augment thin pages
+    need_more = not pages or len((summary_text or "").strip()) < 200
+    if need_more:
+        seeds = [
+            "about", "about-us", "aboutus", "company", "who-we-are",
+            "contact", "contact-us",
+            "team", "leadership",
+            "careers", "jobs",
+            "services", "solutions", "products",
+        ]
+        cand_urls = []
+        for p in seeds:
+            cand_urls.append(f"{root}/{p}")
+        # Fetch in parallel, keep first 2-3 that return content
+        try:
+            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                resps = await asyncio.gather(
+                    *(
+                        client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                        for u in cand_urls
+                    ),
+                    return_exceptions=True,
+                )
+            added = 0
+            for resp, u in zip(resps, cand_urls):
+                if isinstance(resp, Exception):
+                    continue
+                body = getattr(resp, "text", "") or ""
+                # Skip obvious soft-404s
+                if not body or len(body.strip()) < 100:
+                    continue
+                pages.append({"url": u, "html": body})
+                if not summary_text:
+                    summary_text = body
+                added += 1
+                if added >= 3:
+                    break
+        except Exception:
+            pass
+
+    if not pages:
         return None, []
-    pages = [{"url": url, "html": text}]
+
     # Project a minimal record into company_enrichment_runs
-    conn = get_db_connection()
-    with conn:
-        fields = {
-            "company_id": company_id,
-            "about_text": text[:1000],
+    try:
+        conn = get_db_connection()
+        with conn:
+            fields = {
+                "company_id": company_id,
+                "about_text": (summary_text or "")[:1000],
+                "tech_stack": [],
+                "public_emails": [],
+                "jobs_count": 0,
+                "linkedin_url": None,
+            }
+            tid = _default_tenant_id()
+            if tid is not None:
+                fields["tenant_id"] = tid
+            _insert_company_enrichment_run(conn, fields)
+        conn.close()
+    except Exception:
+        pass
+
+    # Legacy store for transparency
+    try:
+        legacy = {
+            "about_text": (summary_text or "")[:1000],
             "tech_stack": [],
             "public_emails": [],
             "jobs_count": 0,
             "linkedin_url": None,
+            "phone_number": [],
+            "hq_city": None,
+            "hq_country": None,
         }
-        tid = _default_tenant_id()
-        if tid is not None:
-            fields["tenant_id"] = tid
-        _insert_company_enrichment_run(conn, fields)
-    conn.close()
-    # Legacy store
-    legacy = {
-        "about_text": text[:1000],
-        "tech_stack": [],
-        "public_emails": [],
-        "jobs_count": 0,
-        "linkedin_url": None,
-        "phone_number": [],
-        "hq_city": None,
-        "hq_country": None,
-    }
-    store_enrichment(company_id, url, legacy)
-    return {"url": url, "content_summary": text[:1000], "signals": {}}, pages
+        store_enrichment(company_id, root, legacy)
+    except Exception:
+        pass
+
+    return {"url": root, "content_summary": (summary_text or "")[:1000], "signals": {}}, pages
 
 
 async def enrich_company_with_tavily(

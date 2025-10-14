@@ -168,12 +168,13 @@ async def persist_results(state: LeadScoringState) -> LeadScoringState:
     """
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
-        # Try set tenant GUC for RLS from env (supports non-HTTP runs)
+        # Try set tenant GUC for RLS from env (supports non-HTTP runs),
+        # and also detect an existing tenant from the current session if present.
         try:
             import os as _os
-            _tenant = _os.getenv('DEFAULT_TENANT_ID')
-            if _tenant:
-                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", _tenant)
+            _tenant_env = _os.getenv('DEFAULT_TENANT_ID')
+            if _tenant_env:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", _tenant_env)
         except Exception:
             pass
         # Ensure tables exist
@@ -203,11 +204,19 @@ async def persist_results(state: LeadScoringState) -> LeadScoringState:
             )
         )
         tenant_val = None
+        # Prefer an already-applied request.tenant_id if present; else env
         try:
-            import os as _os
-            tenant_val = _os.getenv('DEFAULT_TENANT_ID')
+            _current = await conn.fetchval("SELECT current_setting('request.tenant_id', true)")
+            if _current and str(_current).strip().isdigit():
+                tenant_val = str(_current).strip()
         except Exception:
             tenant_val = None
+        if tenant_val is None:
+            try:
+                import os as _os
+                tenant_val = _os.getenv('DEFAULT_TENANT_ID')
+            except Exception:
+                tenant_val = None
         for feat, score in zip(state['lead_features'], state['lead_scores']):
             # Upsert features
             if has_tenant and tenant_val is not None:

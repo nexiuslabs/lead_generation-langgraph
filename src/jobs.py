@@ -491,6 +491,11 @@ async def run_enrich_candidates(job_id: int) -> None:
 
             await _run()
             processed = len(rows)
+            # Best-effort Odoo export for enriched companies
+            try:
+                await _odoo_export_for_ids(tenant_id, rows)
+            except Exception:
+                pass
         # If we fully utilized today's quota, keep the job queued for the next night; else mark done
         if processed >= effective_limit and effective_limit > 0:
             # Re-queue for next window
@@ -515,11 +520,115 @@ async def run_enrich_candidates(job_id: int) -> None:
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"enrich_candidates\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:  # pragma: no cover
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE background_jobs SET status='error', error=%s, ended_at=now() WHERE job_id=%s",
-                (str(e), job_id),
-            )
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE background_jobs SET status='error', error=%s, ended_at=now() WHERE job_id=%s",
+                    (str(e), job_id),
+                )
+        except Exception:
+            pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.exception("enrich_candidates job failed: %s", e)
         log.info("{\"job\":\"enrich_candidates\",\"phase\":\"error\",\"job_id\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, dur_ms, str(e))
+
+
+async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tuple]) -> None:
+    """Best-effort Odoo sync for a batch of companies after nightly enrichment.
+
+    For each (company_id, name, uen) in company_rows, upsert to Odoo partner,
+    add primary contact if present, and create a lead with the latest score.
+    Non-fatal: all exceptions are swallowed per item; logs in OdooStore cover details.
+    """
+    if not company_rows:
+        return
+    try:
+        from app.odoo_store import OdooStore  # async methods
+    except Exception:
+        return
+    try:
+        store = OdooStore(tenant_id=int(tenant_id) if tenant_id is not None else None)
+    except Exception:
+        return
+    # Fetch company core fields, scores and a primary email
+    ids = [int(r[0]) for r in company_rows if r and r[0] is not None]
+    if not ids:
+        return
+    comps: dict[int, dict] = {}
+    emails: dict[int, str | None] = {}
+    scores: dict[int, float] = {}
+    rationales: dict[int, str] = {}
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT company_id, name, uen, industry_norm, employees_est, revenue_bucket,
+                       incorporation_year, website_domain
+                  FROM companies
+                 WHERE company_id = ANY(%s)
+                """,
+                (ids,),
+            )
+            for row in cur.fetchall() or []:
+                try:
+                    comps[int(row[0])] = {
+                        "name": row[1],
+                        "uen": row[2],
+                        "industry_norm": row[3],
+                        "employees_est": row[4],
+                        "revenue_bucket": row[5],
+                        "incorporation_year": row[6],
+                        "website_domain": row[7],
+                    }
+                except Exception:
+                    continue
+            cur.execute(
+                "SELECT company_id, email FROM lead_emails WHERE company_id = ANY(%s)",
+                (ids,),
+            )
+            for r in cur.fetchall() or []:
+                try:
+                    emails[int(r[0])] = r[1]
+                except Exception:
+                    continue
+            cur.execute(
+                "SELECT company_id, score, rationale FROM lead_scores WHERE company_id = ANY(%s)",
+                (ids,),
+            )
+            for r in cur.fetchall() or []:
+                try:
+                    scores[int(r[0])] = float(r[1] or 0.0)
+                    rationales[int(r[0])] = r[2] or ""
+                except Exception:
+                    continue
+    except Exception:
+        # proceed with what we have
+        pass
+    # Export sequentially to avoid hammering Odoo
+    for cid in ids:
+        comp = comps.get(cid) or {}
+        try:
+            partner_id = await store.upsert_company(
+                comp.get("name"),
+                comp.get("uen"),
+                industry_norm=comp.get("industry_norm"),
+                employees_est=comp.get("employees_est"),
+                revenue_bucket=comp.get("revenue_bucket"),
+                incorporation_year=comp.get("incorporation_year"),
+                website_domain=comp.get("website_domain"),
+            )
+            email = emails.get(cid)
+            if email:
+                try:
+                    await store.add_contact(partner_id, email)
+                except Exception:
+                    pass
+            score = scores.get(cid, 0.0)
+            rationale = rationales.get(cid, "")
+            try:
+                await store.create_lead_if_high(partner_id, comp.get("name"), score, {}, rationale, email)
+            except Exception:
+                pass
+        except Exception:
+            # continue best-effort for the rest
+            continue

@@ -6,7 +6,8 @@ import shutil
 import socket
 import subprocess
 import time
-from typing import Any, Dict, Optional
+import asyncio
+from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
 
@@ -50,15 +51,22 @@ class OdooStore:
             host = u.hostname or "?"
             port = u.port or 5432
             db = (u.path or "/").lstrip("/") or "?"
-            logger.info("odoo:target host=%s port=%s db=%s", host, port, db)
+            # Reduce noise: emit at DEBUG to avoid log spam on status polling
+            logger.debug("odoo:target host=%s port=%s db=%s", host, port, db)
         except Exception:
             pass
         # Lazy SSH tunnel (password or key) via env if configured
+        # We re-check reachability at each acquire and attempt to reopen if needed.
         self._ensure_tunnel_once()
+
+    # --- Shared pool registry (per-DSN) ---
+    _pools: dict[str, asyncpg.Pool] = {}
+    _pool_lock: asyncio.Lock | None = None
 
     # --- Optional SSH tunnel management (no-op if env not provided) ---
     _tunnel_opened: bool = False
     _tunnel_proc: Optional[subprocess.Popen] = None
+    _last_tunnel_check: float = 0.0
 
     @staticmethod
     def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
@@ -69,8 +77,11 @@ class OdooStore:
             return False
 
     def _ensure_tunnel_once(self) -> None:
-        if OdooStore._tunnel_opened:
+        # Throttle re-checks to avoid hammering subprocess on hot paths
+        now = time.time()
+        if now - OdooStore._last_tunnel_check < 2.0:
             return
+        OdooStore._last_tunnel_check = now
         ssh_host = os.getenv("SSH_HOST")
         ssh_port = int(os.getenv("SSH_PORT", "22"))
         ssh_user = os.getenv("SSH_USER")
@@ -79,14 +90,14 @@ class OdooStore:
         db_port = int(os.getenv("DB_PORT", "5432"))
         local_port = int(os.getenv("LOCAL_PORT", "25060"))
 
-        # If local port is already open, assume a user-managed tunnel
+        # If local port is already open, record status and return
         if self._port_open("127.0.0.1", local_port) or self._port_open("::1", local_port):
             OdooStore._tunnel_opened = True
             return
 
         if not (ssh_host and ssh_user and db_host_in_droplet):
-            # No SSH configuration provided; skip silently.
-            OdooStore._tunnel_opened = True
+            # No SSH configuration provided; cannot auto-open. Keep flag false so future checks can retry.
+            OdooStore._tunnel_opened = False
             return
 
         # Build ssh command; prefer password auth via sshpass when provided
@@ -95,7 +106,6 @@ class OdooStore:
                 logger.error(
                     "sshpass not found but SSH_PASSWORD is set; cannot auto-open tunnel."
                 )
-                # Do not mark as opened; leave it false so future attempts can retry
                 OdooStore._tunnel_opened = False
                 return
             cmd = [
@@ -159,7 +169,31 @@ class OdooStore:
             logger.exception("SSH tunnel start failed")
             OdooStore._tunnel_opened = False
 
-    async def _acquire(self):
+    async def _get_pool(self) -> Optional[asyncpg.Pool]:
+        """Return a cached asyncpg pool for this DSN, creating it if needed."""
+        if not self.dsn:
+            return None
+        if OdooStore._pool_lock is None:
+            OdooStore._pool_lock = asyncio.Lock()
+        async with OdooStore._pool_lock:
+            pool = OdooStore._pools.get(self.dsn)
+            if pool is None:
+                # Small pool to keep a warm connection across requests
+                pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=2)
+                OdooStore._pools[self.dsn] = pool
+            return pool
+
+    @classmethod
+    async def close_cached_pool(cls, dsn: str) -> None:
+        pool = cls._pools.pop(dsn, None)
+        if pool is not None:
+            try:
+                await pool.close()
+            except Exception:
+                pass
+
+    async def _acquire_conn(self) -> Tuple[asyncpg.Connection, bool]:
+        """Acquire a connection, preferring a cached pool. Returns (conn, pooled)."""
         # Re-check/ensure tunnel in case previous attempt failed or was terminated
         self._ensure_tunnel_once()
         # Best-effort visibility if local port is not open
@@ -172,12 +206,36 @@ class OdooStore:
                 logger.warning("Odoo DSN target %s:%s not reachable before connect()", host, port)
         except Exception:
             pass
-        return await asyncpg.connect(self.dsn)
+        # Try pool first
+        try:
+            pool = await self._get_pool()
+        except Exception:
+            pool = None
+        if pool is not None:
+            conn = await pool.acquire()
+            return conn, True
+        # Fallback to direct connection (no pooling configured)
+        return await asyncpg.connect(self.dsn), False
+
+    async def _release_conn(self, conn: asyncpg.Connection, pooled: bool) -> None:
+        if pooled:
+            try:
+                pool = await self._get_pool()
+                if pool is not None:
+                    await pool.release(conn)
+                    return
+            except Exception:
+                pass
+        # Fallback: close direct connection
+        try:
+            await conn.close()
+        except Exception:
+            pass
 
     async def upsert_company(self, name: str, uen: str | None = None, **fields) -> int:
 
         logger.info("Upserting company name=%s uen=%s", name, uen)
-        conn = await self._acquire()
+        conn, pooled = await self._acquire_conn()
         try:
             try:
                 row = await conn.fetchrow(
@@ -273,7 +331,7 @@ class OdooStore:
             return row["id"]
 
         finally:
-            await conn.close()
+            await self._release_conn(conn, pooled)
 
     async def add_contact(
         self, company_id: int, email: str, full_name: str | None = None
@@ -285,7 +343,7 @@ class OdooStore:
             return None
 
         logger.info("Adding contact email=%s company_id=%s", email, company_id)
-        conn = await self._acquire()
+        conn, pooled = await self._acquire_conn()
         try:
             row = await conn.fetchrow(
                 """
@@ -331,10 +389,10 @@ class OdooStore:
             return row["id"]
 
         finally:
-            await conn.close()
+            await self._release_conn(conn, pooled)
 
     async def connectivity_smoke_test(self) -> None:
-        conn = await self._acquire()
+        conn, pooled = await self._acquire_conn()
         try:
             # Basic connectivity check
             await conn.execute("SELECT 1")
@@ -346,7 +404,7 @@ class OdooStore:
             except Exception:
                 pass
         finally:
-            await conn.close()
+            await self._release_conn(conn, pooled)
 
     async def seed_baseline_entities(self, tenant_id: int, email: str | None = None) -> None:
         """Create minimal baseline entities in Odoo for a new tenant context.
@@ -369,7 +427,7 @@ class OdooStore:
     ):
 
         logger.info("Merging enrichment for company_id=%s", company_id)
-        conn = await self._acquire()
+        conn, pooled = await self._acquire_conn()
         try:
             await conn.execute(
                 """
@@ -388,7 +446,7 @@ class OdooStore:
             logger.info("Merged enrichment for company_id=%s", company_id)
 
         finally:
-            await conn.close()
+            await self._release_conn(conn, pooled)
 
     async def create_lead_if_high(
         self,
