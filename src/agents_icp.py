@@ -701,12 +701,14 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             return []
     ind_toks = _industry_terms(icp)
     jina_snips: Dict[str, str] = {}
-    for d in uniq[:10]:
+    # Limit homepage snapshot checks to a small set to reduce latency
+    for d in uniq[:5]:
         try:
             url = f"https://{d}"
             reader = f"https://r.jina.ai/http://{d}"
             log.info("[jina] GET %s", reader)
-            r = requests.get(reader, timeout=10)
+            # Shorter timeout to avoid long stalls during planning
+            r = requests.get(reader, timeout=6)
             txt = (r.text or "")[:8000]
             # Clean noisy prefixes often present in r.jina output
             lines = [ln.strip() for ln in (txt or "").splitlines() if ln.strip()]
@@ -748,11 +750,12 @@ async def mini_crawl_worker(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     out: List[Dict[str, Any]] = []
     cand = (state.get("discovery_candidates") or [])
-    log.info("[mini] jina-read start count=%d", len(cand[:10]))
-    for dom in (state.get("discovery_candidates") or [])[:10]:
+    # Reduce page reads and shorten timeouts to keep confirm fast
+    log.info("[mini] jina-read start count=%d", len(cand[:5]))
+    for dom in (state.get("discovery_candidates") or [])[:5]:
         url = f"https://{dom}"
         try:
-            txt = jina_read(url, timeout=10)
+            txt = jina_read(url, timeout=6)
             if not txt:
                 log.info("[mini] jina empty domain=%s", dom)
                 continue
@@ -885,7 +888,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             except Exception:
                 return []
         ind_toks = _ind_terms(icp_profile)
-        HEAD = 12  # analyze a slightly larger head to improve ranking quality
+        # Analyze a smaller head to reduce latency while keeping quality reasonable
+        HEAD = 6
         for d in cand[:HEAD]:
             url = f"https://{d}"
             try:
@@ -894,7 +898,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                 t = 0
             try:
                 log.info("[mini] jina-read domain=%s", d)
-                summ = jina_read(url, timeout=10)
+                summ = jina_read(url, timeout=6)
                 if not summ:
                     # Fallback: fetch homepage title/description when Jina is rate limited
                     try:
@@ -970,7 +974,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             # 4a) Heuristic backfill from remaining discovery candidates
             seen = {str((it.get("domain") or "").strip().lower()) for it in top}
             extra: List[Dict[str, Any]] = []
-            for d in cand[HEAD:60]:
+            # Cap additional checks to avoid long serial fetches
+            for d in cand[HEAD:HEAD+10]:
                 try:
                     if not d:
                         continue
@@ -980,7 +985,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                     if _apex_domain(dn) in seed_apex:
                         continue
                     url = f"https://{d}"
-                    body = jina_read(url, timeout=8) or ""
+                    body = jina_read(url, timeout=5) or ""
                     if not body:
                         continue
                     clean = " ".join((body or "").split())

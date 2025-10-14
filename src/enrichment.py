@@ -1025,7 +1025,7 @@ def _ensure_list(v):
 async def _merge_with_jina(data: dict, home: str) -> dict:
     logger.info("    🔁 Merging with r.jina reader")
     try:
-        text = jina_read(home, timeout=12) or ""
+        text = jina_read(home, timeout=8) or ""
     except Exception:
         text = ""
     if not text:
@@ -1167,7 +1167,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     text = ""
     try:
         for v in variants:
-            text = jina_read(v, timeout=12) or ""
+            text = jina_read(v, timeout=8) or ""
             if text:
                 pages.append({"url": v, "html": text})
                 summary_text = text
@@ -1750,7 +1750,7 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     if not extracted_pages:
         try:
             if state.get("company_id") and state.get("home"):
-                text = jina_read(state["home"], timeout=12) or ""
+                text = jina_read(state["home"], timeout=8) or ""
                 if text:
                     state["extracted_pages"] = [
                         {"url": state["home"], "title": "", "raw_content": text}
@@ -3227,7 +3227,7 @@ async def enrich_company(company_id: int, company_name: str):
 
     # 2) jina reader snapshot first
     try:
-        text = jina_read(url, timeout=12) or ""
+        text = jina_read(url, timeout=8) or ""
         about_text = text[:1000]
         tech_stack: list[str] = []
         public_emails: list[str] = []

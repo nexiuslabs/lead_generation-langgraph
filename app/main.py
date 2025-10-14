@@ -15,6 +15,7 @@ import logging
 import re
 import os
 from datetime import datetime
+import time
 import threading
 import asyncio
 import math
@@ -62,8 +63,8 @@ try:
                     return True
                 return True
 
-        # Filter out /session/odoo_info access lines (frontend polls frequently)
-        srv_logger.addFilter(_SkipAccessPath(["/session/odoo_info"]))
+        # Filter out access lines for hot-poll endpoints (frontend polls frequently)
+        srv_logger.addFilter(_SkipAccessPath(["/session/odoo_info", "/shortlist/status"]))
 except Exception:
     pass
 
@@ -1639,6 +1640,26 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
     info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
     tid = info.get("tenant_id")
 
+    # Simple per-tenant cache to avoid DB work and chatter; default TTL 5 minutes
+    try:
+        _SHORTLIST_CACHE  # type: ignore[name-defined]
+    except NameError:  # first load
+        _SHORTLIST_CACHE = {}
+    try:
+        _ttl = float(os.getenv("SHORTLIST_TTL_S", "300") or 300)
+    except Exception:
+        _ttl = 300.0
+
+    # Serve cached value when fresh
+    try:
+        key = int(info.get("tenant_id")) if info.get("tenant_id") is not None else None
+    except Exception:
+        key = None
+    if key in _SHORTLIST_CACHE:
+        ts, cached = _SHORTLIST_CACHE.get(key, (0.0, None))
+        if cached is not None and (time.time() - float(ts)) <= _ttl:
+            return cached
+
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         # Apply RLS tenant context if known
@@ -1710,6 +1731,11 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         "last_run_started_at": (last_run_started_at.isoformat() if isinstance(last_run_started_at, datetime) else None),
         "last_run_ended_at": (last_run_ended_at.isoformat() if isinstance(last_run_ended_at, datetime) else None),
     }
+    # Update cache
+    try:
+        _SHORTLIST_CACHE[key] = (time.time(), out)
+    except Exception:
+        pass
     return out
 
 

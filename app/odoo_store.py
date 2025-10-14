@@ -472,7 +472,7 @@ class OdooStore:
             "creating lead",
             extra={"partner_id": company_id, "score": score},
         )
-        conn = await self._acquire()
+        conn, pooled = await self._acquire_conn()
         try:
 
             row = await conn.fetchrow(
@@ -512,6 +512,5 @@ class OdooStore:
                 score,
             )
             return row["id"]
-
         finally:
-            await conn.close()
+            await self._release_conn(conn, pooled)
