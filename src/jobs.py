@@ -359,7 +359,46 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
         for cid in ids:
             try:
                 name, uen = comp_map.get(int(cid), (str(cid), None))
-                await enrich_company_with_tavily(int(cid), name, uen, search_policy="require_existing")
+                # Pre-step log per company
+                try:
+                    log.info(
+                        "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"company\",\"job_id\":%s,\"tenant_id\":%s,\"company_id\":%s,\"name\":\"%s\"}",
+                        job_id,
+                        tenant_id,
+                        int(cid),
+                        (name or "").replace("\"", "'")[:200],
+                    )
+                except Exception:
+                    pass
+                final_state = await enrich_company_with_tavily(
+                    int(cid), name, uen, search_policy="require_existing"
+                )
+                # Post-step detailed summary per company
+                try:
+                    completed = bool(final_state.get("completed")) if isinstance(final_state, dict) else None
+                    error = final_state.get("error") if isinstance(final_state, dict) else None
+                    domains = final_state.get("domains") if isinstance(final_state, dict) else None
+                    pages = final_state.get("extracted_pages") if isinstance(final_state, dict) else None
+                    chunks = final_state.get("chunks") if isinstance(final_state, dict) else None
+                    data = final_state.get("data") if isinstance(final_state, dict) else None
+                    lusha = final_state.get("lusha_used") if isinstance(final_state, dict) else None
+                    degraded = final_state.get("degraded_reasons") if isinstance(final_state, dict) else None
+                    log.info(
+                        "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"result\",\"job_id\":%s,\"tenant_id\":%s,\"company_id\":%s,\"completed\":%s,\"error\":%s,\"domains\":%s,\"pages\":%s,\"chunks\":%s,\"emails\":%s,\"lusha_used\":%s,\"degraded\":%s}",
+                        job_id,
+                        tenant_id,
+                        int(cid),
+                        completed,
+                        (json.dumps(error) if error is not None else "null"),
+                        (len(domains) if isinstance(domains, list) else 0),
+                        (len(pages) if isinstance(pages, list) else 0),
+                        (len(chunks) if isinstance(chunks, list) else 0),
+                        (len((data or {}).get("email", [])) if isinstance(data, dict) else 0),
+                        bool(lusha),
+                        (json.dumps(degraded) if degraded is not None else "null"),
+                    )
+                except Exception:
+                    pass
                 processed += 1
             except Exception:
                 # continue best-effort

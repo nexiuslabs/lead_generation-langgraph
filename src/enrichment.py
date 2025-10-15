@@ -1844,7 +1844,8 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
         except Exception as e:
             logger.warning("   ↳ Fallback HTTP fetch failed", exc_info=True)
     # If still nothing, inject a Jina homepage snapshot and finish
-    if not extracted_pages:
+    # Avoid duplicate Jina attempts when deterministic crawl already tried it
+    if not extracted_pages and not bool(state.get("jina_attempted")):
         try:
             if state.get("company_id") and state.get("home"):
                 text = jina_read(state["home"], timeout=8) or ""
@@ -1877,6 +1878,12 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
     try:
+        # Mark that we'll attempt a r.jina snapshot in this node to avoid
+        # re-attempting the same fetch in node_extract_pages fallback.
+        try:
+            state["jina_attempted"] = True
+        except Exception:
+            pass
         logger.info(f"[node_jina_snapshot] company_id={state['company_id']}, home={state['home']}")
         summary, pages = await _jina_snapshot_pages(state["company_id"], state["home"])
         if pages:
