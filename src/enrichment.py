@@ -2047,12 +2047,11 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
             except Exception:
                 pass
             # Build company query name (avoid domains in queries); titles from ICP
-            # Title-only queries (no company/domain) using ICP buyer titles
             company_query_name = _company_query_name_from_state(state)
             queries = apify_build_queries("", titles)
-            if queries:
+            if queries or company_query_name:
                 logger.info(
-                    f"[apify_contacts] Using Apify for contact discovery; company_id={company_id} query_mode=title_only titles={titles}"
+                    f"[apify_contacts] Using Apify for contact discovery; company_id={company_id} query_mode={'company_chain' if True else 'title_only'} titles={titles}"
                 )
                 # Daily cap enforcement
                 if not _apify_cap_ok(tid, need=1):
@@ -2070,12 +2069,16 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                 else:
                     try:
                         t0 = time.perf_counter()
-                        # Prefer company -> employees -> profiles chain if enabled
-                        # Force title-only search mode (no company/by-name chain) to avoid domain/name queries
-                        mode_chain = False
+                        # Force chain mode to satisfy actors that require profileUrls (prevents 400)
+                        mode_chain = True
                         if mode_chain:
-                            # Reserved: chain path disabled for title-only mode
-                            contacts_raw = []
+                            # Company->employees->profileUrls->profiles path with optional title filter
+                            contacts_raw = await apify_contacts_via_chain(
+                                company_query_name or (state.get("company_name") or ""),
+                                titles,
+                                max_items=50,
+                                timeout_s=APIFY_SYNC_TIMEOUT_S,
+                            )
                             raw = []
                         else:
                             raw = await apify_run(

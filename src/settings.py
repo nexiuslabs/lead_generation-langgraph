@@ -320,3 +320,12 @@ try:
     DDG_EARLY_STOP_AT = int(os.getenv("DDG_EARLY_STOP_AT", "15") or 15)
 except Exception:
     DDG_EARLY_STOP_AT = 15
+
+# Enrichment strict Top‑10 mode: when true, enrichment should NOT trigger
+# additional domain discovery; it must use the Top‑10 candidates from ICP flow.
+STRICT_TOP10_ENRICH = os.getenv("STRICT_TOP10_ENRICH", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

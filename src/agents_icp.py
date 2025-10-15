@@ -407,7 +407,8 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                             if base and (base in in_page_set or base in collected):
                                 continue
                         filtered.append(d)
-                    page_domains = filtered
+                    # De-duplicate per-page to avoid repeated log spam for same domain
+                    page_domains = _uniq(filtered)
                 # Log non-empty page results once (avoid noisy blanks)
                 if page_domains:
                     try:
@@ -461,7 +462,8 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                             if base and (base in in_page_set or base in collected):
                                 continue
                         filtered.append(d)
-                    page_domains = filtered
+                    # De-duplicate per-page to avoid repeated log spam for same domain
+                    page_domains = _uniq(filtered)
                     try:
                         log.info(
                             "[ddg] page %d domains: %s",
@@ -570,8 +572,40 @@ def ensure_icp_enriched_with_jina(state: Dict[str, Any]) -> Dict[str, Any]:
         icp = dict(state.get("icp_profile") or {})
         if _icp_completeness(icp) >= 3:
             return state
-        # Ensure we have r.jina snippets from discovery
-        if not state.get("jina_snippets"):
+        # Respect strict_top10: do NOT trigger new discovery during enrich; reuse candidates
+        strict_top10 = False
+        try:
+            strict_top10 = bool(state.get("strict_top10"))
+        except Exception:
+            strict_top10 = False
+        # Env default to enforce strict Top‑10 if state flag is missing
+        try:
+            if not strict_top10:
+                import os as _os
+                strict_top10 = (_os.getenv("STRICT_TOP10_ENRICH", "true").lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            pass
+        # If strict and we already have candidates, build snippets directly for those domains
+        if strict_top10 and (state.get("discovery_candidates") or []):
+            try:
+                cand: List[str] = [d for d in (state.get("discovery_candidates") or []) if _is_probable_domain(str(d))]
+                snips: Dict[str, str] = {}
+                for d in cand[:10]:
+                    try:
+                        url = f"https://{d}"
+                        t = jina_read(url, timeout=6)
+                        if t:
+                            clean = " ".join((t or "").split())
+                            snips[d] = clean[:400]
+                    except Exception:
+                        continue
+                if snips:
+                    state["jina_snippets"] = snips
+                    log.info("[enrich] strict_top10=True; built jina_snippets for %d candidates", len(snips))
+            except Exception as e:
+                log.info("[enrich] strict_top10 snippet build failed: %s", e)
+        # If we still have no snippets, and not strict (or no candidates provided), use planner to get some
+        if not state.get("jina_snippets") and not (strict_top10 and (state.get("discovery_candidates") or [])):
             try:
                 _tmp = discovery_planner({"icp_profile": icp})
                 # Carry over snippets and candidates
@@ -703,6 +737,13 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     Inputs: state['icp_profile']
     Outputs: state['discovery_candidates'] = ['domain1.com', ...]
     """
+    # Honor strict_top10 flag: if present and candidates exist, skip discovery entirely
+    try:
+        if bool(state.get("strict_top10")) and isinstance(state.get("discovery_candidates"), list) and state.get("discovery_candidates"):
+            log.info("[plan] strict_top10=True; skipping discovery (using provided candidates)")
+            return state
+    except Exception:
+        pass
     icp = state.get("icp_profile") or {}
     inds = ", ".join(icp.get("industries") or [])
     sig_list = (icp.get("integrations") or []) + (icp.get("triggers") or [])
