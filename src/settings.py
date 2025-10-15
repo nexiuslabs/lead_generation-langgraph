@@ -35,6 +35,16 @@ ICP_RULE_NAME = os.getenv("ICP_RULE_NAME", "default")
 LANGCHAIN_MODEL = os.getenv("LANGCHAIN_MODEL", "gpt-4o-mini")
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 
+# Agent discovery toggle (use LLM-based planning/extraction in preview flows)
+# Default ON to activate PRD19 agent-driven discovery.
+ENABLE_AGENT_DISCOVERY = os.getenv("ENABLE_AGENT_DISCOVERY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+AGENT_MODEL_DISCOVERY = os.getenv("AGENT_MODEL_DISCOVERY", LANGCHAIN_MODEL)
+
 
 # Turn off all LangChain tracing/telemetry
 os.environ["LANGCHAIN_TRACING"] = "false"
@@ -131,6 +141,17 @@ PERSIST_CRAWL_CORPUS = os.getenv("PERSIST_CRAWL_CORPUS", "false").lower() in (
     "on",
 )
 
+# ResearchOps docs root (server path)
+DOCS_ROOT = os.getenv("DOCS_ROOT", str((_ROOT_DIR / "docs").resolve()))
+
+# PRD19: ACRA/SSIC usage only in nightly (SG) — do not run in chat
+ENABLE_ACRA_IN_CHAT = os.getenv("ENABLE_ACRA_IN_CHAT", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 # --- Feature 11: Retry/Breaker/Flags -----------------------------------------
 # Retry/backoff policy (defaults align with DevPlan 11)
 RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3") or 3)
@@ -216,9 +237,23 @@ ENRICH_SKIP_IF_ANY_HISTORY = os.getenv("ENRICH_SKIP_IF_ANY_HISTORY", "false").lo
     "on",
 )
 
-# --- Feature 17: ICP Finder flags -------------------------------------------
-# Gate the ICP Finder endpoints and chat flow; default off until enabled.
-ENABLE_ICP_INTAKE = os.getenv("ENABLE_ICP_INTAKE", "false").lower() in (
+# --- Agentic enrichment toggle -------------------------------------------------
+# When true, use a planner-driven agent loop instead of the fixed graph sequence.
+ENRICH_AGENTIC = os.getenv("ENRICH_AGENTIC", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Max number of planner steps per company to prevent runaway loops
+try:
+    ENRICH_AGENTIC_MAX_STEPS = int(os.getenv("ENRICH_AGENTIC_MAX_STEPS", "12") or 12)
+except Exception:
+    ENRICH_AGENTIC_MAX_STEPS = 12
+
+# --- Feature 17/19: ICP Finder flags ----------------------------------------
+# Gate the ICP Finder endpoints and chat flow; default ON to fully replace legacy.
+ENABLE_ICP_INTAKE = os.getenv("ENABLE_ICP_INTAKE", "true").lower() in (
     "1",
     "true",
     "yes",
@@ -231,3 +266,35 @@ ICP_WIZARD_FAST_START_ONLY = os.getenv("ICP_WIZARD_FAST_START_ONLY", "true").low
     "yes",
     "on",
 )
+
+# DuckDuckGo discovery controls
+ENABLE_DDG_DISCOVERY = os.getenv("ENABLE_DDG_DISCOVERY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# When true, domain discovery must use DuckDuckGo only (no non-DDG outlink mining for discovery)
+STRICT_DDG_ONLY = os.getenv("STRICT_DDG_ONLY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# When true, do not generate competitor/brand-based DDG queries from seeds
+STRICT_INDUSTRY_QUERY_ONLY = os.getenv("STRICT_INDUSTRY_QUERY_ONLY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    DDG_TIMEOUT_S = float(os.getenv("DDG_TIMEOUT_S", "5") or 5)
+except Exception:
+    DDG_TIMEOUT_S = 5.0
+try:
+    DDG_MAX_CALLS = int(os.getenv("DDG_MAX_CALLS", "1") or 1)
+except Exception:
+    DDG_MAX_CALLS = 2
+DDG_KL = os.getenv("DDG_KL", "")  # e.g., 'sg-en', 'us-en'

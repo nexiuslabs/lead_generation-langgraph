@@ -6,7 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from psycopg2.extras import Json
 
-from src.crawler import crawl_site
+from src.jina_reader import read_url as jina_read
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel
 from src.database import get_conn
 from src.icp_intake import fuzzy_map_seed_to_acra
 from src.database import get_conn
@@ -129,13 +132,27 @@ class ResolverCard:
 
 
 async def build_resolver_cards(seeds: List[Dict[str, Any]]) -> List[ResolverCard]:
-    """For each seed, pick top domain (via Tavily if needed), crawl key sections, extract fast facts.
+    """For each seed, pick top domain (via Tavily if needed), read via r.jina, extract fast facts via LLM.
 
-    - Robots.txt aware deterministic crawl with a small page budget
-    - Extract fast facts: industry guess, size band guess, geo hints, buyer titles (from value props), integrations mentions
-    - Confidence requires ≥2 agreeing sources (about + careers etc.) to be considered strong
+    - No deterministic crawler; uses Jina Reader homepage text
+    - Extract fast facts: industry guess, size band guess, geo hints, buyer titles, integrations mentions
+    - Confidence derived from text richness combined with search confidence
     """
     cards: List[ResolverCard] = []
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Extract quick company fast-facts from homepage text. Return JSON with keys: industry_guess, size_band_guess, geo_guess, buyer_titles (array), integrations_mentions (array). Keep values concise."),
+        ("human", "Seed: {name}\nDomain: {domain}\n\n{body}"),
+    ])
+
+    class FastFacts(BaseModel):
+        industry_guess: Optional[str] = None
+        size_band_guess: Optional[str] = None
+        geo_guess: Optional[str] = None
+        buyer_titles: Optional[List[str]] = None
+        integrations_mentions: Optional[List[str]] = None
+
+    structured = llm.with_structured_output(FastFacts)
     for s in _dedupe_seeds(seeds):
         name = (s.get("seed_name") or "").strip()
         dom = _norm_domain(s.get("domain"))
@@ -152,37 +169,35 @@ async def build_resolver_cards(seeds: List[Dict[str, Any]]) -> List[ResolverCard
         if not cand:
             continue
         url = f"https://{cand}"
-        try:
-            summary = await crawl_site(url, max_pages=4)
-        except Exception as e:
-            log.info("crawl failed for %s: %s", url, e)
+        body = jina_read(url, timeout=12) or ""
+        if not body:
+            log.info("jina empty for %s", url)
             continue
-        sig = summary.get("signals", {})
-        # Heuristic extraction for fast facts; optionally refined later by LLM
-        industry_guess = "b2b" if "solutions" in (sig.get("title") or "").lower() else None
-        size_guess = summary.get("company_size_guess") or None
-        geo_guess = None
-        if (summary.get("title") or "").lower().find("singapore") >= 0:
-            geo_guess = "Singapore"
-        buyer_titles = []
-        for vp in (sig.get("value_props") or [])[:8]:
-            if re.search(r"(ops|revenue|marketing|sales|growth|hr|talent|data)", vp, re.I):
-                buyer_titles.append(vp)
-        buyer_titles = buyer_titles[:5]
-        integrations = []
-        for ps in (sig.get("products_services") or [])[:20]:
-            if re.search(r"integrations?", ps, re.I):
-                integrations.append(ps)
+        # LLM fast-facts from homepage text
+        try:
+            msgs = prompt.format_messages(name=name, domain=cand, body=body[:4000])
+            out = structured.invoke(msgs)
+            data = out.model_dump() if hasattr(out, "model_dump") else (
+                out.dict() if hasattr(out, "dict") else {}
+            )
+            industry_guess = (data.get("industry_guess") or None)
+            size_guess = (data.get("size_band_guess") or None)
+            geo_guess = (data.get("geo_guess") or None)
+            buyer_titles = (data.get("buyer_titles") or []) or []
+            integrations = (data.get("integrations_mentions") or []) or []
+        except Exception as e:
+            log.info("fast-facts extraction failed for %s: %s", url, e)
+            industry_guess = None
+            size_guess = None
+            geo_guess = None
+            buyer_titles = []
+            integrations = []
 
-        # Confidence threshold: require at least two agreeing sources for a strong card
-        sources_ok = int(bool(sig.get("has_careers_page"))) + int(bool(sig.get("has_case_studies")))
-        card_conf = conf
-        if sources_ok >= 2 and conf == "high":
-            card_conf = "high"
-        elif sources_ok >= 1 and conf in ("high", "medium"):
-            card_conf = "medium"
-        else:
-            card_conf = "low"
+        # Confidence: richer body + higher search confidence
+        card_conf = conf or "low"
+        if len(body) > 1200 and (industry_guess or buyer_titles or integrations):
+            if card_conf == "low":
+                card_conf = "medium"
         cards.append(
             ResolverCard(
                 seed_name=name,
@@ -233,16 +248,11 @@ def persist_evidence_records(
 async def collect_evidence_for_domain(
     tenant_id: int, company_id: Optional[int], domain: str
 ) -> int:
-    """Deterministic crawl + light extraction → evidence rows.
-    Quality gates: robots compliance, page caps, triangulation.
-    """
+    """Read homepage via r.jina and extract ICP evidence using LLM."""
     url = f"https://{_norm_domain(domain)}"
-    try:
-        summary = await crawl_site(url, max_pages=6)
-    except Exception as e:
-        log.info("crawl_site failed: %s", e)
+    body = jina_read(url, timeout=12) or ""
+    if not body:
         return 0
-    sig = summary.get("signals", {})
     # Resolve a company_id by website_domain if not provided to satisfy NOT NULL constraints
     try:
         if company_id is None:
@@ -255,37 +265,54 @@ async def collect_evidence_for_domain(
     except Exception:
         company_id = None
     recs: List[Dict[str, Any]] = []
-    # Firmographics
-    if sig.get("hiring", {}).get("open_roles"):
-        recs.append({
-            "signal_key": "hiring_open_roles",
-            "value": sig.get("hiring"),
-            "confidence": 0.6,
-            "why": "Detected careers/hiring cues",
-        })
-    if sig.get("tech"):
-        recs.append({
-            "signal_key": "tech_stack",
-            "value": sig.get("tech"),
-            "confidence": 0.5,
-            "why": "Found vendor script tags",
-        })
-    if sig.get("pricing"):
-        recs.append({
-            "signal_key": "pricing_page",
-            "value": sig.get("pricing")[:5],
-            "confidence": 0.5,
-            "why": "Pricing list items found",
-        })
-    # Triangulation bump
-    appears = int(bool(sig.get("has_careers_page"))) + int(bool(sig.get("has_case_studies"))) + int(bool(sig.get("has_testimonials")))
-    for r in recs:
-        if appears >= 2:
-            r["confidence"] = min(0.95, float(r.get("confidence") or 0.5) + 0.25)
+    # LLM normalization of evidence (PRD19 §6 Evidence Extractor) from Jina body
+    try:
+        from src.agents_icp import evidence_extractor as _agent_evidence_extractor  # type: ignore
+        st = {"evidence": [{"summary": body[:4000]}]}
+        out = _agent_evidence_extractor(st)
+        ev = (out.get("evidence") or [{}])[0]
+        # Map normalized fields into recs where helpful
+        if isinstance(ev.get("integrations"), list) and ev.get("integrations"):
+            recs.append({
+                "signal_key": "integrations",
+                "value": ev.get("integrations"),
+                "confidence": 0.6,
+                "why": "LLM extraction (jina)",
+            })
+        if isinstance(ev.get("buyer_titles"), list) and ev.get("buyer_titles"):
+            recs.append({
+                "signal_key": "buyer_titles",
+                "value": ev.get("buyer_titles"),
+                "confidence": 0.6,
+                "why": "LLM extraction (jina)",
+            })
+        if isinstance(ev.get("hiring_open_roles"), int) and ev.get("hiring_open_roles"):
+            recs.append({
+                "signal_key": "hiring_open_roles",
+                "value": {"count": ev.get("hiring_open_roles")},
+                "confidence": 0.5,
+                "why": "LLM extraction (jina)",
+            })
+        if isinstance(ev.get("has_case_studies"), bool):
+            recs.append({
+                "signal_key": "has_case_studies",
+                "value": ev.get("has_case_studies"),
+                "confidence": 0.5,
+                "why": "LLM extraction (jina)",
+            })
+        if isinstance(ev.get("has_pricing"), bool):
+            recs.append({
+                "signal_key": "has_pricing",
+                "value": ev.get("has_pricing"),
+                "confidence": 0.5,
+                "why": "LLM extraction (jina)",
+            })
+    except Exception:
+        pass
     # Only persist when we have a concrete company_id
     if company_id is None:
         return 0
-    return persist_evidence_records(tenant_id, company_id, recs, source="crawler")
+    return persist_evidence_records(tenant_id, company_id, recs, source="jina_reader")
 
 
 # -----------------------------

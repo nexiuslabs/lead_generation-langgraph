@@ -1,7 +1,6 @@
 # app/main.py
 from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
 from app.odoo_connection_info import get_odoo_connection_info
@@ -16,6 +15,7 @@ import logging
 import re
 import os
 from datetime import datetime
+import time
 import threading
 import asyncio
 import math
@@ -35,6 +35,38 @@ def _ensure_logger(name: str, level: str = "INFO"):
 logger = _ensure_logger("input_norm")
 _ensure_logger("onboarding")
 _ensure_logger("app.odoo_store")
+# Reduce noise from upstream libraries during local_dev
+try:
+    logging.getLogger("langgraph_api.metadata").setLevel(logging.ERROR)
+    # Keep server logs, but avoid spamming warnings for 401/403 on health checks
+    if (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower() == "local_dev":
+        srv_logger = logging.getLogger("langgraph_api.server")
+        srv_logger.setLevel(logging.INFO)
+
+        # Suppress extremely chatty access logs for specific health/poll endpoints
+        class _SkipAccessPath(logging.Filter):
+            def __init__(self, paths):
+                super().__init__()
+                # Match by substring in rendered log line
+                self.paths = tuple(paths)
+
+            def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+                try:
+                    msg = record.getMessage()
+                    if not isinstance(msg, str):
+                        msg = str(msg)
+                    # Drop logs that contain any of the noisy paths
+                    if any(p in msg for p in self.paths):
+                        return False
+                except Exception:
+                    # Fail-open: keep the record if anything goes wrong
+                    return True
+                return True
+
+        # Filter out access lines for hot-poll endpoints (frontend polls frequently)
+        srv_logger.addFilter(_SkipAccessPath(["/session/odoo_info", "/shortlist/status"]))
+except Exception:
+    pass
 
 # Ensure LangGraph checkpoint directory exists to prevent FileNotFoundError
 # e.g., '.langgraph_api/.langgraph_checkpoint.*.pckl.tmp'
@@ -69,8 +101,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lazily enable /agent routes only when LLM is configured to avoid import-time errors
-graph = None
+# Note: LangServe routes removed; chat/graph execution is handled internally without mounting /agent
 
 # Mount auth cookie routes
 try:
@@ -737,25 +768,10 @@ def normalize_input(payload: dict) -> dict:
 
     return state
 
-ENABLE_LANGSERVE_IN_APP = os.getenv("ENABLE_LANGSERVE_IN_APP", "false").lower() in ("1", "true", "yes", "on")
-try:
-    if ENABLE_LANGSERVE_IN_APP and OPENAI_API_KEY:
-        # Import inside conditional to avoid loading langserve when mounted into LangGraph Server
-        from langserve import add_routes  # type: ignore
-        from app.pre_sdr_graph import build_graph  # type: ignore
-
-        graph = build_graph()
-        ui_adapter = RunnableLambda(normalize_input) | graph
-        add_routes(app, ui_adapter, path="/agent")
-        logger.info("/agent routes enabled (LLM configured)")
-    else:
-        logger.info("Skipping /agent routes (ENABLE_LANGSERVE_IN_APP is false or OPENAI_API_KEY missing)")
-except Exception as e:
-    # Never block API/docs if LangServe wiring fails; just log and continue
-    logger.warning("Skipping /agent routes due to initialization error: %s", e)
+# LangServe setup removed: previously mounted /agent when ENABLE_LANGSERVE_IN_APP was true.
 
 @app.get("/info")
-async def info(_: dict = Depends(require_auth)):
+async def info(_: dict = Depends(require_optional_identity)):
     # Expose capability hints and current auth mode (no secrets)
     checkpoint_enabled = True if CHECKPOINT_DIR else False
     dev_bypass = os.getenv("DEV_AUTH_BYPASS", "false").lower() in ("1", "true", "yes", "on")
@@ -1624,6 +1640,26 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
     info = await get_odoo_connection_info(email=email, claim_tid=claim_tid)
     tid = info.get("tenant_id")
 
+    # Simple per-tenant cache to avoid DB work and chatter; default TTL 5 minutes
+    try:
+        _SHORTLIST_CACHE  # type: ignore[name-defined]
+    except NameError:  # first load
+        _SHORTLIST_CACHE = {}
+    try:
+        _ttl = float(os.getenv("SHORTLIST_TTL_S", "300") or 300)
+    except Exception:
+        _ttl = 300.0
+
+    # Serve cached value when fresh
+    try:
+        key = int(info.get("tenant_id")) if info.get("tenant_id") is not None else None
+    except Exception:
+        key = None
+    if key in _SHORTLIST_CACHE:
+        ts, cached = _SHORTLIST_CACHE.get(key, (0.0, None))
+        if cached is not None and (time.time() - float(ts)) <= _ttl:
+            return cached
+
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         # Apply RLS tenant context if known
@@ -1695,6 +1731,11 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         "last_run_started_at": (last_run_started_at.isoformat() if isinstance(last_run_started_at, datetime) else None),
         "last_run_ended_at": (last_run_ended_at.isoformat() if isinstance(last_run_ended_at, datetime) else None),
     }
+    # Update cache
+    try:
+        _SHORTLIST_CACHE[key] = (time.time(), out)
+    except Exception:
+        pass
     return out
 
 

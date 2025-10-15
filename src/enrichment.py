@@ -26,7 +26,7 @@ from tavily import TavilyClient
 from src.obs import bump_vendor as _obs_bump, log_event as _log_obs_event
 from src.retry import with_retry, RetryableError, CircuitBreaker, BackoffPolicy
 
-from src.crawler import crawl_site
+from src.jina_reader import read_url as jina_read
 from src.lusha_client import AsyncLushaClient, LushaError
 from src.vendors.apify_linkedin import (
     run_sync_get_dataset_items as apify_run,
@@ -72,6 +72,7 @@ from src.settings import (
     MERGE_DETERMINISTIC_TIMEOUT_S,
 )
 from src.settings import ENRICH_RECHECK_DAYS, ENRICH_SKIP_IF_ANY_HISTORY
+from src.settings import ENRICH_AGENTIC, ENRICH_AGENTIC_MAX_STEPS
 
 load_dotenv()
 
@@ -118,6 +119,50 @@ else:
     tavily_client = None  # type: ignore[assignment]
     tavily_crawl = None  # type: ignore[assignment]
     tavily_extract = None  # type: ignore[assignment]
+
+
+def _fallback_extract_from_text(text: str) -> dict:
+    """Lightweight, non-LLM extraction to salvage key fields when LLM times out.
+
+    Extracts:
+      - emails: simple regex
+      - phone_number: loose international formats
+      - website_domain: first URL/domain-like token
+      - about_text: first ~2 sentences
+    """
+    out: Dict[str, Any] = {}
+    try:
+        # emails
+        emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text or "")
+        if emails:
+            out["email"] = sorted(set(emails))[:5]
+    except Exception:
+        pass
+    try:
+        # phones (very loose)
+        phones = re.findall(r"\+?\d[\d\s().-]{6,}\d", text or "")
+        if phones:
+            out["phone_number"] = sorted(set([p.strip() for p in phones]))[:5]
+    except Exception:
+        pass
+    try:
+        # domain or URL
+        m = re.search(r"https?://[^\s]+", text or "")
+        if not m:
+            m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", text or "", re.I)
+        if m:
+            out["website_domain"] = m.group(0)
+    except Exception:
+        pass
+    try:
+        # about: first 2 sentences (approx)
+        s = (text or "").strip()
+        if s:
+            parts = re.split(r"(?<=[.!?])\s+", s)
+            out["about_text"] = " ".join(parts[:2])[:500]
+    except Exception:
+        pass
+    return out
 
 # ---- Run context and vendor counters/caps ----
 _RUN_CTX: dict[str, int | None] = {"run_id": None, "tenant_id": None}
@@ -532,9 +577,7 @@ def _get_contact_stats(company_id: int):
                 conn.close()
         except Exception:
             pass
-    logger.info(
-        f"[deterministic_crawl] persisted summary for company_id={company_id}"
-    )
+    logger.info(f"[enrichment] contact stats computed for company_id={company_id}")
     return total, has_named, founder_present
 
 
@@ -979,59 +1022,48 @@ def _ensure_list(v):
     return None
 
 
-async def _merge_with_deterministic(data: dict, home: str) -> dict:
-    logger.info("    🔁 Merging with deterministic signals")
+async def _merge_with_jina(data: dict, home: str) -> dict:
+    logger.info("    🔁 Merging with r.jina reader")
     try:
-        summary = await crawl_site(home, max_pages=CRAWLER_MAX_PAGES)
-    except Exception as exc:
-        logger.warning("       ↳ deterministic crawl for merge failed", exc_info=True)
+        text = jina_read(home, timeout=8) or ""
+    except Exception:
+        text = ""
+    if not text:
         return data
-    signals = summary.get("signals") or {}
-    contact = signals.get("contact") or {}
-    sig_emails = contact.get("emails") or []
-    sig_phones = contact.get("phones") or []
-    # merge arrays
-    base_emails = _ensure_list(data.get("email")) or []
-    data["email"] = sorted(set([*base_emails, *sig_emails]))[:40]
-    base_phones = _ensure_list(data.get("phone_number")) or []
-    data["phone_number"] = sorted(set([*base_phones, *sig_phones]))[:40]
-    # tech stack from detected tech signals
-    tech_values = (signals.get("tech") or {}).values()
-    tech_list: list[str] = []
-    for sub in tech_values:
-        if isinstance(sub, list):
-            tech_list.extend(sub)
-    base_tech = _ensure_list(data.get("tech_stack")) or []
-    data["tech_stack"] = sorted(set([*base_tech, *tech_list]))[:40]
-    # about_text if missing
-    if not data.get("about_text"):
-        val_props = (signals.get("value_props") or [])[:6]
-        if val_props:
-            data["about_text"] = " | ".join(val_props)
-        else:
-            title = signals.get("title") or ""
-            desc = signals.get("meta_description") or ""
-            data["about_text"] = (title + " - " + desc).strip(" -")
-    # jobs_count from open roles
-    if (data.get("jobs_count") in (None, 0)) and isinstance(
-        signals.get("open_roles_count"), int
-    ):
-        data["jobs_count"] = signals.get("open_roles_count", 0)
-    # HQ guess if missing
-    if not data.get("hq_city") or not data.get("hq_country"):
-        text = (
-            (signals.get("title") or "") + " " + (signals.get("meta_description") or "")
-        ).lower()
-        if (
-            "singapore" in text
-            or home.lower().endswith(".sg/")
-            or ".sg" in home.lower()
-        ):
-            data.setdefault("hq_city", "Singapore")
-            data.setdefault("hq_country", "Singapore")
-    # website_domain
-    if not data.get("website_domain"):
+    # Reuse the LLM extraction chain for a small subset to enrich gaps
+    subset_schema = ["about_text", "email", "phone_number", "tech_stack"]
+    try:
+        async def _do_llm(payload: dict) -> str:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, lambda: extract_chain.invoke(payload))
+        payload = {
+            "raw_content": f"{text[:4000]}",
+            "schema_keys": subset_schema,
+            "instructions": (
+                "Return JSON with only the above keys. For email/phone_number/tech_stack return arrays. "
+                "about_text should be a concise 1-2 sentence summary."
+            ),
+        }
+        ai_output = await asyncio.wait_for(_do_llm(payload), timeout=float(LLM_CHUNK_TIMEOUT_S))
+        import json as _json
+        m = re.search(r"\{.*\}", ai_output, re.S)
+        piece = _json.loads(m.group(0)) if m else _json.loads(ai_output)
+        # normalize arrays
+        for k in ["email", "phone_number", "tech_stack"]:
+            piece[k] = _ensure_list(piece.get(k)) or []
+        data = _merge_extracted_records(data, piece)
+    except Exception:
+        pass
+    # Website and HQ quick guess from URL alone
+    if not data.get("website_domain") and isinstance(home, str):
         data["website_domain"] = home
+    try:
+        if (not data.get("hq_city") or not data.get("hq_country")) and isinstance(home, str):
+            if home.lower().endswith(".sg/") or ".sg" in home.lower():
+                data.setdefault("hq_city", "Singapore")
+                data.setdefault("hq_country", "Singapore")
+    except Exception:
+        pass
     return data
 
 
@@ -1096,109 +1128,145 @@ def update_company_core_fields(company_id: int, data: dict):
         conn.close()
 
 
-async def _deterministic_crawl_and_persist(company_id: int, url: str):
-    """Run deterministic crawler, persist summary and pages, and return results."""
-    logger.info(
-        f"[deterministic_crawl] start company_id={company_id}, url={url}, max_pages={CRAWLER_MAX_PAGES}"
-    )
+async def _jina_snapshot_pages(company_id: int, url: str):
+    """Fetch homepage and a few deterministic pages to seed initial data.
+
+    Order of attempts:
+      1) r.jina snapshot of homepage (fast, tolerant parser)
+      2) Direct HTTP GET of homepage with crawler UA
+      3) Direct HTTP GET of deterministic subpages (about/contact/careers, etc.)
+
+    Returns a tuple (summary_dict, pages) where pages is a list of
+    {url, html} or {url, raw_content} entries suitable for downstream
+    chunking and extraction.
+    """
+    # Normalize and derive roots/variants
     try:
-        summary = await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
-    except Exception as exc:
-        logger.exception("   ↳ deterministic crawler failed")
+        base = url
+        if not base:
+            return None, []
+        if not base.startswith("http"):
+            base = f"https://{base}"
+        u = urlparse(base)
+        root = f"{u.scheme}://{u.netloc}"
+        variants = [base]
+        # Add www variant if missing
+        try:
+            host = u.netloc or ""
+            if host and not host.lower().startswith("www."):
+                variants.append(f"{u.scheme}://www.{host}{u.path or ''}")
+        except Exception:
+            pass
+    except Exception:
         return None, []
 
-    pages = summary.pop("pages", [])
+    pages: list[dict] = []
+    summary_text = ""
+
+    # 1) Try r.jina for homepage
+    text = ""
     try:
-        logger.info(
-            f"[deterministic_crawl] fetched pages={len(pages)} for company_id={company_id}"
-        )
+        for v in variants:
+            text = jina_read(v, timeout=8) or ""
+            if text:
+                pages.append({"url": v, "html": text})
+                summary_text = text
+                break
+    except Exception:
+        text = ""
+
+    # 2) Direct HTTP GET fallback for homepage
+    if not text:
+        try:
+            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                resp = await client.get(variants[0], follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                if getattr(resp, "text", ""):
+                    body = resp.text
+                    pages.append({"url": variants[0], "html": body})
+                    summary_text = body
+        except Exception:
+            pass
+
+    # 3) Deterministic subpages if homepage still empty or to augment thin pages
+    need_more = not pages or len((summary_text or "").strip()) < 200
+    if need_more:
+        seeds = [
+            "about", "about-us", "aboutus", "company", "who-we-are",
+            "contact", "contact-us",
+            "team", "leadership",
+            "careers", "jobs",
+            "services", "solutions", "products",
+        ]
+        cand_urls = []
+        for p in seeds:
+            cand_urls.append(f"{root}/{p}")
+        # Fetch in parallel, keep first 2-3 that return content
+        try:
+            async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                resps = await asyncio.gather(
+                    *(
+                        client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                        for u in cand_urls
+                    ),
+                    return_exceptions=True,
+                )
+            added = 0
+            for resp, u in zip(resps, cand_urls):
+                if isinstance(resp, Exception):
+                    continue
+                body = getattr(resp, "text", "") or ""
+                # Skip obvious soft-404s
+                if not body or len(body.strip()) < 100:
+                    continue
+                pages.append({"url": u, "html": body})
+                if not summary_text:
+                    summary_text = body
+                added += 1
+                if added >= 3:
+                    break
+        except Exception:
+            pass
+
+    if not pages:
+        return None, []
+
+    # Project a minimal record into company_enrichment_runs
+    try:
+        conn = get_db_connection()
+        with conn:
+            fields = {
+                "company_id": company_id,
+                "about_text": (summary_text or "")[:1000],
+                "tech_stack": [],
+                "public_emails": [],
+                "jobs_count": 0,
+                "linkedin_url": None,
+            }
+            tid = _default_tenant_id()
+            if tid is not None:
+                fields["tenant_id"] = tid
+            _insert_company_enrichment_run(conn, fields)
+        conn.close()
     except Exception:
         pass
 
-    conn = psycopg2.connect(dsn=POSTGRES_DSN)
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO summaries (company_id, url, title, description, content_summary, key_pages, signals, rule_score, rule_band, shortlist, crawl_metadata)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
-                """,
-                (
-                    company_id,
-                    summary.get("url"),
-                    summary.get("title"),
-                    summary.get("description"),
-                    summary.get("content_summary"),
-                    Json(summary.get("key_pages")),
-                    Json(summary.get("signals")),
-                    summary.get("rule_score"),
-                    summary.get("rule_band"),
-                    Json(summary.get("shortlist")),
-                    Json(summary.get("crawl_metadata")),
-                ),
-            )
-    conn.close()
-
-    # Project into company_enrichment_runs for downstream compatibility
-    signals = summary.get("signals", {}) or {}
-    about_text = summary.get("content_summary") or " ".join(
-        (signals.get("value_props") or [])[:6]
-    )
-    tech_values = (signals.get("tech") or {}).values()
-    tech_stack = sorted({t for sub in tech_values for t in (sub or [])})[:25]
-    public_emails = ((signals.get("contact") or {}).get("emails") or [])[:10]
-    jobs_count = signals.get("open_roles_count", 0)
-
-    conn = get_db_connection()
-    with conn:
-        fields = {
-            "company_id": company_id,
-            "about_text": about_text,
-            "tech_stack": tech_stack,
-            "public_emails": public_emails,
-            "jobs_count": jobs_count,
+    # Legacy store for transparency
+    try:
+        legacy = {
+            "about_text": (summary_text or "")[:1000],
+            "tech_stack": [],
+            "public_emails": [],
+            "jobs_count": 0,
             "linkedin_url": None,
+            "phone_number": [],
+            "hq_city": None,
+            "hq_country": None,
         }
-        tid = _default_tenant_id()
-        if tid is not None:
-            fields["tenant_id"] = tid
-        _insert_company_enrichment_run(
-            conn,
-            fields,
-        )
-    conn.close()
+        store_enrichment(company_id, root, legacy)
+    except Exception:
+        pass
 
-    # Guess HQ city/country (simple heuristics)
-    def _guess_city_country(sig: dict, url_: str):
-        text = (sig.get("title") or "") + " " + (sig.get("meta_description") or "")
-        if (
-            "singapore" in text.lower()
-            or url_.lower().endswith(".sg/")
-            or ".sg" in url_.lower()
-        ):
-            return ("Singapore", "Singapore")
-        return (None, None)
-
-    hq_city, hq_country = _guess_city_country(signals, url)
-    phones = (signals.get("contact") or {}).get("phones") or []
-
-    legacy = {
-        "about_text": about_text or "",
-        "tech_stack": tech_stack or [],
-        "public_emails": public_emails or [],
-        "jobs_count": jobs_count or 0,
-        "linkedin_url": None,
-        "phone_number": phones,
-        "hq_city": hq_city,
-        "hq_country": hq_country,
-    }
-    store_enrichment(company_id, url, legacy)
-    logger.info(
-        f"[deterministic_crawl] stored enrichment legacy payload for company_id={company_id}"
-    )
-
-    return summary, pages
+    return {"url": root, "content_summary": (summary_text or "")[:1000], "signals": {}}, pages
 
 
 async def enrich_company_with_tavily(
@@ -1241,7 +1309,10 @@ async def enrich_company_with_tavily(
         logger.info(
             f"[enrichment] start company_id={company_id}, name={company_name!r}"
         )
-        final_state = await enrichment_agent.ainvoke(initial_state)
+        if ENRICH_AGENTIC:
+            final_state = await run_enrichment_agentic(initial_state)  # planner-driven
+        else:
+            final_state = await enrichment_agent.ainvoke(initial_state)  # fixed graph
         logger.info(
             f"[enrichment] completed company_id={company_id}, extracted_pages={len(final_state.get('extracted_pages') or [])}, completed={final_state.get('completed')}"
         )
@@ -1675,22 +1746,26 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
                 extracted_pages.append({"url": u, "html": getattr(resp, "text", "")})
         except Exception as e:
             logger.warning("   ↳ Fallback HTTP fetch failed", exc_info=True)
-    # If still nothing, run deterministic crawler fallback and finish
+    # If still nothing, inject a Jina homepage snapshot and finish
     if not extracted_pages:
         try:
             if state.get("company_id") and state.get("home"):
-                await _deterministic_crawl_and_persist(
-                    state["company_id"], state["home"]
-                )
-                state["completed"] = True
-                state["extracted_pages"] = []
-                try:
-                    (state.setdefault("degraded_reasons", [])) .append("CRAWL_THIN")
-                except Exception:
-                    pass
-                return state
+                text = jina_read(state["home"], timeout=8) or ""
+                if text:
+                    state["extracted_pages"] = [
+                        {"url": state["home"], "title": "", "raw_content": text}
+                    ]
+                    logger.info("   ↳ injected jina homepage content for extraction")
+                else:
+                    state["completed"] = True
+                    state["extracted_pages"] = []
+                    try:
+                        (state.setdefault("degraded_reasons", [])) .append("DATA_EMPTY:jina_home")
+                    except Exception:
+                        pass
+                    return state
         except Exception as exc:
-            logger.warning("   ↳ deterministic crawler fallback failed", exc_info=True)
+            logger.warning("   ↳ jina fallback failed", exc_info=True)
     state["extracted_pages"] = extracted_pages
     try:
         logger.info(
@@ -1705,25 +1780,19 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
     try:
-        logger.info(
-            f"[node_deterministic_crawl] company_id={state['company_id']}, home={state['home']}"
-        )
-        summary, pages = await _deterministic_crawl_and_persist(
-            state["company_id"], state["home"]
-        )
+        logger.info(f"[node_jina_snapshot] company_id={state['company_id']}, home={state['home']}")
+        summary, pages = await _jina_snapshot_pages(state["company_id"], state["home"])
         if pages:
             state["extracted_pages"] = [
                 {"url": p.get("url"), "title": "", "raw_content": p.get("html")}
                 for p in pages
             ]
-            logger.info(
-                f"[node_deterministic_crawl] extracted_pages from deterministic={len(pages)}"
-            )
+            logger.info(f"[node_jina_snapshot] extracted_pages from jina={len(pages)}")
         if summary:
             state["deterministic_summary"] = summary
-            logger.info("[node_deterministic_crawl] set deterministic_summary")
+            logger.info("[node_jina_snapshot] set deterministic_summary (jina)")
     except Exception as exc:
-        logger.warning("   ↳ deterministic crawl failed", exc_info=True)
+        logger.warning("   ↳ jina snapshot failed", exc_info=True)
     return state
 
 
@@ -1829,6 +1898,39 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
                     continue
                 except Exception:
                     pass
+            # Handle slow model / timeout / cancellation similarly by trimming once,
+            # and fall back to regex extraction to salvage key fields.
+            elif isinstance(e, asyncio.TimeoutError) or isinstance(e, asyncio.CancelledError) or "timeout" in msg.lower():
+                try:
+                    trimmed = chunk[: int(len(chunk) * 0.6)]
+                    payload_trim2 = {
+                        "raw_content": f"Company: {company_name}\n\n{trimmed}",
+                        "schema_keys": schema_keys,
+                        "instructions": (
+                            "Return a single JSON object with only the above keys. Use null for unknown. "
+                            "For tech_stack, email, and phone_number return arrays of strings. "
+                            "Use integers for employees_est and incorporation_year when possible. "
+                            "website_domain should be the official domain for the company. "
+                            "about_text should be a concise 1-3 sentence summary of the company."
+                        ),
+                    }
+                    ai_output = await asyncio.wait_for(_do_llm(payload_trim2), timeout=float(LLM_CHUNK_TIMEOUT_S))
+                    m = re.search(r"\{.*\}", ai_output, re.S)
+                    piece = json.loads(m.group(0)) if m else json.loads(ai_output)
+                    data = _merge_extracted_records(data, piece)
+                    logger.info(f"   ↳ Chunk {i} retried after timeout with trimmed content")
+                    continue
+                except Exception:
+                    # Regex fallback to salvage some fields
+                    try:
+                        salvaged = _fallback_extract_from_text(chunk)
+                        if salvaged:
+                            data = _merge_extracted_records(data, salvaged)
+                            (state.setdefault("degraded_reasons", [])) .append("LLM_TIMEOUT_FALLBACK")
+                            logger.warning(f"   ↳ Chunk {i} timeout; applied regex fallback fields={list(salvaged.keys())}")
+                            continue
+                    except Exception:
+                        pass
             logger.warning(f"   ↳ Chunk {i} extraction parse failed", exc_info=True)
             continue
     for k in ["email", "phone_number", "tech_stack"]:
@@ -1836,13 +1938,13 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
     try:
         if state.get("home"):
             data = await asyncio.wait_for(
-                _merge_with_deterministic(data, state["home"]),
+                _merge_with_jina(data, state["home"]),
                 timeout=float(MERGE_DETERMINISTIC_TIMEOUT_S),
             )
     except asyncio.TimeoutError:
-        logger.warning("   ↳ deterministic merge timed out; skipping")
+        logger.warning("   ↳ jina merge timed out; skipping")
     except Exception:
-        logger.warning("   ↳ deterministic merge skipped", exc_info=True)
+        logger.warning("   ↳ jina merge skipped", exc_info=True)
     state["data"] = data
     return state
 
@@ -2247,6 +2349,7 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
 # Build the LangGraph for enrichment
 enrichment_graph = StateGraph(EnrichmentState)
 enrichment_graph.add_node("find_domain", node_find_domain)
+ 
 enrichment_graph.add_node("deterministic_crawl", node_deterministic_crawl)
 enrichment_graph.add_node("discover_urls", node_discover_urls)
 enrichment_graph.add_node("expand_crawl", node_expand_crawl)
@@ -2314,6 +2417,188 @@ def _normalize_company_name(name: str) -> list[str]:
     core = [p for p in parts if p not in SUFFIXES]
     # Keep first 2-3 tokens for matching
     return core[:3] or parts[:2]
+
+
+# -------- Agentic planner (optional, feature-flagged) -------------------------
+
+def _summarize_state_for_agent(state: "EnrichmentState") -> str:
+    try:
+        have_domain = bool(state.get("home"))
+        pages = len(state.get("extracted_pages") or [])
+        urls = len(state.get("filtered_urls") or [])
+        data = state.get("data") or {}
+        keys = [k for k, v in (data or {}).items() if v]
+        parts = [
+            f"have_domain={have_domain}",
+            f"filtered_urls={urls}",
+            f"extracted_pages={pages}",
+            f"data_keys={keys[:8]}",
+        ]
+        return ", ".join(parts)
+    except Exception:
+        return "have_domain=?, filtered_urls=?, extracted_pages=?, data_keys=[]"
+
+
+AGENT_ACTIONS = [
+    # Domain
+    "use_existing_domain",  # rely on DB/company state
+    "search_domain",        # call node_find_domain
+    # Crawl and content
+    "deterministic_crawl",  # node_deterministic_crawl
+    "discover_urls",        # node_discover_urls
+    "expand_crawl",         # node_expand_crawl
+    "extract_pages",        # node_extract_pages
+    "build_chunks",         # node_build_chunks
+    "llm_extract",          # node_llm_extract
+    # Contacts
+    "apify_contacts",       # node_apify_contacts
+    # Company info via Apify
+    # Persistence
+    "persist_core",         # node_persist_core
+    "persist_legacy",       # node_persist_legacy
+    # Stop
+    "finish",
+]
+
+
+async def _agent_execute(action: str, state: "EnrichmentState") -> "EnrichmentState":
+    # Route to existing nodes to avoid duplicating logic.
+    if action == "use_existing_domain":
+        # node_find_domain already checks DB first, so reuse it
+        return await node_find_domain(state)
+    if action == "search_domain":
+        return await node_find_domain(state)
+    if action == "deterministic_crawl":
+        return await node_deterministic_crawl(state)
+    if action == "discover_urls":
+        return await node_discover_urls(state)
+    if action == "expand_crawl":
+        return await node_expand_crawl(state)
+    if action == "extract_pages":
+        return await node_extract_pages(state)
+    if action == "build_chunks":
+        return await node_build_chunks(state)
+    if action == "llm_extract":
+        return await node_llm_extract(state)
+    if action == "apify_contacts":
+        return await node_apify_contacts(state)
+    if action == "persist_core":
+        return await node_persist_core(state)
+    if action == "persist_legacy":
+        return await node_persist_legacy(state)
+    return state
+
+
+def _agent_prompt(company_name: str, summary: str) -> str:
+    return (
+        "You are an enrichment planner agent. Your goal is to enrich a company with: "
+        "website domain, key firmographics (about_text, tech_stack, linkedin_url, phones, HQ), and contact persons (prefer decision-makers). "
+        "You have a set of actions. At each step, choose the best next action given the current summary, avoiding redundant work and respecting that vendor calls are capped.\n\n"
+        f"Company: {company_name}\n"
+        f"State: {summary}\n\n"
+        "Available actions (JSON only):\n"
+        "- use_existing_domain: rely on any existing domain (node_find_domain does this).\n"
+        "- search_domain: search for domain if missing.\n"
+        "- deterministic_crawl: fetch homepage + deterministic pages if domain exists.\n"
+        "- discover_urls: pick relevant site URLs.\n"
+        "- expand_crawl: add about/contact/careers pages.\n"
+        "- extract_pages: fetch pages for extraction.\n"
+        "- build_chunks: merge/trim content for LLM.\n"
+        "- llm_extract: extract fields from chunks.\n"
+        "- apify_contacts: discover contacts when emails/contacts are missing.\n"
+        "- persist_core: upsert core fields to DB.\n"
+        "- persist_legacy: write legacy projection and finish.\n"
+        "- finish: stop when data is sufficient or after persistence.\n\n"
+        "Return strictly JSON: {\"action\": <one of actions>, \"reason\": <short string>}\n"
+        "Prefer to finish after persist_legacy or when state.completed is true."
+    )
+
+
+async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
+    steps = 0
+    # Reuse global llm with low temperature for determinism
+    while steps < int(ENRICH_AGENTIC_MAX_STEPS):
+        # Stop if pipeline marked completed
+        if state.get("completed"):
+            logger.info("[agentic] state.completed=true; stopping")
+            break
+        summary = _summarize_state_for_agent(state)
+        prompt = _agent_prompt(state.get("company_name") or "", summary)
+        try:
+            out = llm.invoke(prompt)
+            # Extract content from ChatMessage if present
+            content = None
+            try:
+                content = getattr(out, "content", None)
+            except Exception:
+                content = None
+            if not content:
+                content = str(out) if out is not None else ""
+            # Try strict JSON parse first
+            parsed = {}
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                # Heuristic: find JSON substring
+                s = content
+                start = s.find("{")
+                end = s.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        parsed = json.loads(s[start : end + 1])
+                    except Exception:
+                        parsed = {}
+            action = (parsed or {}).get("action")
+            reason = (parsed or {}).get("reason") or ""
+        except Exception:
+            action = None
+            reason = "planner_exception"
+
+        # Choose safe default or override when parsing fails or action invalid/loops
+        have_domain = bool(state.get("home"))
+        have_pages = bool(state.get("extracted_pages") or [])
+        have_chunks = bool(state.get("chunks") or [])
+        have_data = bool(state.get("data") or {})
+        if not action or action not in AGENT_ACTIONS:
+            if not have_domain:
+                action = "search_domain"
+                reason = reason or "default_no_domain"
+            elif not have_pages:
+                action = "deterministic_crawl"
+                reason = reason or "default_need_pages"
+            elif not have_chunks:
+                action = "build_chunks"
+                reason = reason or "default_build_chunks"
+            elif not have_data:
+                action = "llm_extract"
+                reason = reason or "default_llm_extract"
+            else:
+                # Persist and finish by default once we have data
+                action = "persist_legacy"
+                reason = reason or "default_persist_finish"
+        else:
+            # Override repetitive crawl/expand suggestions to progress the pipeline
+            if have_pages and not have_chunks and action in ("expand_crawl", "deterministic_crawl"):
+                action = "build_chunks"
+                reason = "override_progress_build_chunks"
+            elif have_chunks and not have_data and action in ("expand_crawl", "deterministic_crawl"):
+                action = "llm_extract"
+                reason = "override_progress_llm_extract"
+            elif have_data and action in ("expand_crawl", "deterministic_crawl", "discover_urls"):
+                action = "persist_legacy"
+                reason = "override_progress_persist"
+
+        # keep routing overrides minimal
+
+        logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
+        if action == "finish":
+            break
+        try:
+            state = await _agent_execute(action, state)
+        except Exception:
+            logger.warning("[agentic] action execution failed; continuing", exc_info=True)
+        steps += 1
+    return state
 
 
 def find_domain(company_name: str) -> list[str]:
@@ -2944,30 +3229,15 @@ async def enrich_company(company_id: int, company_name: str):
         return
     url = urls[0]
 
-    # 2) deterministic crawl first
+    # 2) jina reader snapshot first
     try:
-        summary = await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
-        # Also project into enrichment_runs for downstream compatibility
-        signals = summary.get("signals", {})
-        about_text = summary.get("content_summary") or " ".join(
-            signals.get("value_props", [])[:6]
-        )
-        tech_stack = sorted(set(sum(signals.get("tech", {}).values(), [])))[:25]
-        public_emails = (signals.get("contact") or {}).get("emails", [])[:10]
-        jobs_count = signals.get("open_roles_count", 0)
+        text = jina_read(url, timeout=8) or ""
+        about_text = text[:1000]
+        tech_stack: list[str] = []
+        public_emails: list[str] = []
+        jobs_count = 0
 
-        print(
-            "signals: ",
-            signals,
-            "about_text: ",
-            about_text,
-            "tech_stack: ",
-            tech_stack,
-            "public_emails: ",
-            public_emails,
-            "jobs_count: ",
-            jobs_count,
-        )
+        print("about_text:", about_text, "tech_stack:", tech_stack, "public_emails:", public_emails, "jobs_count:", jobs_count)
 
         conn = get_db_connection()
         with conn:
@@ -2989,50 +3259,34 @@ async def enrich_company(company_id: int, company_name: str):
         conn.close()
 
         # Prepare data dict for store_enrichment (best-effort for all fields)
-        # Heuristics for city/country: use 'Singapore' if '.sg' TLD or city/country in signals, else None
-        def guess_city_country(signals, url):
-            # Try from signals, else guess from TLD
+        # Heuristics for city/country: use 'Singapore' if '.sg' TLD; else None
+        def guess_city_country(url):
             city = None
             country = None
-            text = (
-                (signals.get("title") or "")
-                + " "
-                + (signals.get("meta_description") or "")
-            )
-            if (
-                "singapore" in text.lower()
-                or url.lower().endswith(".sg/")
-                or ".sg" in url.lower()
-            ):
+            if url.lower().endswith(".sg/") or ".sg" in url.lower():
                 city = country = "Singapore"
-            # TODO: Add more heuristics as needed
             return city, country
 
-        hq_city, hq_country = guess_city_country(signals, url)
+        hq_city, hq_country = guess_city_country(url)
         website_domain = (
             urlparse(url).netloc.lower()
             if url.startswith("http")
             else (url or "").lower()
         )
-        email = public_emails[0] if public_emails else None
-        phones = (signals.get("contact") or {}).get("phones", [])
-        phone_number = phones[0] if phones else None
         data = {
             "about_text": about_text,
             "tech_stack": tech_stack,
             "public_emails": public_emails,
             "jobs_count": jobs_count,
             "linkedin_url": None,
-            "phone_number": (signals.get("contact") or {}).get(
-                "phones", []
-            ),  # all phones
+            "phone_number": [],
             "hq_city": hq_city,
             "hq_country": hq_country,
             "website_domain": website_domain,
             "email": public_emails,  # all emails
-            "products_services": signals.get("products_services", []),
-            "value_props": signals.get("value_props", []),
-            "pricing": signals.get("pricing", []),
+            "products_services": [],
+            "value_props": [],
+            "pricing": [],
             # You can add more fields here as needed
         }
         print(
@@ -3045,7 +3299,7 @@ async def enrich_company(company_id: int, company_name: str):
     except Exception as exc:
         import traceback
 
-        print(f"   ↳ deterministic crawler failed: {exc}. Falling back to Tavily/LLM.")
+        print(f"   ↳ Jina snapshot failed: {exc}. Falling back to Tavily/LLM.")
         traceback.print_exc()
 
     # 4) fallback to your existing Tavily + LLM extraction (current code path)

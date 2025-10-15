@@ -58,6 +58,17 @@ except Exception:  # pragma: no cover
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
 try:
+    from src.settings import ENABLE_AGENT_DISCOVERY  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_AGENT_DISCOVERY = False  # type: ignore
+try:
+    # Optional LLM agents (PRD19 §6)
+    from src.agents_icp import icp_synthesizer as _agent_icp_synth  # type: ignore
+    from src.agents_icp import discovery_planner as _agent_plan_discovery  # type: ignore
+except Exception:  # pragma: no cover
+    _agent_icp_synth = None  # type: ignore
+    _agent_plan_discovery = None  # type: ignore
+try:
     from src.settings import ENABLE_ICP_INTAKE  # type: ignore
 except Exception:  # pragma: no cover
     ENABLE_ICP_INTAKE = False  # type: ignore
@@ -65,6 +76,19 @@ try:
     from src.settings import ICP_WIZARD_FAST_START_ONLY  # type: ignore
 except Exception:  # pragma: no cover
     ICP_WIZARD_FAST_START_ONLY = True  # type: ignore
+try:
+    from src.settings import ENABLE_ACRA_IN_CHAT  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_ACRA_IN_CHAT = False  # type: ignore
+try:
+    from src.settings import STRICT_DDG_ONLY  # type: ignore
+except Exception:  # pragma: no cover
+    STRICT_DDG_ONLY = True  # type: ignore
+try:
+    # Lead‑gen conversational Q&A helpers
+    from src.conversation_agent import answer_leadgen_question as _qa_answer  # type: ignore
+except Exception:  # pragma: no cover
+    _qa_answer = None  # type: ignore
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -80,6 +104,224 @@ logger.setLevel(_level)
 
 # Session-boot token: used to gate explicit actions after server restarts
 BOOT_TOKEN = os.getenv("LG_SERVER_BOOT_TOKEN") or str(uuid4())
+
+
+# --- Helper: announce completion for queued background next-40 jobs ---
+def _announce_completed_bg_jobs(state) -> None:
+    try:
+        pend = list(state.get("pending_bg_jobs") or [])
+        if not pend:
+            return
+        done_ids: list[int] = []
+        msgs: list[str] = []
+        with get_conn() as conn, conn.cursor() as cur:
+            for jid in pend:
+                try:
+                    cur.execute(
+                        "SELECT status, processed, total, error, params FROM background_jobs WHERE job_id=%s",
+                        (int(jid),),
+                    )
+                    r = cur.fetchone()
+                    if not r:
+                        continue
+                    status, processed, total, error, params = r
+                    if str(status or "").lower() != "done":
+                        continue
+                    # Build A/B/C bucket summary from lead_scores for the job's company_ids
+                    ids = []
+                    try:
+                        ids = [int(i) for i in ((params or {}).get("company_ids") or []) if str(i).strip()]
+                    except Exception:
+                        ids = []
+                    counts: dict[str, int] = {"A": 0, "B": 0, "C": 0}
+                    if ids:
+                        cur.execute(
+                            "SELECT bucket, COUNT(*) FROM lead_scores WHERE company_id = ANY(%s) GROUP BY bucket",
+                            (ids,),
+                        )
+                        for br in cur.fetchall() or []:
+                            b, c = (br[0] or "C"), int(br[1] or 0)
+                            counts[str(b)] = c
+                    err_txt = f" error={error}" if error else ""
+                    msgs.append(
+                        f"Background enrichment finished (job {jid}). Processed {int(processed or 0)}/{int(total or 0)}. "
+                        f"Buckets: A={counts.get('A',0)}, B={counts.get('B',0)}, C={counts.get('C',0)}.{err_txt}"
+                    )
+                    done_ids.append(int(jid))
+                except Exception:
+                    continue
+        if msgs:
+            for m in msgs:
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=m)])
+        if done_ids:
+            try:
+                state["pending_bg_jobs"] = [j for j in pend if int(j) not in set(done_ids)]
+            except Exception:
+                state["pending_bg_jobs"] = [j for j in pend if j not in done_ids]
+    except Exception:
+        return
+
+
+# --- Helper: enqueue Non‑SG next‑40 after Top‑10 enrichment completes ---
+def _enqueue_next40_if_applicable(state) -> None:
+    try:
+        # Avoid duplicate enqueue within the same conversation thread
+        if bool(state.get("next40_enqueued")):
+            return
+        # Always attempt to enqueue the next 40 for background enrichment
+        # (no longer gated by Non‑SG only)
+        from src.database import get_conn as __get_conn
+        from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
+        # Resolve tenant id from state/env/mapping
+        try:
+            tid = _resolve_tenant_id_for_write_sync(state)
+        except Exception:
+            tid = None
+        _tidv = int(tid) if isinstance(tid, int) else None
+        if _tidv is None:
+            try:
+                with __get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                    _r = _cur.fetchone()
+                    _tidv = int(_r[0]) if _r and _r[0] is not None else None
+            except Exception:
+                _tidv = None
+        if _tidv is None:
+            return
+        bg_limit = 40
+        try:
+            bg_limit = int((os.getenv("BG_NEXT_COUNT") or "40")) or 40
+        except Exception:
+            bg_limit = 40
+        doms: list[str] = []
+        preview_total = 0
+        preview_doms: list[str] = []
+        with __get_conn() as __c2, __c2.cursor() as __cur2:
+            try:
+                # Collect preview Top‑10 first (for total + exclusion)
+                __cur2.execute(
+                    """
+                    SELECT domain
+                    FROM staging_global_companies
+                    WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                    ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                    LIMIT 10
+                    """,
+                    (_tidv,),
+                )
+                _p = __cur2.fetchall() or []
+                preview_doms = [str(r[0]) for r in _p if r and r[0]]
+                # Now select the next 40 from staged web discovery excluding preview
+                __cur2.execute(
+                    """
+                    SELECT domain
+                    FROM staging_global_companies
+                    WHERE tenant_id=%s
+                      AND source = 'web_discovery'
+                      AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                      AND NOT LOWER(domain) = ANY(%s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (_tidv, [d.lower() for d in preview_doms] or [''], bg_limit),
+                )
+                rows = __cur2.fetchall() or []
+                doms = [str(r[0]) for r in rows if r and r[0]]
+                __cur2.execute(
+                    "SELECT COUNT(*) FROM staging_global_companies WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true",
+                    (_tidv,),
+                )
+                cr = __cur2.fetchone()
+                preview_total = int(cr[0] or 0) if cr else 0
+            except Exception:
+                doms = []
+        if not doms:
+            return
+        # Map to company_ids
+        bg_ids: list[int] = []
+        with __get_conn() as __c3, __c3.cursor() as __cur3:
+            try:
+                __cur3.execute(
+                    "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                    ([d.lower() for d in doms],),
+                )
+                _rows = __cur3.fetchall() or []
+                _map = {str((r[1] or "").lower()): int(r[0]) for r in _rows if r and r[0] is not None}
+                for d in doms:
+                    key = str(d.lower())
+                    _cid = _map.get(key)
+                    if _cid:
+                        bg_ids.append(_cid)
+                    else:
+                        # Ensure a companies row exists for this domain, then include it
+                        try:
+                            ensured = _ensure_company_by_domain(d)
+                            if ensured:
+                                bg_ids.append(int(ensured))
+                        except Exception:
+                            continue
+            except Exception:
+                bg_ids = []
+        if not bg_ids:
+            return
+        job = __enqueue_bg(int(_tidv), bg_ids)
+        jid = (job or {}).get("job_id")
+        # Verify that the background job row exists for additional certainty
+        try:
+            with __get_conn() as _vc, _vc.cursor() as _vcur:
+                _vcur.execute(
+                    "SELECT job_type, status FROM background_jobs WHERE job_id=%s",
+                    (int(jid) if jid else -1,),
+                )
+                _v = _vcur.fetchone()
+                verified = bool(_v)
+        except Exception:
+            verified = False
+        try:
+            logger.info(
+                "[enrich] enqueue next40 count=%s job_id=%s (preview_total=%s tenant_id=%s verified=%s) ids_head=%s",
+                str(len(bg_ids)),
+                str(jid),
+                str(preview_total),
+                str(_tidv),
+                str(verified),
+                ",".join([str(i) for i in (bg_ids[:5] if isinstance(bg_ids, list) else [])]),
+            )
+        except Exception:
+            pass
+        # Track and inform user in chat
+        pend = list(state.get("pending_bg_jobs") or [])
+        if jid:
+            pend.append(int(jid))
+        state["pending_bg_jobs"] = pend
+        state["next40_enqueued"] = True
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(content=f"I’m enriching the next {min(len(bg_ids), bg_limit)} in the background (job {jid}). I’ll reply here when it’s done. You can also check /jobs/{jid}.")],
+        )
+    except Exception:
+        # best-effort; do not block
+        return
+
+
+def _is_non_sg_active_profile(state: Dict[str, Any]) -> bool:
+    """Heuristic to decide Non‑SG based on icp_profile geos/hq_country.
+
+    Returns True if we cannot positively detect Singapore as an active geo.
+    """
+    try:
+        prof = dict(state.get("icp_profile") or {})
+        geos = prof.get("geos") or []
+        if isinstance(geos, list):
+            for g in geos:
+                if isinstance(g, str) and g.strip().lower() == "singapore":
+                    return False
+        hq = (prof.get("hq_country") or "").strip().lower()
+        if hq == "singapore":
+            return False
+    except Exception:
+        pass
+    return True
 
 # --- Helper: ensure required Fast-Start fields are present (asked and captured) ---
 def _icp_required_fields_done(icp: dict, ask_counts: dict | None = None) -> bool:
@@ -126,6 +368,7 @@ def _icp_required_fields_done(icp: dict, ask_counts: dict | None = None) -> bool
 # ---------- DB table names (env-overridable) ----------
 COMPANY_TABLE = os.getenv("COMPANY_TABLE", "companies")
 LEAD_SCORES_TABLE = os.getenv("LEAD_SCORES_TABLE", "lead_scores")
+STAGING_GLOBAL_TABLE = os.getenv("STAGING_GLOBAL_TABLE", "staging_global_companies")
 
 
 class PreSDRState(TypedDict, total=False):
@@ -209,20 +452,160 @@ def _icp_payload_from_state_icp(icp: dict) -> dict:
     return payload
 
 
+def _merge_icp_profile_into_payload(payload: dict, icp_profile: dict) -> dict:
+    """Merge LLM-derived icp_profile keys into icp_rules payload structure.
+
+    Adds: industries, integrations, buyer_titles, triggers, size_bands (if present).
+    """
+    out = dict(payload or {})
+    prof = dict(icp_profile or {})
+    def _arr(key: str) -> list[str]:
+        vals = prof.get(key) or []
+        if not isinstance(vals, list):
+            return []
+        return [str(v).strip() for v in vals if isinstance(v, str) and v.strip()]
+    for k in ("industries", "integrations", "buyer_titles", "triggers", "size_bands"):
+        arr = _arr(k)
+        if arr:
+            out[k] = sorted(set(arr))
+    return out
+
+
+def _ensure_company_by_domain(domain: str) -> int | None:
+    """Ensure a companies row exists for an apex domain; return company_id or None."""
+    try:
+        dom = (domain or "").strip().lower()
+        if not dom:
+            return None
+        # strip protocol and path
+        import re as _re
+        dom = dom.replace("http://", "").replace("https://", "")
+        if dom.startswith("www."):
+            dom = dom[4:]
+        for sep in ["/", "?", "#"]:
+            if sep in dom:
+                dom = dom.split(sep, 1)[0]
+        with get_conn() as _c, _c.cursor() as _cur:
+            _cur.execute("SELECT company_id FROM companies WHERE website_domain=%s", (dom,))
+            r = _cur.fetchone()
+            if r and r[0] is not None:
+                return int(r[0])
+            _cur.execute(
+                "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                (dom, dom),
+            )
+            rr = _cur.fetchone()
+            return int(rr[0]) if rr and rr[0] is not None else None
+    except Exception:
+        return None
+
+
+def _clean_snippet(s: str) -> str:
+    try:
+        t = (s or "").strip()
+        if not t:
+            return ""
+        import re as _re
+        # Drop common r.jina metadata and JSON-y fragments
+        t = _re.sub(r"\b(Title:|URL Source:|Published Time:|Markdown Content:|Warning:)\b.*?\s+", "", t, flags=_re.I)
+        t = _re.sub(r"\{[^}]{0,200}\}", " ", t)  # small JSON blobs
+        t = " ".join(t.split())
+        return t[:180]
+    except Exception:
+        return (s or "")[:180]
+
+
+def _fmt_top10_md(rows: list[dict]) -> str:
+    if not rows:
+        return "No lookalikes found."
+    hdr = ["#", "Domain", "Score", "Why", "Snippet"]
+    out = [
+        "| " + " | ".join(hdr) + " |",
+        "|" + "|".join(["---"] * len(hdr)) + "|",
+    ]
+    for idx, r in enumerate(rows, 1):
+        dom = str(r.get("domain") or "")
+        score = str(int(r.get("score") or 0))
+        why = str(r.get("why") or "")
+        snip = _clean_snippet(str(r.get("snippet") or ""))
+        out.append(f"| {idx} | {dom} | {score} | {why} | {snip} |")
+    return "\n".join(out)
+
+
 def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> None:
-    # Insert a new ICP rule row for this tenant; rely on RLS via GUC
+    # Upsert an ICP rule row for this tenant; rely on RLS via GUC
     with get_conn() as conn, conn.cursor() as cur:
         try:
             cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
         except Exception:
             pass
-        cur.execute(
-            """
-            INSERT INTO icp_rules(tenant_id, name, payload)
-            VALUES (%s, %s, %s)
-            """,
-            (tid, name, Json(payload)),
-        )
+        try:
+            keys = list((payload or {}).keys())
+            logger.info("[icp_rules] upsert → tenant_id=%s name=%s keys=%s", tid, name, keys[:8])
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                """
+                INSERT INTO icp_rules(tenant_id, name, payload)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (tenant_id, name) DO UPDATE SET
+                  payload = EXCLUDED.payload,
+                  created_at = NOW()
+                """,
+                (tid, name, Json(payload)),
+            )
+        except Exception as _up_e:
+            try:
+                logger.warning("[icp_rules] upsert failed tenant_id=%s name=%s err=%s", tid, name, _up_e)
+            except Exception:
+                pass
+            raise
+        try:
+            logger.info("[icp_rules] upsert OK → tenant_id=%s name=%s", tid, name)
+        except Exception:
+            pass
+
+
+def _upsert_icp_profile_sync(tid: int, icp_profile: dict, name: str = "Default ICP") -> None:
+    """Merge/update icp_profile fields into current icp_rules payload for tenant.
+
+    Keys merged: industries, integrations, buyer_titles, size_bands, triggers.
+    """
+    try:
+        try:
+            logger.info(
+                "[icp_rules] merge profile → tenant_id=%s name=%s icp_profile_keys=%s",
+                tid,
+                name,
+                list((icp_profile or {}).keys())[:8],
+            )
+        except Exception:
+            pass
+        base: dict = {}
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM icp_rules WHERE tenant_id=%s AND name=%s ORDER BY created_at DESC LIMIT 1",
+                (tid, name),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                if isinstance(row[0], dict):
+                    base = dict(row[0])
+        merged = _merge_icp_profile_into_payload(base, dict(icp_profile or {}))
+        try:
+            logger.info(
+                "[icp_rules] merged payload keys → tenant_id=%s name=%s keys=%s",
+                tid,
+                name,
+                list(merged.keys())[:8],
+            )
+        except Exception:
+            pass
+        _save_icp_rule_sync(tid, merged, name=name)
+    except Exception:
+        # Non-fatal; ignore if table missing or RLS blocks
+        pass
 
 
 def _resolve_tenant_id_for_write_sync(state: dict) -> Optional[int]:
@@ -275,6 +658,242 @@ def _last_text(msgs) -> str:
     if isinstance(m, dict):
         return m.get("content") or ""
     return str(m)
+
+
+def _persist_web_candidates_to_staging(
+    domains: list[str],
+    tenant_id: Optional[int] = None,
+    ai_metadata: Optional[dict] = None,
+    per_domain_meta: Optional[dict[str, dict]] = None,
+) -> int:
+    """Persist discovered global (non‑SG) candidate domains into a lightweight staging table.
+
+    - Table: staging_global_companies(id PK, tenant_id, domain, source, created_at, ai_metadata JSONB)
+    - Idempotent on (tenant_id, domain, source) via ON CONFLICT DO NOTHING.
+    - Accepts a single `ai_metadata` blob (applied to all) and/or a per-domain metadata map.
+    """
+    if not domains:
+        return 0
+    ds = [str(d).strip().lower() for d in domains if isinstance(d, str) and d.strip()]
+    ds = sorted(set(ds))
+    if not ds:
+        return 0
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            # Set tenant GUC for RLS consistency (even if staging has no RLS, keep uniform)
+            try:
+                if isinstance(tenant_id, int):
+                    cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tenant_id),))
+            except Exception:
+                pass
+            # Ensure table exists (dev-safe) including ai_metadata column
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {STAGING_GLOBAL_TABLE} (
+                  id BIGSERIAL PRIMARY KEY,
+                  tenant_id BIGINT NULL,
+                  domain TEXT NOT NULL,
+                  source TEXT NOT NULL DEFAULT 'web_discovery',
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  ai_metadata JSONB NOT NULL DEFAULT '{{}}',
+                  UNIQUE (tenant_id, domain, source)
+                )
+                """
+            )
+            rows = 0
+            for d in ds:
+                try:
+                    meta = (per_domain_meta or {}).get(d) if isinstance(per_domain_meta, dict) else None
+                    if not isinstance(meta, dict):
+                        meta = dict(ai_metadata or {}) if isinstance(ai_metadata, dict) else {}
+                    # Ensure a small provenance trail at minimum
+                    if "provenance" not in meta:
+                        meta["provenance"] = {"agent": "agents_icp.discovery", "stage": "staging"}
+                    cur.execute(
+                        f"""
+                        INSERT INTO {STAGING_GLOBAL_TABLE}(tenant_id, domain, source, ai_metadata)
+                        VALUES (%s,%s,'web_discovery',%s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (tenant_id, d, Json(meta)),
+                    )
+                    rows += cur.rowcount if isinstance(cur.rowcount, int) else 0
+                except Exception:
+                    # continue best-effort
+                    pass
+            return rows
+    except Exception:
+        return 0
+
+
+def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
+    """Persist Top‑10 preview into staging, companies, icp_evidence, and lead_scores."""
+    try:
+        # Staging with per-domain ai_metadata (score/why/snippet provenance)
+        per_meta: dict[str, dict] = {}
+        for it in (top or [])[:10]:
+            if not isinstance(it, dict):
+                continue
+            dom = (it.get("domain") or "").strip().lower()
+            if not dom:
+                continue
+            per_meta[dom] = {
+                "preview": True,
+                "score": it.get("score"),
+                "bucket": it.get("bucket"),
+                "why": it.get("why"),
+                "snippet": (it.get("snippet") or "")[:200],
+                "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
+            }
+        _ = _persist_web_candidates_to_staging(
+            [str(it.get("domain")) for it in top if isinstance(it, dict) and it.get("domain")],
+            int(tid) if isinstance(tid, int) else None,
+            ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
+            per_domain_meta=per_meta,
+        )
+    except Exception:
+        pass
+    try:
+        with get_conn() as _c, _c.cursor() as _cur:
+            # Ensure tenant GUC is set for RLS writes
+            try:
+                if isinstance(tid, int):
+                    _cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
+            except Exception:
+                pass
+            for it in (top or [])[:10]:
+                dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                if not dom:
+                    continue
+                _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                r = _cur.fetchone()
+                if r and r[0] is not None:
+                    cid = int(r[0])
+                else:
+                    _cur.execute(
+                        "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                        (dom, dom),
+                    )
+                    cid = int((_cur.fetchone() or [None])[0])
+                why = it.get("why") or ""
+                snip = it.get("snippet") or ""
+                try:
+                    _cur.execute(
+                        "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s,%s,%s,%s,'web_preview')",
+                        (int(tid) if isinstance(tid, int) else None, cid, "top10_preview", Json({"why": why, "snippet": snip})),
+                    )
+                except Exception:
+                    pass
+                try:
+                    score = float(it.get("score") or 0)
+                except Exception:
+                    score = 0.0
+                bucket = it.get("bucket") or ("A" if score >= 70 else ("B" if score >= 50 else "C"))
+                rationale = why or snip
+                try:
+                    _cur.execute(
+                        """
+                        INSERT INTO lead_scores(company_id, score, bucket, rationale, cache_key)
+                        VALUES (%s,%s,%s,%s,NULL)
+                        ON CONFLICT (company_id) DO UPDATE SET
+                          score = EXCLUDED.score,
+                          bucket = EXCLUDED.bucket,
+                          rationale = EXCLUDED.rationale
+                        """,
+                        (cid, score, bucket, rationale),
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _load_persisted_top10(tid: Optional[int]) -> list[dict]:
+    """Load recently persisted Top‑10 preview.
+
+    Preference:
+    1) If tenant_id is known, read from `icp_evidence` + `lead_scores` for that tenant (RLS requires tenant).
+    2) If nothing found (or tenant unknown), read from `staging_global_companies` where ai_metadata.preview=true,
+       filtered by tenant when available; otherwise read the latest preview rows (dev-safe fallback).
+    """
+    try:
+        with get_conn() as _c, _c.cursor() as _cur:
+            # 1) Tenant-scoped evidence table (requires tenant for RLS)
+            if isinstance(tid, int):
+                try:
+                    _cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tid),))
+                except Exception:
+                    pass
+                try:
+                    _cur.execute(
+                        """
+                        SELECT c.website_domain AS domain,
+                               COALESCE(ls.score,0) AS score,
+                               COALESCE(ls.bucket,'C') AS bucket,
+                               (ev.value->>'why') AS why,
+                               (ev.value->>'snippet') AS snippet
+                          FROM icp_evidence ev
+                          JOIN companies c ON c.company_id = ev.company_id
+                          LEFT JOIN lead_scores ls ON ls.company_id = ev.company_id
+                         WHERE ev.tenant_id = %s
+                           AND ev.signal_key = 'top10_preview'
+                         ORDER BY ev.created_at DESC
+                         LIMIT 10
+                        """,
+                        (tid,),
+                    )
+                    rows = _cur.fetchall() or []
+                    out: list[dict] = []
+                    for r in rows:
+                        d = {
+                            "domain": (r[0] or "").strip().lower(),
+                            "score": float(r[1] or 0),
+                            "bucket": r[2] or "C",
+                            "why": r[3] or "",
+                            "snippet": r[4] or "",
+                        }
+                        if d["domain"]:
+                            out.append(d)
+                    if out:
+                        return out
+                except Exception:
+                    # fall through to staging fallback
+                    pass
+
+            # 2) Fallback: staging preview rows (dev-safe; may be global if tenant unknown)
+            try:
+                _cur.execute(
+                    f"""
+                    SELECT domain,
+                           COALESCE((ai_metadata->>'score')::float, 0) AS score,
+                           COALESCE((ai_metadata->>'bucket'), 'C') AS bucket,
+                           (ai_metadata->>'why') AS why,
+                           (ai_metadata->>'snippet') AS snippet
+                      FROM {STAGING_GLOBAL_TABLE}
+                     WHERE (tenant_id = %s OR %s IS NULL)
+                       AND COALESCE((ai_metadata->>'preview')::boolean, false) = true
+                     ORDER BY created_at DESC
+                     LIMIT 10
+                    """,
+                    (tid if isinstance(tid, int) else None, None if tid is None else tid),
+                )
+                rows2 = _cur.fetchall() or []
+                out2: list[dict] = []
+                for r in rows2:
+                    d = {
+                        "domain": (r[0] or "").strip().lower(),
+                        "score": float(r[1] or 0),
+                        "bucket": r[2] or "C",
+                        "why": r[3] or "",
+                        "snippet": r[4] or "",
+                    }
+                    if d["domain"]:
+                        out2.append(d)
+                return out2
+            except Exception:
+                return []
+    except Exception:
+        return []
 
 
 def _parse_website(text: str) -> Optional[str]:
@@ -520,40 +1139,46 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
                             )
                     )
                     return state
+            # Optionally run LLM ICP synthesizer to augment inferred profile
+            try:
+                if ENABLE_AGENT_DISCOVERY and _agent_icp_synth is not None:
+                    s = {
+                        "icp_profile": dict(state.get("icp") or {}),
+                        "seeds": [{"url": u, "snippet": ""} for u in (icp.get("seeds_list") or [])],
+                    }
+                    icp_prof = _agent_icp_synth(s).get("icp_profile")
+                    if icp_prof:
+                        state["icp_profile"] = icp_prof
+                        # Inform the user in chat once the AI agents have synthesized the ICP
+                        try:
+                            ind = ", ".join((icp_prof.get("industries") or [])[:3]) or "n/a"
+                            titles = ", ".join((icp_prof.get("buyer_titles") or [])[:3]) or "n/a"
+                            sizes = ", ".join((icp_prof.get("size_bands") or [])[:3]) or "n/a"
+                            sigs = ", ".join((icp_prof.get("integrations") or [])[:3]) or "n/a"
+                            trig = ", ".join((icp_prof.get("triggers") or [])[:3]) or "n/a"
+                            lines = [
+                                "ICP profile ready.",
+                                f"- Industries: {ind}",
+                                f"- Buyer titles: {titles}",
+                                f"- Size bands: {sizes}",
+                                f"- Integrations/signals: {sigs}",
+                                f"- Triggers: {trig}",
+                                "Reply confirm to proceed or edit any field.",
+                            ]
+                            state["messages"].append(AIMessage("\n".join(lines)))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             # Ready to confirm
             state["messages"].append(
                 AIMessage(
-                    "Thanks! I’ll crawl your site + seed sites, map to ACRA/SSIC, and propose micro‑ICPs with evidence. Reply confirm to proceed, or add more seeds."
+                    "Thanks! I’ll crawl your site + seed sites, plan web discovery, and propose a Top‑10 with evidence. ACRA is only used later in the nightly SG pass. Reply confirm to proceed, or add more seeds."
                 )
             )
             return state
     except Exception:
         pass
-
-    # Legacy prompts only when Finder is disabled
-    if not ENABLE_ICP_INTAKE:
-        if "industry" not in icp:
-            state["messages"].append(
-                AIMessage("Which industries or problem spaces? (e.g., SaaS, Pro Services)")
-            )
-            icp["industry"] = True
-            return state
-        if "employees" not in icp:
-            state["messages"].append(
-                AIMessage("Typical company size? (e.g., 10–200 employees)")
-            )
-            icp["employees"] = True
-            return state
-        if "geo" not in icp:
-            state["messages"].append(AIMessage("Primary geographies? (SG, SEA, global)"))
-            icp["geo"] = True
-            return state
-        if "signals" not in icp:
-            state["messages"].append(
-                AIMessage("Buying signals? (hiring, stack, certifications)")
-            )
-            icp["signals"] = True
-            return state
 
     state["messages"].append(
         AIMessage("Great. Reply **confirm** to save, or tell me what to change.")
@@ -563,6 +1188,11 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
 
 @log_node("confirm")
 def icp_confirm(state: PreSDRState) -> PreSDRState:
+    # Announce any completed background jobs (next-40) from prior turns
+    try:
+        _announce_completed_bg_jobs(state)
+    except Exception:
+        pass
     # Persist ICP from the basic flow when user confirms
     try:
         # Feature 17: ICP Finder — save intake (website + seeds) and run mapping/suggestions
@@ -596,6 +1226,13 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         # Legacy flow persistence
         icp = dict(state.get("icp") or {})
         payload = _icp_payload_from_state_icp(icp)
+        # Merge any synthesized icp_profile fields into payload before persist
+        try:
+            prof = dict(state.get("icp_profile") or {})
+            if prof:
+                payload = _merge_icp_profile_into_payload(payload, prof)
+        except Exception:
+            pass
         if payload:
             tid = _resolve_tenant_id_for_write_sync(state)
             if isinstance(tid, int):
@@ -657,54 +1294,153 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
     except Exception:
         icp_total = n
 
-    msg_lines: list[str] = []
-    msg_lines.append(f"Got {n} companies.")
-
-    # SSIC resolution and ACRA totals
-    ssic_matches = []
+    # Optionally plan agent-driven discovery candidates for preview (non-blocking)
     try:
-        if terms:
-            ssic_matches = _find_ssic_codes_by_terms(terms)
-            if ssic_matches:
-                top_code, top_title, _ = ssic_matches[0]
-                msg_lines.append(f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)")
-            else:
-                msg_lines.append("Matched 0 SSIC codes")
-            # ACRA total and sample
-            codes = {c for (c, _t, _s) in ssic_matches}
-            total_acra = 0
-            rows = []
-            try:
-                if _count_acra_by_ssic_codes:
-                    total_acra = _count_acra_by_ssic_codes(codes)  # type: ignore[arg-type]
-                rows = _select_acra_by_ssic_codes(codes, 10)
-            except Exception:
-                total_acra = 0
-                rows = []
-            if total_acra:
-                msg_lines.append(f"Found {total_acra} ACRA candidates. Sample:")
+        if ENABLE_AGENT_DISCOVERY and _agent_plan_discovery is not None:
+            s = {"icp_profile": state.get("icp_profile") or {}}
+            acand = _agent_plan_discovery(s).get("discovery_candidates") or []
+            if acand:
+                state["agent_candidates"] = acand
+                # Persist all discovered domains into global staging for audit/queueing (with provenance ai_metadata)
                 try:
-                    # Persist for later nightly planning across nodes
-                    state["acra_total_suggested"] = int(total_acra)
-                except Exception:
-                    pass
-                for r in rows[:2]:
-                    uen = (r.get("uen") or "").strip()
-                    nm = (r.get("entity_name") or "").strip()
-                    code = (r.get("primary_ssic_code") or "").strip()
-                    status = (r.get("entity_status_description") or "").strip()
-                    msg_lines.append(f"UEN: {uen} – {nm} – SSIC {code} – status: {status}")
-            else:
-                msg_lines.append("Found 0 ACRA candidates.")
+                    tid = _resolve_tenant_id_for_write_sync(state)
+                    icp_prof = dict(state.get("icp_profile") or {})
+                    icp_keys = sorted([k for k, v in icp_prof.items() if v])
+                    meta = {"provenance": {"agent": "agents_icp.discovery_planner", "stage": "plan"}, "icp_profile_keys": icp_keys[:8]}
+                    added = _persist_web_candidates_to_staging([str(d) for d in acand if isinstance(d, str)], tid, ai_metadata=meta)
+                    state["web_discovery_total"] = len(acand)
+                    logger.info(
+                        "[discovery] found_total=%d persisted=%d table=%s",
+                        len(acand),
+                        int(added or 0),
+                        STAGING_GLOBAL_TABLE,
+                    )
+                except Exception as _pe:
+                    try:
+                        logger.info("[candidates] staging persist skipped: %s", _pe)
+                    except Exception:
+                        pass
     except Exception:
-        # Non-blocking
+        pass
+    # Build a concise status message with correct totals
+    msg_lines: list[str] = []
+    try:
+        # Prefer the total discovered via agent web discovery; else fall back to ICP-matched total in DB
+        total_web = int(state.get("web_discovery_total") or 0)
+    except Exception:
+        total_web = 0
+    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+    if display_total > 0:
+        msg_lines.append(f"Found {display_total} ICP candidates. Showing Top‑10 preview below.")
+    else:
+        msg_lines.append("Collecting ICP candidates…")
+
+    # Web discovery Top‑10 (agent-driven) — present to the user; move ACRA to nightly
+    try:
+        web_cand = state.get("agent_candidates") or []
+        if isinstance(web_cand, list) and web_cand:
+            msg_lines.append(f"Planned web discovery: found {len(web_cand)} candidate domains.")
+            show = web_cand[:10]
+            for i, dom in enumerate(show, 1):
+                try:
+                    d = dom if isinstance(dom, str) else str(dom)
+                    msg_lines.append(f"{i}) {d}")
+                except Exception:
+                    continue
+            msg_lines.append("I’ll use these to extract evidence and score fit.")
+    except Exception:
+        pass
+
+    # Compute and display Top‑10 with "why" lines
+    try:
+        if ENABLE_AGENT_DISCOVERY:
+            try:
+                from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+            except Exception:
+                _agent_top10 = None  # type: ignore
+            if _agent_top10 is not None:
+                top = _agent_top10(state.get("icp_profile") or {}, state.get("tenant_id"))
+                if top:
+                    state["agent_top10"] = top
+                    # Persist preview so later runs reuse the same Top‑10
+                    try:
+                        tid = _resolve_tenant_id_for_write_sync(state)
+                    except Exception:
+                        tid = None
+                    _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top)
+                    # Also persist the icp_profile we just used/derived so it evolves over time
+                    try:
+                        if isinstance(tid, int):
+                            _upsert_icp_profile_sync(tid, state.get("icp_profile") or {}, name="Default ICP")
+                    except Exception:
+                        pass
+                    # Pretty Top‑10 table
+                    try:
+                        table = _fmt_top10_md(top)
+                        # Include total so users see "10 of N"
+                        _tot = display_total if isinstance(display_total, int) and display_total > 0 else len(top)
+                        msg_lines.append(f"Top-listed lookalikes (with why) — showing 10 of {_tot}:\n\n" + table)
+                    except Exception:
+                        # Fallback to simple lines
+                        _tot = display_total if isinstance(display_total, int) and display_total > 0 else 10
+                        msg_lines.append(f"Top‑listed lookalikes (with why) — showing 10 of {_tot}:")
+                        for i, row in enumerate(top, 1):
+                            dom = row.get("domain")
+                            why = row.get("why") or "signal match"
+                            score = int(row.get("score") or 0)
+                            snip = _clean_snippet(row.get("snippet") or "")
+                            if snip:
+                                msg_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                            else:
+                                msg_lines.append(f"{i}) {dom} — {why} (score {score})")
+                    # Avoid a second discovery pass: skip ensure_icp_enriched_with_jina here.
+                    # Discovery just ran to produce Top‑10; calling enrichment would re-trigger DDG.
+                    try:
+                        logger.info("[confirm] Skipping ICP enrichment-from-discovery to prevent duplicate DDG runs")
+                    except Exception:
+                        pass
+                    # After showing results, show a detailed ICP Profile summary for the user
+                    try:
+                        icp_prof = state.get("icp_profile") or {}
+                        inds = (icp_prof.get("industries") or [])
+                        titles_l = (icp_prof.get("buyer_titles") or [])
+                        sizes_l = (icp_prof.get("size_bands") or [])
+                        ints = (icp_prof.get("integrations") or [])
+                        trigs = (icp_prof.get("triggers") or [])
+                        msg_lines.append("ICP Profile")
+                        msg_lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
+                        msg_lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
+                        msg_lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
+                        sigs_arr = (ints or []) + (trigs or [])
+                        msg_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
+                        # Persist ICP profile to icp_rules for reuse across threads/API
+                        try:
+                            if isinstance(tid, int):
+                                base = _icp_payload_from_state_icp(state.get("icp") or {})
+                                merged = _merge_icp_profile_into_payload(base, icp_prof)
+                                if merged:
+                                    _save_icp_rule_sync(int(tid), merged, name="Default ICP")
+                                    logger.info("[confirm] Persisted ICP profile (icp_rules) with keys=%s", list(merged.keys()))
+                        except Exception:
+                            pass
+                    except Exception:
+                        msg_lines.append("ICP Profile")
+    except Exception:
         pass
 
     # Planned enrichment counts
-        try:
-            enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
-        except Exception:
-            enrich_now_limit = 10
+    try:
+        enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+    except Exception:
+        enrich_now_limit = 10
+    # If we have an agent Top‑10, prefer that count to set expectations accurately
+    try:
+        top_for_count = state.get("agent_top10") or []
+        if isinstance(top_for_count, list) and top_for_count:
+            do_now = min(len(top_for_count), enrich_now_limit)
+        else:
+            do_now = min(n, enrich_now_limit) if n else 0
+    except Exception:
         do_now = min(n, enrich_now_limit) if n else 0
         if n > 0:
             # Prefer ACRA total by suggested SSICs, else by matched terms, else company total
@@ -737,7 +1473,7 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
             except Exception:
                 nightly = max(int(icp_total) - do_now, 0)
         msg_lines.append(
-            f"Ready to enrich {do_now} now; {nightly} scheduled for nightly. Type 'run enrichment' after accepting a micro‑ICP."
+            f"We can enrich {do_now} companies now. The nightly runner will process the remaining ICP companies. Type 'run enrichment' after accepting a micro‑ICP."
         )
     else:
         msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -774,11 +1510,224 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         if payload:
             tid = _resolve_tenant_id_for_write_sync(state)  # basic flow uses sync helper
             if isinstance(tid, int):
+                # Merge any previously learned icp_profile fields as well
+                prof = dict(state.get("icp_profile") or {})
+                if prof:
+                    try:
+                        _upsert_icp_profile_sync(tid, prof, name="Default ICP")
+                    except Exception:
+                        pass
                 _save_icp_rule_sync(tid, payload, name="Default ICP")
     except Exception:
         pass
 
     candidates = state.get("candidates") or []
+    # Force strict Top‑10 when a persisted Top‑10 preview exists for this tenant
+    try:
+        tid_for_read = _resolve_tenant_id_for_write_sync(state)
+    except Exception:
+        tid_for_read = None
+    try:
+        if not state.get("strict_top10"):
+            persisted_top = _load_persisted_top10(int(tid_for_read) if isinstance(tid_for_read, int) else None)
+            if isinstance(persisted_top, list) and persisted_top:
+                # Map domains to company rows (create if missing)
+                from src.database import get_conn as __get_conn
+                mapped: list[dict] = []
+                with __get_conn() as _c2, _c2.cursor() as _cur2:
+                    for it in persisted_top[:10]:
+                        try:
+                            dom = (it.get("domain") or "").strip().lower()
+                            if not dom:
+                                continue
+                            _cur2.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                            r = _cur2.fetchone()
+                            if r and r[0] is not None:
+                                cid = int(r[0]); name = (r[1] or dom)
+                            else:
+                                _cur2.execute(
+                                    "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                                    (dom, dom),
+                                )
+                                cid = int((_cur2.fetchone() or [None])[0]); name = dom
+                            mapped.append({"id": cid, "name": name})
+                        except Exception:
+                            continue
+                if mapped:
+                    candidates = mapped
+                    state["candidates"] = mapped
+                    state["strict_top10"] = True
+    except Exception:
+        pass
+    # Ensure: if a Top‑10 list from web discovery exists, enrich exactly those first.
+    if isinstance(state.get("agent_top10"), list) and state.get("agent_top10"):
+        try:
+            from src.database import get_conn as _get_conn
+            with _get_conn() as _c, _c.cursor() as _cur:
+                cand: list[dict] = []
+                for it in (state.get("agent_top10") or [])[:10]:
+                    dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                    if not dom:
+                        continue
+                    _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                    row = _cur.fetchone()
+                    if row and row[0] is not None:
+                        cid = int(row[0])
+                        name = (row[1] or dom)
+                    else:
+                        _cur.execute(
+                            "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                            (dom, dom),
+                        )
+                        cid = int((_cur.fetchone() or [None])[0])
+                        name = dom
+                    cand.append({"id": cid, "name": name})
+                if cand:
+                    candidates = cand
+                    state["candidates"] = cand
+                    state["strict_top10"] = True
+                    # Non‑SG: enqueue background next‑40 enrichment and inform user (best effort)
+                    try:
+                        if not _is_non_sg_active_profile(state):
+                            raise RuntimeError("active profile is SG; skip next-40 background")
+                        from src.database import get_conn as __get_conn
+                        from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
+                        bg_limit = 40
+                        try:
+                            import os as __os
+                            bg_limit = int(__os.getenv("BG_NEXT_COUNT", "40") or 40)
+                        except Exception:
+                            bg_limit = 40
+                        # Load next‑40 preview domains from staging (ordered by preview score)
+                        doms: list[str] = []
+                        with __get_conn() as __c2, __c2.cursor() as __cur2:
+                            try:
+                                # Resolve tenant id for scoping (reuse DEFAULT_TENANT_ID or first active mapping)
+                                _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                                _tidv = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                            except Exception:
+                                _tidv = None
+                            if _tidv is None:
+                                try:
+                                    __cur2.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                    _r = __cur2.fetchone()
+                                    _tidv = int(_r[0]) if _r and _r[0] is not None else None
+                                except Exception:
+                                    _tidv = None
+                            if _tidv is not None:
+                                __cur2.execute(
+                                    """
+                                    SELECT domain
+                                    FROM staging_global_companies
+                                    WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                                    ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                                    OFFSET 10 LIMIT %s
+                                    """,
+                                    (_tidv, bg_limit),
+                                )
+                                _r2 = __cur2.fetchall() or []
+                                doms = [str(r[0]) for r in _r2 if r and r[0]]
+                                try:
+                                    __cur2.execute(
+                                        """
+                                        SELECT COUNT(*) FROM staging_global_companies
+                                        WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                                        """,
+                                        (_tidv,),
+                                    )
+                                    _cnt_row = __cur2.fetchone()
+                                    _preview_total = int(_cnt_row[0] or 0) if _cnt_row else 0
+                                except Exception:
+                                    _preview_total = 0
+                        # Map to company_ids
+                        bg_ids: list[int] = []
+                        if doms:
+                            with __get_conn() as __c3, __c3.cursor() as __cur3:
+                                __cur3.execute(
+                                    "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                                    ([d.lower() for d in doms],),
+                                )
+                                _rows = __cur3.fetchall() or []
+                                _map = {str((r[1] or "").lower()): int(r[0]) for r in _rows if r and r[0] is not None}
+                                for d in doms:
+                                    _cid = _map.get(str(d.lower()))
+                                    if _cid:
+                                        bg_ids.append(_cid)
+                        if bg_ids and _tidv is not None:
+                            _job = __enqueue_bg(int(_tidv), bg_ids)
+                            _jid = (_job or {}).get("job_id")
+                            try:
+                                logger.info(
+                                    "[next40] preview_total=%s enrich_now=%s queued_next=%s job_id=%s tenant_id=%s",
+                                    str(_preview_total if '_preview_total' in locals() else '?'),
+                                    "10",
+                                    str(len(bg_ids)),
+                                    str(_jid),
+                                    str(_tidv),
+                                )
+                            except Exception:
+                                pass
+                            # Track pending background job in state for later completion announcement
+                            try:
+                                pend = list(state.get("pending_bg_jobs") or [])
+                                if _jid:
+                                    pend.append(int(_jid))
+                                state["pending_bg_jobs"] = pend
+                            except Exception:
+                                pass
+                            state["messages"] = add_messages(
+                                state.get("messages") or [],
+                                [AIMessage(content=f"Enriching the next {min(len(bg_ids), bg_limit)} in the background (job {_jid}). I will reply here when it finishes. You can also check status via /jobs/{_jid}.")],
+                            )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    # If Top‑10 was shown earlier but agent_top10 is missing in this state (new cycle/thread),
+    # load the last persisted Top‑10 preview and use it strictly for enrichment.
+    if not candidates:
+        try:
+            tid = _resolve_tenant_id_for_write_sync(state)
+        except Exception:
+            tid = None
+        tid_int = int(tid) if isinstance(tid, int) else None
+        try:
+            persisted_top = _load_persisted_top10(tid_int)
+        except Exception:
+            persisted_top = []
+        if not persisted_top:
+            regenerated_top = await _regenerate_top10_if_missing(state, tid_int)
+            if regenerated_top:
+                persisted_top = regenerated_top
+        if persisted_top:
+            try:
+                from src.database import get_conn as _get_conn
+                with _get_conn() as _c, _c.cursor() as _cur:
+                    cand: list[dict] = []
+                    for it in persisted_top[:10]:
+                        dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                        if not dom:
+                            continue
+                        _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                        row = _cur.fetchone()
+                        if row and row[0] is not None:
+                            cid = int(row[0])
+                            name = (row[1] or dom)
+                        else:
+                            _cur.execute(
+                                "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                                (dom, dom),
+                            )
+                            cid = int((_cur.fetchone() or [None])[0])
+                            name = dom
+                        cand.append({"id": cid, "name": name})
+                    if cand:
+                        candidates = cand
+                        state["candidates"] = cand
+                        state["strict_top10"] = True
+                        _persist_top10_preview(tid_int, persisted_top)
+            except Exception:
+                pass
     # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
     if not candidates:
         try:
@@ -800,6 +1749,21 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         except Exception:
             pass
     if not candidates:
+        # Strict policy: do not enrich arbitrary companies when Top‑10 is missing
+        try:
+            # Helpful diagnostics for operators (logs only)
+            try:
+                _tid_dbg = _resolve_tenant_id_for_write_sync(state)
+                _dbg_top = _load_persisted_top10(int(_tid_dbg) if isinstance(_tid_dbg, int) else None)
+                logger.info("[enrich] strict Top-10 missing; tenant_id=%s persisted_top=%d", _tid_dbg, len(_dbg_top or []))
+            except Exception:
+                pass
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [AIMessage(content="I couldn’t find the last Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate and lock a Top‑10, then try 'run enrichment' again.")],
+            )
+        except Exception:
+            pass
         return state
 
     pool = await get_pg_pool()
@@ -964,6 +1928,9 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
             cid = row["company_id"]
             emails.setdefault(cid, row["email"])
 
+    odoo_upserts = 0
+    odoo_contacts = 0
+    odoo_leads = 0
     for cid in ids:
         comp = comps.get(cid, {})
         if not comp:
@@ -980,10 +1947,15 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                 incorporation_year=comp.get("incorporation_year"),
                 website_domain=comp.get("website_domain"),
             )
+            try:
+                odoo_upserts += 1 if isinstance(odoo_id, int) and odoo_id > 0 else 0
+            except Exception:
+                pass
             if email:
                 try:
                     await store.add_contact(odoo_id, email)
                     logger.info("odoo export: contact added email=%s for partner_id=%s", email, odoo_id)
+                    odoo_contacts += 1
                 except Exception as _contact_exc:
                     logger.warning("odoo export: add_contact failed email=%s err=%s", email, _contact_exc)
             try:
@@ -1004,19 +1976,128 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                         score.get("rationale", ""),
                         email,
                     )
+                    odoo_leads += 1
                 except Exception as _lead_exc:
                     logger.warning("odoo export: create_lead failed partner_id=%s err=%s", odoo_id, _lead_exc)
         except Exception as exc:
             logger.exception("odoo sync failed for company_id=%s", cid)
 
-    state["messages"].append(
-        AIMessage(f"Enrichment complete for {len(results)} companies.")
-    )
+    # Present a scored shortlist table in chat (top by score)
+    try:
+        logger.info("[odoo] export summary upserts=%s contacts=%s leads=%s", odoo_upserts, odoo_contacts, odoo_leads)
+    except Exception:
+        pass
+    try:
+        scored_rows = [scores.get(cid) for cid in ids if scores.get(cid)]
+        # Fallback: if in-memory scores are empty, try DB lead_scores
+        if not scored_rows:
+            try:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT company_id, score::float, bucket FROM lead_scores WHERE company_id = ANY($1::int[])",
+                        ids,
+                    )
+                for r in rows:
+                    scored_rows.append({
+                        "company_id": int(r["company_id"]),
+                        "score": float(r["score"] or 0.0),
+                        "bucket": (r["bucket"] or "").strip() or "-",
+                    })
+            except Exception:
+                scored_rows = []
+        scored_rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+        head = scored_rows[: min(10, len(scored_rows))]
+        if head:
+            try:
+                logger.info("[shortlist] rendering scored table rows=%s", len(head))
+            except Exception:
+                pass
+            lines = ["Lead Shortlist (top scored):", "", "| Company | Score | Bucket |", "|---|---:|:---:|"]
+            for r in head:
+                cid = int(r.get("company_id")) if r.get("company_id") is not None else None
+                comp = comps.get(cid, {}) if cid is not None else {}
+                nm = comp.get("name") or f"Company {cid}"
+                sc = f"{float(r.get('score') or 0):.1f}"
+                bk = (r.get("bucket") or "").strip() or "-"
+                lines.append(f"| {nm} | {sc} | {bk} |")
+            state["messages"].append(AIMessage("\n".join(lines)))
+        else:
+            # Last fallback: present a simple table without scores
+            lines = ["Lead Shortlist:", "", "| Company |", "|---|"]
+            for cid in ids[: min(10, len(ids))]:
+                nm = (comps.get(cid, {}) or {}).get("name") or f"Company {cid}"
+                lines.append(f"| {nm} |")
+            state["messages"].append(AIMessage("\n".join(lines)))
+    except Exception:
+        state["messages"].append(
+            AIMessage(f"Enrichment complete for {len(results)} companies.")
+        )
     return state
 
 
+def _boot_guard_route(state: PreSDRState) -> bool:
+    """Return True if we should halt routing until a fresh human message after boot.
+
+    Mirrors the boot-resume guard used in the LLM router, so both simple and
+    LLM-driven graphs honor the same behavior across server restarts.
+    """
+    try:
+        msgs = state.get("messages") or []
+        def _is_human(m) -> bool:
+            try:
+                if isinstance(m, HumanMessage):
+                    return True
+                if isinstance(m, dict):
+                    role = (m.get("type") or m.get("role") or "").lower()
+                    return role in {"human", "user"}
+            except Exception:
+                return False
+            return False
+        if state.get("boot_init_token") != BOOT_TOKEN:
+            state["boot_init_token"] = BOOT_TOKEN
+            state["boot_seen_messages_len"] = len(msgs)
+            last = msgs[-1] if msgs else None
+            # Halt only if there isn't a fresh human message
+            if not (last and _is_human(last)):
+                logger.info("router -> end (boot resume guard: waiting for new user input)")
+                return True
+            # Fresh human: clear duplicate guard to allow routing
+            state["last_user_boot_token"] = BOOT_TOKEN
+            try:
+                if "last_routed_text" in state:
+                    del state["last_routed_text"]
+            except Exception:
+                pass
+        else:
+            if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
+                last = msgs[-1] if msgs else None
+                if last and _is_human(last):
+                    state["last_user_boot_token"] = BOOT_TOKEN
+                    try:
+                        if "last_routed_text" in state:
+                            del state["last_routed_text"]
+                    except Exception:
+                        pass
+                state["boot_seen_messages_len"] = len(msgs)
+    except Exception:
+        return False
+    return False
+
+
 def route(state: PreSDRState) -> str:
+    # Enforce boot-resume guard for the simple router as well
+    if _boot_guard_route(state):
+        return "end"
     text = _last_text(state.get("messages")).lower()
+    # Map common start intents to ICP intake
+    if re.search(r"\b(start\s+lead\s*gen|start\s+leadgen|start\s+lead\s+generation|find\s+leads)\b", text):
+        logger.info("router -> icp (explicit start intent)")
+        try:
+            state["last_routed_text"] = text
+            state["icp_in_progress"] = True
+        except Exception:
+            pass
+        return "icp"
     if "confirm" in text:
         dest = "confirm"
     elif "run enrichment" in text:
@@ -1128,6 +2209,49 @@ def _last_user_text(state: GraphState) -> str:
     return _to_text((state.get("messages") or [AIMessage("")])[-1].content).strip()
 
 
+def _top10_preview_was_sent(state: GraphState) -> bool:
+    """Return True if an AI message already presented a Top-10 lookalike table."""
+    try:
+        for msg in reversed(state.get("messages") or []):
+            if not isinstance(msg, AIMessage):
+                continue
+            text = _to_text(getattr(msg, "content", "") or "").strip().lower()
+            if not text:
+                continue
+            if "top-10 lookalikes" in text or "top‑10 lookalikes" in text:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _regenerate_top10_if_missing(
+    state: GraphState, tenant_id: Optional[int]
+) -> List[Dict[str, Any]]:
+    """Rebuild the Top-10 list when the preview was shown but persistence missed it."""
+    if not _top10_preview_was_sent(state):
+        return []
+    try:
+        from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+    except Exception as _imp_err:  # pragma: no cover - import edge case
+        logger.info("[top10] regeneration skipped: %s", _imp_err)
+        return []
+    icp_prof = dict(state.get("icp_profile") or {})
+    try:
+        regenerated = await asyncio.to_thread(_agent_top10, icp_prof, tenant_id)
+    except Exception as _regen_exc:
+        logger.info("[top10] regeneration failed: %s", _regen_exc)
+        return []
+    if isinstance(regenerated, list) and regenerated:
+        state["agent_top10"] = regenerated
+        try:
+            _persist_top10_preview(tenant_id, regenerated)
+        except Exception:
+            pass
+        return regenerated
+    return []
+
+
 # None/skip/any detector for buying signals
 NEG_NONE = {
     "none",
@@ -1159,8 +2283,27 @@ def _user_just_confirmed(state: dict) -> bool:
     msgs = state.get("messages") or []
     for m in reversed(msgs):
         if isinstance(m, HumanMessage):
-            txt = (getattr(m, "content", "") or "").strip().lower()
-            return txt in {"confirm", "yes", "y", "ok", "okay", "looks good", "lgtm"}
+            raw = (getattr(m, "content", "") or "").strip().lower()
+            # normalize punctuation
+            import re as _re
+            txt = _re.sub(r"[\s.!?]+$", "", raw)
+            # accept common confirmations
+            confirmed_set = {
+                "confirm",
+                "confirmed",
+                "yes",
+                "y",
+                "ok",
+                "okay",
+                "looks good",
+                "lgtm",
+                "go ahead",
+                "proceed",
+                "continue",
+                "sounds good",
+                "done",
+            }
+            return txt in confirmed_set
     return False
 
 
@@ -1699,6 +2842,11 @@ def _extract_icp_industries_from_text(text: str) -> list[str]:
 
 
 async def icp_node(state: GraphState) -> GraphState:
+    # Mark that we are in the ICP intake flow so router can keep sending user replies here
+    try:
+        state["icp_in_progress"] = True
+    except Exception:
+        pass
     # If the user already confirmed but ICP is incomplete, proactively ask the next question
     # to avoid router loops where the last message remains the user's "confirm".
     if _user_just_confirmed(state):
@@ -1826,7 +2974,7 @@ async def icp_node(state: GraphState) -> GraphState:
                             state["icp_last_focus"] = "seeds"
                             state["messages"] = add_messages(
                                 state.get("messages") or [],
-                                [AIMessage(f"I need at least 5 best customers. You shared {len(seeds)}; please add a few more (Company — website).")],
+                                [AIMessage(f"That doesn’t quite answer my question yet — I need at least 5 best customers. You shared {len(seeds)}; please add a few more (format: Company — website).")],
                             )
                             state["icp"] = icp_f
                             return state
@@ -1834,22 +2982,33 @@ async def icp_node(state: GraphState) -> GraphState:
                         state["icp_last_focus"] = "seeds"
                         state["messages"] = add_messages(
                             state.get("messages") or [],
-                            [AIMessage("Got it. Please list seeds as 'Company — domain' per line.")],
+                            [AIMessage("That doesn’t seem to answer my question about best customers. Please list seeds as 'Company — domain' per line, one per line. Thanks!")],
                         )
                         state["icp"] = icp_f
                         return state
-            # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation
-            if ICP_WIZARD_FAST_START_ONLY and not icp_f.get("fast_start_explained"):
-                expl = [
-                    "I will infer industries from evidence instead of asking.",
-                    "What I will crawl:",
-                    "- Your site: Industries served, Customers/Case Studies, Integrations, Pricing (ACV hints), Careers (buyer/team clues), Partners, blog topics.",
-                    "- Seed and anti-customer sites: industry labels, product lines, About text, Careers (roles/scale), Integrations pages, locations.",
-                    "I'll map seeds → SSIC codes via ssic_ref → ACRA (primary_ssic_code) to learn which SSICs and bands dominate winners.",
-                ]
-                state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
-                icp_f["fast_start_explained"] = True
+            # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation immediately
+            if ICP_WIZARD_FAST_START_ONLY:
+                if not icp_f.get("fast_start_explained"):
+                    expl = [
+                        "I will infer industries from evidence instead of asking.",
+                        "What I will crawl:",
+                        "- Your site: Industries served, Customers/Case Studies, Integrations, Pricing (ACV hints), Careers (buyer/team clues), Partners, blog topics.",
+                        "- Seed and anti-customer sites: industry labels, product lines, About text, Careers (roles/scale), Integrations pages, locations.",
+                        "Then I’ll run web discovery to propose a Top‑10 lookalikes list with evidence. ACRA is only used later in the nightly SG pass.",
+                    ]
+                    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
+                    icp_f["fast_start_explained"] = True
+                # Go straight to confirmation prompt
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [
+                        AIMessage(
+                            "Thanks! I’ll crawl your site + seed sites, run web discovery, extract evidence, and propose a Top‑10 with why‑us fit. ACRA is used later during the SG nightly pass. Reply confirm to proceed, or adjust any detail."
+                        )
+                    ],
+                )
                 state["icp"] = icp_f
+                return state
 
             # Collect core ICP points before confirmation: industries -> employees -> geos -> (optional) signals
             # 1) Industries (skip when fast-start is enabled; we infer from evidence)
@@ -2138,100 +3297,19 @@ async def icp_node(state: GraphState) -> GraphState:
                 state.get("messages") or [],
                 [
                     AIMessage(
-                        "Thanks! I’ll crawl your site + seed sites, map to ACRA/SSIC, enrich evidence, mine patterns, and propose micro‑ICPs. Reply confirm to proceed, or adjust any detail."
+                        "Thanks! I’ll crawl your site + seed sites, run web discovery, extract evidence, and propose a Top‑10 with why‑us fit. ACRA is used later during the SG nightly pass. Reply confirm to proceed, or adjust any detail."
                     )
                 ],
             )
             state["icp"] = icp_f
             return state
     except Exception:
-        # Non-blocking: fall through to legacy questions if anything goes wrong
-        pass
-
-    # Legacy Q&A path (industries, size, geos, signals)
-    # 1) Extract structured update
-    update = await extract_update_from_text(text)
-
-    icp = dict(state.get("icp") or {})
-
-    # 2) Merge extractor output into ICP (prefer precise phrases from user text)
-    if True:
-        human_terms = _extract_icp_industries_from_text(text)
-        llm_terms = [s.strip() for s in (update.industries or []) if s and s.strip()]
-        merged: list[str] = []
-        # human phrases first, preserve order
-        for t in human_terms:
-            if t not in merged:
-                merged.append(t)
-        # then LLM terms if new (case-insensitive dedupe)
-        low = {t.lower(): t for t in merged}
-        for t in llm_terms:
-            tl = t.lower()
-            if tl not in low:
-                merged.append(t)
-                low[tl] = t
-        # Prefer multiword phrases: drop single-word generics contained in multiwords
-        multi = [t for t in merged if " " in t]
-        if multi:
-            singles = {t for t in merged if " " not in t}
-            singles = {s for s in singles if any(s.lower() in m.split() for m in multi)}
-            merged = [t for t in merged if not (" " not in t and t in singles)]
-        if merged:
-            icp["industries"] = merged
-    if update.employees_min is not None:
-        icp["employees_min"] = update.employees_min
-    if update.employees_max is not None:
-        icp["employees_max"] = update.employees_max
-    # New: revenue_bucket and incorporation year
-    if getattr(update, "revenue_bucket", None):
-        # normalize to lowercase canonical values if possible
-        rb = (update.revenue_bucket or "").strip().lower()
-        if rb in ("small", "medium", "large"):
-            icp["revenue_bucket"] = rb
-    if getattr(update, "year_min", None) is not None:
-        icp["year_min"] = update.year_min
-    if getattr(update, "year_max", None) is not None:
-        icp["year_max"] = update.year_max
-    if update.geos:
-        icp["geos"] = sorted(set([s.strip() for s in update.geos if s.strip()]))
-    if update.signals:
-        icp["signals"] = sorted(set([s.strip() for s in update.signals if s.strip()]))
-
-    # 3) Treat explicit “none/skip/any” as signals_done
-    if _says_none(text) or getattr(update, "signals_done", False):
-        icp["signals"] = []
-        icp["signals_done"] = True
-
-    new_msgs: List[BaseMessage] = []
-
-    # If user pasted companies, preserve previous behavior
-    if update.pasted_companies:
-        state["candidates"] = [{"name": n} for n in update.pasted_companies]
-        new_msgs.append(
-            AIMessage(
-                content=f"Got {len(update.pasted_companies)} companies. Type **run enrichment** to start."
-            )
+        # Non-blocking: simplify to confirmation to keep PRD19 minimal flow
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage("Great. Reply **confirm** to save, or tell me what to change.")],
         )
-
-    # 4) Back-off: if we already asked about 'signals' once and still don't have them, stop asking
-    ask_counts = dict(state.get("ask_counts") or {})
-    q, focus = next_icp_question(icp)
-    if (
-        focus == "signals"
-        and ask_counts.get("signals", 0) >= 1
-        and not icp.get("signals")
-    ):
-        icp["signals_done"] = True
-        q, focus = next_icp_question(icp)
-
-    ask_counts[focus] = ask_counts.get(focus, 0) + 1
-    state["ask_counts"] = ask_counts
-
-    new_msgs.append(AIMessage(content=q))
-
-    state["icp"] = icp
-    state["messages"] = add_messages(state.get("messages") or [], new_msgs)
-    return state
+        return state
 
 
 async def candidates_node(state: GraphState) -> GraphState:
@@ -2460,7 +3538,7 @@ async def candidates_node(state: GraphState) -> GraphState:
         except Exception:
             scheduled = max(int(icp_total) - do_now, 0)
         lines.append(
-            f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Accept a micro‑ICP, then type 'run enrichment' to proceed."
+            f"We can enrich {do_now} companies now. The nightly runner will process the remaining ICP companies. Accept a micro‑ICP, then type 'run enrichment' to proceed."
         )
     else:
         lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -2473,6 +3551,19 @@ async def candidates_node(state: GraphState) -> GraphState:
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
     logger.info("[confirm] Entered confirm_node")
+    # Emit a quick progress note so the user sees immediate feedback
+    try:
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(content="Confirm received. Gathering evidence and planning Top‑10…")],
+        )
+    except Exception:
+        pass
+    try:
+        from src.settings import ENABLE_AGENT_DISCOVERY as _ead  # type: ignore
+        logger.info("[confirm] ENABLE_AGENT_DISCOVERY=%s", _ead)
+    except Exception:
+        logger.info("[confirm] ENABLE_AGENT_DISCOVERY unavailable (default False)")
     # Persist ICP captured in the dynamic graph flow
     try:
         icp = dict(state.get("icp") or {})
@@ -2532,35 +3623,76 @@ async def confirm_node(state: GraphState) -> GraphState:
                             cards = await _icp_build_resolver_cards(seeds_in)
                             if cards:
                                 logger.info("[confirm] Resolver cards built: %d", len(cards))
+                                # Merge resolver fast-facts into icp_profile to avoid 'n/a' later
+                                try:
+                                    prof = dict(state.get("icp_profile") or {})
+                                    inds: list[str] = []
+                                    titles: list[str] = []
+                                    sizes: list[str] = []
+                                    integrs: list[str] = []
+                                    for c in cards:
+                                        ff = c.fast_facts or {}
+                                        if ff.get("industry_guess"):
+                                            inds.append(str(ff.get("industry_guess")).strip().lower())
+                                        if ff.get("size_band_guess"):
+                                            sizes.append(str(ff.get("size_band_guess")).strip().lower())
+                                        for t in (ff.get("buyer_titles") or []) or []:
+                                            if isinstance(t, str) and t.strip():
+                                                titles.append(t.strip().lower())
+                                        for it in (ff.get("integrations_mentions") or []) or []:
+                                            if isinstance(it, str) and it.strip():
+                                                integrs.append(it.strip().lower())
+                                    # de-dupe & assign only when present
+                                    if inds:
+                                        prof.setdefault("industries", [])
+                                        prof["industries"] = sorted(set((prof.get("industries") or []) + inds))
+                                    if titles:
+                                        prof.setdefault("buyer_titles", [])
+                                        prof["buyer_titles"] = sorted(set((prof.get("buyer_titles") or []) + titles))
+                                    if sizes:
+                                        prof.setdefault("size_bands", [])
+                                        prof["size_bands"] = sorted(set((prof.get("size_bands") or []) + sizes))
+                                    if integrs:
+                                        prof.setdefault("integrations", [])
+                                        prof["integrations"] = sorted(set((prof.get("integrations") or []) + integrs))
+                                    state["icp_profile"] = prof
+                                except Exception:
+                                    pass
                                 lines = ["Domain resolver preview:"]
                                 low_conf = 0
                                 for i, c in enumerate(cards, 1):
                                     facts = []
                                     ff = c.fast_facts or {}
                                     if ff.get("industry_guess"):
-                                        facts.append(f"industry={ff.get('industry_guess')}")
+                                        facts.append(f"Industry: {ff.get('industry_guess')}")
                                     if ff.get("size_band_guess"):
-                                        facts.append(f"size={ff.get('size_band_guess')}")
+                                        facts.append(f"Size: {ff.get('size_band_guess')}")
                                     if ff.get("geo_guess"):
-                                        facts.append(f"geo={ff.get('geo_guess')}")
+                                        facts.append(f"Geo: {ff.get('geo_guess')}")
                                     buyers = ", ".join(ff.get("buyer_titles") or [])
                                     if buyers:
-                                        facts.append(f"buyers={buyers}")
+                                        facts.append(f"Buyers: {buyers}")
                                     integ = ", ".join(ff.get("integrations_mentions") or [])
                                     if integ:
-                                        facts.append(f"integrations={integ}")
-                                    fact_str = f" ({'; '.join(facts)})" if facts else ""
-                                    lines.append(f"{i}) {c.seed_name} → {c.domain} [{c.confidence}] — {c.why}{fact_str}")
+                                        facts.append(f"Integrations: {integ}")
+                                    fact_str = f" — {'; '.join(facts)}" if facts else ""
+                                    lines.append(
+                                        f"{i}) Seed: {c.seed_name} — Domain: {c.domain} — Confidence: {c.confidence} — Reason: {c.why}{fact_str}"
+                                    )
                                     if (c.confidence or "").lower() == "low":
                                         low_conf += 1
                                 if low_conf:
                                     lines.append(f"{low_conf} low‑confidence matches. Reply with edits if any domain looks off.")
-                        state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+                        # Do not show resolver results in chat; log instead
+                        try:
+                            logger.info("[confirm] Resolver preview (suppressed in chat):\n%s", "\n".join(lines))
+                        except Exception:
+                            pass
                         chips.append("Domain resolve ✓")
                     except Exception:
                         pass
 
-                    # Evidence collection (Step 4) and ACRA anchoring (Step 5) — best‑effort batch
+                    # Evidence collection (Step 4) — best‑effort batch (ACRA anchoring disabled by default per PRD19)
                     try:
                         ev_count = 0
                         acra_count = 0
@@ -2572,30 +3704,41 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 from urllib.parse import urlparse
                                 _apex = (urlparse(site_url).netloc or site_url).lower()
                                 if _apex:
-                                    n0 = await _icp_collect_evidence_for_domain(tid, None, _apex)
+                                    # Ensure companies row exists so evidence persists
+                                    try:
+                                        _cid = await asyncio.to_thread(_ensure_company_by_domain, _apex)
+                                    except Exception:
+                                        _cid = None
+                                    n0 = await _icp_collect_evidence_for_domain(tid, _cid, _apex)
                                     logger.info("[confirm] Evidence rows for tenant website=%s: %s", _apex, n0)
                                     ev_count += int(n0 or 0)
                         except Exception:
                             pass
                         async def _collect_for_seed(s: dict):
-                            """Collect crawl evidence and ACRA SSIC anchoring for each seed.
-                            Do BOTH when possible so we still get SSIC evidence even if crawl yields 0.
+                            """Collect crawl evidence for each seed; ACRA anchoring only when enabled.
                             Returns tuple: (evidence_rows_added, acra_rows_added)
                             """
                             name = (s.get("seed_name") or "").strip()
                             dom = (s.get("domain") or "").strip()
                             ev_added = 0
                             acra_added = 0
+                            # Ensure company row for seed domain so evidence can persist
+                            cid = None
+                            try:
+                                if dom:
+                                    cid = await asyncio.to_thread(_ensure_company_by_domain, dom)
+                            except Exception:
+                                cid = None
                             # Crawl evidence (best effort)
                             if _icp_collect_evidence_for_domain and dom:
                                 try:
-                                    n = await _icp_collect_evidence_for_domain(tid, None, dom)
+                                    n = await _icp_collect_evidence_for_domain(tid, cid, dom)
                                     logger.info("[confirm] Evidence rows for domain=%s: %s", dom, n)
                                     ev_added += int(n or 0)
                                 except Exception:
                                     pass
-                            # Always attempt ACRA anchoring from seed name as well
-                            if _icp_acra_anchor_seed and name:
+                            # Optional: ACRA anchoring from seed name
+                            if ENABLE_ACRA_IN_CHAT and _icp_acra_anchor_seed and name:
                                 try:
                                     acra = await asyncio.to_thread(_icp_acra_anchor_seed, tid, name, None)
                                     logger.info(
@@ -2616,13 +3759,247 @@ async def confirm_node(state: GraphState) -> GraphState:
                         logger.info("[confirm] Evidence total=%s ACRA total=%s", ev_count, acra_count)
                         if seeds_list:
                             chips.append("Evidence ✓")
-                            chips.append("ACRA ✓")
+                            if ENABLE_ACRA_IN_CHAT and acra_count:
+                                chips.append("ACRA ✓")
                     except Exception:
                         pass
 
-                    # Pattern mining + Micro‑ICPs (Step 6–8)
+                    # Agent-driven discovery Top-10 with "why" + Jina snippets (PRD19)
                     try:
-                        if _icp_winner_profile and _icp_micro_suggestions:
+                        if ENABLE_AGENT_DISCOVERY:
+                            logger.info("[confirm] Agent discovery enabled — importing agents_icp")
+                            try:
+                                from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+                                from src.agents_icp import icp_synthesizer as _agent_synth  # type: ignore
+                                logger.info("[confirm] agents_icp import ok")
+                            except Exception as e:
+                                logger.warning("[confirm] agents_icp import failed: %s", e)
+                                _agent_top10 = None  # type: ignore
+                                _agent_synth = None  # type: ignore
+                        if _agent_top10 is not None:
+                                icp_prof = state.get("icp_profile") or {}
+                                # If no profile yet, derive minimal profile from current ICP answers
+                                if not icp_prof:
+                                    try:
+                                        _icp = dict(state.get("icp") or {})
+                                        prof0: dict[str, list[str]] = {}
+                                        inds = []
+                                        if isinstance(_icp.get("industries"), list):
+                                            inds = [str(s).strip() for s in _icp.get("industries") if isinstance(s, str) and s.strip()]
+                                        elif isinstance(_icp.get("industry"), str) and _icp.get("industry").strip():
+                                            inds = [str(_icp.get("industry")).strip()]
+                                        if inds:
+                                            prof0["industries"] = inds
+                                        titles = []
+                                        if isinstance(_icp.get("champion_titles"), list):
+                                            titles = [str(s).strip() for s in _icp.get("champion_titles") if isinstance(s, str) and s.strip()]
+                                        if titles:
+                                            prof0["buyer_titles"] = titles
+                                        sizes = []
+                                        if isinstance(_icp.get("size_bands"), list):
+                                            sizes = [str(s).strip() for s in _icp.get("size_bands") if isinstance(s, str) and s.strip()]
+                                        if sizes:
+                                            prof0["size_bands"] = sizes
+                                        signals = []
+                                        if isinstance(_icp.get("signals"), list):
+                                            signals.extend([str(s).strip() for s in _icp.get("signals") if isinstance(s, str) and s.strip()])
+                                        if isinstance(_icp.get("integrations_required"), list):
+                                            signals.extend([str(s).strip() for s in _icp.get("integrations_required") if isinstance(s, str) and s.strip()])
+                                        if signals:
+                                            prof0["integrations"] = list({s.lower(): s for s in signals}.values())
+                                        trigs = []
+                                        if isinstance(_icp.get("triggers"), list):
+                                            trigs = [str(s).strip() for s in _icp.get("triggers") if isinstance(s, str) and s.strip()]
+                                        if trigs:
+                                            prof0["triggers"] = trigs
+                                        if prof0:
+                                            icp_prof = prof0
+                                            state["icp_profile"] = icp_prof
+                                            logger.info("[confirm] Derived icp_profile from ICP answers keys=%s", list(prof0.keys()))
+                                    except Exception:
+                                        pass
+                                # If empty, synthesize from seeds quickly
+                                if not icp_prof and _agent_synth is not None:
+                                    try:
+                                        seeds_ev = [{"url": s.get("domain"), "snippet": s.get("seed_name")} for s in (icp.get("seeds_list") or [])]
+                                        sstate = {"icp_profile": {}, "seeds": seeds_ev}
+                                        logger.info("[confirm] invoking icp_synthesizer on %d seeds", len(seeds_ev))
+                                        out = await asyncio.to_thread(_agent_synth, sstate)
+                                        icp_prof = out.get("icp_profile") or {}
+                                        state["icp_profile"] = icp_prof
+                                    except Exception as e:
+                                        logger.warning("[confirm] icp_synthesizer failed: %s", e)
+                                        icp_prof = {}
+                                # Best-effort tenant id
+                                tnet = None
+                                try:
+                                    tnet = int(tid) if tid is not None else None
+                                except Exception:
+                                    tnet = None
+                                # Pass seed domains as discovery hints for DDG
+                                try:
+                                    seed_domains = []
+                                    for s in (icp.get("seeds_list") or []):
+                                        dom = (s.get("domain") or "").strip().lower() if isinstance(s, dict) else ""
+                                        if dom:
+                                            seed_domains.append(dom)
+                                    if seed_domains:
+                                        from src.agents_icp import set_seed_hints as _set_seed_hints  # type: ignore
+                                        try:
+                                            _set_seed_hints(seed_domains)
+                                            logger.info("[confirm] set %d seed hints for discovery", len(seed_domains))
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                logger.info("[confirm] invoking plan_top10_with_reasons; have_icp=%s", bool(icp_prof))
+                                top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
+                                logger.info("[confirm] agent top10 count=%d", len(top or []))
+                                if not top:
+                                    # Seeds-based competitor query fallback is disabled when STRICT_INDUSTRY_QUERY_ONLY
+                                    try:
+                                        from src.settings import STRICT_INDUSTRY_QUERY_ONLY as _strict  # type: ignore
+                                    except Exception:
+                                        _strict = True
+                                    if not _strict:
+                                        try:
+                                            from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
+                                            seed_domains = []
+                                            for s in (icp.get("seeds_list") or []):
+                                                dom = (s.get("domain") or "").strip().lower()
+                                                if dom:
+                                                    seed_domains.append(dom)
+                                            if seed_domains:
+                                                top = await asyncio.to_thread(_fb_seeds, seed_domains, icp_prof)
+                                                logger.info("[confirm] seeds-fallback top10 count=%d", len(top or []))
+                                        except Exception as _fb1_e:
+                                            logger.warning("[confirm] seeds-fallback failed: %s", _fb1_e)
+                                if not top and not STRICT_DDG_ONLY:
+                                    # Fallback 2: Jina outlinks from seeds (no DDG) — disabled when STRICT_DDG_ONLY
+                                    try:
+                                        from src.agents_icp import fallback_top10_via_seed_outlinks as _fb_outlinks  # type: ignore
+                                        seed_domains = []
+                                        for s in (icp.get("seeds_list") or []):
+                                            dom = (s.get("domain") or "").strip().lower()
+                                            if dom:
+                                                seed_domains.append(dom)
+                                        if seed_domains:
+                                            top = await asyncio.to_thread(_fb_outlinks, seed_domains, icp_prof)
+                                            logger.info("[confirm] seeds-outlinks fallback top10 count=%d", len(top or []))
+                                    except Exception as _fb2_e:
+                                        logger.warning("[confirm] seeds-outlinks fallback failed: %s", _fb2_e)
+                                if not top:
+                                    # Fallback 3: legacy DDG+Jina heuristic (may be disabled by env)
+                                    try:
+                                        from src.agents_icp import plan_top10_with_reasons_fallback as _top10_fb  # type: ignore
+                                        top = await asyncio.to_thread(_top10_fb, icp_prof)
+                                        logger.info("[confirm] legacy fallback top10 count=%d", len(top or []))
+                                    except Exception as _fb_e:
+                                        logger.warning("[confirm] top10 legacy fallback failed: %s", _fb_e)
+                                if top:
+                                    # Persist and stash for reuse during 'run enrichment'
+                                    try:
+                                        tid2 = await _resolve_tenant_id_for_write(state)
+                                    except Exception:
+                                        tid2 = None
+                                    try:
+                                        _persist_top10_preview(int(tid2) if isinstance(tid2, int) else None, top)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        state["agent_top10"] = top
+                                    except Exception:
+                                        pass
+                                    # Pretty Top‑10 table (separate message from ICP Profile)
+                                    top_lines: list[str]
+                                    try:
+                                        table = _fmt_top10_md(top)
+                                        top_lines = ["Top‑listed lookalikes (with why):\n\n" + table]
+                                    except Exception:
+                                        top_lines = ["Top‑listed lookalikes (with why):"]
+                                        for i, row in enumerate(top, 1):
+                                            dom = row.get("domain")
+                                            why = row.get("why") or "signal match"
+                                            score = int(row.get("score") or 0)
+                                            snip = _clean_snippet(row.get("snippet") or "")
+                                            if snip:
+                                                top_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                                            else:
+                                                top_lines.append(f"{i}) {dom} — {why} (score {score})")
+                                    # Enrich ICP from r.jina+ddg if sparse, then show a detailed profile summary
+                                    try:
+                                        from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
+                                        try:
+                                            out = _icp_enrich({"icp_profile": state.get("icp_profile") or {}})
+                                            if isinstance(out.get("icp_profile"), dict):
+                                                state["icp_profile"] = out.get("icp_profile")
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    # Build ICP Profile as a separate message block
+                                    profile_lines: list[str] = []
+                                    try:
+                                        icp_prof = state.get("icp_profile") or {}
+                                        inds = (icp_prof.get("industries") or [])
+                                        titles_l = (icp_prof.get("buyer_titles") or [])
+                                        sizes_l = (icp_prof.get("size_bands") or [])
+                                        ints = (icp_prof.get("integrations") or [])
+                                        trigs = (icp_prof.get("triggers") or [])
+                                        profile_lines.append("ICP Profile")
+                                        profile_lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
+                                        profile_lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
+                                        profile_lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
+                                        sigs_arr = (ints or []) + (trigs or [])
+                                        profile_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
+                                    except Exception:
+                                        profile_lines.append("ICP Profile")
+                                    # Emit Top‑10 table and ICP Profile as two separate messages
+                                    state["messages"] = add_messages(
+                                        state.get("messages") or [],
+                                        [AIMessage("\n".join(top_lines)), AIMessage("\n".join(profile_lines))],
+                                    )
+                                    chips.append("Top‑10 ✓")
+                                else:
+                                    # No Top‑10 from web discovery; advise user to adjust ICP rather than echo seeds
+                                    try:
+                                        state["messages"] = add_messages(
+                                            state.get("messages") or [],
+                                            [AIMessage("Web discovery returned no lookalikes. Try broadening industries or adding signals (integrations, buyer titles).")],
+                                        )
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        logger.warning("[confirm] agent discovery block failed: %s", e)
+
+                    # Ensure ICP profile is persisted even if Top‑10 is empty
+                    try:
+                        icp_prof2 = dict(state.get("icp_profile") or {})
+                        if icp_prof2:
+                            try:
+                                tid3 = await _resolve_tenant_id_for_write(state)
+                            except Exception:
+                                tid3 = None
+                            if isinstance(tid3, int):
+                                try:
+                                    base_payload: dict = {}
+                                except Exception:
+                                    base_payload = {}
+                                try:
+                                    merged_payload = _merge_icp_profile_into_payload(base_payload, icp_prof2)
+                                except Exception:
+                                    merged_payload = icp_prof2
+                                try:
+                                    _save_icp_rule_sync(int(tid3), merged_payload, name="Default ICP")
+                                    logger.info("[confirm] Persisted ICP profile fallback (icp_rules) keys=%s", list((merged_payload or {}).keys())[:8])
+                                except Exception as _pf_e:
+                                    logger.warning("[confirm] ICP profile persist fallback failed: %s", _pf_e)
+                    except Exception:
+                        pass
+
+                    # Pattern mining + Micro‑ICPs (Step 6–8) — disabled in chat when ACRA is off (nightly only)
+                    try:
+                        if ENABLE_ACRA_IN_CHAT and _icp_winner_profile and _icp_micro_suggestions:
                             logger.info("[confirm] Building winners profile")
                             prof = await asyncio.to_thread(_icp_winner_profile, tid)
                             items2 = await asyncio.to_thread(_icp_micro_suggestions, prof)
@@ -2686,8 +4063,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                     except Exception:
                         pass
 
-                    # Synchronously map seeds and refresh patterns for fast suggestions
-                    if _icp_map_seeds and _icp_refresh_patterns and _icp_generate_suggestions:
+                    # Synchronously map seeds and refresh patterns — disabled in chat by default (nightly only)
+                    if ENABLE_ACRA_IN_CHAT and _icp_map_seeds and _icp_refresh_patterns and _icp_generate_suggestions:
                         logger.info("[confirm] Map seeds to evidence + refresh patterns + generate suggestions")
                         await asyncio.to_thread(_icp_map_seeds, tid)
                         await asyncio.to_thread(_icp_refresh_patterns)
@@ -2796,39 +4173,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                     state["candidates"] = cand[:enrich_now_limit]
         except Exception:
             pass
-    # If still fewer than limit and we have SSIC codes, top up from ACRA by ensuring rows
+    # If still fewer than limit, do not top up from ACRA in chat (PRD19); leave to nightly
     n = len(state.get("candidates") or [])
-    if n < enrich_now_limit:
-        try:
-            icp = state.get("icp") or {}
-            terms = [
-                s.strip().lower() for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()
-            ]
-            if terms:
-                ssic_matches = _find_ssic_codes_by_terms(terms)
-                codes = {c for (c, _t, _s) in ssic_matches}
-                if codes:
-                    rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, enrich_now_limit)
-                    pool = await get_pg_pool()
-                    added: list[dict] = []
-                    needed = enrich_now_limit - n
-                    for r in rows:
-                        if needed <= 0:
-                            break
-                        nm = (r.get("entity_name") or "").strip()
-                        if not nm:
-                            continue
-                        try:
-                            cid = await _ensure_company_row(pool, nm)
-                        except Exception:
-                            continue
-                        added.append({"id": cid, "name": nm, "uen": (r.get("uen") or "").strip() or None})
-                        needed -= 1
-                    if added:
-                        state["candidates"] = (state.get("candidates") or []) + added
-                        n = len(state["candidates"])  # refresh
-        except Exception:
-            pass
     # Cap to limit
     if n > enrich_now_limit:
         state["candidates"] = (state.get("candidates") or [])[:enrich_now_limit]
@@ -2915,59 +4261,18 @@ async def confirm_node(state: GraphState) -> GraphState:
     ssic_matches = []
     msg_lines: list[str] = []
 
-    # Start with candidate count
-    msg_lines.append(f"Got {n} companies. ")
-
+    # Start with candidate count (prefer web discovery total, else DB ICP total, else local count)
     try:
-        if terms:
-            ssic_matches = _find_ssic_codes_by_terms(terms)
-            if ssic_matches:
-                top_code, top_title, _ = ssic_matches[0]
-                msg_lines.append(
-                    f"Matched {len(ssic_matches)} SSIC codes (top: {top_code} {top_title} …)"
-                )
-            else:
-                msg_lines.append("Matched 0 SSIC codes")
-
-            # Fetch ACRA sample
-            try:
-                codes = {c for (c, _t, _s) in ssic_matches}
-                # Count all candidates and fetch a small sample for display
-                from src.icp import _count_acra_by_ssic_codes
-                total_acra = await asyncio.to_thread(_count_acra_by_ssic_codes, codes)
-                rows = await asyncio.to_thread(_select_acra_by_ssic_codes, codes, 10)
-            except Exception:
-                rows = []
-                total_acra = 0
-            if total_acra:
-                msg_lines.append(f"- Found {total_acra} ACRA candidates. Sample:")
-                for r in rows[:2]:
-                    uen = (r.get("uen") or "").strip()
-                    nm = (r.get("entity_name") or "").strip()
-                    code = (r.get("primary_ssic_code") or "").strip()
-                    status = (r.get("entity_status_description") or "").strip()
-                    msg_lines.append(
-                        f"UEN: {uen} – {nm} – SSIC {code} – status: {status}"
-                    )
-                # Fallback: seed candidates directly from ACRA when none exist
-                if n == 0 and not state.get("candidates"):
-                    try:
-                        derived = []
-                        for r in rows[:20]:
-                            nm = (r.get("entity_name") or "").strip()
-                            if not nm:
-                                continue
-                            derived.append({"name": nm, "uen": (r.get("uen") or "").strip() or None})
-                        if derived:
-                            state["candidates"] = derived
-                            n = len(derived)
-                    except Exception:
-                        pass
-            else:
-                msg_lines.append("- Found 0 ACRA candidates.")
+        total_web = int(state.get("web_discovery_total") or 0)
     except Exception:
-        # Don’t block on SSIC/ACRA preview errors
-        pass
+        total_web = 0
+    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+    if display_total > 0:
+        msg_lines.append(f"Found {display_total} ICP candidates.")
+    else:
+        msg_lines.append("Collecting ICP candidates…")
+
+    # PRD19: hide SSIC/ACRA preview in chat; ACRA is for nightly SG pass only
 
     # Plan enrichment counts: how many now vs later
     do_now = min(n, enrich_now_limit) if n else 0
@@ -2982,7 +4287,7 @@ async def confirm_node(state: GraphState) -> GraphState:
         else:
             scheduled = max((total_acra if 'total_acra' in locals() else icp_total) - do_now, 0)
         msg_lines.append(
-            f"Ready to enrich {do_now} now; {scheduled} scheduled for nightly. Accept a micro‑ICP, then type 'run enrichment' to proceed."
+            f"We can enrich {do_now} companies now. The nightly runner will process the remaining ICP companies. Accept a micro‑ICP, then type 'run enrichment' to proceed."
         )
     else:
         msg_lines.append("No candidates yet. I’ll keep collecting ICP details.")
@@ -2999,6 +4304,24 @@ async def confirm_node(state: GraphState) -> GraphState:
 
 
 async def enrich_node(state: GraphState) -> GraphState:
+    # Announce any completed background jobs (next-40) from prior turns
+    try:
+        _announce_completed_bg_jobs(state)
+    except Exception:
+        pass
+    # Mark the last routed human command so the router's duplicate-guard
+    # can halt re-entry loops (e.g., repeated "run enrichment").
+    try:
+        state["last_routed_text"] = (_last_user_text(state) or "").strip().lower()
+    except Exception:
+        pass
+    try:
+        # Concise trace to correlate start of enrichment in logs
+        strict = bool(state.get("strict_top10"))
+        cand_n = len(state.get("candidates") or []) if isinstance(state.get("candidates"), list) else 0
+        logger.info("[enrich] begin strict_top10=%s candidates=%d", strict, cand_n)
+    except Exception:
+        pass
     # Persist current ICP immediately when enrichment is requested, even if user skipped explicit confirm
     try:
         icp_cur = dict(state.get("icp") or {})
@@ -3011,6 +4334,104 @@ async def enrich_node(state: GraphState) -> GraphState:
         pass
 
     text = _last_user_text(state)
+
+    # Strict Top‑10 enrichment: if a Top‑10 list from web discovery exists,
+    # build candidates from those domains and do not mix with ACRA/top-ups.
+    # Guard: do NOT override existing candidate list with a too-short Top‑10.
+    try:
+        top10 = state.get("agent_top10") or []
+    except Exception:
+        top10 = []
+    # Try loading last persisted Top‑10 preview for this tenant if not present in memory
+    if not (isinstance(top10, list) and top10):
+        try:
+            tid = await _resolve_tenant_id_for_write(state)
+        except Exception:
+            tid = None
+        persisted_top = _load_persisted_top10(int(tid) if isinstance(tid, int) else None)
+        if persisted_top:
+            top10 = persisted_top
+        else:
+            # Strict mode: do not regenerate Top‑10 during enrichment; require user to confirm again
+            if bool(state.get("strict_top10")):
+                try:
+                    logger.info("[enrich] strict mode: no persisted Top‑10; aborting (no discovery)")
+                except Exception:
+                    pass
+            # Last resort (non-strict only): if the chat previously showed Top‑10, attempt regeneration once
+            elif _top10_preview_was_sent(state):
+                try:
+                    regen = await _regenerate_top10_if_missing(state, int(tid) if isinstance(tid, int) else None)
+                    if regen:
+                        top10 = regen
+                except Exception:
+                    pass
+    # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
+    # Strict policy: reuse persisted Top‑10. If unavailable, ask user to regenerate.
+    if not (isinstance(top10, list) and top10):
+        try:
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [AIMessage(content="I can’t find the Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate it, then use 'run enrichment'.")],
+            )
+        except Exception:
+            pass
+        return state
+    if isinstance(top10, list) and top10:
+        try:
+            from src.database import get_conn as _get_conn
+            with _get_conn() as _c, _c.cursor() as _cur:
+                cand: list[dict] = []
+                for it in top10[:10]:
+                    dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                    if not dom:
+                        continue
+                    _cur.execute("SELECT company_id, name FROM companies WHERE website_domain=%s", (dom,))
+                    row = _cur.fetchone()
+                    if row and row[0] is not None:
+                        cid = int(row[0])
+                        name = (row[1] or dom)
+                    else:
+                        _cur.execute(
+                            "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                            (dom, dom),
+                        )
+                        cid = int((_cur.fetchone() or [None])[0])
+                        name = dom
+                    cand.append({"id": cid, "name": name})
+            if cand:
+                # Only override existing candidates when Top‑10 has at least the immediate enrichment limit
+                try:
+                    enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+                except Exception:
+                    enrich_now_limit = 10
+                existing = state.get("candidates") or []
+                if existing and len(cand) < enrich_now_limit:
+                    try:
+                        logger.info(
+                            "[enrich] keep existing candidates=%d; top10 too short=%d (limit=%d)",
+                            len(existing) if isinstance(existing, list) else 0,
+                            len(cand),
+                            enrich_now_limit,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    state["candidates"] = cand
+                    state["strict_top10"] = True
+                    try:
+                        logger.info("[enrich] using persisted top10 count=%d", len(cand))
+                    except Exception:
+                        pass
+        except Exception:
+            # Non-fatal; fall back to existing selection logic
+            pass
+        # Persist preview if tenant known
+        try:
+            tid = await _resolve_tenant_id_for_write(state)
+        except Exception:
+            tid = None
+        _persist_top10_preview(int(tid) if isinstance(tid, int) else None, top10 if isinstance(top10, list) else [])
     if not state.get("candidates"):
         # Prefer sync_head_company_ids captured during chat normalize (10 upserts)
         try:
@@ -3053,7 +4474,8 @@ async def enrich_node(state: GraphState) -> GraphState:
     except Exception:
         enrich_now_limit = 10
     # If we have fewer than the desired head count, try to top up from ACRA by SSIC codes
-    if len(candidates) < enrich_now_limit:
+    # Skip top-ups when strict Top‑10 is active
+    if len(candidates) < enrich_now_limit and not state.get("strict_top10"):
         try:
             # Derive SSIC codes from selected suggestions
             sugg = state.get("micro_icp_suggestions") or []
@@ -3174,6 +4596,16 @@ async def enrich_node(state: GraphState) -> GraphState:
     state["results"] = results
     state["enrichment_completed"] = all_done
 
+    # Always enqueue background for the next 40 preview candidates (once per thread),
+    # even if some of the head-of-line enrichments failed or were skipped.
+    try:
+        _enqueue_next40_if_applicable(state)
+    except Exception as _enq_exc:
+        try:
+            logger.warning("[next40] enqueue failed: %s", _enq_exc)
+        except Exception:
+            pass
+
     if all_done:
         # Compose completion message; include ACRA/ICP totals and nightly remainder
         icp_total = 0
@@ -3186,18 +4618,15 @@ async def enrich_node(state: GraphState) -> GraphState:
             acra_total_state = int(state.get("acra_total_suggested") or 0)
         except Exception:
             acra_total_state = 0
-        base_total = acra_total_state or icp_total
-        remaining = max(base_total - len(results), 0) if base_total else None
-        suffix = (
-            f" Total candidates: {base_total}. Remaining scheduled nightly: {remaining}."
-            if base_total
-            else " The enrichment pipeline will continue by nightly runner."
+        # Do not surface counts; keep a simple nightly note
+        done_msg = (
+            f"Enrichment complete for {len(results)} companies. The nightly runner will process the remaining ICP companies."
         )
-        done_msg = f"Enrichment complete for {len(results)} companies." + suffix
         state["messages"] = add_messages(
             state.get("messages") or [],
             [AIMessage(content=done_msg)],
         )
+        # (Already enqueued next‑40 above if applicable)
         # Trigger lead scoring pipeline and persist scores for UI consumption
         try:
             # Include all results for scoring, but export to Odoo only for non-skipped rows
@@ -3274,7 +4703,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                                     SELECT s.title
                                     FROM icp_evidence e
                                     JOIN ssic_ref s
-                                      ON regexp_replace(s.code::text,'\D','','g') = regexp_replace((e.value->>'ssic')::text,'\D','','g')
+                                      ON regexp_replace(s.code::text,'\\D','','g') = regexp_replace((e.value->>'ssic')::text,'\\D','','g')
                                     WHERE e.signal_key='ssic'
                                     GROUP BY s.title
                                     ORDER BY COUNT(*) DESC
@@ -3315,7 +4744,36 @@ async def enrich_node(state: GraphState) -> GraphState:
                             logger.warning("nightly remainder enqueue failed: %s", _qexc)
 
                 # Best-effort Odoo sync for completed companies (skip ones we skipped enriching)
+                # Guarded by env flag and readiness; skip in local dev unless explicitly enabled.
                 try:
+                    def _odoo_export_enabled() -> bool:
+                        # Policy: if ODOO_EXPORT_ENABLED is explicitly set, honor it.
+                        # Otherwise, auto-enable when a mapping/DSN is present.
+                        try:
+                            raw = os.getenv("ODOO_EXPORT_ENABLED")
+                            if raw is not None:
+                                v = raw.strip().lower()
+                                return v in ("1", "true", "yes", "on")
+                        except Exception:
+                            pass
+                        # Auto-enable if we can resolve any active mapping or DSN
+                        try:
+                            from src.settings import ODOO_POSTGRES_DSN as _ODSN
+                            if _ODSN:
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            with get_conn() as _c, _c.cursor() as _cur:
+                                _cur.execute("SELECT 1 FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                                return bool(_cur.fetchone())
+                        except Exception:
+                            return False
+
+                    if not _odoo_export_enabled():
+                        logger.info("odoo export skipped: disabled by policy (no mapping/flag)")
+                        # Soft-skip export without raising; proceed with rest of flow
+                        raise StopIteration
                     pool = await get_pg_pool()
                     async with pool.acquire() as conn:
                         comp_rows = await conn.fetch(
@@ -3506,20 +4964,148 @@ async def enrich_node(state: GraphState) -> GraphState:
                                 logger.exception(
                                     "odoo sync failed for company_id=%s", cid
                                 )
+                except StopIteration:
+                    pass
                 except Exception as _odoo_exc:
                     logger.exception("odoo sync block failed")
         except Exception as _score_exc:
             logger.exception("lead scoring failed")
     else:
-        done = sum(1 for r in results if r.get("completed"))
+        # Partial completion: score and export the completed subset now; enqueue the remainder for background.
+        done = [r for r in results if r.get("completed")]
+        pending = [r for r in results if not r.get("completed")]
+        done_ids = [int(r.get("company_id")) for r in done if r.get("company_id") is not None]
+        pending_ids = [int(r.get("company_id")) for r in pending if r.get("company_id") is not None]
+
+        # Score the completed subset and render the table immediately
+        try:
+            if done_ids:
+                scoring_initial_state = {
+                    "candidate_ids": done_ids,
+                    "lead_features": [],
+                    "lead_scores": [],
+                    "icp_payload": {
+                        "employee_range": {
+                            "min": (state.get("icp") or {}).get("employees_min"),
+                            "max": (state.get("icp") or {}).get("employees_max"),
+                        },
+                        "revenue_bucket": (state.get("icp") or {}).get("revenue_bucket"),
+                        "incorporation_year": {
+                            "min": (state.get("icp") or {}).get("year_min"),
+                            "max": (state.get("icp") or {}).get("year_max"),
+                        },
+                    },
+                }
+                await lead_scoring_agent.ainvoke(scoring_initial_state)
+                # Filter candidates to the completed subset for display
+                try:
+                    cands = state.get("candidates") or []
+                    state["candidates"] = [c for c in cands if int(c.get("id") or 0) in set(done_ids)]
+                except Exception:
+                    pass
+                state = await score_node(state)
+        except Exception:
+            logger.exception("partial scoring failed")
+
+        # Attempt Odoo export for completed subset (best-effort)
+        try:
+            if done_ids:
+                from app.odoo_store import OdooStore
+                # Resolve tenant id, mirroring the all_done path
+                _tid_val = state.get("tenant_id") if isinstance(state, dict) else None
+                try:
+                    _tid = int(_tid_val) if _tid_val is not None else None
+                except Exception:
+                    _tid = None
+                if _tid is None:
+                    try:
+                        _tid_env = os.getenv("DEFAULT_TENANT_ID")
+                        _tid = int(_tid_env) if _tid_env and _tid_env.isdigit() else None
+                    except Exception:
+                        _tid = None
+                store = None
+                try:
+                    store = OdooStore(tenant_id=_tid)
+                except Exception:
+                    store = None
+                if store is not None:
+                    async with pool.acquire() as conn:
+                        comp_rows = await conn.fetch(
+                            """
+                            SELECT company_id, name, uen, industry_norm, employees_est,
+                                   revenue_bucket, incorporation_year, website_domain
+                            FROM companies WHERE company_id = ANY($1::int[])
+                            """,
+                            done_ids,
+                        )
+                        comps = {r["company_id"]: dict(r) for r in comp_rows}
+                        email_rows = await conn.fetch(
+                            "SELECT company_id, email FROM lead_emails WHERE company_id = ANY($1::int[])",
+                            done_ids,
+                        )
+                        emails: Dict[int, str] = {}
+                        for row in email_rows:
+                            emails.setdefault(row["company_id"], row["email"])
+                        score_rows = await conn.fetch(
+                            "SELECT company_id, score, rationale FROM lead_scores WHERE company_id = ANY($1::int[])",
+                            done_ids,
+                        )
+                        scores = {r["company_id"]: dict(r) for r in score_rows}
+                    for cid in done_ids:
+                        comp = comps.get(cid) or {}
+                        email = emails.get(cid)
+                        try:
+                            odoo_id = await store.upsert_company(
+                                comp.get("name"),
+                                comp.get("uen"),
+                                industry_norm=comp.get("industry_norm"),
+                                employees_est=comp.get("employees_est"),
+                                revenue_bucket=comp.get("revenue_bucket"),
+                                incorporation_year=comp.get("incorporation_year"),
+                                website_domain=comp.get("website_domain"),
+                            )
+                            if email:
+                                try:
+                                    await store.add_contact(odoo_id, email)
+                                except Exception:
+                                    pass
+                            sc = scores.get(cid)
+                            if sc:
+                                try:
+                                    await store.create_lead_if_high(
+                                        odoo_id,
+                                        comp.get("name"),
+                                        float(sc.get("score") or 0.0),
+                                        {},
+                                        str(sc.get("rationale") or ""),
+                                        email,
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            logger.exception("odoo sync failed for company_id=%s", cid)
+        except Exception:
+            logger.exception("partial odoo export failed")
+
+        # Enqueue pending items for background enrichment if any
+        try:
+            if pending_ids:
+                tid = await _resolve_tenant_id_for_write(state)
+                if tid is not None:
+                    from src.jobs import enqueue_web_discovery_bg_enrich as __enqueue_bg
+                    __enqueue_bg(int(tid), pending_ids)
+        except Exception as _bg_exc:
+            try:
+                logger.warning("[enqueue-pending] failed: %s", _bg_exc)
+            except Exception:
+                pass
+
+        # Notify user and continue
         total = len(results)
+        msg = f"Enrichment finished with issues ({len(done_ids)}/{total} completed). I scored and listed completed ones here; the rest are queued for background."
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [
-                AIMessage(
-                    content=f"Enrichment finished with issues ({done}/{total} completed). I’ll wait to score until all complete."
-                )
-            ],
+            [AIMessage(content=msg)],
         )
     return state
 
@@ -3569,6 +5155,13 @@ async def score_node(state: GraphState) -> GraphState:
         return state
 
     async with pool.acquire() as conn:
+        # Apply RLS tenant context if known so we can read tenant-scoped lead_scores
+        try:
+            tid = await _resolve_tenant_id_for_write(state)
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", str(tid))
+        except Exception:
+            pass
         # 1) Fetch latest scores for the candidate IDs
         score_rows = await conn.fetch(
             f"""
@@ -3647,60 +5240,135 @@ def router(state: GraphState) -> str:
 
     text = _last_user_text(state).lower()
 
-    # Boot-session initialization: record current message count so we only honor
-    # commands after a NEW human message arrives post-boot.
+    # Boot-session initialization: record current message count and STOP
+    # any resumed run immediately after server restart. We only honor commands
+    # after a NEW human message arrives post-boot.
     try:
+        def _is_human(m) -> bool:
+            try:
+                if isinstance(m, HumanMessage):
+                    return True
+                if isinstance(m, dict):
+                    role = (m.get("type") or m.get("role") or "").lower()
+                    return role in {"human", "user"}
+            except Exception:
+                return False
+            return False
+
         if state.get("boot_init_token") != BOOT_TOKEN:
             state["boot_init_token"] = BOOT_TOKEN
             state["boot_seen_messages_len"] = len(msgs)
+            last = msgs[-1] if msgs else None
+            # Halt only if there isn't a fresh human message
+            if not (last and _is_human(last)):
+                logger.info("router -> end (boot resume guard: waiting for new user input)")
+                return "end"
+            # Fresh human: clear duplicate guard to allow routing
+            state["last_user_boot_token"] = BOOT_TOKEN
+            try:
+                if "last_routed_text" in state:
+                    del state["last_routed_text"]
+            except Exception:
+                pass
         else:
             # On subsequent router cycles, if new messages appended and last is Human → mark as fresh user action
             if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
                 last = msgs[-1] if msgs else None
-                def _is_human(m) -> bool:
-                    try:
-                        if isinstance(m, HumanMessage):
-                            return True
-                        if isinstance(m, dict):
-                            role = (m.get("type") or m.get("role") or "").lower()
-                            return role in {"human", "user"}
-                    except Exception:
-                        return False
-                    return False
                 if last and _is_human(last):
                     state["last_user_boot_token"] = BOOT_TOKEN
+                    # New human input: allow routing again by clearing last_routed_text
+                    try:
+                        if "last_routed_text" in state:
+                            del state["last_routed_text"]
+                    except Exception:
+                        pass
                 state["boot_seen_messages_len"] = len(msgs)
     except Exception:
         pass
 
-    # Do not auto-run anything if assistant spoke last, unless user explicitly typed a new command.
-    # This prevents enrichment from resuming on server restart. Nightly jobs should invoke nodes directly.
-    if _last_is_ai(msgs) and "run enrichment" not in text and not re.search(r"\baccept\s+micro[- ]icp\b", text):
-        logger.info("router -> end (assistant last; no explicit user action)")
+    # If we've already routed for this exact human text, wait for new input to avoid loops
+    try:
+        if (state.get("last_routed_text") or "") == text and text.strip():
+            logger.info("router -> end (duplicate command; waiting for new user input)")
+            return "end"
+    except Exception:
+        pass
+
+    # Note: Do not route to enrichment here. We intentionally handle
+    # explicit 'run enrichment' after the assistant-last guard below to
+    # avoid loops when the assistant just spoke.
+
+    # If the assistant spoke last, do not route again until a NEW human message arrives.
+    # This prevents loops where the router keeps re-reading the same last human text.
+    if _last_is_ai(msgs):
+        logger.info("router -> end (assistant last)")
         return "end"
 
-    # Enrichment gating: require required Fast-Start fields; otherwise route back to ICP Q&A
-    if (
-        "run enrichment" in text
-        and state.get("candidates")
-        and not state.get("results")
-    ):
-        icp_f = dict(state.get("icp") or {})
-        asks = dict(state.get("ask_counts") or {})
-        if ENABLE_ICP_INTAKE and not _icp_required_fields_done(icp_f, asks):
-            logger.info("router -> icp (ask remaining required Fast-Start fields before enrichment)")
-            return "icp"
-        logger.info("router -> enrich (explicit user override)")
-        return "enrich"
+    # Intent detection: only begin ICP when the user explicitly asks for lead generation
+    # Note: do NOT treat 'run enrichment' as generic lead-intent here; it has an
+    # explicit branch later that routes to enrichment. Including it here would
+    # misroute to the ICP node and block enrichment.
+    lead_intent = False
+    try:
+        # phrases like: start lead gen, start lead generation, start discovery, start prospecting
+        if re.search(r"\bstart\s+(lead(\s*gen|\s*generation)?|prospect(ing)?|discovery|enrich(ment)?)\b", text):
+            lead_intent = True
+        # commands like: find/generate/prospect/discover leads/companies
+        if re.search(r"\b(find|generate|prospect|discover)\s+(leads?|companies)\b", text):
+            lead_intent = True
+    except Exception:
+        lead_intent = False
+
+    if lead_intent:
+        logger.info("router -> icp (explicit lead-gen intent)")
+        try:
+            state["last_routed_text"] = text
+            state["icp_in_progress"] = True
+        except Exception:
+            pass
+        return "icp"
+
+    # Greetings: acknowledge and explain how to start lead-gen, without auto-starting
+    if re.search(r"\b(hello|hi|hey|howdy)\b", text) and not bool(state.get("welcomed")):
+        logger.info("router -> welcome (greeting)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        return "welcome"
+
+    # If user pasted a website/domain and Finder is enabled, treat it as starting/continuing ICP
+    try:
+        url = _parse_website(text)
+    except Exception:
+        url = None
+    if url:
+        logger.info("router -> icp (website/domain provided)")
+        try:
+            state["last_routed_text"] = text
+            state["icp_in_progress"] = True
+            # Initialize icp dict if missing so icp node can store website
+            if not state.get("icp"):
+                state["icp"] = {}
+        except Exception:
+            pass
+        return "icp"
+
+    # (Handled above) Explicit enrichment command routes immediately
 
     # Accept micro‑ICP selection
     if re.search(r"\baccept\s+micro[- ]icp\b", text):
         logger.info("router -> accept (user accepted micro‑ICP)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
         return "accept"
 
-    # 1) Pipeline progression
+    # 1) Pipeline progression (explicit only)
     # Finder gating: do NOT auto-advance to enrichment until micro-ICP suggestions are done
-    if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
+    # Finder gating: allow explicit 'run enrichment' to override the hold
+    if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done") and ("run enrichment" not in text):
         # If we already have candidates but haven't finished Finder suggestions, hold and wait for user
         if state.get("candidates") and not state.get("results"):
             logger.info("router -> end (Finder: hold before enrichment until suggestions)")
@@ -3715,10 +5383,7 @@ def router(state: GraphState) -> str:
     has_scored = bool(state.get("scored"))
     enrichment_completed = bool(state.get("enrichment_completed"))
 
-    # Only progress when a human spoke last. This stops auto-run after server restarts.
-    if has_candidates and not has_results and not _last_is_ai(msgs):
-        logger.info("router -> enrich (have candidates, no enrichment)")
-        return "enrich"
+    # Do not auto-progress; enrichment only runs on explicit command handled below.
     if has_results and enrichment_completed and not has_scored:
         logger.info("router -> score (have enrichment, no scores, all completed)")
         return "score"
@@ -3728,18 +5393,17 @@ def router(state: GraphState) -> str:
 
     # 2) If assistant spoke last and no pending work, wait for user input (covered by early guard)
 
-    # 3) Fast-path: user requested enrichment
+    # 3) Fast-path: user requested enrichment (only when last turn was human)
     if "run enrichment" in text:
-        # Finder context: if suggestions not finished yet, hold until they are done
-        if ENABLE_ICP_INTAKE and not state.get("finder_suggestions_done"):
-            logger.info("router -> end (Finder: hold until suggestions are done before run enrichment)")
-            return "end"
-        # Proceed with enrichment when candidates exist, regardless of ICP completeness
-        if state.get("candidates"):
-            logger.info("router -> enrich (user requested enrichment)")
-            return "enrich"
-        logger.info("router -> candidates (prepare candidates before enrichment)")
-        return "candidates"
+        logger.info("router -> enrich (user requested enrichment)")
+        try:
+            state["last_routed_text"] = text
+            # Enrichment should strictly use the previously persisted Top‑10;
+            # never re-run discovery during this command.
+            state["strict_top10"] = True
+        except Exception:
+            pass
+        return "enrich"
 
     # 4) If user pasted an explicit company list, jump to candidates
     # Avoid misclassifying comma-separated industry/geo lists as companies.
@@ -3748,37 +5412,92 @@ def router(state: GraphState) -> str:
     if pasted and any(("." in n) or (" " in n) for n in pasted):
         if ENABLE_ICP_INTAKE and not _icp_complete(icp):
             logger.info("router -> icp (Finder gating: ignore explicit list until ICP set)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
             return "icp"
         logger.info("router -> candidates (explicit company list)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
         return "candidates"
 
-    # 5) User said confirm: proceed forward once (avoid loops)
+    # 5) Free‑form lead‑gen Q&A: if the user asked a general question, answer it directly.
+    # Avoid hijacking explicit commands.
+    try:
+        if (
+            _qa_answer is not None
+            and not any(k in text for k in ("run enrichment", "accept micro", "accept micro-icp"))
+            and ("?" in text or re.match(r"\b(how|what|why|when|where|which|tips|best|increase|improve)\b", text))
+            and (state.get("last_answered_text") != text)
+        ):
+            logger.info("router -> leadgen_qa (free‑form question detected)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "leadgen_qa"
+    except Exception:
+        pass
+
+    # 6) User said confirm: proceed forward once (avoid loops)
     if _user_just_confirmed(state):
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
         if ENABLE_ICP_INTAKE:
             has_minimal = bool(icp.get("website_url")) and bool(icp.get("seeds_list"))
             if has_minimal:
                 logger.info("router -> confirm (Finder minimal intake present; proceeding to confirm pipeline)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
                 return "confirm"
             # Otherwise continue asking for missing pieces
             if not _icp_complete(icp):
                 logger.info("router -> icp (Finder gating: need website + seeds before confirm)")
                 return "icp"
-        # If we already derived candidates, move ahead to enrichment; else collect candidates first.
-        if state.get("candidates"):
-            logger.info("router -> enrich (user confirmed ICP; have candidates)")
-            return "enrich"
-        logger.info("router -> candidates (user confirmed ICP)")
-        return "candidates"
+        # After confirm, do not auto-run enrichment. Hold for explicit 'run enrichment'.
+        if not state.get("candidates"):
+            logger.info("router -> candidates (user confirmed ICP; prepare candidates)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "candidates"
+        logger.info("router -> end (confirmed; waiting for 'run enrichment')")
+        return "end"
 
-    # 6) If ICP is not complete yet, continue ICP Q&A
-    if not _icp_complete(icp):
-        logger.info("router -> icp (need more ICP)")
-        return "icp"
+    # 6) ICP intake progression: if ICP is in progress and incomplete, route to ICP to parse the user's reply
+    try:
+        asks = dict(state.get("ask_counts") or {})
+    except Exception:
+        asks = {}
+    try:
+        if ENABLE_ICP_INTAKE:
+            if bool(state.get("icp_in_progress")) and not _icp_required_fields_done(icp or {}, asks):
+                logger.info("router -> icp (continue ICP intake)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "icp"
+        else:
+            # Non-Finder mode: continue asking until basic ICP is complete
+            if (icp and not _icp_complete(icp)):
+                logger.info("router -> icp (continue ICP basics)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "icp"
+    except Exception:
+        pass
 
-    # 7) Default
-    logger.info("router -> icp (default)")
-    return "icp"
+    # 7) Default: do nothing until explicit intent
+    logger.info("router -> end (no explicit lead‑gen intent)")
+    return "end"
 
 
 def router_entry(state: GraphState) -> GraphState:
@@ -3838,6 +5557,56 @@ def build_graph():
     g.add_node("confirm", confirm_node)
     g.add_node("enrich", enrich_node)
     g.add_node("score", score_node)
+    # Welcome node for greetings without kicking off lead-gen automatically
+    def welcome(state: GraphState) -> GraphState:
+        try:
+            msg = (
+                "Hi! I can answer questions about lead generation. "
+                "When you’re ready to begin, say ‘start lead gen’, ‘find leads’, or ‘run enrichment’."
+            )
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(msg)])
+            state["welcomed"] = True
+        except Exception:
+            pass
+        return state
+    g.add_node("welcome", welcome)
+    # Lead‑gen Q&A node for free‑form questions
+    def leadgen_qa(state: GraphState) -> GraphState:
+        try:
+            q = _last_user_text(state)
+            # Build a richer runtime context for smart, system-only answers
+            try:
+                run_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
+            except Exception:
+                run_now_limit = 10
+            ctx = {
+                "icp": state.get("icp") or {},
+                "candidates_count": (len(state.get("candidates") or []) if isinstance(state.get("candidates"), list) else 0),
+                "results_count": (len(state.get("results") or []) if isinstance(state.get("results"), list) else 0),
+                "scored_count": (len(state.get("scored") or []) if isinstance(state.get("scored"), list) else 0),
+                "ENABLE_ICP_INTAKE": bool(ENABLE_ICP_INTAKE),
+                "ENABLE_AGENT_DISCOVERY": bool(ENABLE_AGENT_DISCOVERY),
+                "ENABLE_ACRA_IN_CHAT": bool(ENABLE_ACRA_IN_CHAT),
+                "finder_suggestions_done": bool(state.get("finder_suggestions_done")),
+                "micro_icp_selected": bool(state.get("micro_icp_selected")),
+                "icp_match_total": state.get("icp_match_total"),
+                "acra_total_suggested": state.get("acra_total_suggested"),
+                "enrich_now_planned": state.get("enrich_now_planned"),
+                "RUN_NOW_LIMIT": run_now_limit,
+            }
+            if _qa_answer is not None:
+                ans = _qa_answer(q, context=ctx)
+            else:
+                ans = "I can answer lead‑gen questions once the LLM is configured."
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(ans)])
+            state["last_answered_text"] = (q or "").strip().lower()
+        except Exception as e:
+            try:
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(f"I hit an error answering that: {e}")])
+            except Exception:
+                pass
+        return state
+    g.add_node("leadgen_qa", leadgen_qa)
     # Accept micro‑ICP selection node
     g.add_node("accept", accept_micro_icp)
     # Central router: every node returns here so we can advance the workflow
@@ -3848,12 +5617,15 @@ def build_graph():
         "accept": "accept",
         "enrich": "enrich",
         "score": "score",
+        "leadgen_qa": "leadgen_qa",
+        "welcome": "welcome",
         "end": END,
     }
     # Start in the router so we always decide the right first step
     g.set_entry_point("router")
     g.add_conditional_edges("router", router, mapping)
     # Every worker node loops back to the router
+    # Route all worker nodes back to router EXCEPT welcome, which should end the run
     for node in ("icp", "candidates", "confirm", "accept", "enrich", "score"):
         g.add_edge(node, "router")
     return g.compile()

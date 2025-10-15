@@ -165,12 +165,15 @@ async def require_identity(request: Request) -> dict:
 
 
 async def require_optional_identity(request: Request) -> dict:
-    """Return identity from bearer token when present; otherwise allow dev-style headers.
+    """Best-effort identity extraction.
 
-    - Does not require a tenant_id claim.
-    - If no Authorization header, checks cookie `nx_access`.
-    - Intended for onboarding endpoints to avoid 401 loops when frontend has not
-      attached the token yet, while still verifying when a token is present.
+    Behavior:
+    - If a JWT is present (cookie or Authorization header), verify and return claims.
+    - If no JWT:
+      - In `local_dev` or when `DEV_AUTH_BYPASS` is truthy, accept an optional
+        `X-Tenant-ID` header and return a minimal dev claim. This unblocks local
+        health checks and status polling without requiring full SSO.
+      - Otherwise, raise 401 (production default).
     """
     token = request.cookies.get("nx_access")
     if not token:
@@ -182,5 +185,13 @@ async def require_optional_identity(request: Request) -> dict:
         request.state.tenant_id = claims.get("tenant_id")
         request.state.roles = claims.get("roles", [])
         return claims
-    # No credentials; return 401 to enforce production behavior
+    # No token present: allow dev bypass with optional X-Tenant-ID
+    variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower()
+    dev_bypass = _is_truthy(os.getenv("DEV_AUTH_BYPASS")) or (variant == "local_dev")
+    if dev_bypass:
+        hdr_tid = request.headers.get("x-tenant-id") or request.headers.get("X-Tenant-ID")
+        tid_val = hdr_tid.strip() if isinstance(hdr_tid, str) and hdr_tid.strip() else None
+        request.state.tenant_id = tid_val
+        request.state.roles = []
+        return {"sub": "dev-bypass", "tenant_id": tid_val, "roles": []}
     raise HTTPException(status_code=401, detail="Missing credentials")

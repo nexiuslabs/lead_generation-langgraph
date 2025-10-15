@@ -1,0 +1,18 @@
+###############################################
+# Development and tooling (optional)
+# Install with: pip install -r requirements-dev.txt
+###############################################
+
+# Code quality
+black
+isort
+
+# Testing
+pytest-asyncio
+pytest-tornasync
+pytest-trio
+pytest-twisted
+
+# LangGraph local tooling / API helpers
+langgraph-api
+langgraph-cli

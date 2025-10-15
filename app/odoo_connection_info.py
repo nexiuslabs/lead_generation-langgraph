@@ -1,13 +1,51 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict, Any
+import os
+import time
+from typing import Optional, Dict, Any, Tuple
 
 from src.database import get_conn
 from app.odoo_store import OdooStore
-import os
 
 logger = logging.getLogger("onboarding")
+
+# Cache for /session/odoo_info to avoid spamming connectivity checks and logs
+_INFO_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_LAST_LOG: Dict[int, Tuple[float, Optional[bool]]] = {}
+
+def _ttl_seconds() -> float:
+    try:
+        return float(os.getenv("ODOO_INFO_TTL_S", "5") or 5)
+    except Exception:
+        return 5.0
+
+def _cache_get(tid: Optional[int]) -> Optional[Dict[str, Any]]:
+    if tid is None:
+        return None
+    e = _INFO_CACHE.get(int(tid))
+    if not e:
+        return None
+    ts, val = e
+    if (time.time() - ts) <= _ttl_seconds():
+        return val
+    return None
+
+def _cache_set(tid: Optional[int], val: Dict[str, Any]) -> None:
+    if tid is None:
+        return
+    _INFO_CACHE[int(tid)] = (time.time(), val)
+
+def _log_status(email: str, tid: Optional[int], db_name: Optional[str], ready: bool) -> None:
+    if tid is None:
+        logger.info("session:odoo_info email=%s tenant_id=%s db_name=%s ready=%s", email, tid, db_name, ready)
+        return
+    key = int(tid)
+    prev = _LAST_LOG.get(key)
+    now = time.time()
+    if prev is None or prev[1] != ready or (now - prev[0]) >= 30.0:
+        logger.info("session:odoo_info email=%s tenant_id=%s db_name=%s ready=%s", email, tid, db_name, ready)
+        _LAST_LOG[key] = (now, ready)
 
 
 def _infer_db_from_dsn() -> Optional[str]:
@@ -69,6 +107,10 @@ def _current_odoo_db_name(tenant_id: int) -> Optional[str]:
 
 async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict[str, Any]:
     tid = _resolve_tenant_id(email, claim_tid)
+    # Serve from cache when fresh to avoid repeated Odoo connectivity checks/logs
+    cached = _cache_get(tid)
+    if cached is not None:
+        return cached
     db_name = None
     base_url = None
     if tid is not None:
@@ -104,15 +146,9 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
     except Exception:
         login_url = None
 
-    logger.info(
-        "session:odoo_info email=%s tenant_id=%s db_name=%s ready=%s",
-        email,
-        tid,
-        db_name,
-        ready,
-    )
+    _log_status(email, tid, db_name, ready)
 
-    return {
+    out = {
         "email": email,
         "tenant_id": tid,
         "odoo": {
@@ -123,3 +159,5 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
             "login_url": login_url,
         },
     }
+    _cache_set(tid, out)
+    return out

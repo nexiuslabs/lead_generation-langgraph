@@ -3,7 +3,6 @@ from typing import Dict, Any, List, Union
 import os
 import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, END
 from app.pre_sdr_graph import build_graph, GraphState  # new dynamic builder
 from src.database import get_conn
@@ -505,6 +504,67 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
         if tid is not None:
             state["tenant_id"] = tid
     except Exception:
+        pass
+
+    # Best-effort: if we have a tenant_id (or can infer one), pre-load the last saved ICP rule
+    # and reuse it to prime the chat state so users don't need to re-enter ICP each session.
+    try:
+        tenant_id = state.get("tenant_id")
+        if tenant_id is None:
+            # Fall back to DSN→odoo_connections mapping like other helpers do
+            try:
+                from app.odoo_connection_info import get_odoo_connection_info
+                info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
+                tenant_id = info.get("tenant_id") if isinstance(info, dict) else None
+                if tenant_id is not None:
+                    state["tenant_id"] = tenant_id
+            except Exception:
+                tenant_id = None
+        if tenant_id is not None:
+            from src.database import get_conn as _get_conn
+            with _get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute(
+                    "SELECT payload FROM icp_rules WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 1",
+                    (int(tenant_id),),
+                )
+                row = _cur.fetchone()
+                payload_rule = row[0] if row and row[0] is not None else None
+            if isinstance(payload_rule, dict) and payload_rule:
+                # Map rule payload into chat state icp fields and an icp_profile for agent discovery
+                icp_ic = {}
+                prof = {}
+                # Lists
+                for k in ("industries", "integrations", "buyer_titles", "triggers", "geos"):
+                    v = payload_rule.get(k)
+                    if isinstance(v, list) and any(isinstance(x, str) and x.strip() for x in v):
+                        if k in ("integrations", "buyer_titles", "triggers"):
+                            prof[k] = v
+                        else:
+                            icp_ic[k] = v
+                # Ranges
+                er = payload_rule.get("employee_range") or {}
+                if isinstance(er, dict):
+                    if er.get("min") is not None:
+                        icp_ic["employees_min"] = er.get("min")
+                    if er.get("max") is not None:
+                        icp_ic["employees_max"] = er.get("max")
+                yr = payload_rule.get("incorporation_year") or {}
+                if isinstance(yr, dict):
+                    if yr.get("min") is not None:
+                        icp_ic["year_min"] = yr.get("min")
+                    if yr.get("max") is not None:
+                        icp_ic["year_max"] = yr.get("max")
+                # Other direct fields (optional)
+                for k in ("revenue_bucket",):
+                    if k in payload_rule:
+                        icp_ic[k] = payload_rule.get(k)
+                # Persist into state if not already set by this input
+                if icp_ic and not state.get("icp"):
+                    state["icp"] = icp_ic
+                if prof:
+                    state["icp_profile"] = prof
+    except Exception:
+        # Non-fatal; proceed without priming
         pass
 
     # optional “companies”/“candidates” passthrough for your graph

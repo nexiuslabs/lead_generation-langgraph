@@ -17,15 +17,23 @@ Highlights
 Install
 - python -m venv .venv
 - source .venv/bin/activate
+- pip install --upgrade pip
 - pip install -r requirements.txt
 
+Dev tools (optional)
+- pip install -r requirements-dev.txt
+
 Dependencies (from requirements.txt)
-- python-dotenv, langchain-core, langchain-openai, langchain_community
-- langgraph, langgraph-prebuilt
-- asyncpg, psycopg2
-- scikit-learn
-- httpx, beautifulsoup4
-- grandalf (diagramming)
+- fastapi>=0.115,<0.116 and starlette>=0.38.6
+- httpx>=0.26,<0.28, requests, beautifulsoup4
+- langchain, langchain-core, langchain-openai, langchain_community
+- langgraph, langgraph-prebuilt, langgraph-sdk
+- asyncpg, psycopg2, scikit-learn
+- python-dotenv, PyJWT, passlib, apscheduler, grandalf (diagramming)
+
+Notes on environments
+- Always install in a fresh virtualenv; avoid using system Python packages.
+- If you previously installed conflicting global packages (e.g., embedchain, crewai, langgraph-api), recreate the venv: `rm -rf .venv && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`.
 
 ## Environment Variables (credentials)
 Create a local `.env` (never commit). GitHub Push Protection will block pushes if secrets are committed.
@@ -43,7 +51,7 @@ Optional / Recommended
 - CRAWL_MAX_PAGES: default `6` (total site pages after homepage)
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
 - ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
-- ENABLE_LANGSERVE_IN_APP: set to `true` to expose `/agent` routes for LangGraph development
+ 
 
 Example `.env` (do not use real keys here)
 ```
@@ -57,17 +65,10 @@ LANGCHAIN_MODEL=gpt-4o-mini
 TEMPERATURE=0.3
 CRAWL_MAX_PAGES=6
 EXTRACT_CORPUS_CHAR_LIMIT=35000
-ENABLE_LANGSERVE_IN_APP=true
+ 
 ```
 
-## Local LangGraph Development
-
-The API can expose a LangGraph at `/agent` for interactive testing.
-
-1. Set `OPENAI_API_KEY` in your environment.
-2. Set `ENABLE_LANGSERVE_IN_APP=true` to mount the `/agent` routes when running `uvicorn`.
-3. Start the server: `uvicorn app.main:app --host 0.0.0.0 --port 2024`.
-4. When using `npx langgraph dev` or LangGraph Studio, supply the same `OPENAI_API_KEY`; the key is used client-side for OpenAI calls.
+ 
 
 ## Odoo Integration
 
@@ -219,7 +220,7 @@ Logs & Output
 - Missing tables: run the SQL migrations above
 - ZeroBounce errors: missing/invalid key; enrichment continues without verified status
 - `GET /whoami 403`: the request lacks a valid Nexius SSO token or `tenant_id` claim. Sign in and include `Authorization: Bearer <JWT>` when calling `/whoami`.
-- `Failed to connect to LangGraph server`: ensure the API is running, `OPENAI_API_KEY` is set, and `ENABLE_LANGSERVE_IN_APP=true` to expose `/agent`.
+- `Failed to connect to API`: ensure the API is running and `OPENAI_API_KEY` is set when using LLM-backed features.
 
 ## Notes
 - Default OpenAI model is `gpt-4o-mini`; set `LANGCHAIN_MODEL` to change

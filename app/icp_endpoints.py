@@ -1,10 +1,14 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Header, Request
+import logging
+import asyncio
+import os
 from typing import Optional, List, Dict, Any
 from psycopg2.extras import Json
 
 # Import the dependency and helpers at module scope so tests can monkeypatch ep.* symbols
 from app.auth import require_auth  # noqa: F401  # exposed for monkeypatching in tests
 from schemas.icp import IntakePayload, SuggestionCard, AcceptRequest
+from schemas.research import ResearchImportRequest, ResearchImportResult
 from src.database import get_conn
 from src.icp_intake import (
     save_icp_intake,
@@ -17,8 +21,10 @@ from src.jobs import (
     enqueue_icp_intake_process,  # re-export for tests to monkeypatch
     run_icp_intake_process,  # re-export for tests to monkeypatch
 )
+from src.enrichment import enrich_company_with_tavily  # async enrich by company_id
 
 router = APIRouter(prefix="/icp", tags=["icp"])
+log = logging.getLogger("icp_endpoints")
 
 
 def _resolve_tenant_id(req: Request, x_tenant_id: Optional[str]) -> Optional[int]:
@@ -45,7 +51,13 @@ def _resolve_tenant_id(req: Request, x_tenant_id: Optional[str]) -> Optional[int
 def _save_icp_rule(tid: int, payload: Dict[str, Any], name: str = "Default ICP") -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO icp_rules(tenant_id, name, payload) VALUES (%s,%s,%s)",
+            """
+            INSERT INTO icp_rules(tenant_id, name, payload)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              created_at = NOW()
+            """,
             (tid, name, Json(payload)),
         )
 
@@ -220,6 +232,273 @@ async def post_accept(
         # Non-blocking: acceptance persists even if scheduling fails
         pass
     return {"ok": True, "scheduled": True, "run_now": min(head, len(ssic_codes) if ssic_codes else head)}
+
+
+@router.post("/enrich/top10")
+async def enrich_top10(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Enrich the persisted Top‑10 preview strictly by tenant.
+
+    Looks up Top‑10 domains from staging_global_companies where ai_metadata.preview=true
+    ordered by preview score, maps to company_ids, and enriches them one by one.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    try:
+        run_now_limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
+    except Exception:
+        run_now_limit = 10
+    domains: list[str] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                SELECT domain
+                FROM staging_global_companies
+                WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                LIMIT %s
+                """,
+                (tid, run_now_limit),
+            )
+            rows = cur.fetchall() or []
+            domains = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            domains = []
+    if not domains:
+        raise HTTPException(status_code=412, detail="top10 preview not found; please confirm to regenerate")
+    # Map to company_ids
+    company_ids: list[int] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT company_id FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                ([d.lower() for d in domains],),
+            )
+            rows = cur.fetchall() or []
+            company_ids = [int(r[0]) for r in rows if r and r[0] is not None]
+        except Exception:
+            company_ids = []
+    processed = 0
+    for cid in company_ids:
+        try:
+            await enrich_company_with_tavily(int(cid))
+            processed += 1
+        except Exception:
+            # continue with best-effort behavior
+            pass
+    return {"ok": True, "requested": len(company_ids), "processed": processed}
+
+
+@router.post("/enrich/next40")
+async def enrich_next40(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Enqueue background enrichment for the next 40 preview domains (Non‑SG only).
+
+    Selects the next set of preview domains after the Top‑10 for the same tenant,
+    resolves to company_ids, and enqueues a background job to enrich them.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    try:
+        run_now_limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
+        bg_next_count = int(os.getenv("BG_NEXT_COUNT", "40") or 40)
+    except Exception:
+        run_now_limit, bg_next_count = 10, 40
+    domains: list[str] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                SELECT domain
+                FROM staging_global_companies
+                WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                OFFSET %s LIMIT %s
+                """,
+                (tid, run_now_limit, bg_next_count),
+            )
+            rows = cur.fetchall() or []
+            domains = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            domains = []
+    if not domains:
+        raise HTTPException(status_code=404, detail="no next40 preview domains found")
+    # Resolve to company_ids
+    company_ids: list[int] = []
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                ([d.lower() for d in domains],),
+            )
+            rows = cur.fetchall() or []
+            found = {str((r[1] or "").lower()): int(r[0]) for r in rows if r and r[0] is not None}
+            for d in domains:
+                cid = found.get(str(d.lower()))
+                if cid:
+                    company_ids.append(cid)
+        except Exception:
+            company_ids = []
+    if not company_ids:
+        raise HTTPException(status_code=404, detail="no company_ids resolved for next40")
+    # Enqueue background job
+    try:
+        from src.jobs import enqueue_web_discovery_bg_enrich
+        job = enqueue_web_discovery_bg_enrich(int(tid), company_ids)
+        return {"ok": True, "job_id": job.get("job_id")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
+
+
+@router.get("/top10")
+async def get_top10(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Return Top‑10 lookalikes with why/snippets using DDG+Jina discovery.
+
+    Also persists lightweight preview evidence and scores to DB for auditability.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    # Build a minimal icp_profile from latest icp_rules payload when available
+    icp_profile: Dict[str, Any] = {}
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM icp_rules WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 1",
+                (tid,),
+            )
+            row = cur.fetchone()
+            payload = (row and row[0]) or {}
+            # Map simple keys if present
+            if isinstance(payload, dict):
+                if isinstance(payload.get("industries"), list):
+                    icp_profile["industries"] = payload.get("industries")
+                if isinstance(payload.get("integrations"), list):
+                    icp_profile["integrations"] = payload.get("integrations")
+                if isinstance(payload.get("buyer_titles"), list):
+                    icp_profile["buyer_titles"] = payload.get("buyer_titles")
+                if isinstance(payload.get("triggers"), list):
+                    icp_profile["triggers"] = payload.get("triggers")
+                if isinstance(payload.get("size_bands"), list):
+                    icp_profile["size_bands"] = payload.get("size_bands")
+    except Exception:
+        icp_profile = {}
+    # Run agents Top‑10
+    try:
+        from src.agents_icp import plan_top10_with_reasons as _top10
+    except Exception:
+        raise HTTPException(status_code=500, detail="agents unavailable")
+    top = await asyncio.to_thread(_top10, icp_profile, tid)
+    try:
+        log.info("[top10] planned candidates count=%d tenant_id=%s", len(top or []), tid)
+    except Exception:
+        pass
+    items: List[Dict[str, Any]] = []
+    # Persist preview evidence and ensure company rows (Top‑10 only)
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            for it in (top or [])[:10]:
+                dom = (it.get("domain") or "").strip().lower()
+                name = dom  # placeholder until crawl/enrichment fills real name
+                if not dom:
+                    continue
+                # Ensure company row by domain if missing
+                cur.execute(
+                    "SELECT company_id, name FROM companies WHERE website_domain=%s",
+                    (dom,),
+                )
+                r = cur.fetchone()
+                if r and r[0] is not None:
+                    cid = int(r[0])
+                else:
+                    cur.execute(
+                        "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s, NOW()) RETURNING company_id",
+                        (name, dom),
+                    )
+                    cid = int(cur.fetchone()[0])
+                # Write preview evidence (why/snippet) for auditability
+                why = it.get("why") or ""
+                snip = it.get("snippet") or ""
+                try:
+                    cur.execute(
+                        "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s,%s,%s,%s,'web_preview')",
+                        (tid, cid, "top10_preview", Json({"why": why, "snippet": snip})),
+                    )
+                except Exception:
+                    pass
+                # Upsert into lead_scores with preview fields
+                try:
+                    score = float(it.get("score") or 0)
+                except Exception:
+                    score = 0.0
+                bucket = it.get("bucket") or "C"
+                rationale = why or snip
+                cur.execute(
+                    """
+                    INSERT INTO lead_scores(company_id, score, bucket, rationale, cache_key)
+                    VALUES (%s,%s,%s,%s,NULL)
+                    ON CONFLICT (company_id) DO UPDATE SET
+                      score = EXCLUDED.score,
+                      bucket = EXCLUDED.bucket,
+                      rationale = EXCLUDED.rationale
+                    """,
+                    (cid, score, bucket, rationale),
+                )
+                items.append({"company_id": cid, **it})
+    except Exception:
+        # Non-fatal: still return top list
+        items = [{**it} for it in (top or [])]
+    return {"items": items}
+
+
+@router.post("/run")
+async def post_icp_run(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Shortcut endpoint: generate Top‑10 and persist preview artifacts.
+
+    Returns the same payload as GET /icp/top10.
+    """
+    return await get_top10(req, user, x_tenant_id)  # type: ignore[misc]
+
+
+@router.post("/research/import", response_model=ResearchImportResult)
+async def post_research_import(
+    body: ResearchImportRequest,
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    if int(body.tenant_id) != int(tid):
+        raise HTTPException(status_code=403, detail="tenant mismatch")
+    # Only allow server-side scanning by path for now
+    root = body.root or os.getenv("DOCS_ROOT") or "./docs"
+    try:
+        from src.research_import import import_docs_for_tenant
+
+        result = await asyncio.to_thread(import_docs_for_tenant, tid, root)
+        # Coerce to schema
+        return ResearchImportResult(**result)
+    except Exception as e:  # noqa: F841
+        raise HTTPException(status_code=500, detail="import failed")
 
 
 @router.get("/patterns")
