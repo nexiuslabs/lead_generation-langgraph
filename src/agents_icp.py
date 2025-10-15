@@ -627,15 +627,15 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             inds = ", ".join([s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()])
             site = "site:.sg" if (country_hint == 'sg') else ""
             sys = (
-                "Compose ONE effective DuckDuckGo query to find companies in the TARGET INDUSTRY only. "
-                "Use industry terms only (no buyer titles, no triggers, no integrator/vendor names). "
-                "Keep it concise (<= 12 words), prefer noun phrases. Include the site filter verbatim if provided. "
-                "Output JUST the query line."
+                "Compose ONE DuckDuckGo query to find companies strictly within the provided TARGET INDUSTRY terms. "
+                "Only use words that appear in the 'industries' list (no buyer titles, no triggers, no vendor names, no generic examples). "
+                "Keep it concise (<= 12 words). Include the site filter verbatim if provided. "
+                "If 'industries' is empty, output exactly: b2b distributors (plus the site filter if provided). "
+                "Output JUST the query."
             )
             human = (
                 f"industries: {inds}\n"
-                f"site_filter: {site}\n"
-                f"examples: food & beverage distributors; consumer goods wholesale; logistics distributors"
+                f"site_filter: {site}"
             )
             from langchain_core.messages import SystemMessage, HumanMessage
             messages = [SystemMessage(content=sys), HumanMessage(content=human)]
@@ -644,6 +644,28 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             # Guard rails: ensure site filter is present if required
             if country_hint == 'sg' and "site:.sg" not in q:
                 q = (q + " site:.sg").strip()
+            # Additional guard rails: reject generic/exampley outputs that are not grounded in industries
+            try:
+                raw_inds = [s for s in (icp.get("industries") or []) if isinstance(s, str)]
+                tokens: list[str] = []
+                for s in raw_inds:
+                    for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                        t = t.strip(" &").strip()
+                        if len(t) >= 3:
+                            tokens.append(t)
+                tokset = set(tokens)
+                qlow = q.lower()
+                bad_examples = {
+                    "food & beverage distributors",
+                    "food and beverage distributors",
+                    "consumer goods wholesale",
+                    "logistics distributors",
+                }
+                # If industries given but no token overlap OR matches a known bad example, drop to heuristic
+                if tokset and (not any(tok in qlow for tok in tokset) or qlow in bad_examples):
+                    return None
+            except Exception:
+                pass
             return q if len(q) >= 4 else None
         except Exception as e:
             log.info("[plan] llm-query fail: %s", e)
