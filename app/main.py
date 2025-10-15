@@ -35,6 +35,7 @@ def _ensure_logger(name: str, level: str = "INFO"):
 logger = _ensure_logger("input_norm")
 _ensure_logger("onboarding")
 _ensure_logger("app.odoo_store")
+_ensure_logger("jobs")
 # Reduce noise from upstream libraries during local_dev
 try:
     logging.getLogger("langgraph_api.metadata").setLevel(logging.ERROR)
@@ -100,6 +101,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Background worker must NOT run inside the API process.
+# Operate it separately via scripts/run_bg_worker.py to avoid lifecycle issues on server restarts.
+try:
+    logging.getLogger("bg_worker").info(
+        "In-app BGWorker disabled. Use scripts/run_bg_worker.py."
+    )
+except Exception:
+    pass
 
 # Note: LangServe routes removed; chat/graph execution is handled internally without mounting /agent
 

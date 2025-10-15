@@ -298,3 +298,25 @@ try:
 except Exception:
     DDG_MAX_CALLS = 2
 DDG_KL = os.getenv("DDG_KL", "")  # e.g., 'sg-en', 'us-en'
+
+# DuckDuckGo pagination tuning (env-tunable)
+try:
+    DDG_PAGINATION_MAX_PAGES = int(os.getenv("DDG_PAGINATION_MAX_PAGES", "10") or 10)
+except Exception:
+    DDG_PAGINATION_MAX_PAGES = 10
+try:
+    DDG_PAGINATION_SLEEP_MS = int(os.getenv("DDG_PAGINATION_SLEEP_MS", "250") or 250)
+except Exception:
+    DDG_PAGINATION_SLEEP_MS = 250
+try:
+    DDG_PAGE_SIZE_GUESS = int(os.getenv("DDG_PAGE_SIZE_GUESS", "25") or 25)
+except Exception:
+    DDG_PAGE_SIZE_GUESS = 25
+
+# Early stop threshold: if discovery finds at least this many unique apex
+# domains during the first query (within the configured page cap), stop paging
+# and proceed to the next steps. Default: 15.
+try:
+    DDG_EARLY_STOP_AT = int(os.getenv("DDG_EARLY_STOP_AT", "15") or 15)
+except Exception:
+    DDG_EARLY_STOP_AT = 15

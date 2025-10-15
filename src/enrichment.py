@@ -103,6 +103,58 @@ def _mask_email(e: str) -> str:
 def _redact_email_list(emails: list[str]) -> list[str]:
     return [_mask_email(e) for e in emails]
 
+def _looks_like_domain(s: str | None) -> bool:
+    try:
+        v = (s or "").strip().lower()
+        return bool(v and "." in v and not v.startswith("http"))
+    except Exception:
+        return False
+
+def _company_query_name_from_state(state: dict) -> str:
+    """Choose a human-ish company name to use for Apify queries (no domains).
+
+    Priority:
+      1) LLM-extracted name in state['data']['name'] if not domain-like
+      2) state['company_name'] if not domain-like
+      3) Derive label from website_domain/home apex (strip TLDs, www, split hyphens)
+    """
+    try:
+        data = state.get("data") or {}
+        nm = (data.get("name") or "").strip()
+        if nm and not _looks_like_domain(nm):
+            return nm
+    except Exception:
+        pass
+    try:
+        nm2 = (state.get("company_name") or "").strip()
+        if nm2 and not _looks_like_domain(nm2):
+            return nm2
+    except Exception:
+        pass
+    # Fall back to deriving from domain/home
+    dom = None
+    try:
+        dom = (data.get("website_domain") or state.get("home") or state.get("company_name") or "").strip()
+    except Exception:
+        dom = (state.get("home") or state.get("company_name") or "").strip()
+    try:
+        if dom and dom.startswith("http"):
+            dom = urlparse(dom).netloc
+        host = (dom or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        # take apex label (before first dot)
+        label = host.split(".")[0]
+        # de-hyphen, simple capitalization
+        parts = [p for p in re.split(r"[-_]+", label) if p]
+        if not parts:
+            return label or ""
+        # Title-case words of length > 2, keep acronyms as upper
+        cleaned = " ".join([w.upper() if len(w) <= 2 else w.capitalize() for w in parts])
+        return cleaned
+    except Exception:
+        return (dom or "").split(".")[0]
+
 def _default_tenant_id() -> int | None:
     try:
         v = os.getenv("DEFAULT_TENANT_ID")
@@ -1985,11 +2037,22 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
             titles_env = CONTACT_TITLES or []
             titles_tenant = icp_preferred_titles_for_tenant(tid if tid else None)
             titles = titles_tenant or titles_env or LUSHA_PREFERRED_TITLES
-            company_name = state.get("company_name") or ""
-            queries = apify_build_queries(company_name, titles)
+            try:
+                titles_source = (
+                    "icp_preferred_titles" if titles_tenant else ("CONTACT_TITLES" if titles_env else "default_titles")
+                )
+                logger.info(
+                    f"[apify_contacts] titles_source={titles_source} titles_used={titles} company_id={company_id}"
+                )
+            except Exception:
+                pass
+            # Build company query name (avoid domains in queries); titles from ICP
+            # Title-only queries (no company/domain) using ICP buyer titles
+            company_query_name = _company_query_name_from_state(state)
+            queries = apify_build_queries("", titles)
             if queries:
                 logger.info(
-                    f"[apify_contacts] Using Apify for contact discovery; company_id={company_id} queries={queries}"
+                    f"[apify_contacts] Using Apify for contact discovery; company_id={company_id} query_mode=title_only titles={titles}"
                 )
                 # Daily cap enforcement
                 if not _apify_cap_ok(tid, need=1):
@@ -2008,14 +2071,12 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                     try:
                         t0 = time.perf_counter()
                         # Prefer company -> employees -> profiles chain if enabled
-                        if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
-                            contacts_raw = await apify_contacts_via_chain(
-                                company_name,
-                                titles=(titles if isinstance(titles, list) else None),
-                                max_items=25,
-                                timeout_s=APIFY_SYNC_TIMEOUT_S,
-                            )
-                            raw = contacts_raw  # for count logging below; already normalized
+                        # Force title-only search mode (no company/by-name chain) to avoid domain/name queries
+                        mode_chain = False
+                        if mode_chain:
+                            # Reserved: chain path disabled for title-only mode
+                            contacts_raw = []
+                            raw = []
                         else:
                             raw = await apify_run(
                                 {"queries": queries},
@@ -2026,6 +2087,14 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                         logger.info(
                             f"[apify_contacts] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
                         )
+                        # Explicit success marker for operational confirmations
+                        try:
+                            duration_ms = int((time.perf_counter() - t0) * 1000)
+                            logger.info(
+                                f"[apify_contacts] success company_id={company_id} mode={'company_employee_chain' if mode_chain else 'direct_actor'} duration_ms={duration_ms}"
+                            )
+                        except Exception:
+                            pass
                         # Optional: log a small sample of the Apify raw items and normalized contacts
                         try:
                             dbg = os.getenv("APIFY_DEBUG_LOG_ITEMS", "").lower() in ("1", "true", "yes", "on")
@@ -2559,6 +2628,21 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
         have_pages = bool(state.get("extracted_pages") or [])
         have_chunks = bool(state.get("chunks") or [])
         have_data = bool(state.get("data") or {})
+        # Prefer to run Apify contacts when emails/contacts are missing
+        should_run_apify = False
+        try:
+            dat = state.get("data") or {}
+            need_emails = not (dat.get("email") or [])
+            need_phones = not (dat.get("phone_number") or [])
+            needs_contacts = False
+            cid = state.get("company_id")
+            if cid:
+                total, has_named, _founder = _get_contact_stats(int(cid))
+                needs_contacts = (int(total) == 0) or (not has_named)
+            prefer_apify = ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
+            should_run_apify = bool(prefer_apify and (need_emails or need_phones or needs_contacts))
+        except Exception:
+            should_run_apify = False
         if not action or action not in AGENT_ACTIONS:
             if not have_domain:
                 action = "search_domain"
@@ -2573,9 +2657,13 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
                 action = "llm_extract"
                 reason = reason or "default_llm_extract"
             else:
-                # Persist and finish by default once we have data
-                action = "persist_legacy"
-                reason = reason or "default_persist_finish"
+                # If we have core data but are missing contacts/emails, run Apify before persisting
+                if should_run_apify:
+                    action = "apify_contacts"
+                    reason = reason or "default_contacts_missing"
+                else:
+                    action = "persist_legacy"
+                    reason = reason or "default_persist_finish"
         else:
             # Override repetitive crawl/expand suggestions to progress the pipeline
             if have_pages and not have_chunks and action in ("expand_crawl", "deterministic_crawl"):
@@ -2585,8 +2673,16 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
                 action = "llm_extract"
                 reason = "override_progress_llm_extract"
             elif have_data and action in ("expand_crawl", "deterministic_crawl", "discover_urls"):
-                action = "persist_legacy"
-                reason = "override_progress_persist"
+                if should_run_apify:
+                    action = "apify_contacts"
+                    reason = "override_contacts_missing"
+                else:
+                    action = "persist_legacy"
+                    reason = "override_progress_persist"
+            # If the planner suggests persisting/finishing but contacts are missing, run Apify first
+            elif action in ("persist_core", "persist_legacy", "finish") and should_run_apify and not bool(state.get("apify_used")):
+                action = "apify_contacts"
+                reason = "override_contacts_before_persist"
 
         # keep routing overrides minimal
 

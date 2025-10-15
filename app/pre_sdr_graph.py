@@ -187,6 +187,10 @@ def _enqueue_next40_if_applicable(state) -> None:
             except Exception:
                 _tidv = None
         if _tidv is None:
+            try:
+                logger.info("[next40] skip enqueue: tenant unresolved")
+            except Exception:
+                pass
             return
         bg_limit = 40
         try:
@@ -236,6 +240,10 @@ def _enqueue_next40_if_applicable(state) -> None:
             except Exception:
                 doms = []
         if not doms:
+            try:
+                logger.info("[next40] skip enqueue: no next domains found (preview_total=%s)", str(preview_total))
+            except Exception:
+                pass
             return
         # Map to company_ids
         bg_ids: list[int] = []
@@ -263,6 +271,10 @@ def _enqueue_next40_if_applicable(state) -> None:
             except Exception:
                 bg_ids = []
         if not bg_ids:
+            try:
+                logger.info("[next40] skip enqueue: no company_ids resolved from domains")
+            except Exception:
+                pass
             return
         job = __enqueue_bg(int(_tidv), bg_ids)
         jid = (job or {}).get("job_id")
@@ -2036,13 +2048,21 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
 
 
 def _boot_guard_route(state: PreSDRState) -> bool:
-    """Return True if we should halt routing until a fresh human message after boot.
+    """Return True to halt any resumed run immediately after a server restart.
 
-    Mirrors the boot-resume guard used in the LLM router, so both simple and
-    LLM-driven graphs honor the same behavior across server restarts.
+    Implementation note:
+    - New runs created via the outer lg_entry.normalize node set `boot_ack=True`.
+      Those should proceed without being halted here.
+    - Resumed runs from a previous server session have no `boot_ack` and will be
+      halted once, preventing post-restart auto-advancement.
     """
     try:
+        if bool(state.get("boot_ack")):
+            return False
+        # Heuristic bypass: if the last message is a fresh Human command that
+        # explicitly starts lead gen, proceed and set ack.
         msgs = state.get("messages") or []
+        last = msgs[-1] if msgs else None
         def _is_human(m) -> bool:
             try:
                 if isinstance(m, HumanMessage):
@@ -2053,35 +2073,27 @@ def _boot_guard_route(state: PreSDRState) -> bool:
             except Exception:
                 return False
             return False
-        if state.get("boot_init_token") != BOOT_TOKEN:
-            state["boot_init_token"] = BOOT_TOKEN
-            state["boot_seen_messages_len"] = len(msgs)
-            last = msgs[-1] if msgs else None
-            # Halt only if there isn't a fresh human message
-            if not (last and _is_human(last)):
-                logger.info("router -> end (boot resume guard: waiting for new user input)")
-                return True
-            # Fresh human: clear duplicate guard to allow routing
-            state["last_user_boot_token"] = BOOT_TOKEN
+        def _text_of(m) -> str:
             try:
-                if "last_routed_text" in state:
-                    del state["last_routed_text"]
+                if isinstance(m, HumanMessage):
+                    return str(m.content or "")
+                if isinstance(m, dict):
+                    c = m.get("content")
+                    return str(c or "")
             except Exception:
                 pass
-        else:
-            if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
-                last = msgs[-1] if msgs else None
-                if last and _is_human(last):
-                    state["last_user_boot_token"] = BOOT_TOKEN
-                    try:
-                        if "last_routed_text" in state:
-                            del state["last_routed_text"]
-                    except Exception:
-                        pass
-                state["boot_seen_messages_len"] = len(msgs)
+            return ""
+        if last and _is_human(last):
+            t = _text_of(last).strip().lower()
+            if any(kw in t for kw in ("start lead gen", "start leadgen", "start lead generation", "find leads")):
+                state["boot_ack"] = True
+                return False
+        # Default: mark and halt this pass; next user message will proceed
+        state["boot_ack"] = True
+        logger.info("router -> end (boot resume guard: server restarted; awaiting new input)")
+        return True
     except Exception:
         return False
-    return False
 
 
 def route(state: PreSDRState) -> str:
@@ -2156,7 +2168,7 @@ def build_presdr_graph():
 # ------------------------------
 
 
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     # Ensure appends across runs/nodes
     messages: Annotated[List[BaseMessage], add_messages]
     icp: Dict[str, Any]
@@ -2166,6 +2178,16 @@ class GraphState(TypedDict):
     icp_confirmed: bool
     ask_counts: Dict[str, int]  # how many times we asked each slot
     scored: List[Dict[str, Any]]
+    # Session / routing meta (persist across nodes)
+    last_routed_text: str
+    boot_ack: bool
+    # Common gating flags used across router cycles
+    icp_in_progress: bool
+    micro_icp_selected: bool
+    finder_suggestions_done: bool
+    strict_top10: bool
+    enrichment_completed: bool
+    welcomed: bool
 
 
 # ------------------------------
@@ -5235,56 +5257,12 @@ async def score_node(state: GraphState) -> GraphState:
 
 
 def router(state: GraphState) -> str:
+    # Strict boot guard: end any resumed run immediately after server restart
+    if _boot_guard_route(state):
+        return "end"
     msgs = state.get("messages") or []
     icp = state.get("icp") or {}
-
     text = _last_user_text(state).lower()
-
-    # Boot-session initialization: record current message count and STOP
-    # any resumed run immediately after server restart. We only honor commands
-    # after a NEW human message arrives post-boot.
-    try:
-        def _is_human(m) -> bool:
-            try:
-                if isinstance(m, HumanMessage):
-                    return True
-                if isinstance(m, dict):
-                    role = (m.get("type") or m.get("role") or "").lower()
-                    return role in {"human", "user"}
-            except Exception:
-                return False
-            return False
-
-        if state.get("boot_init_token") != BOOT_TOKEN:
-            state["boot_init_token"] = BOOT_TOKEN
-            state["boot_seen_messages_len"] = len(msgs)
-            last = msgs[-1] if msgs else None
-            # Halt only if there isn't a fresh human message
-            if not (last and _is_human(last)):
-                logger.info("router -> end (boot resume guard: waiting for new user input)")
-                return "end"
-            # Fresh human: clear duplicate guard to allow routing
-            state["last_user_boot_token"] = BOOT_TOKEN
-            try:
-                if "last_routed_text" in state:
-                    del state["last_routed_text"]
-            except Exception:
-                pass
-        else:
-            # On subsequent router cycles, if new messages appended and last is Human → mark as fresh user action
-            if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
-                last = msgs[-1] if msgs else None
-                if last and _is_human(last):
-                    state["last_user_boot_token"] = BOOT_TOKEN
-                    # New human input: allow routing again by clearing last_routed_text
-                    try:
-                        if "last_routed_text" in state:
-                            del state["last_routed_text"]
-                    except Exception:
-                        pass
-                state["boot_seen_messages_len"] = len(msgs)
-    except Exception:
-        pass
 
     # If we've already routed for this exact human text, wait for new input to avoid loops
     try:
@@ -5310,8 +5288,8 @@ def router(state: GraphState) -> str:
     # misroute to the ICP node and block enrichment.
     lead_intent = False
     try:
-        # phrases like: start lead gen, start lead generation, start discovery, start prospecting
-        if re.search(r"\bstart\s+(lead(\s*gen|\s*generation)?|prospect(ing)?|discovery|enrich(ment)?)\b", text):
+        # phrases like: start lead gen, start lead gent (common typo), start lead generation, start discovery, start prospecting
+        if re.search(r"\bstart\s+(lead(\s*gen[t]?|\s*generation)?|prospect(ing)?|discovery|enrich(ment)?)\b", text):
             lead_intent = True
         # commands like: find/generate/prospect/discover leads/companies
         if re.search(r"\b(find|generate|prospect|discover)\s+(leads?|companies)\b", text):

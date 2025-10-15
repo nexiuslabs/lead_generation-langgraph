@@ -15,7 +15,17 @@ import html as html_lib
 from bs4 import BeautifulSoup
 
 from langchain_openai import ChatOpenAI
-from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
+from src.settings import (
+    ENABLE_DDG_DISCOVERY,
+    DDG_TIMEOUT_S,
+    DDG_KL,
+    DDG_MAX_CALLS,
+    DDG_PAGINATION_MAX_PAGES,
+    DDG_PAGINATION_SLEEP_MS,
+    DDG_PAGE_SIZE_GUESS,
+    DDG_EARLY_STOP_AT,
+    STRICT_DDG_ONLY,
+)
 try:
     from src.settings import STRICT_INDUSTRY_QUERY_ONLY  # type: ignore
 except Exception:  # pragma: no cover
@@ -42,7 +52,7 @@ except Exception:  # pragma: no cover
 
 # Enforce a minimum timeout for DDG endpoints (connect, read)
 try:
-    _DDG_TIMEOUT_MIN = 8.0
+    _DDG_TIMEOUT_MIN = 5.0
     TIMEOUT_S = float(DDG_TIMEOUT_S)
     if TIMEOUT_S < _DDG_TIMEOUT_MIN:
         TIMEOUT_S = _DDG_TIMEOUT_MIN
@@ -287,9 +297,9 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
     def _get(url: str, params: dict | None = None, data: dict | None = None, method: str = "GET"):
         # Retry on transient connection/read issues with small backoff
         try:
-            tries = max(1, int(os.getenv("DDG_REQUEST_RETRIES", "3") or 3))
+            tries = max(1, int(os.getenv("DDG_REQUEST_RETRIES", "1") or 1))
         except Exception:
-            tries = 3
+            tries = 1
         last_err = None
         for attempt in range(1, tries + 1):
             try:
@@ -350,10 +360,10 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         except Exception:
             return True
 
-    # 1) Fetch up to 8 pages directly from DDG endpoints; parse anchors
+    # 1) Fetch multiple pages directly from DDG endpoints; parse anchors
     collected: List[str] = []
-    MAX_PAGES = 8
-    PAGE_SIZE_GUESS = 30
+    MAX_PAGES = max(1, int(DDG_PAGINATION_MAX_PAGES))
+    PAGE_SIZE_GUESS = max(10, int(DDG_PAGE_SIZE_GUESS))
     params_base = {"q": query}
     if (DDG_KL or kl):
         params_base["kl"] = (DDG_KL or kl)
@@ -363,12 +373,16 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html/
         DDG_LITE_GET,       # lite.duckduckgo.com/lite/
     ]
+    EARLY_STOP_AT = max(0, int(DDG_EARLY_STOP_AT))
+    no_delta_pages = 0
+    blank_pages = 0
     for page in range(MAX_PAGES):
         if len(collected) >= max_results:
             break
         s_off = page * PAGE_SIZE_GUESS
         page_ok = False
         found_any_for_page = False
+        before_count = len(collected)
         for ep in endpoints:
             try:
                 params = dict(params_base)
@@ -383,15 +397,27 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     d = _apex_domain(h)
                     if d and _is_probable_domain(d) and _site_filter(d):
                         page_domains.append(d)
-                # Log and merge
-                try:
-                    log.info(
-                        "[ddg] page %d domains: %s",
-                        page + 1,
-                        ", ".join([f"https://{d}" for d in page_domains[:min(25, len(page_domains))]]),
-                    )
-                except Exception:
-                    pass
+                # Filter out 2f* variants when the non-2f apex exists in-page or already collected
+                if page_domains:
+                    filtered: List[str] = []
+                    in_page_set = set(page_domains)
+                    for d in page_domains:
+                        if d.startswith("2f"):
+                            base = d[2:]
+                            if base and (base in in_page_set or base in collected):
+                                continue
+                        filtered.append(d)
+                    page_domains = filtered
+                # Log non-empty page results once (avoid noisy blanks)
+                if page_domains:
+                    try:
+                        log.info(
+                            "[ddg] page %d domains: %s",
+                            page + 1,
+                            ", ".join([f"https://{d}" for d in page_domains[:min(25, len(page_domains))]]),
+                        )
+                    except Exception:
+                        pass
                 if page_domains:
                     found_any_for_page = True
                     for d in page_domains:
@@ -404,6 +430,17 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             except Exception as e:
                 # Try next endpoint for this page
                 continue
+        # Track delta from direct endpoints
+        if len(collected) == before_count:
+            no_delta_pages += 1
+        else:
+            no_delta_pages = 0
+        # Be gentle to avoid being throttled
+        try:
+            if DDG_PAGINATION_SLEEP_MS and page < (MAX_PAGES - 1):
+                time.sleep(max(0.0, float(DDG_PAGINATION_SLEEP_MS) / 1000.0))
+        except Exception:
+            pass
         if not found_any_for_page:
             # As a last resort, try r.jina snapshot for this page and parse via regex/text
             snapshot = _ddg_snapshot_via_jina(query, s_offset=s_off)
@@ -414,25 +451,84 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     d = _apex_domain(h)
                     if d and _is_probable_domain(d) and _site_filter(d):
                         page_domains.append(d)
-                try:
-                    log.info(
-                        "[ddg] page %d domains: %s",
-                        page + 1,
-                        ", ".join([f"https://{d}" for d in page_domains[:min(25, len(page_domains))]]),
-                    )
-                except Exception:
-                    pass
+                # Filter out 2f* variants when the non-2f apex exists in-page or already collected
+                if page_domains:
+                    filtered: List[str] = []
+                    in_page_set = set(page_domains)
+                    for d in page_domains:
+                        if d.startswith("2f"):
+                            base = d[2:]
+                            if base and (base in in_page_set or base in collected):
+                                continue
+                        filtered.append(d)
+                    page_domains = filtered
+                    try:
+                        log.info(
+                            "[ddg] page %d domains: %s",
+                            page + 1,
+                            ", ".join([f"https://{d}" for d in page_domains[:min(25, len(page_domains))]]),
+                        )
+                    except Exception:
+                        pass
                 for d in page_domains:
                     if d not in collected:
                         collected.append(d)
                     if len(collected) >= max_results:
                         break
+                # Snapshot considered non-blank if it produced any domains
+                if page_domains:
+                    blank_pages = 0
+                else:
+                    blank_pages += 1
             else:
                 # If first page fails entirely, return what we have (likely empty)
                 if page == 0:
                     return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
-                break
-    return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
+                blank_pages += 1
+        else:
+            # Reset blank counter when direct endpoints produced domains
+            blank_pages = 0
+        # Stop if no new unique domains across 2 consecutive pages
+        if no_delta_pages >= 2:
+            break
+        # Stop if we see 2 consecutive blank pages (direct+snapshot)
+        if blank_pages >= 2:
+            break
+        # Early stop once we have enough to proceed
+        if EARLY_STOP_AT and len(collected) >= EARLY_STOP_AT:
+            break
+    uniq_list = [d for d in _uniq(collected) if _is_probable_domain(str(d))]
+    # 2) Optional ddgs library fallback to top-up to target count
+    try:
+        # Respect strict DDG-only mode and early-stop: do not trigger DDGS fallback
+        if (not STRICT_DDG_ONLY) and (len(uniq_list) < max_results) and DDGS is not None and not (EARLY_STOP_AT and len(uniq_list) >= EARLY_STOP_AT):
+            need = max_results - len(uniq_list)
+            try:
+                log.info("[ddg] ddgs fallback need=%d", need)
+            except Exception:
+                pass
+            with DDGS() as ddg:
+                for i, res in enumerate(ddg.text(query, max_results=need) or []):  # type: ignore[attr-defined]
+                    try:
+                        url = (res.get("href") or res.get("link") or res.get("url") or res.get("targetUrl") or "")
+                        if not isinstance(url, str) or not url:
+                            continue
+                        host = (urlparse(url).netloc or "").lower()
+                        d = _apex_domain(host)
+                        if d and _is_probable_domain(d) and d not in uniq_list and _site_filter(d):
+                            uniq_list.append(d)
+                        if len(uniq_list) >= max_results:
+                            break
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    # Log final count
+    try:
+        log.info("[ddg] collected total=%d (target=%d) unique_apex=%d", len(collected), max_results, len(uniq_list))
+    except Exception:
+        pass
+    return uniq_list[:max_results]
 
 
 log = logging.getLogger("agents.icp")
@@ -669,7 +765,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 fallback = (fallback + " site:.sg").strip()
             query = fallback or "b2b distributors"
 
-    # Single-query discovery: paginate up to 8 pages, stop at 50
+    # Single-query discovery: paginate up to configured pages (default 10), cap 50
     log.info("[plan] ddg-only query: %s", query)
     domains: List[str] = []
     try:
@@ -678,6 +774,53 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.info("[plan] ddg fail: %s", e)
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+    # Backfill with additional DDG queries only if still below the early-stop threshold
+    if len(uniq) < 50 and len(uniq) < max(1, int(DDG_EARLY_STOP_AT)):
+        try:
+            added = 0
+            # Build a small set of alternative queries from industry tokens
+            def _industry_terms(profile: Dict[str, Any]) -> list[str]:
+                try:
+                    raw = [s for s in (profile.get("industries") or []) if isinstance(s, str)]
+                    toks: list[str] = []
+                    for s in raw:
+                        for t in re.split(r"[^a-zA-Z&]+", s.lower()):
+                            t = t.strip(" &").strip()
+                            if len(t) >= 3:
+                                toks.append(t)
+                    return sorted(set(toks))
+                except Exception:
+                    return []
+            toks = _industry_terms(icp)
+            # Generic B2B distribution synonyms
+            synonyms = ["distributor", "distributors", "wholesale", "wholesaler", "importer", "supplier", "trading"]
+            alt_queries: list[str] = []
+            for t in (toks[:3] or [""]):
+                for syn in synonyms:
+                    if t:
+                        alt = f"{t} {syn}"
+                    else:
+                        alt = f"b2b {syn}"
+                    if country_hint == 'sg':
+                        alt = (alt + " site:.sg").strip()
+                    if alt not in alt_queries:
+                        alt_queries.append(alt)
+            # Run backfill queries until we reach threshold/50 (pages per query still capped)
+            for q in alt_queries[:6]:
+                if len(uniq) >= max(50, int(DDG_EARLY_STOP_AT)):
+                    break
+                try:
+                    for dom in _ddg_search_domains(q, max_results=50, country=country_hint):
+                        if _is_probable_domain(str(dom)) and dom not in uniq:
+                            uniq.append(dom)
+                            added += 1
+                            if len(uniq) >= max(50, int(DDG_EARLY_STOP_AT)):
+                                break
+                except Exception:
+                    continue
+            log.info("[plan] ddg backfill added=%d total=%d", added, len(uniq))
+        except Exception as e:
+            log.info("[plan] ddg backfill fail: %s", e)
     # Exclude seed domains (by apex) from discovery set to avoid reprocessing submitted customers
     try:
         seed_apex = {_apex_domain(s) for s in (SEED_HINTS or [])}
@@ -1041,14 +1184,38 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             # 4b) Disable any additional DDG-based fallbacks to enforce single-query discovery.
             #     We intentionally do NOT run seed-competitor queries or legacy heuristic queries
             #     that would trigger extra DDG calls. Only the first r.jina+DDG query is used.
+        # Ensure we have at least Top‑10 placeholders when enough candidates were discovered
+        try:
+            cand_total = len(cand)
+        except Exception:
+            cand_total = 0
+        min_top = min(10, cand_total)
+        if len(top) < min_top:
+            # Backfill with placeholder entries (low-score C bucket) for remaining discovered domains
+            existing = {str((it.get("domain") or "").strip().lower()) for it in top}
+            for d in cand:
+                if len(top) >= min_top:
+                    break
+                dn = str(d).strip().lower()
+                if not dn or dn in existing:
+                    continue
+                top.append({
+                    "domain": dn,
+                    "score": 0,
+                    "bucket": "C",
+                    "why": "insufficient evidence (placeholder)",
+                    "snippet": None,
+                })
+                existing.add(dn)
         # Return at most 50 for persistence (UI will only show Top‑10)
         total_ret = min(DESIRED, len(top))
         top = top[:total_ret]
         try:
             # Keep original Top‑10 log for backwards compatibility
             log.info("[confirm] agent top10 count=%d", min(10, len(top)))
-            # New: log total planned count
-            log.info("[confirm] agent planned total=%d", len(top))
+            # Also surface discovered (raw) vs planned (scored+placeholders)
+            log.info("[confirm] agent discovered count=%d", cand_total)
+            log.info("[confirm] agent top_list_total=%d", len(top))
         except Exception:
             pass
         # Display message after analysis for backend logs
@@ -1083,7 +1250,7 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         # Discover domains strictly via DDG
         domains: List[str] = []
         for q in queries[:3]:
-            for dom in _ddg_search_domains(q, max_results=25):
+            for dom in _ddg_search_domains(q, max_results=50):
                 domains.append(dom)
         uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))][:20]
         if not uniq:
@@ -1187,7 +1354,7 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
         # Run DDG for each query (cap)
         cand: List[str] = []
         for q in qset[:6]:
-            for dom in _ddg_search_domains(q, max_results=25):
+            for dom in _ddg_search_domains(q, max_results=50):
                 cand.append(dom)
         uniq = [h for h in _uniq(cand) if _is_probable_domain(h) and h not in seed_set][:60]
         if not uniq:

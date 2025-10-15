@@ -4,6 +4,7 @@ import os
 import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langgraph.graph import StateGraph, END
+from app.pre_sdr_graph import BOOT_TOKEN  # align boot-guard state for fresh runs
 from app.pre_sdr_graph import build_graph, GraphState  # new dynamic builder
 from src.database import get_conn
 from src.icp import _find_ssic_codes_by_terms
@@ -127,6 +128,12 @@ def _extract_industry_terms(text: str) -> List[str]:
         "b2c",
         "confirm",
         "run enrichment",
+        # explicit control intents that should not be treated as industries
+        "start lead gen",
+        "start lead gent",
+        "start leadgen",
+        "start lead generation",
+        "find leads",
         # chat commands / control phrases
         "accept micro-icp",
         "accept micro‑icp",
@@ -645,6 +652,18 @@ def make_graph(config: Dict[str, Any] | None = None):
     def normalize_node(payload: Dict[str, Any]) -> GraphState:
         # Accept raw UI payload and coerce into graph state
         state = _normalize(payload)
+        # Mark this as a fresh run on this server boot so the inner
+        # graph's boot guard does not halt routing for new user input.
+        try:
+            msgs = state.get("messages") or []
+            state["boot_init_token"] = BOOT_TOKEN
+            state["boot_seen_messages_len"] = len(msgs)
+            state["boot_ack"] = True
+            # Clear any stale dedupe key to allow routing on this text
+            if "last_routed_text" in state:
+                del state["last_routed_text"]
+        except Exception:
+            pass
         # type: ignore[return-value] — runtime shape matches PreSDRState
         return state  # type: ignore
 

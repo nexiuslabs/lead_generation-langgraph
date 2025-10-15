@@ -284,6 +284,11 @@ def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int]) -> d
         except Exception:
             # Best-effort: notification is optional
             pass
+        # Structured enqueue log for observability
+        try:
+            log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"queued\",\"job_id\":%s,\"tenant_id\":%s,\"count\":%s}", jid, tenant_id, len(ids))
+        except Exception:
+            pass
         return {"job_id": jid}
 
 
@@ -308,6 +313,24 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
             raise RuntimeError("company_ids required")
         if enrich_company_with_tavily is None:
             raise RuntimeError("enrich unavailable")
+        # Begin an observability run and set enrichment context for proper tenant scoping
+        run_id = None
+        try:
+            from src import obs as _obs
+            if tenant_id is not None:
+                run_id = _obs.begin_run(int(tenant_id))
+                try:
+                    _obs.set_run_context(int(run_id), int(tenant_id))
+                except Exception:
+                    pass
+                # Propagate context to enrichment module so company_enrichment_runs rows link to this run_id
+                try:
+                    if _enrich_set_ctx and run_id is not None:
+                        _enrich_set_ctx(int(run_id), int(tenant_id))
+                except Exception:
+                    pass
+        except Exception:
+            run_id = None
         # Resolve company names/uen for enrichment call signature
         comp_map: dict[int, tuple[str, str | None]] = {}
         try:
@@ -349,6 +372,13 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                 if attempt == 2:
                     raise
                 await _asyncio.sleep(0.5 * (attempt + 1))
+        # Finalize the run header
+        try:
+            if run_id is not None:
+                from src import obs as _obs
+                _obs.finalize_run(int(run_id), status="succeeded")
+        except Exception:
+            pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:  # pragma: no cover
@@ -365,6 +395,13 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                 if attempt == 2:
                     break
                 await _asyncio.sleep(0.5 * (attempt + 1))
+        # Finalize the run header on error as well
+        try:
+            if 'run_id' in locals() and run_id is not None:
+                from src import obs as _obs
+                _obs.finalize_run(int(run_id), status="failed")
+        except Exception:
+            pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
 

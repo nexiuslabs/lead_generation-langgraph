@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 from typing import List, Dict, Any, Optional
 import httpx
+import re
 import logging
 from urllib.parse import quote
 import json as _json
@@ -46,6 +47,15 @@ async def run_sync_get_dataset_items(
     url = f"{APIFY_BASE}/acts/{_actor_id().replace('/', '~')}/run-sync-get-dataset-items"
     params = {"token": _token(), "format": dataset_format}
     headers = {"Content-Type": "application/json"}
+    try:
+        logger.info(
+            "Apify begin actor=%s payload_keys=%s format=%s",
+            _actor_id(),
+            list(payload.keys()),
+            dataset_format,
+        )
+    except Exception:
+        pass
 
     def _log_items_sample(items: List[Dict[str, Any]], label: str) -> None:
         try:
@@ -163,7 +173,17 @@ async def run_sync_get_dataset_items(
 
     # Try original payload first
     try:
-        return await _post(payload)
+        items = await _post(payload)
+        try:
+            logger.info(
+                "Apify ok actor=%s path=%s items=%d",
+                _actor_id(),
+                "run-sync-get-dataset-items",
+                len(items or []),
+            )
+        except Exception:
+            pass
+        return items
     except httpx.HTTPStatusError as e:
         status = getattr(e.response, "status_code", None)
         body_snippet = None
@@ -274,6 +294,16 @@ async def run_sync_get_dataset_items(
                         items = await _run_sync_then_fetch(v)
                     except httpx.HTTPStatusError:
                         pass
+                try:
+                    logger.info(
+                        "Apify ok actor=%s path=%s variant=%d items=%d",
+                        _actor_id(),
+                        "variant",
+                        i,
+                        len(items or []),
+                    )
+                except Exception:
+                    pass
                 return items
             except httpx.HTTPStatusError:
                 continue
@@ -315,14 +345,34 @@ async def run_sync_get_dataset_items(
                     if profile_urls:
                         try:
                             logger.info("Apify: retrying profile actor with %d profileUrls", len(profile_urls))
-                            return await _post({"profileUrls": profile_urls, "maxItems": 10})
+                            items2 = await _post({"profileUrls": profile_urls, "maxItems": 10})
+                            try:
+                                logger.info(
+                                    "Apify ok actor=%s path=%s items=%d",
+                                    _actor_id(),
+                                    "search+profile",
+                                    len(items2 or []),
+                                )
+                            except Exception:
+                                pass
+                            return items2
                         except Exception:
                             pass
         except Exception:
             pass
         # Final attempt: run-sync against original payload
         try:
-            return await _run_sync_then_fetch(payload)
+            items3 = await _run_sync_then_fetch(payload)
+            try:
+                logger.info(
+                    "Apify ok actor=%s path=%s items=%d",
+                    _actor_id(),
+                    "run-sync+dataset",
+                    len(items3 or []),
+                )
+            except Exception:
+                pass
+            return items3
         except Exception:
             return []
     except Exception:
@@ -332,22 +382,21 @@ async def run_sync_get_dataset_items(
 
 
 def build_queries(company_name: str, titles: List[str]) -> List[str]:
+    """Build profile search queries using ICP buyer titles ONLY (no company name/domain).
+
+    - Returns one query per title and a boolean OR consolidation.
+    - Titles with spaces are quoted for better matching.
+    """
     titles = [t for t in (titles or []) if (t or "").strip()]
-    if not company_name:
+    if not titles:
         return []
-    company_q = f'"{company_name}"'
     queries: List[str] = []
-    # Prefer one query per title to maximize compatibility with actors that
-    # expect simple keyword strings rather than boolean logic.
     for t in titles:
         t_q = f'"{t}"' if (" " in t) else t
-        queries.append(f"{company_q} {t_q}")
-    # Also include a combined boolean query for actors that support it
-    if titles:
-        t_bool = " OR ".join([f'"{x}"' if " " in x else x for x in titles])
-        queries.append(f"{company_q} AND ({t_bool})")
-    # And a plain company-only query as a last resort
-    queries.append(company_q)
+        queries.append(t_q)
+    # Also include a combined boolean title query
+    t_bool = " OR ".join([f'"{x}"' if " " in x else x for x in titles])
+    queries.append(t_bool)
     # De-duplicate while preserving order
     seen = set()
     out: List[str] = []
