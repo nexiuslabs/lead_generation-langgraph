@@ -1423,21 +1423,32 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
         logger.info("   ↳ No domain in DB for require_existing; stopping")
         return state
 
-    # 1) Tavily search if available
-    if not domains and ENABLE_TAVILY_FALLBACK and tavily_client is not None:
+    # 1) Domain discovery (DDG primary, Tavily fallback)
+    if not domains:
         try:
             t0 = time.perf_counter()
-            domains = find_domain(name)
-            _obs_vendor("tavily", calls=1)
-            _obs_log("find_domain", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"query": name})
-        except Exception as e:
-            _obs_vendor("tavily", calls=1, errors=1)
-            _obs_log("find_domain", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(e).__name__)
-            logger.warning("   ↳ Tavily find_domain failed", exc_info=True)
-            try:
-                (state.setdefault("degraded_reasons", [])) .append("TAVILY_FAIL")
-            except Exception:
-                pass
+            # Use our DDG-backed finder (prefers .sg bias); includes Tavily as fallback internally
+            ddg_domains = find_domain(name)
+            if ddg_domains:
+                domains = ddg_domains
+                _obs_log(
+                    "find_domain",
+                    "discovery",
+                    "ok",
+                    company_id=state.get("company_id"),
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    extra={"query": name},
+                )
+                logger.info(f"   ↳ Domain discovery provided: {domains[0]}")
+        except Exception:
+            _obs_log(
+                "find_domain",
+                "discovery",
+                "error",
+                company_id=state.get("company_id"),
+                error_code="domain_discovery_error",
+            )
+            logger.warning("   ↳ Domain discovery failed", exc_info=True)
     # Lusha fallback if needed
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
@@ -2706,23 +2717,71 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
 
 
 def find_domain(company_name: str) -> list[str]:
-    print(f"    🔍 Search domain for '{company_name}'")
-    if tavily_client is None:
-        print("       ↳ Tavily client not initialized.")
-        return []
+    """Domain discovery using DuckDuckGo HTML (via r.jina) with SG bias.
 
+    Returns a small list of https URLs for likely official domains, preferring
+    .sg TLDs and brand-matching labels.
+    """
+    print(f"    🔍 Search domain for '{company_name}' (DDG)")
     core = _normalize_company_name(company_name)
-    normalized_query = " ".join(core)
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
 
-    # 1) Use normalized name first, fall back to quoted variants
+    try:
+        from src.ddg_simple import search_domains as _ddg
+    except Exception:
+        return []
+
+    try:
+        hosts = _ddg(f"{company_name} site:.sg", max_results=20, country="sg")
+        if not hosts:
+            hosts = _ddg(company_name, max_results=20, country="sg")
+    except Exception:
+        hosts = []
+
+    if not hosts:
+        print("       ↳ No domains from DDG.")
+        # Fallback to Tavily search if configured
+        try:
+            tv = _find_domain_tavily(company_name)
+            if tv:
+                return tv
+        except Exception:
+            pass
+        return []
+
+    # Rank hosts: prefer brand-exact labels and .sg
+    def _rank_host(h: str) -> tuple:
+        host = h.lower()
+        label = host.split(".")[0]
+        is_brand_exact = (label.replace("-", "") == name_nospace)
+        tld_sg = host.endswith(".sg")
+        parts = host.split(".")
+        return (
+            0 if is_brand_exact else 1,
+            0 if tld_sg else 1,
+            len(parts),
+            host,
+        )
+
+    ranked = sorted(dict.fromkeys(hosts), key=_rank_host)
+    urls = [h if h.startswith("http") else f"https://{h}" for h in ranked[:2]]
+    print(f"       ↳ DDG domains: {urls}")
+    return urls
+
+
+def _find_domain_tavily(company_name: str) -> list[str]:
+    """Tavily-based domain discovery as a fallback path."""
+    if tavily_client is None:
+        return []
+    core = _normalize_company_name(company_name)
+    name_nospace = "".join(core)
+    name_hyphen = "-".join(core)
     try:
         queries = [
-            f"{normalized_query} official website",
+            f"{' '.join(core)} official website",
             f'"{company_name}" "official website"',
             f'"{company_name}" site:.sg',
-            f"{company_name} official website",
         ]
         response = None
         for q in queries:
@@ -2737,14 +2796,10 @@ def find_domain(company_name: str) -> list[str]:
             if isinstance(response, dict) and response.get("results"):
                 break
         if not isinstance(response, dict) or not response.get("results"):
-            print("       ↳ No results from Tavily search.")
             return []
-    except Exception as exc:
-        print(f"       ↳ Search error: {exc}")
+    except Exception:
         return []
 
-    # Filter URLs to those containing the core company name (first two words)
-    filtered_urls: list[str] = []
     AGGREGATORS = {
         "linkedin.com",
         "facebook.com",
@@ -2780,39 +2835,24 @@ def find_domain(company_name: str) -> list[str]:
         "yelp.com",
         "recordowl.com",
         "sgpgrid.com",
-        # Add common non-official/aggregator content domains observed
-        "made-in-china.com",
-        "morepaper.org",
-        "artbarblog.com",
-        "jumpfrompaper.com",
     }
+    filtered_urls: list[str] = []
     for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
-        print("       ↳ Found URL:", url)
         if not url:
             continue
         parsed = urlparse(url)
         netloc = parsed.netloc.lower()
-        if netloc.startswith("www."):
-            netloc_stripped = netloc[4:]
-        else:
-            netloc_stripped = netloc
-        apex = (
-            ".".join(netloc_stripped.split(".")[-2:])
-            if "." in netloc_stripped
-            else netloc_stripped
-        )
+        netloc_stripped = netloc[4:] if netloc.startswith("www.") else netloc
+        apex = ".".join(netloc_stripped.split(".")[-2:]) if "." in netloc_stripped else netloc_stripped
         apex_label = apex.split(".")[0]
         domain_label = netloc_stripped.split(".")[0]
 
         is_aggregator = apex in AGGREGATORS
-        is_sg = netloc_stripped.endswith(".sg") or apex.endswith(".sg")
         is_brand_exact = (
-            apex_label == name_nospace
-            or domain_label.replace("-", "") == name_nospace
+            apex_label == name_nospace or domain_label.replace("-", "") == name_nospace
         )
 
-        # page text signals
         title = (h.get("title") or "").lower()
         snippet = (h.get("content") or h.get("snippet") or "").lower()
         text = f"{title} {snippet}"
@@ -2822,20 +2862,12 @@ def find_domain(company_name: str) -> list[str]:
             or (core and core[0] in domain_label)
         )
         text_match = all(part in text for part in core)
-
-        # Enforce heuristics:
-        # - Reject marketplaces/aggregators (unless the brand name equals the aggregator apex e.g., Amazon)
         if is_aggregator and not is_brand_exact:
             continue
-        # - Require name evidence in domain label or page text (or exact brand apex)
         if not (label_match or text_match or is_brand_exact):
             continue
-        # Previously we forced .sg or exact brand; relax to accept legitimate non-.sg brand domains
-        # as long as aggregator is excluded and name evidence is present.
-
         filtered_urls.append(url)
 
-    # Rank: prefer .sg TLD, then shorter apex domains, then https
     def _rank(u: str) -> tuple:
         p = urlparse(u)
         host = p.netloc.lower()
@@ -2857,12 +2889,8 @@ def find_domain(company_name: str) -> list[str]:
         )
 
     if filtered_urls:
-        filtered_urls = sorted(set(filtered_urls), key=_rank)
-        # Only keep top 2 that most likely represent the official company website
-        filtered_urls = filtered_urls[:2]
-        print(f"       ↳ Filtered URLs: {filtered_urls}")
+        filtered_urls = sorted(set(filtered_urls), key=_rank)[:2]
         return filtered_urls
-    print("       ↳ No matching URLs found after heuristics.")
     return []
 
 
