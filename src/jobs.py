@@ -92,11 +92,22 @@ async def run_staging_upsert(job_id: int) -> None:
         # Call batched upsert once (internally streams and batches)
         processed = upsert_batched(terms)
         total = processed
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
-                (processed, total, job_id),
-            )
+        # Robust status update with retry — avoid flipping a successful job to error due
+        # to a transient DB write failure at the end of processing.
+        for attempt in range(3):
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                        (processed, total, job_id),
+                    )
+                break
+            except psycopg2.Error:
+                if attempt == 2:
+                    # Give up on marking done; keep going without raising to avoid mislabeling the job as error
+                    pass
+                else:
+                    await _asyncio.sleep(0.5 * (attempt + 1))
         # Best-effort: resolve SSIC codes from the same free-text terms and enqueue enrichment
         try:
             from src.icp import _find_ssic_codes_by_terms as _resolve_ssic
@@ -257,7 +268,7 @@ async def run_manual_research_enrich(job_id: int) -> None:
             rows = cur.fetchall() or []
         for cid, name, uen in rows:
             try:
-                await enrich_company_with_tavily(int(cid), name, uen)
+                await enrich_company_with_tavily(int(cid), name, uen, search_policy="require_existing")
                 processed += 1
             except Exception:
                 continue
@@ -348,7 +359,7 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
         for cid in ids:
             try:
                 name, uen = comp_map.get(int(cid), (str(cid), None))
-                await enrich_company_with_tavily(int(cid), name, uen)
+                await enrich_company_with_tavily(int(cid), name, uen, search_policy="require_existing")
                 processed += 1
             except Exception:
                 # continue best-effort
@@ -539,7 +550,7 @@ async def run_enrich_candidates(job_id: int) -> None:
             async def _run():
                 async def _one(cid: int, name: str, uen: Optional[str]):
                     try:
-                        await enrich_company_with_tavily(cid, name, uen)
+                        await enrich_company_with_tavily(cid, name, uen, search_policy="discover")
                     except Exception:
                         pass
                 await _asyncio.gather(*[_one(int(r[0]), str(r[1]), (r[2] or None)) for r in rows])

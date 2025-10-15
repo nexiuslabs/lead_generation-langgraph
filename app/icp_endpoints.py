@@ -286,7 +286,8 @@ async def enrich_top10(
     processed = 0
     for cid in company_ids:
         try:
-            await enrich_company_with_tavily(int(cid))
+            # Top-10 enrichment expects domains already present; skip domain search
+            await enrich_company_with_tavily(int(cid), search_policy="require_existing")
             processed += 1
         except Exception:
             # continue with best-effort behavior

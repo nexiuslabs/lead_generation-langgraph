@@ -168,7 +168,7 @@ CB_GLOBAL_EXEMPT_VENDORS = [
 ]
 
 # Fallback toggles
-ENABLE_TAVILY_FALLBACK = os.getenv("ENABLE_TAVILY_FALLBACK", "true").lower() in (
+ENABLE_TAVILY_FALLBACK = os.getenv("ENABLE_TAVILY_FALLBACK", "false").lower() in (
     "1",
     "true",
     "yes",

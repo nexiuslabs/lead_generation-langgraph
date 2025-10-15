@@ -1878,7 +1878,7 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
-        await enrich_company_with_tavily(cid, name, uen)
+        await enrich_company_with_tavily(cid, name, uen, search_policy="require_existing")
         return {"company_id": cid, "name": name, "uen": uen}
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
@@ -4578,7 +4578,7 @@ async def enrich_node(state: GraphState) -> GraphState:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
-        final_state = await enrich_company_with_tavily(cid, name, uen)
+        final_state = await enrich_company_with_tavily(cid, name, uen, search_policy="require_existing")
         completed = (
             bool(final_state.get("completed"))
             if isinstance(final_state, dict)

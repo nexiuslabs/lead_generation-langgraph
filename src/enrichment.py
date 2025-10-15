@@ -1270,7 +1270,11 @@ async def _jina_snapshot_pages(company_id: int, url: str):
 
 
 async def enrich_company_with_tavily(
-    company_id: int, company_name: str, uen: str | None = None
+    company_id: int,
+    company_name: str | None = None,
+    uen: str | None = None,
+    *,
+    search_policy: str = "auto",  # 'require_existing' for Top-10/Next-40, 'discover' for nightly ACRA
 ):
     """
     Orchestrated enrichment flow using LangGraph. This wrapper constructs
@@ -1278,7 +1282,7 @@ async def enrich_company_with_tavily(
     """
     initial_state = {
         "company_id": company_id,
-        "company_name": company_name,
+        "company_name": (company_name or ""),
         "uen": uen,
         "domains": [],
         "home": None,
@@ -1291,6 +1295,7 @@ async def enrich_company_with_tavily(
         "completed": False,
         "error": None,
         "degraded_reasons": [],
+        "search_policy": (search_policy or "auto"),
     }
     try:
         # Global skip logic to avoid re-enriching companies that already have
@@ -1377,12 +1382,14 @@ class EnrichmentState(TypedDict, total=False):
     completed: bool
     error: Optional[str]
     degraded_reasons: List[str]
+    search_policy: str
 
 
 async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed"):
         return state
     name = state.get("company_name") or ""
+    policy = (state.get("search_policy") or "auto").lower()
     # 0) DB fallback: use existing website_domain for this company if present
     try:
         cid = state.get("company_id")
@@ -1408,6 +1415,13 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
             domains = []
     except Exception:
         domains = []
+
+    # Fast-path: For Top-10/Next-40, require existing domain and skip search
+    if not domains and policy == "require_existing":
+        state["error"] = "no_domain_existing"
+        state["completed"] = True
+        logger.info("   ↳ No domain in DB for require_existing; stopping")
+        return state
 
     # 1) Tavily search if available
     if not domains and ENABLE_TAVILY_FALLBACK and tavily_client is not None:
@@ -1459,6 +1473,89 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
                 (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
             except Exception:
                 pass
+    # 3) DuckDuckGo HTML fallback (no API key required)
+    if not domains:
+        try:
+            from src.ddg_simple import search_domains as _ddg_simple  # lightweight HTML scrape
+            # Prefer SG results when dealing with ACRA/SSIC companies.
+            # Try with a site:.sg bias first, then without.
+            ddg_hosts: List[str] = _ddg_simple(f"{name} site:.sg", max_results=20, country="sg")
+            if not ddg_hosts:
+                ddg_hosts = _ddg_simple(name, max_results=20, country="sg")
+            if ddg_hosts:
+                # Choose first suitable host; build https URL
+                host = ddg_hosts[0]
+                dom = host if host.startswith("http") else f"https://{host}"
+                domains = [dom]
+                try:
+                    (state.setdefault("degraded_reasons", [])).append("DOMAIN_DDG_FALLBACK")
+                except Exception:
+                    pass
+                logger.info(f"   ↳ DDG provided domain: {dom}")
+        except Exception:
+            # Silent failure; proceed to graceful termination below
+            pass
+
+    # 4) Heuristic guess for .sg SMBs (no vendor calls)
+    if not domains and name:
+        try:
+            def _slugify_company(n: str) -> List[str]:
+                s = (n or "").lower()
+                # remove punctuation
+                s = re.sub(r"[^a-z0-9\s]", " ", s)
+                parts = [p for p in s.split() if p]
+                # drop common suffixes
+                drop = {"pte", "ltd", "ltd.", "private", "limited", "singapore", "plc", "llp", "llc", "inc", "inc."}
+                core = [p for p in parts if p not in drop]
+                if not core:
+                    core = parts
+                # try first 2-3 tokens
+                c2 = core[:2]
+                c3 = core[:3]
+                variants = []
+                if c3:
+                    variants.append("".join(c3))
+                    variants.append("-".join(c3))
+                if c2:
+                    variants.append("".join(c2))
+                    variants.append("-".join(c2))
+                return [v for v in variants if len(v) >= 3]
+
+            candidates: List[str] = []
+            for base in _slugify_company(name):
+                for tld in (".com.sg", ".sg", ".com"):
+                    for prefix in ("", "www."):
+                        candidates.append(prefix + base + tld)
+            # De-dup
+            seen: set[str] = set()
+            candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+            # Test candidates quickly with HTTP GET
+            import httpx as _httpx
+            ok_host: Optional[str] = None
+            try:
+                async with _httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                    for host in candidates[:12]:
+                        try:
+                            url = f"https://{host}"
+                            resp = await client.get(url, follow_redirects=True, timeout=5.0)
+                            if resp.status_code and resp.status_code < 500 and (len((resp.text or "").strip()) > 100):
+                                ok_host = host
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                ok_host = None
+            if ok_host:
+                dom = f"https://{ok_host}"
+                domains = [dom]
+                try:
+                    (state.setdefault("degraded_reasons", [])).append("DOMAIN_GUESS_FALLBACK")
+                except Exception:
+                    pass
+                logger.info(f"   ↳ Heuristic provided domain: {dom}")
+        except Exception:
+            pass
+
     if not domains:
         # Graceful termination: no domain available, nothing to crawl/extract.
         # Mark as completed so upstream pipeline can proceed to scoring/next steps.

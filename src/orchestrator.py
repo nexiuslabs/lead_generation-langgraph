@@ -98,7 +98,7 @@ async def enrich_companies(company_ids):
 
     for idx, (company_id, name) in enumerate(companies, start=1):
         print(f"\n--- ({idx}/{len(companies)}) id={company_id}, name={name!r} ---")
-        await enrich_company_with_tavily(company_id, name)
+        await enrich_company_with_tavily(company_id, name, search_policy="require_existing")
 
 def output_candidate_records(company_ids):
     conn = psycopg2.connect(dsn=POSTGRES_DSN)

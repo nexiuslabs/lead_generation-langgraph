@@ -3,6 +3,7 @@ from typing import Optional, List
 
 from src.database import get_conn
 from src.jobs import run_staging_upsert, run_enrich_candidates, enqueue_staging_upsert
+from datetime import timedelta, datetime
 
 
 async def run_queued_jobs(limit: Optional[int] = None) -> int:
@@ -12,6 +13,53 @@ async def run_queued_jobs(limit: Optional[int] = None) -> int:
     """
     jobs: list[tuple[int, str]] = []
     with get_conn() as conn, conn.cursor() as cur:
+        # Maintenance: requeue stale 'running' jobs and retry eligible 'error' jobs
+        try:
+            import os
+            # Staleness threshold for 'running' jobs (minutes)
+            try:
+                stale_minutes = int(os.getenv("JOB_STALE_MINUTES", "30") or 30)
+            except Exception:
+                stale_minutes = 30
+            # Max automatic retries for 'error' jobs
+            try:
+                max_retries = int(os.getenv("JOB_MAX_RETRIES", "2") or 2)
+            except Exception:
+                max_retries = 2
+            # 1) Requeue stale running ACRA jobs
+            cur.execute(
+                """
+                UPDATE background_jobs b
+                SET status='queued', started_at=NULL, ended_at=NULL
+                WHERE b.status='running'
+                  AND b.job_type IN ('staging_upsert','enrich_candidates')
+                  AND b.started_at IS NOT NULL
+                  AND b.started_at < now() - make_interval(mins => %s)
+                  AND (b.ended_at IS NULL OR b.ended_at < b.started_at)
+                RETURNING b.job_id
+                """,
+                (stale_minutes,),
+            )
+            _ = cur.fetchall()  # consume
+            # 2) Requeue eligible error ACRA jobs with bounded retries (stored in params.retries)
+            # Ensure params is jsonb; increment retries atomically
+            cur.execute(
+                """
+                UPDATE background_jobs b
+                SET status='queued', started_at=NULL, ended_at=NULL, error=NULL,
+                    params = jsonb_set(COALESCE(b.params, '{}'::jsonb), '{retries}',
+                                       to_jsonb(COALESCE((b.params->>'retries')::int, 0) + 1), true)
+                WHERE b.status='error'
+                  AND b.job_type IN ('staging_upsert','enrich_candidates')
+                  AND COALESCE((b.params->>'retries')::int, 0) < %s
+                RETURNING b.job_id
+                """,
+                (max_retries,),
+            )
+            _ = cur.fetchall()
+        except Exception:
+            # Maintenance is best-effort; continue to job selection
+            pass
         # Nightly runner: only process ACRA pipeline jobs (staging_upsert → enrich_candidates).
         # Web discovery next‑40 runs immediately on enqueue and is excluded from nightly.
         sql = (
