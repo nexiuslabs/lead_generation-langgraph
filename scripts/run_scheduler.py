@@ -33,7 +33,11 @@ async def main_async():
 
     async def job():
         try:
-            await run_all()
+            processed = await run_all()
+            try:
+                logging.getLogger("nightly").info("nightly processed queued jobs: %s", processed)
+            except Exception:
+                pass
             # Refresh ICP patterns MV after nightly completes so suggestions stay current
             try:
                 from src.icp_intake import refresh_icp_patterns as _refresh_icp_patterns

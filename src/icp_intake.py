@@ -178,6 +178,12 @@ def refresh_icp_patterns() -> None:
         try:
             cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY icp_patterns")
         except Exception:
+            # If CONCURRENTLY fails (e.g., missing unique index), the transaction
+            # is left aborted; clear it before retrying a non-concurrent refresh.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             # Fallback when non-concurrent refresh is required
             cur.execute("REFRESH MATERIALIZED VIEW icp_patterns")
 
