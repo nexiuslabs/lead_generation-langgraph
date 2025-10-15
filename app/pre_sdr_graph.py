@@ -5430,7 +5430,8 @@ def router(state: GraphState) -> str:
         if (
             _qa_answer is not None
             and not any(k in text for k in ("run enrichment", "accept micro", "accept micro-icp"))
-            and ("?" in text or re.match(r"\b(how|what|why|when|where|which|tips|best|increase|improve)\b", text))
+            # Detect question intent: question mark OR question verbs anywhere in text
+            and ("?" in text or re.search(r"\b(how|what|why|when|where|which|tips|best|increase|improve|explain|define|definition|meaning)\b", text, flags=re.I))
             and (state.get("last_answered_text") != text)
         ):
             logger.info("router -> leadgen_qa (free‑form question detected)")
