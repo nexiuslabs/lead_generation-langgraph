@@ -72,11 +72,19 @@ async def run_staging_upsert(job_id: int) -> None:
         )
     processed = 0
     total = 0
-    # Load params
+    # Load params + tenant for downstream enqueue
+    tenant_id: int | None = None
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT params FROM background_jobs WHERE job_id=%s", (job_id,))
+        cur.execute("SELECT tenant_id, params FROM background_jobs WHERE job_id=%s", (job_id,))
         r = cur.fetchone()
-        params = (r and r[0]) or {}
+        if r:
+            try:
+                tenant_id = int(r[0]) if r[0] is not None else None
+            except Exception:
+                tenant_id = None
+            params = r[1] or {}
+        else:
+            params = {}
         terms = [((t or '').strip().lower()) for t in (params.get('terms') or []) if (t or '').strip()]
     try:
         if not upsert_batched:
@@ -89,19 +97,28 @@ async def run_staging_upsert(job_id: int) -> None:
                 "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
                 (processed, total, job_id),
             )
-        # Best-effort: if terms look like industry/SSIC titles, enqueue enrichment job for the same selection
+        # Best-effort: resolve SSIC codes from the same free-text terms and enqueue enrichment
         try:
-            codes: List[str] = []
-            with get_conn() as conn, conn.cursor() as cur:
-                cur.execute(
-                    "SELECT regexp_replace(code::text,'\\D','','g') FROM ssic_ref WHERE LOWER(title) = ANY(%s::text[])",
-                    ([t.strip().lower() for t in terms if (t or '').strip()],),
-                )
-                rows = cur.fetchall() or []
-                codes = [str(r[0]) for r in rows if r and r[0] is not None]
+            from src.icp import _find_ssic_codes_by_terms as _resolve_ssic
+            resolved = _resolve_ssic(terms) if terms else []
+            codes = [str(c).strip() for (c, _title, _score) in (resolved or []) if str(c).strip()]
             if codes:
-                enqueue_enrich_candidates(None, codes)
+                # Pass through the same tenant to scope observability and caps
+                _res = enqueue_enrich_candidates(tenant_id, codes)
+                try:
+                    preview = ", ".join(codes[:10]) + (f", ... (+{len(codes)-10} more)" if len(codes) > 10 else "")
+                    log.info(
+                        "{\"job\":\"staging_upsert\",\"phase\":\"post\",\"job_id\":%s,\"tenant_id\":%s,\"enrich_job_id\":%s,\"codes_count\":%s,\"codes_preview\":\"%s\"}",
+                        job_id,
+                        tenant_id,
+                        (_res.get("job_id") if isinstance(_res, dict) else None),
+                        len(codes),
+                        preview,
+                    )
+                except Exception:
+                    pass
         except Exception:
+            # Non-fatal; enrichment will be skipped if codes can't be resolved
             pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"staging_upsert\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
@@ -401,6 +418,16 @@ async def run_enrich_candidates(job_id: int) -> None:
         codes = [str(c).strip() for c in (params.get('ssic_codes') or []) if str(c).strip()]
         if not codes:
             raise RuntimeError("ssic_codes missing for enrich_candidates")
+        try:
+            log.info(
+                "{\"job\":\"enrich_candidates\",\"phase\":\"tenant\",\"job_id\":%s,\"tenant_id\":%s,\"codes_count\":%s,\"codes_preview\":\"%s\"}",
+                job_id,
+                tenant_id,
+                len(codes),
+                ", ".join(codes[:10]) + (f", ... (+{len(codes)-10} more)" if len(codes) > 10 else ""),
+            )
+        except Exception:
+            pass
         # Begin an observability run and set enrichment context for proper tenant scoping
         run_id = None
         try:
@@ -446,6 +473,15 @@ async def run_enrich_candidates(job_id: int) -> None:
             # If we cannot compute, fall back to the cap to avoid over-processing
             remaining_today = DAILY_CAP
 
+        # Log capacity snapshot per tenant
+        try:
+            log.info(
+                "{\"job\":\"enrich_candidates\",\"phase\":\"capacity\",\"job_id\":%s,\"tenant_id\":%s,\"cap\":%s,\"remaining_today\":%s}",
+                job_id, tenant_id, DAILY_CAP, remaining_today,
+            )
+        except Exception:
+            pass
+
         if remaining_today <= 0:
             # Defer this job to the next nightly window
             with get_conn() as conn, conn.cursor() as cur:
@@ -453,6 +489,15 @@ async def run_enrich_candidates(job_id: int) -> None:
                     "UPDATE background_jobs SET status='queued', error=%s WHERE job_id=%s",
                     ("deferred: daily cap reached", job_id),
                 )
+            try:
+                log.info(
+                    "{\"job\":\"enrich_candidates\",\"phase\":\"deferred\",\"job_id\":%s,\"tenant_id\":%s,\"reason\":\"daily_cap_reached\",\"cap\":%s}",
+                    job_id,
+                    tenant_id,
+                    DAILY_CAP,
+                )
+            except Exception:
+                pass
             # Finalize run header if we started one
             try:
                 if run_id is not None:
@@ -477,6 +522,16 @@ async def run_enrich_candidates(job_id: int) -> None:
                 (codes, effective_limit),
             )
             rows = cur.fetchall() or []
+        try:
+            log.info(
+                "{\"job\":\"enrich_candidates\",\"phase\":\"select\",\"job_id\":%s,\"tenant_id\":%s,\"selected\":%s,\"effective_limit\":%s}",
+                job_id,
+                tenant_id,
+                len(rows),
+                effective_limit,
+            )
+        except Exception:
+            pass
         processed = 0
         if enrich_company_with_tavily and rows:
             import asyncio as _asyncio
@@ -504,6 +559,16 @@ async def run_enrich_candidates(job_id: int) -> None:
                     "UPDATE background_jobs SET status='queued', processed=COALESCE(processed,0)+%s, total=COALESCE(total,0)+%s, ended_at=now() WHERE job_id=%s",
                     (processed, processed, job_id),
                 )
+            try:
+                log.info(
+                    "{\"job\":\"enrich_candidates\",\"phase\":\"requeue\",\"job_id\":%s,\"tenant_id\":%s,\"processed\":%s,\"effective_limit\":%s}",
+                    job_id,
+                    tenant_id,
+                    processed,
+                    effective_limit,
+                )
+            except Exception:
+                pass
         else:
             with get_conn() as conn, conn.cursor() as cur:
                 cur.execute(
@@ -518,7 +583,13 @@ async def run_enrich_candidates(job_id: int) -> None:
         except Exception:
             pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
-        log.info("{\"job\":\"enrich_candidates\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
+        log.info(
+            "{\"job\":\"enrich_candidates\",\"phase\":\"finish\",\"job_id\":%s,\"tenant_id\":%s,\"processed\":%s,\"duration_ms\":%s}",
+            job_id,
+            tenant_id,
+            processed,
+            dur_ms,
+        )
     except Exception as e:  # pragma: no cover
         try:
             with get_conn() as conn, conn.cursor() as cur:
