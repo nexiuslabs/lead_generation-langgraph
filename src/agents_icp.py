@@ -700,6 +700,27 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.info("[plan] ddg fail: %s", e)
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+    # Snapshot full set prior to seed exclusion for logging/audit
+    uniq_all: List[str] = list(uniq)
+    # Relax site filter if results are too few: rerun without site: and merge
+    try:
+        if len(uniq) < 10:
+            q_relaxed = re.sub(r"\bsite:[^\s]+", "", query).strip()
+            if q_relaxed and q_relaxed != query:
+                more: List[str] = []
+                try:
+                    for dom in _ddg_search_domains(q_relaxed, max_results=50, country=country_hint):
+                        more.append(dom)
+                except Exception:
+                    more = []
+                if more:
+                    uniq = [d for d in _uniq(uniq + more) if _is_probable_domain(str(d))]
+                    try:
+                        log.info("[plan] ddg relaxed domains added=%d", len(more))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
     # Exclude seed domains (by apex) from discovery set to avoid reprocessing submitted customers
     try:
         seed_apex = {_apex_domain(s) for s in (SEED_HINTS or [])}
@@ -707,6 +728,11 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
     log.info("[plan] ddg domains found=%d (uniq=%d)", len(domains), len(uniq))
+    # Emit full discovery list (including any seeds) for observability
+    try:
+        log.info("[plan] discovery all urls=%s", ", ".join([f"https://{d}" for d in uniq_all]))
+    except Exception:
+        pass
     # Optional Jina Reader fetch for quick homepage snippets of first few domains
     # Industry-based filter: keep only candidates whose snippets mention industry terms
     def _industry_terms(profile: Dict[str, Any]) -> list[str]:

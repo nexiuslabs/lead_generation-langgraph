@@ -4400,29 +4400,18 @@ async def enrich_node(state: GraphState) -> GraphState:
                         name = dom
                     cand.append({"id": cid, "name": name})
             if cand:
-                # Only override existing candidates when Top‑10 has at least the immediate enrichment limit
+                # Always use the discovered Top‑10 exclusively, even if fewer than limit
                 try:
                     enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
                 except Exception:
                     enrich_now_limit = 10
-                existing = state.get("candidates") or []
-                if existing and len(cand) < enrich_now_limit:
-                    try:
-                        logger.info(
-                            "[enrich] keep existing candidates=%d; top10 too short=%d (limit=%d)",
-                            len(existing) if isinstance(existing, list) else 0,
-                            len(cand),
-                            enrich_now_limit,
-                        )
-                    except Exception:
-                        pass
-                else:
-                    state["candidates"] = cand
-                    state["strict_top10"] = True
-                    try:
-                        logger.info("[enrich] using persisted top10 count=%d", len(cand))
-                    except Exception:
-                        pass
+                sel = cand[:enrich_now_limit] if len(cand) > enrich_now_limit else cand
+                state["candidates"] = sel
+                state["strict_top10"] = True
+                try:
+                    logger.info("[enrich] using agent/persisted top10 count=%d", len(sel))
+                except Exception:
+                    pass
         except Exception:
             # Non-fatal; fall back to existing selection logic
             pass
