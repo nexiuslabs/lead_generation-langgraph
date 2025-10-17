@@ -1361,6 +1361,7 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
             if _agent_top10 is not None:
                 top = _agent_top10(state.get("icp_profile") or {}, state.get("tenant_id"))
                 if top:
+                    # Store full planned set in memory; UI will still show Top‑10
                     state["agent_top10"] = top
                     # Persist preview so later runs reuse the same Top‑10
                     try:
@@ -4316,13 +4317,7 @@ async def enrich_node(state: GraphState) -> GraphState:
         state["last_routed_text"] = (_last_user_text(state) or "").strip().lower()
     except Exception:
         pass
-    try:
-        # Concise trace to correlate start of enrichment in logs
-        strict = bool(state.get("strict_top10"))
-        cand_n = len(state.get("candidates") or []) if isinstance(state.get("candidates"), list) else 0
-        logger.info("[enrich] begin strict_top10=%s candidates=%d", strict, cand_n)
-    except Exception:
-        pass
+    # Defer detailed begin log until after we resolve Top‑10 vs fallback candidates
     # Persist current ICP immediately when enrichment is requested, even if user skipped explicit confirm
     try:
         icp_cur = dict(state.get("icp") or {})
@@ -4367,17 +4362,43 @@ async def enrich_node(state: GraphState) -> GraphState:
                         top10 = regen
                 except Exception:
                     pass
-    # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
-    # Strict policy: reuse persisted Top‑10. If unavailable, ask user to regenerate.
+    # If Top‑10 is still missing, regenerate a fresh Top‑10 now (fallback), persist, then proceed
     if not (isinstance(top10, list) and top10):
         try:
-            state["messages"] = add_messages(
-                state.get("messages") or [],
-                [AIMessage(content="I can’t find the Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate it, then use 'run enrichment'.")],
-            )
+            from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
         except Exception:
-            pass
-        return state
+            _agent_top10 = None  # type: ignore
+        if _agent_top10 is not None:
+            try:
+                icp_prof = dict(state.get("icp_profile") or {})
+            except Exception:
+                icp_prof = {}
+            try:
+                t_id = await _resolve_tenant_id_for_write(state)
+            except Exception:
+                t_id = None
+            try:
+                regenerated = await asyncio.to_thread(_agent_top10, icp_prof, (int(t_id) if isinstance(t_id, int) else None))
+            except Exception:
+                regenerated = []
+            if regenerated:
+                # Persist and stash full planned set; enrichment still caps run-now
+                try:
+                    state["agent_top10"] = regenerated
+                    _persist_top10_preview((int(t_id) if isinstance(t_id, int) else None), regenerated)
+                except Exception:
+                    pass
+                top10 = regenerated
+        # If still missing after regeneration, ask user to confirm again
+        if not (isinstance(top10, list) and top10):
+            try:
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [AIMessage(content="I can’t find the Top‑10 shortlist. I tried to regenerate it but got no results. Please type ‘confirm’ to rebuild it, then use 'run enrichment'.")],
+                )
+            except Exception:
+                pass
+            return state
     if isinstance(top10, list) and top10:
         try:
             from src.database import get_conn as _get_conn
@@ -4518,6 +4539,15 @@ async def enrich_node(state: GraphState) -> GraphState:
     if len(candidates) > enrich_now_limit:
         candidates = candidates[:enrich_now_limit]
         state["candidates"] = candidates
+    # Finalize start-of-enrichment log with strict flag after Top‑10 detection/regen and candidate selection
+    try:
+        logger.info(
+            "[enrich] begin strict_top10=%s candidates=%d",
+            str(bool(state.get("strict_top10"))),
+            int(len(state.get("candidates") or [])),
+        )
+    except Exception:
+        pass
     if not candidates:
         # Offer clear next steps when no candidates could be found
         state["messages"] = add_messages(
