@@ -269,8 +269,54 @@ async def enrich_top10(
             domains = [str(r[0]) for r in rows if r and r[0]]
         except Exception:
             domains = []
+    # Fallback: if no persisted Top‑10 preview, compute a fresh Top‑10, persist, and use it
     if not domains:
-        raise HTTPException(status_code=412, detail="top10 preview not found; please confirm to regenerate")
+        # Reconstruct a minimal icp_profile from latest icp_rules
+        icp_profile: Dict[str, Any] = {}
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT payload FROM icp_rules WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 1",
+                    (tid,),
+                )
+                row = cur.fetchone()
+                payload = (row and row[0]) or {}
+                if isinstance(payload, dict):
+                    if isinstance(payload.get("industries"), list):
+                        icp_profile["industries"] = payload.get("industries")
+                    if isinstance(payload.get("integrations"), list):
+                        icp_profile["integrations"] = payload.get("integrations")
+                    if isinstance(payload.get("buyer_titles"), list):
+                        icp_profile["buyer_titles"] = payload.get("buyer_titles")
+                    if isinstance(payload.get("triggers"), list):
+                        icp_profile["triggers"] = payload.get("triggers")
+                    if isinstance(payload.get("size_bands"), list):
+                        icp_profile["size_bands"] = payload.get("size_bands")
+        except Exception:
+            icp_profile = {}
+        # Plan Top‑10 with reasons using agents helper
+        try:
+            from src.agents_icp import plan_top10_with_reasons as _top10  # type: ignore
+        except Exception:
+            _top10 = None  # type: ignore
+        if _top10 is None:
+            raise HTTPException(status_code=412, detail="top10 preview not found and agents unavailable")
+        top = await asyncio.to_thread(_top10, icp_profile, tid)
+        if not top:
+            raise HTTPException(status_code=412, detail="top10 preview not found; please confirm to regenerate")
+        # Persist preview rows and discovered candidates for auditability and reuse
+        try:
+            from app.pre_sdr_graph import _persist_top10_preview, _persist_web_candidates_to_staging  # type: ignore
+            # Persist Top‑10 preview with why/snippet/score
+            _persist_top10_preview(tid, top)
+            # Persist any additional discovered candidates (beyond Top‑10) into staging without preview flag
+            rest = [str(it.get("domain")).strip().lower() for it in (top[10:] if len(top) > 10 else []) if isinstance(it, dict) and it.get("domain")]
+            if rest:
+                _persist_web_candidates_to_staging(rest, tid, ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}})
+        except Exception:
+            # Best-effort: proceed with enrichment even if persistence fails
+            pass
+        domains = [str(it.get("domain")) for it in (top or [])[:run_now_limit] if isinstance(it, dict) and it.get("domain")]
     # Map to company_ids
     company_ids: list[int] = []
     with get_conn() as conn, conn.cursor() as cur:
@@ -292,7 +338,67 @@ async def enrich_top10(
         except Exception:
             # continue with best-effort behavior
             pass
-    return {"ok": True, "requested": len(company_ids), "processed": processed}
+    # After Top‑10 enrichment, enqueue the next 40 for background enrichment
+    bg_job_id = None
+    try:
+        from src.jobs import enqueue_web_discovery_bg_enrich as _enqueue_bg
+        next_domains: list[str] = []
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                # Prefer staged web discovery rows excluding preview to select the next set
+                cur.execute(
+                    """
+                    WITH preview AS (
+                      SELECT LOWER(domain) AS d
+                      FROM staging_global_companies
+                      WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                      ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
+                      LIMIT %s
+                    )
+                    SELECT domain
+                      FROM staging_global_companies
+                     WHERE tenant_id=%s
+                       AND source='web_discovery'
+                       AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                       AND LOWER(domain) NOT IN (SELECT d FROM preview)
+                     ORDER BY created_at DESC
+                     LIMIT %s
+                    """,
+                    (tid, run_now_limit, tid, int(os.getenv("BG_NEXT_COUNT", "40") or 40)),
+                )
+                rows2 = cur.fetchall() or []
+                next_domains = [str(r[0]) for r in rows2 if r and r[0]]
+        except Exception:
+            next_domains = []
+        if next_domains:
+            # Map to company_ids (ensure rows exist)
+            ids: list[int] = []
+            with get_conn() as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT company_id, website_domain FROM companies WHERE LOWER(website_domain) = ANY(%s)",
+                        ([d.lower() for d in next_domains],),
+                    )
+                    found = {str((r[1] or "").lower()): int(r[0]) for r in (cur.fetchall() or []) if r and r[0] is not None}
+                    for d in next_domains:
+                        cid = found.get(str(d.lower()))
+                        if cid is not None:
+                            ids.append(int(cid))
+                        else:
+                            # ensure a row exists for this domain
+                            cur.execute(
+                                "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,NOW()) RETURNING company_id",
+                                (d, d),
+                            )
+                            ids.append(int(cur.fetchone()[0]))
+                except Exception:
+                    ids = []
+            if ids:
+                job = _enqueue_bg(int(tid), ids)
+                bg_job_id = job.get("job_id") if isinstance(job, dict) else None
+    except Exception:
+        bg_job_id = None
+    return {"ok": True, "requested": len(company_ids), "processed": processed, "next40_job_id": bg_job_id}
 
 
 @router.post("/enrich/next40")
