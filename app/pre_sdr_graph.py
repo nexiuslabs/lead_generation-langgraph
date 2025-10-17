@@ -1324,12 +1324,29 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         pass
     # Build a concise status message with correct totals
     msg_lines: list[str] = []
+    # Compute discovered candidates (domain URLs) count for display
+    # Prefer in-memory discovery results strictly for accuracy per run
+    discovered_total = 0
     try:
-        # Prefer the total discovered via agent web discovery; else fall back to ICP-matched total in DB
-        total_web = int(state.get("web_discovery_total") or 0)
+        ac = state.get("agent_candidates") or []
+        if isinstance(ac, list) and ac:
+            discovered_total = len(ac)
     except Exception:
-        total_web = 0
-    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+        discovered_total = 0
+    if discovered_total <= 0:
+        try:
+            at = state.get("agent_top10") or []
+            if isinstance(at, list) and at:
+                discovered_total = len(at)
+        except Exception:
+            discovered_total = 0
+    if discovered_total <= 0:
+        # Last resort: use a cached count if present; avoid DB/staging totals to prevent mismatch
+        try:
+            discovered_total = int(state.get("web_discovery_total") or 0)
+        except Exception:
+            discovered_total = 0
+    display_total = discovered_total
     if display_total > 0:
         msg_lines.append(f"Found {display_total} ICP candidates. Showing Top‑10 preview below.")
     else:
@@ -4263,12 +4280,29 @@ async def confirm_node(state: GraphState) -> GraphState:
     ssic_matches = []
     msg_lines: list[str] = []
 
-    # Start with candidate count (prefer web discovery total, else DB ICP total, else local count)
+    # Start with discovered candidates count (domain URLs)
+    # Prefer in-memory discovery results strictly for accuracy per run
+    discovered_total = 0
     try:
-        total_web = int(state.get("web_discovery_total") or 0)
+        ac = state.get("agent_candidates") or []
+        if isinstance(ac, list) and ac:
+            discovered_total = len(ac)
     except Exception:
-        total_web = 0
-    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+        discovered_total = 0
+    if discovered_total <= 0:
+        try:
+            at = state.get("agent_top10") or []
+            if isinstance(at, list) and at:
+                discovered_total = len(at)
+        except Exception:
+            discovered_total = 0
+    if discovered_total <= 0:
+        # Last resort: use cached state count if present; avoid DB/staging totals
+        try:
+            discovered_total = int(state.get("web_discovery_total") or 0)
+        except Exception:
+            discovered_total = 0
+    display_total = discovered_total
     if display_total > 0:
         msg_lines.append(f"Found {display_total} ICP candidates.")
     else:
