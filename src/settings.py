@@ -206,6 +206,11 @@ APIFY_USE_COMPANY_EMPLOYEE_CHAIN = os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN",
     "yes",
     "on",
 )
+# Domain→LinkedIn company resolver (used for Top‑10/Next‑40)
+APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID = os.getenv(
+    "APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID",
+    "s-r~free-linkedin-company-finder---linkedin-address-from-any-site",
+)
 
 # Per-run/daily caps. We reuse 'contact_lookups' vendor cap for simplicity.
 try:

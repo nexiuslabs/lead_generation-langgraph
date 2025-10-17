@@ -32,6 +32,13 @@ def _employees_actor_id() -> Optional[str]:
     v = os.getenv("APIFY_EMPLOYEES_ACTOR_ID", "harvestapi~linkedin-company-employees")
     return v or None
 
+def _company_finder_by_domain_actor_id() -> str:
+    # New domain→LinkedIn company resolver (for Top‑10 / Next‑40 flows)
+    return os.getenv(
+        "APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID",
+        "s-r~free-linkedin-company-finder---linkedin-address-from-any-site",
+    )
+
 
 async def run_sync_get_dataset_items(
     payload: Dict[str, Any], *, dataset_format: str = "json", timeout_s: int = 600
@@ -452,6 +459,80 @@ async def _run_actor_items(actor_id: str, payload: Dict[str, Any], *, dataset_fo
     return []
 
 
+async def company_url_from_domain(domain: str, *, timeout_s: int = 600, dataset_format: str = "json") -> Optional[str]:
+    """Resolve LinkedIn company URL from a website domain via dedicated Apify actor.
+
+    Uses: s-r~free-linkedin-company-finder---linkedin-address-from-any-site
+    Input: {"domains": ["example.com"]}
+    Output: returns first url matching linkedin.com/company/* when present.
+    """
+    if not domain:
+        return None
+    # Normalize: strip scheme if present
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(domain).netloc
+        dom = netloc or domain
+        dom = dom.lstrip("http://").lstrip("https://")
+        dom = dom.split("/")[0]
+    except Exception:
+        dom = domain
+    actor_id = _company_finder_by_domain_actor_id().replace("/", "~")
+    url = f"{APIFY_BASE}/acts/{actor_id}/run-sync-get-dataset-items"
+    headers = {
+        "Content-Type": "application/json",
+        # Apify supports token param or Bearer header; follow the new API example
+        "Authorization": f"Bearer {_token()}",
+    }
+    params = {"format": dataset_format, "clean": "true"}
+    payload = {"domains": [dom]}
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            r = await client.post(url, params=params, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            items: List[Dict[str, Any]]
+            if isinstance(data, dict) and isinstance(data.get("items"), list):
+                items = data.get("items")
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = []
+            # Extract a LinkedIn company URL from items
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                # Support multiple possible key names from the actor
+                for k in (
+                    "linkedinUrl",
+                    "companyUrl",
+                    "url",
+                    "linkedin_url",
+                    "linkedinCompanyUrl",
+                    "linkedin_company_url",
+                ):
+                    v = it.get(k)
+                    if isinstance(v, str) and "/linkedin.com/company/" in v:
+                        try:
+                            # Normalize regional subdomains to www for better actor compatibility
+                            # e.g., https://sg.linkedin.com/company/... -> https://www.linkedin.com/company/...
+                            from urllib.parse import urlparse, urlunparse
+                            parsed = urlparse(v)
+                            host = parsed.netloc or ""
+                            if host.endswith("linkedin.com") and not host.startswith("www."):
+                                host = host.split(".", 1)[-1]  # keep linkedin.com
+                                host = "www." + host
+                                v = urlunparse((parsed.scheme or "https", host, parsed.path or "", "", "", ""))
+                        except Exception:
+                            pass
+                        return v
+            return None
+    except httpx.HTTPStatusError:
+        return None
+    except Exception:
+        return None
+
+
 async def company_to_profile_urls(company_name: str, *, max_items: int = 50, timeout_s: int = 600) -> List[str]:
     """Resolve a company's LinkedIn URL from name, then list employee profile URLs.
 
@@ -516,4 +597,38 @@ async def contacts_via_company_chain(company_name: str, titles: List[str] | None
                 filtered.append(it)
         items = filtered
     logger.info("Apify profile actor: requested=%d received=%d filtered=%d", min(len(profile_urls), max_items), len(items or []), len(items or []))
+    return normalize_contacts(items or [])
+
+
+async def contacts_via_domain_chain(domain: str, titles: List[str] | None = None, *, max_items: int = 50, timeout_s: int = 600) -> List[Dict[str, Any]]:
+    """Chain: domain -> company URL (new actor) -> employees -> profiles -> normalize.
+
+    Intended for Top‑10 / Next‑40 flows where domain is already known from ICP.
+    """
+    profile_actor = _actor_id()
+    comp_url = await company_url_from_domain(domain, timeout_s=timeout_s)
+    logger.info("Apify domain→company: domain=%s company_url=%s", domain, comp_url)
+    if not comp_url:
+        return []
+    # Employees listing
+    emp_actor = _employees_actor_id()
+    if not emp_actor:
+        return []
+    emp_items = await _run_actor_items(emp_actor, {"companies": [comp_url], "maxItems": max_items}, timeout_s=timeout_s)
+    profile_urls: List[str] = []
+    for it in emp_items or []:
+        url = it.get("linkedinUrl") or it.get("profileUrl") or it.get("url")
+        if isinstance(url, str) and ".linkedin.com/in/" in url:
+            profile_urls.append(url)
+    profile_urls = list(dict.fromkeys(profile_urls))[:max_items]
+    if not profile_urls:
+        return []
+    items = await _run_actor_items(profile_actor, {"profileUrls": profile_urls, "maxItems": max_items}, timeout_s=timeout_s)
+    if titles:
+        filtered: List[Dict[str, Any]] = []
+        for it in items or []:
+            txt = (it.get("jobTitle") or it.get("headline") or "")
+            if _title_matches(txt, titles):
+                filtered.append(it)
+        items = filtered
     return normalize_contacts(items or [])

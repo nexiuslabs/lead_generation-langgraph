@@ -746,7 +746,7 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
                 "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
             }
         _ = _persist_web_candidates_to_staging(
-            [str(it.get("domain")) for it in top if isinstance(it, dict) and it.get("domain")],
+            [str(it.get("domain")) for it in (top or [])[:10] if isinstance(it, dict) and it.get("domain")],
             int(tid) if isinstance(tid, int) else None,
             ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
             per_domain_meta=per_meta,
@@ -3854,7 +3854,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     pass
                                 logger.info("[confirm] invoking plan_top10_with_reasons; have_icp=%s", bool(icp_prof))
                                 top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
-                                logger.info("[confirm] agent top10 count=%d", len(top or []))
+                                # Log Top‑10 (cap to 10) for consistency with UI
+                                logger.info("[confirm] agent top10 count=%d", min(10, len(top or [])))
                                 if not top:
                                     # Seeds-based competitor query fallback is disabled when STRICT_INDUSTRY_QUERY_ONLY
                                     try:

@@ -9,6 +9,7 @@ from app.auth import require_auth, require_identity, require_optional_identity
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
 import os
+import shutil
 import csv
 from io import StringIO
 import logging
@@ -75,6 +76,30 @@ try:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 except Exception as e:
     logger.warning("Failed to ensure checkpoint dir %s: %s", CHECKPOINT_DIR, e)
+
+# Optional: clear any persisted LangGraph checkpoint/runs on server boot in local dev
+try:
+    _variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT") or "local_dev").strip().lower()
+    _clear_flag = (os.getenv("LANGGRAPH_CLEAR_ON_BOOT") or "").strip().lower()
+    # Default to clearing on boot in local_dev unless explicitly disabled
+    _should_clear = (_variant == "local_dev" and _clear_flag not in {"0", "false", "no", "off"}) or _clear_flag in {"1", "true", "yes", "on"}
+    if _should_clear and os.path.isdir(CHECKPOINT_DIR):
+        removed = 0
+        for name in os.listdir(CHECKPOINT_DIR):
+            p = os.path.join(CHECKPOINT_DIR, name)
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+                removed += 1
+            except Exception:
+                # Best-effort; continue
+                continue
+        if removed:
+            logger.info("Cleared %d checkpoint items from %s on boot", removed, CHECKPOINT_DIR)
+except Exception as _e:
+    logger.warning("Unable to clear checkpoint dir on boot: %s", _e)
 
 app = FastAPI(title="Pre-SDR LangGraph Server")
 

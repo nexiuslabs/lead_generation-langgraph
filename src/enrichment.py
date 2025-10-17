@@ -33,6 +33,8 @@ from src.vendors.apify_linkedin import (
     build_queries as apify_build_queries,
     normalize_contacts as apify_normalize,
     contacts_via_company_chain as apify_contacts_via_chain,
+    contacts_via_domain_chain as apify_contacts_via_domain_chain,
+    company_url_from_domain as apify_company_url_from_domain,
 )
 from src.openai_client import get_embedding
 from src.settings import (
@@ -2123,21 +2125,85 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                     try:
                         t0 = time.perf_counter()
                         # Prefer company -> employees -> profiles chain if enabled
-                        if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
-                            contacts_raw = await apify_contacts_via_chain(
-                                company_name,
-                                titles=(titles if isinstance(titles, list) else None),
-                                max_items=25,
-                                timeout_s=APIFY_SYNC_TIMEOUT_S,
-                            )
-                            raw = contacts_raw  # for count logging below; already normalized
+                        # For Top‑10 / Next‑40 (require_existing) use domain→company resolver before contacts
+                        policy = (state.get("search_policy") or "auto").lower()
+                        if policy == "require_existing":
+                            from urllib.parse import urlparse
+                            home = state.get("home") or ""
+                            dom = urlparse(home).netloc if home else ""
+                            if dom:
+                                # Try to resolve company LinkedIn URL and persist on company data for core upsert
+                                try:
+                                    comp_url = await apify_company_url_from_domain(dom, timeout_s=APIFY_SYNC_TIMEOUT_S, dataset_format=APIFY_DATASET_FORMAT)
+                                except Exception:
+                                    comp_url = None
+                                if comp_url:
+                                    try:
+                                        (state.setdefault("data", {}))["linkedin_url"] = comp_url
+                                    except Exception:
+                                        pass
+                                # Now attempt contacts via domain chain
+                                contacts_raw = await apify_contacts_via_domain_chain(
+                                    dom,
+                                    titles=(titles if isinstance(titles, list) else None),
+                                    max_items=25,
+                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                )
+                                raw = contacts_raw
+                                # Fallback to company-name chain when domain chain yields nothing
+                                if not contacts_raw:
+                                    try:
+                                        logger.info("[apify_contacts] domain chain empty; falling back to company-name chain")
+                                    except Exception:
+                                        pass
+                                    if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                        contacts_raw = await apify_contacts_via_chain(
+                                            company_name,
+                                            titles=(titles if isinstance(titles, list) else None),
+                                            max_items=25,
+                                            timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                        )
+                                        raw = contacts_raw
+                                    else:
+                                        raw = await apify_run(
+                                            {"queries": queries},
+                                            dataset_format=APIFY_DATASET_FORMAT,
+                                            timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                        )
+                                        contacts_raw = apify_normalize(raw)
+                            else:
+                                # No domain present; fall back to company-name chain if enabled
+                                if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                    contacts_raw = await apify_contacts_via_chain(
+                                        company_name,
+                                        titles=(titles if isinstance(titles, list) else None),
+                                        max_items=25,
+                                        timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                    )
+                                    raw = contacts_raw
+                                else:
+                                    raw = await apify_run(
+                                        {"queries": queries},
+                                        dataset_format=APIFY_DATASET_FORMAT,
+                                        timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                    )
+                                    contacts_raw = apify_normalize(raw)
                         else:
-                            raw = await apify_run(
-                                {"queries": queries},
-                                dataset_format=APIFY_DATASET_FORMAT,
-                                timeout_s=APIFY_SYNC_TIMEOUT_S,
-                            )
-                            contacts_raw = apify_normalize(raw)
+                            if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                contacts_raw = await apify_contacts_via_chain(
+                                    company_name,
+                                    titles=(titles if isinstance(titles, list) else None),
+                                    max_items=25,
+                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                )
+                                raw = contacts_raw
+                            else:
+                                raw = await apify_run(
+                                    {"queries": queries},
+                                    dataset_format=APIFY_DATASET_FORMAT,
+                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                )
+                                contacts_raw = apify_normalize(raw)
                         logger.info(
                             f"[apify_contacts] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
                         )
@@ -2704,6 +2770,27 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
                 reason = "override_progress_persist"
 
         # keep routing overrides minimal
+
+        # If planner wants to persist/finish but we still need contacts, force Apify step first
+        try:
+            if action in ("persist_core", "persist_legacy", "finish"):
+                data = state.get("data") or {}
+                need_emails = not (data.get("email") or [])
+                need_phones = not (data.get("phone_number") or [])
+                company_id = state.get("company_id")
+                total_contacts, has_named, founder_present = _get_contact_stats(company_id) if company_id else (0, False, False)
+                needs_contacts = total_contacts == 0
+                missing_names = not has_named
+                missing_founder = not founder_present
+                prefer_apify = (
+                    ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
+                )
+                tid = int(_RUN_CTX.get("tenant_id") or 0)
+                if prefer_apify and (need_emails or need_phones or needs_contacts or missing_names or missing_founder) and _dec_cap("contact_lookups", 1) and _apify_cap_ok(tid, need=1):
+                    action = "apify_contacts"
+                    reason = "force_contacts_before_persist"
+        except Exception:
+            pass
 
         logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
         if action == "finish":
