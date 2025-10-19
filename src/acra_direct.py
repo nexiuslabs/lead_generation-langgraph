@@ -229,7 +229,12 @@ def _set_rls_tenant() -> None:
         pass
 
 
-def stream_staging_candidates(limit: Optional[int] = None, start_after_id: Optional[int] = None, start_from_uen: Optional[str] = None, recheck_days: Optional[int] = None) -> Iterable[Dict[str, Any]]:
+def stream_staging_candidates(
+    limit: Optional[int] = None,
+    start_after_id: Optional[int] = None,
+    start_from_uen: Optional[str] = None,
+    recheck_days: Optional[int] = None,
+) -> Iterable[Dict[str, Any]]:
     """Yield staging rows without ICP filtering, with flexible column mapping.
 
     Notes:
@@ -281,14 +286,89 @@ def stream_staging_candidates(limit: Optional[int] = None, start_after_id: Optio
         if start_from_uen and c_uen:
             where_clauses.append(f"{c_uen} > %s")
             params.append(start_from_uen)
+        # Selection-time recency filter: when recheck_days is provided and UEN exists on staging,
+        # skip rows whose corresponding company has a recent enrichment history.
+        if recheck_days and recheck_days > 0 and c_uen:
+            where_clauses.append(
+                "NOT EXISTS (\n"
+                "  SELECT 1\n"
+                "  FROM companies c\n"
+                "  JOIN company_enrichment_runs r ON r.company_id = c.company_id\n"
+                f"  WHERE c.uen IS NOT DISTINCT FROM {c_uen}\n"
+                "    AND COALESCE(r.updated_at, now()) >= now() - (%s::text || ' days')::interval\n"
+                ")"
+            )
+            params.append(str(int(recheck_days)))
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
         order_by = c_id or (c_uen if c_uen else c_name)
         lim_sql = f" LIMIT {int(limit)}" if isinstance(limit, int) and limit > 0 else ""
         sql = f"SELECT {', '.join(select_list)} FROM staging_acra_companies{where_sql} ORDER BY {order_by} ASC{lim_sql}"
+        # Optional debug to aid diagnosing empty selections
+        try:
+            dbg = (os.getenv("ACRA_DIRECT_DEBUG", "").lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            dbg = False
+        if dbg:
+            try:
+                print(f"[acra_direct.debug] order_by={order_by} limit={limit}")
+                print(f"[acra_direct.debug] where={where_clauses} params={params}")
+                print(f"[acra_direct.debug] sql={sql}")
+            except Exception:
+                pass
         cur.execute(sql, tuple(params))
         out_cols = [d[0] for d in cur.description]
         for r in cur.fetchall() or []:
             yield dict(zip(out_cols, r))
+
+
+def _ensure_service_progress_table() -> None:
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS service_progress (
+                  service_key TEXT PRIMARY KEY,
+                  last_id BIGINT,
+                  last_uen TEXT,
+                  updated_at TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+    except Exception:
+        pass
+
+
+def _get_progress(service_key: str) -> Tuple[Optional[int], Optional[str]]:
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_id, last_uen FROM service_progress WHERE service_key=%s",
+                (service_key,),
+            )
+            row = cur.fetchone()
+            if row:
+                return (row[0], row[1])
+    except Exception:
+        return (None, None)
+    return (None, None)
+
+
+def _set_progress(service_key: str, last_id: Optional[int], last_uen: Optional[str]) -> None:
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO service_progress(service_key, last_id, last_uen, updated_at)
+                VALUES (%s,%s,%s, now())
+                ON CONFLICT (service_key) DO UPDATE SET
+                  last_id=EXCLUDED.last_id,
+                  last_uen=EXCLUDED.last_uen,
+                  updated_at=now()
+                """,
+                (service_key, last_id, last_uen),
+            )
+    except Exception:
+        pass
 
 
 def run_once() -> Dict[str, int]:
@@ -304,16 +384,60 @@ def run_once() -> Dict[str, int]:
     batch = _env_int("ACRA_DIRECT_BATCH_LIMIT", 0)
     start_after_id = _env_int("ACRA_DIRECT_START_AFTER_ID", 0) or None
     start_from_uen = _env_str("ACRA_DIRECT_START_FROM_UEN", None)
+    recheck_days = _env_int("ACRA_DIRECT_RECHECK_DAYS", 0) or None
+    # Optional per-run vendor caps (contact lookups)
+    try:
+        from src.enrichment import set_vendor_caps  # type: ignore
+        cap_env = os.getenv("CONTACT_LOOKUPS_CAP") or os.getenv("ACRA_CONTACT_LOOKUPS_CAP")
+        cap = int(cap_env) if cap_env and str(cap_env).isdigit() else None
+        if cap:
+            set_vendor_caps(contact_lookups=cap)
+    except Exception:
+        pass
+    # Progress resume: merge explicit env with stored checkpoint by taking the furthest position
+    try:
+        _ensure_service_progress_table()
+        pid, puen = _get_progress("acra_direct")
+        if pid is not None:
+            try:
+                pid_i = int(pid)
+                if (start_after_id is None) or (pid_i > int(start_after_id)):
+                    start_after_id = pid_i
+            except Exception:
+                pass
+        if puen is not None and str(puen).strip():
+            try:
+                puen_s = str(puen)
+                if (start_from_uen is None) or (puen_s > str(start_from_uen)):
+                    start_from_uen = puen_s
+            except Exception:
+                pass
+    except Exception:
+        pass
     # Iterate
     count = 0
-    for row in stream_staging_candidates(limit=(batch if batch and batch > 0 else None), start_after_id=start_after_id, start_from_uen=start_from_uen):
+    for row in stream_staging_candidates(
+        limit=(batch if batch and batch > 0 else None),
+        start_after_id=start_after_id,
+        start_from_uen=start_from_uen,
+        recheck_days=recheck_days,
+    ):
         count += 1
         try:
             cid, info = upsert_company_from_staging(row)
             log.info("[direct] upsert company_id=%s uen=%s name=%s industry_code=%s title=%s", cid, info.get("uen"), info.get("name"), info.get("industry_code"), info.get("industry_title"))
+            # Advance checkpoint early to avoid repeating the same row on interruption.
+            try:
+                _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
+            except Exception:
+                pass
             if _recent_enrichment_exists(cid):
                 skipped += 1
                 log.info("[direct] skip company_id=%s due to prior enrichment", cid)
+                try:
+                    _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
+                except Exception:
+                    pass
                 continue
             if run_id is not None:
                 set_run_context(run_id, int(os.getenv("DEFAULT_TENANT_ID", "0") or 0))
@@ -331,11 +455,24 @@ def run_once() -> Dict[str, int]:
             except Exception:
                 pass
             processed += 1
+        except KeyboardInterrupt:
+            # Ensure checkpoint saved, then break to allow clean resume next run
+            try:
+                _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
+            except Exception:
+                pass
+            log.info("[direct] interrupted; checkpoint saved; exiting early")
+            break
         except Exception as e:
             failures += 1
             sid = row.get("staging_id") or row.get("uen") or row.get("entity_name")
             log.warning("[direct] failure staging_ref=%s err=%s", sid, e)
             continue
+        finally:
+            try:
+                _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
+            except Exception:
+                pass
     dur_ms = int((time.perf_counter() - t0) * 1000)
     log.info("[direct] finished processed=%s skipped=%s failures=%s duration_ms=%s", processed, skipped, failures, dur_ms)
     return {"processed": processed, "skipped": skipped, "failures": failures}
