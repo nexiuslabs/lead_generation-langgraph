@@ -1477,16 +1477,21 @@ async def export_latest_scores_json(limit: int = 200, request: Request = None, c
                 await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
+        # Require a resolved tenant id to avoid cross-tenant leakage
+        if tid is None:
+            return []
         rows = await conn.fetch(
             """
             SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
                    s.score, s.bucket, s.rationale
             FROM companies c
             JOIN lead_scores s ON s.company_id = c.company_id
+            WHERE s.tenant_id = $2
             ORDER BY s.score DESC NULLS LAST
             LIMIT $1
             """,
             limit,
+            tid,
         )
     return [dict(r) for r in rows]
 
@@ -1506,17 +1511,24 @@ async def export_latest_scores_csv(limit: int = 200, request: Request = None, cl
                 await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
-        rows = await conn.fetch(
-            """
-            SELECT c.company_id, c.name, c.industry_norm, c.employees_est,
-                   s.score, s.bucket, s.rationale
-            FROM companies c
-            JOIN lead_scores s ON s.company_id = c.company_id
-            ORDER BY s.score DESC NULLS LAST
-            LIMIT $1
-            """,
-            limit,
-        )
+        # Require a resolved tenant id to avoid cross-tenant leakage
+        if tid is None:
+            # Return an empty CSV with headers
+            rows = []
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT c.company_id, c.name, c.industry_norm, c.employees_est,
+                       s.score, s.bucket, s.rationale
+                FROM companies c
+                JOIN lead_scores s ON s.company_id = c.company_id
+                WHERE s.tenant_id = $2
+                ORDER BY s.score DESC NULLS LAST
+                LIMIT $1
+                """,
+                limit,
+                tid,
+            )
     buf = StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else [
         "company_id","name","industry_norm","employees_est","score","bucket","rationale"
@@ -1568,10 +1580,12 @@ async def export_odoo_sync(body: dict | None = None, request: Request = None, cl
                    (SELECT e.email FROM lead_emails e WHERE e.company_id=s.company_id LIMIT 1) AS primary_email
             FROM lead_scores s
             JOIN companies c ON c.company_id = s.company_id
+            WHERE s.tenant_id = $2
             ORDER BY s.score DESC NULLS LAST
             LIMIT $1
             """,
             limit,
+            tid,
         )
     # Use tenant-scoped Odoo mapping
     store = OdooStore(tenant_id=int(tid)) if tid is not None else OdooStore()
@@ -1693,34 +1707,32 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
                 await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
-
-        # Count scored rows (RLS will scope if enabled)
-        try:
-            total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores"))
-        except Exception:
+        # If we cannot resolve tenant, do not leak global counts
+        if tid is None:
             total_scored = 0
+            last_ts: datetime | None = None
+            last_run_id = None
+            last_run_status = None
+            last_run_started_at = None
+            last_run_ended_at = None
+        else:
+            # Count only this tenant's scored rows
+            try:
+                total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = $1", tid))
+            except Exception:
+                total_scored = 0
 
-        # last_refreshed_at heuristics: prefer enrichment/company run timestamps if present,
-        # fallback to company last_seen joined to lead_scores, else None.
-        last_ts: datetime | None = None
-        last_run_id = None
-        last_run_status = None
-        last_run_started_at = None
-        last_run_ended_at = None
+            # Last activity from this tenant's enrichment runs
+            last_ts: datetime | None = None
+            last_run_id = None
+            last_run_status = None
+            last_run_started_at = None
+            last_run_ended_at = None
 
-        # Try company_enrichment_runs.run_timestamp
-        try:
-            ts = await conn.fetchval("SELECT MAX(run_timestamp) FROM company_enrichment_runs")
-            if isinstance(ts, datetime):
-                last_ts = ts
-        except Exception:
-            last_ts = last_ts
-
-        # Try enrichment_runs.started_at and include run fields (subject to RLS)
-        if last_ts is None:
             try:
                 row = await conn.fetchrow(
-                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs ORDER BY run_id DESC LIMIT 1"
+                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs WHERE tenant_id = $1 ORDER BY run_id DESC LIMIT 1",
+                    tid,
                 )
                 if row:
                     last_run_id = row["run_id"]
@@ -1729,21 +1741,6 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
                     last_run_ended_at = row["ended_at"]
                     if isinstance(last_run_started_at, datetime):
                         last_ts = last_run_started_at
-            except Exception:
-                last_ts = last_ts
-
-        # Fallback: companies.last_seen for rows that have scores
-        if last_ts is None:
-            try:
-                ts = await conn.fetchval(
-                    """
-                    SELECT MAX(c.last_seen)
-                    FROM companies c
-                    JOIN lead_scores s ON s.company_id = c.company_id
-                    """
-                )
-                if isinstance(ts, datetime):
-                    last_ts = ts
             except Exception:
                 last_ts = last_ts
 
