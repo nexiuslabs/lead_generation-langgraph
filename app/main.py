@@ -1482,8 +1482,43 @@ async def export_latest_scores_json(limit: int = 200, request: Request = None, c
             return []
         rows = await conn.fetch(
             """
-            SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
-                   s.score, s.bucket, s.rationale
+            SELECT c.company_id,
+                   c.name,
+                   c.website_domain,
+                   c.industry_norm,
+                   c.employees_est,
+                   s.score,
+                   s.bucket,
+                   s.rationale,
+                   -- Primary email from discovered lead emails (best-effort)
+                   (
+                     SELECT e.email
+                     FROM lead_emails e
+                     WHERE e.company_id = s.company_id
+                     ORDER BY e.left_company NULLS FIRST, e.smtp_confidence DESC NULLS LAST
+                     LIMIT 1
+                   ) AS primary_email,
+                   -- Basic contact person details (best-effort)
+                   (
+                     SELECT c2.full_name FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_name,
+                   (
+                     SELECT c2.job_title FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_title,
+                   (
+                     SELECT c2.linkedin_profile FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_linkedin,
+                   (
+                     SELECT c2.phone_number FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_phone
             FROM companies c
             JOIN lead_scores s ON s.company_id = c.company_id
             WHERE s.tenant_id = $2
@@ -1518,8 +1553,42 @@ async def export_latest_scores_csv(limit: int = 200, request: Request = None, cl
         else:
             rows = await conn.fetch(
                 """
-                SELECT c.company_id, c.name, c.industry_norm, c.employees_est,
-                       s.score, s.bucket, s.rationale
+                SELECT c.company_id,
+                       c.name,
+                       c.industry_norm,
+                       c.employees_est,
+                       s.score,
+                       s.bucket,
+                       s.rationale,
+                       -- Primary email from discovered lead emails (best-effort)
+                       (
+                         SELECT e.email
+                         FROM lead_emails e
+                         WHERE e.company_id = s.company_id
+                         ORDER BY e.left_company NULLS FIRST, e.smtp_confidence DESC NULLS LAST
+                         LIMIT 1
+                       ) AS primary_email,
+                       -- Basic contact person details (best-effort)
+                       (
+                         SELECT c2.full_name FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_name,
+                       (
+                         SELECT c2.job_title FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_title,
+                       (
+                         SELECT c2.linkedin_profile FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_linkedin,
+                       (
+                         SELECT c2.phone_number FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_phone
                 FROM companies c
                 JOIN lead_scores s ON s.company_id = c.company_id
                 WHERE s.tenant_id = $2
@@ -1531,7 +1600,8 @@ async def export_latest_scores_csv(limit: int = 200, request: Request = None, cl
             )
     buf = StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else [
-        "company_id","name","industry_norm","employees_est","score","bucket","rationale"
+        "company_id","name","industry_norm","employees_est","score","bucket","rationale",
+        "primary_email","contact_name","contact_title","contact_linkedin","contact_phone"
     ])
     writer.writeheader()
     for r in rows:
