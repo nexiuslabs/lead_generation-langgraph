@@ -157,6 +157,21 @@ def _fallback_extract_from_text(text: str) -> dict:
     except Exception:
         pass
     try:
+        # linkedin company URL (best-effort)
+        lk = None
+        for pat in (
+            r"https?://(?:[a-z]+\.)?linkedin\.com/company/[^\s)]+",
+            r"https?://(?:[a-z]+\.)?linkedin\.com/companies/[^\s)]+",
+        ):
+            m2 = re.search(pat, text or "", flags=re.IGNORECASE)
+            if m2:
+                lk = m2.group(0)
+                break
+        if lk:
+            out["linkedin_url"] = lk
+    except Exception:
+        pass
+    try:
         # about: first 2 sentences (approx)
         s = (text or "").strip()
         if s:
@@ -671,8 +686,11 @@ def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
                     row["title"] = c.get("title")
                 if "linkedin_profile" in cols and c.get("linkedin_url"):
                     row["linkedin_profile"] = c.get("linkedin_url")
+                # Support either linkedin_url or linkedin_profile columns
                 if "linkedin_url" in cols and c.get("linkedin_url"):
                     row["linkedin_url"] = c.get("linkedin_url")
+                elif "linkedin_profile" in cols and c.get("linkedin_url"):
+                    row["linkedin_profile"] = c.get("linkedin_url")
                 if "location_city" in cols and c.get("location"):
                     row["location_city"] = c.get("location")
                 if "contact_source" in cols:
@@ -1169,6 +1187,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     text = ""
     try:
         for v in variants:
+            logger.info(f"[jina-home] trying {v}")
             text = jina_read(v, timeout=8) or ""
             if text:
                 pages.append({"url": v, "html": text})
@@ -1177,11 +1196,35 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     except Exception:
         text = ""
 
+    # 1a) Try r.jina for deterministic subpages (contact/about) before HTTP fallback
+    try:
+        if text:  # homepage present — enrich with 1–2 key subpages via Jina
+            sub_paths = ["contact-us", "about", "contact", "about-us"]
+            added = 0
+            for p in sub_paths:
+                u = f"{root}/{p}"
+                try:
+                    logger.info(f"[jina-sub] trying {u}")
+                    t = jina_read(u, timeout=6) or ""
+                    if t and len(t.strip()) > 100:
+                        logger.info(f"[jina-sub] ok {u} len={len(t)}")
+                        pages.append({"url": u, "html": t[:10000]})
+                        if not summary_text:
+                            summary_text = t
+                        added += 1
+                        if added >= 2:
+                            break
+                except Exception:
+                    logger.info(f"[jina-sub] failed {u}")
+                    continue
+    except Exception:
+        pass
+
     # 2) Direct HTTP GET fallback for homepage
     if not text:
         try:
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
-                resp = await client.get(variants[0], follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                resp = await client.get(variants[0], follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=8.0))
                 if getattr(resp, "text", ""):
                     body = resp.text
                     pages.append({"url": variants[0], "html": body})
@@ -1190,47 +1233,84 @@ async def _jina_snapshot_pages(company_id: int, url: str):
             pass
 
     # 3) Deterministic subpages if homepage still empty or to augment thin pages
-    need_more = not pages or len((summary_text or "").strip()) < 200
-    if need_more:
-        seeds = [
-            "about", "about-us", "aboutus", "company", "who-we-are",
-            "contact", "contact-us",
-            "team", "leadership",
-            "careers", "jobs",
-            "services", "solutions", "products",
-        ]
-        cand_urls = []
-        for p in seeds:
-            cand_urls.append(f"{root}/{p}")
-        # Fetch in parallel, keep first 2-3 that return content
-        try:
+    # Always attempt a minimal HTTP fetch of key subpages to capture footer links (e.g., LinkedIn)
+    # even when homepage is non-empty, to improve social link extraction robustness.
+    try:
+        seeds_min = ["about", "about-us", "contact", "contact-us"]
+        # avoid duplicates
+        existing = { (p.get("url") or "").rstrip("/") for p in pages }
+        targets = [f"{root}/{p}" for p in seeds_min]
+        fetch = [u for u in targets if u.rstrip("/") not in existing]
+        if fetch:
+            logger.info("[http-sub] attempting minimal HTTP subpages: %s", ", ".join(fetch[:4]))
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
                 resps = await asyncio.gather(
                     *(
-                        client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
-                        for u in cand_urls
+                        client.get(u, follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=6.0))
+                        for u in fetch
                     ),
                     return_exceptions=True,
                 )
             added = 0
-            for resp, u in zip(resps, cand_urls):
+            for resp, u in zip(resps, fetch):
                 if isinstance(resp, Exception):
+                    logger.info(f"[http-sub] exception {u}")
                     continue
                 body = getattr(resp, "text", "") or ""
-                # Skip obvious soft-404s
-                if not body or len(body.strip()) < 100:
+                if not body or len(body.strip()) < 80:
+                    logger.info(f"[http-sub] thin/empty {u}")
                     continue
-                pages.append({"url": u, "html": body})
+                logger.info(f"[http-sub] ok {u} len={len(body)}")
+                pages.append({"url": u, "html": body[:10000]})
                 if not summary_text:
                     summary_text = body
                 added += 1
-                if added >= 3:
+                if added >= 2:
                     break
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     if not pages:
         return None, []
+
+    # Extract LinkedIn company URL from collected pages (homepage + subpages)
+    def _normalize_linkedin_company(u: str) -> str:
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(u)
+            scheme = p.scheme or "https"
+            netloc = (p.netloc or "").lower()
+            if netloc.endswith("linkedin.com") and not netloc.startswith("www."):
+                netloc = "www.linkedin.com"
+            path = p.path or ""
+            # strip tracking params/fragments
+            return urlunparse((scheme, netloc, path, "", "", ""))
+        except Exception:
+            return u
+
+    lk_company = None
+    try:
+        for p in pages:
+            body = p.get("html") or p.get("raw_content") or p.get("content") or ""
+            if isinstance(body, dict):
+                body = body.get("text") or ""
+            # Prefer company URLs
+            m = re.search(r'https?://(?:[a-z]+\.)?linkedin\.com/company/[^\s)>"\']+', str(body), flags=re.IGNORECASE)
+            if m:
+                lk_company = _normalize_linkedin_company(m.group(0))
+                break
+        # Secondary pattern for plural /companies/
+        if not lk_company:
+            for p in pages:
+                body = p.get("html") or p.get("raw_content") or p.get("content") or ""
+                if isinstance(body, dict):
+                    body = body.get("text") or ""
+                m = re.search(r'https?://(?:[a-z]+\.)?linkedin\.com/companies/[^\s)>"\']+', str(body), flags=re.IGNORECASE)
+                if m:
+                    lk_company = _normalize_linkedin_company(m.group(0))
+                    break
+    except Exception:
+        lk_company = None
 
     # Project a minimal record into company_enrichment_runs
     try:
@@ -1242,7 +1322,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
                 "tech_stack": [],
                 "public_emails": [],
                 "jobs_count": 0,
-                "linkedin_url": None,
+                "linkedin_url": lk_company,
             }
             tid = _default_tenant_id()
             if tid is not None:
@@ -1259,7 +1339,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
             "tech_stack": [],
             "public_emails": [],
             "jobs_count": 0,
-            "linkedin_url": None,
+            "linkedin_url": lk_company,
             "phone_number": [],
             "hq_city": None,
             "hq_country": None,
@@ -1268,7 +1348,8 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     except Exception:
         pass
 
-    return {"url": root, "content_summary": (summary_text or "")[:1000], "signals": {}}, pages
+    signals = {"linkedin_company_url": lk_company} if lk_company else {}
+    return {"url": root, "content_summary": (summary_text or "")[:1000], "signals": signals}, pages
 
 
 async def enrich_company_with_tavily(
@@ -1908,6 +1989,13 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
         if summary:
             state["deterministic_summary"] = summary
             logger.info("[node_jina_snapshot] set deterministic_summary (jina)")
+            try:
+                sig = (summary or {}).get("signals") or {}
+                lk = sig.get("linkedin_company_url")
+                if lk and not (state.get("data") or {}).get("linkedin_url"):
+                    (state.setdefault("data", {}))["linkedin_url"] = lk
+            except Exception:
+                pass
     except Exception as exc:
         logger.warning("   ↳ jina snapshot failed", exc_info=True)
     return state
@@ -2073,11 +2161,81 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
         return state
     if state.get("completed") and state.get("error") == "no_domain":
         logger.info("[apify_contacts] No domain found; proceeding to Apify by company name")
+    # Single-shot guard per company/session: do not spam Apify within the same run
+    try:
+        attempts = int(state.get("apify_attempts") or 0)
+    except Exception:
+        attempts = 0
+    if attempts >= 1:
+        logger.info("[apify_contacts] already attempted; skipping further tries")
+        return state
+    state["apify_attempts"] = attempts + 1
     data = state.get("data") or {}
     company_id = state.get("company_id")
     if not company_id:
         return state
     try:
+        # First, attempt to extract contacts directly from deterministic site pages
+        try:
+            pages = state.get("extracted_pages") or []
+            site_contacts: list[dict] = []
+            home = (state.get("home") or "").lower()
+            # Consider About/Contact, and also homepage (footers often hold LinkedIn icons)
+            for p in pages:
+                u = (p.get("url") or "").lower()
+                is_about_contact = any(tok in u for tok in ("about", "contact"))
+                is_home = False
+                if home:
+                    try:
+                        from urllib.parse import urlparse
+                        up = urlparse(u)
+                        hp = urlparse(home)
+                        is_home = (up.netloc == hp.netloc) and ((up.path or "/").rstrip("/") in ("", "/"))
+                    except Exception:
+                        is_home = (u.rstrip("/") == home.rstrip("/"))
+                if is_about_contact or is_home:
+                    body = p.get("html") or p.get("raw_content") or p.get("content") or ""
+                    if isinstance(body, dict):
+                        body = body.get("text") or ""
+                    site_contacts.extend(_extract_contacts_from_text(str(body)))
+            if site_contacts:
+                ins, upd = upsert_contacts_from_site(company_id, site_contacts)
+                logger.info(f"[site_contacts] upserted from pages: inserted={ins}, updated={upd} company_id={company_id}")
+                # Verify any emails and mirror to lead_emails
+                emails = [c.get("email") for c in site_contacts if c.get("email")]
+                if emails:
+                    verification = verify_emails(emails)
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            for ver in verification:
+                                email_verified = True if ver.get("status") == "valid" else False
+                                cur.execute(
+                                    """
+                                    INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                    VALUES (%s,%s,%s,%s,%s, now())
+                                    ON CONFLICT (email) DO UPDATE SET
+                                      company_id=EXCLUDED.company_id,
+                                      verification_status=EXCLUDED.verification_status,
+                                      smtp_confidence=EXCLUDED.smtp_confidence,
+                                      source=EXCLUDED.source,
+                                      last_verified_at=EXCLUDED.last_verified_at
+                                    """,
+                                    (
+                                        ver["email"],
+                                        company_id,
+                                        ver.get("status"),
+                                        ver.get("confidence"),
+                                        "site_page",
+                                    ),
+                                )
+                # Recompute contact stats after site extraction; may skip vendor
+                total_contacts, has_named, founder_present = _get_contact_stats(company_id)
+                if total_contacts > 0 and has_named:
+                    logger.info("[site_contacts] sufficient contacts found; skipping Apify")
+                    state["data"] = data
+                    return state
+        except Exception:
+            pass
         need_emails = not (data.get("email") or [])
         need_phones = not (data.get("phone_number") or [])
         total_contacts, has_named, founder_present = _get_contact_stats(company_id)
@@ -2786,7 +2944,19 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
                     ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
                 )
                 tid = int(_RUN_CTX.get("tenant_id") or 0)
-                if prefer_apify and (need_emails or need_phones or needs_contacts or missing_names or missing_founder) and _dec_cap("contact_lookups", 1) and _apify_cap_ok(tid, need=1):
+                # Do not force repeatedly if an attempt has already occurred in this run
+                prior_attempts = 0
+                try:
+                    prior_attempts = int(state.get("apify_attempts") or 0)
+                except Exception:
+                    prior_attempts = 0
+                if (
+                    prefer_apify
+                    and (need_emails or need_phones or needs_contacts or missing_names or missing_founder)
+                    and (prior_attempts < 1)
+                    and _dec_cap("contact_lookups", 1)
+                    and _apify_cap_ok(tid, need=1)
+                ):
                     action = "apify_contacts"
                     reason = "force_contacts_before_persist"
         except Exception:
@@ -3322,6 +3492,200 @@ def _normalize_phone_list(values: list[str]) -> list[str]:
         if num and num not in out:
             out.append(num)
     return out
+
+
+def _extract_contacts_from_text(text: str) -> List[Dict[str, Any]]:
+    """Heuristic contact extraction from About/Contact page text.
+
+    Returns a list of contacts with keys: full_name?, title?, email?, phone?
+    Conservative patterns to minimize false positives.
+    """
+    if not text or len((text or "").strip()) < 80:
+        return []
+    s = text
+    out: list[dict] = []
+    # Emails first as anchors
+    emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s)
+    # Filter out asset-like false positives (e.g., image@2x.png)
+    def _is_asset_like_email(addr: str) -> bool:
+        try:
+            _, post = addr.split("@", 1)
+            post_l = post.lower()
+            if "/" in post_l:
+                return True
+            bad_ext = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico")
+            return any(post_l.endswith(ext) for ext in bad_ext)
+        except Exception:
+            return False
+    emails = [e for e in emails if not _is_asset_like_email(e)]
+    # Common senior titles (lowercase for matching)
+    titles = [
+        "founder", "co-founder", "ceo", "cto", "cfo", "coo",
+        "owner", "director", "managing director", "managing partner",
+        "head of", "principal", "vp", "vice president", "lead",
+        "manager", "partner", "chairman", "chief ", "head",
+    ]
+    # LinkedIn profile patterns
+    linkedin = re.findall(r"https?://(?:www\.)?linkedin\.com/(?:in|pub|company)/[^\s)]+", s, flags=re.IGNORECASE)
+
+    # Helper to guess name near an anchor position
+    def _guess_name_around(pos: int) -> str | None:
+        window = s[max(0, pos - 120): pos + 120]
+        # Look for patterns like "Name, Title" or "Title: Name"
+        # Try "Name, Title"
+        m = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*,\s*([A-Za-z][^,\n]{2,40})", window)
+        if m:
+            return m.group(1)
+        # Try "Title: Name"
+        m = re.search(r"([A-Za-z][^:]{2,40}):\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", window)
+        if m:
+            return m.group(2)
+        # As a last resort, take two capitalized words right before
+        m = re.search(r"([A-Z][a-z]+\s+[A-Z][a-z]+)$", window)
+        if m:
+            return m.group(1)
+        return None
+
+    def _guess_title_around(pos: int) -> str | None:
+        window = (s[max(0, pos - 120): pos + 120] or "").lower()
+        for t in titles:
+            if t in window:
+                return t
+        return None
+
+    seen_emails: set[str] = set()
+    for e in emails[:10]:
+        if e.lower() in seen_emails:
+            continue
+        seen_emails.add(e.lower())
+        pos = s.find(e)
+        name = _guess_name_around(pos) or None
+        title = _guess_title_around(pos) or None
+        out.append({"full_name": name, "title": title, "email": e})
+
+    # Also harvest LinkedIn profiles with adjacent names
+    for lk in linkedin[:10]:
+        pos = s.lower().find(lk.lower())
+        name = _guess_name_around(pos) or None
+        title = _guess_title_around(pos) or None
+        # Avoid duplicates by name+linkedin
+        if any((c.get("linkedin_url") == lk) or (name and c.get("full_name") == name) for c in out):
+            continue
+        out.append({"full_name": name, "title": title, "linkedin_url": lk})
+
+    # De-dup and filter empties
+    norm: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for c in out:
+        key = (c.get("full_name"), c.get("title"), c.get("email"), c.get("linkedin_url"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        # Keep only rows with at least one signal
+        if any([c.get("full_name"), c.get("title"), c.get("email"), c.get("linkedin_url")]):
+            norm.append(c)
+    return norm[:8]
+
+
+def upsert_contacts_from_site(company_id: int, contacts: List[Dict[str, Any]]):
+    """Upsert contacts parsed from site pages (About/Contact) into contacts.
+
+    Mirrors behavior of vendor upserts; sets contact_source='site_page'.
+    Also mirrors emails into lead_emails when available.
+    Returns (inserted, updated).
+    """
+    if not contacts:
+        return (0, 0)
+    inserted, updated = 0, 0
+    conn = get_db_connection()
+    try:
+        cols = _get_table_columns(conn, "contacts")
+        has_email = "email" in cols
+        has_updated_at = "updated_at" in cols
+        with conn, conn.cursor() as cur:
+            for c in contacts:
+                email = c.get("email")
+                row: Dict[str, Any] = {"company_id": company_id}
+                if "full_name" in cols and c.get("full_name"):
+                    row["full_name"] = c.get("full_name")
+                if "title" in cols and c.get("title"):
+                    row["title"] = c.get("title")
+                # Support either linkedin_url or linkedin_profile columns
+                if "linkedin_url" in cols and c.get("linkedin_url"):
+                    row["linkedin_url"] = c.get("linkedin_url")
+                elif "linkedin_profile" in cols and c.get("linkedin_url"):
+                    row["linkedin_profile"] = c.get("linkedin_url")
+                if has_email and email:
+                    row["email"] = email
+                # Optional phone field if schema has it
+                if "phone" in cols and c.get("phone"):
+                    row["phone"] = c.get("phone")
+                if "contact_source" in cols:
+                    row["contact_source"] = "site_page"
+
+                # Existence check by email first, else by linkedin_url
+                exists = False
+                if has_email and email:
+                    cur.execute(
+                        "SELECT 1 FROM contacts WHERE company_id=%s AND email IS NOT DISTINCT FROM %s LIMIT 1",
+                        (company_id, email),
+                    )
+                    exists = bool(cur.fetchone())
+                elif c.get("linkedin_url") and ("linkedin_url" in cols or "linkedin_profile" in cols):
+                    lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                    cur.execute(
+                        f"SELECT 1 FROM contacts WHERE company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s LIMIT 1",
+                        (company_id, c.get("linkedin_url")),
+                    )
+                    exists = bool(cur.fetchone())
+
+                if exists:
+                    set_cols = [k for k in row.keys() if k not in ("company_id", "email")]
+                    if set_cols:
+                        assignments = ", ".join([f"{k}=%s" for k in set_cols])
+                        params = [row[k] for k in set_cols]
+                        if has_email and email:
+                            where_clause = "company_id=%s AND email IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, email])
+                        else:
+                            lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                            where_clause = f"company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, c.get("linkedin_url")])
+                        if has_updated_at:
+                            assignments = assignments + ", updated_at=now()"
+                        cur.execute(f"UPDATE contacts SET {assignments} WHERE {where_clause}", params)
+                        updated += cur.rowcount or 0
+                else:
+                    cols_list = list(row.keys())
+                    placeholders = ",".join(["%s"] * len(cols_list))
+                    cur.execute(
+                        f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                        [row[k] for k in cols_list],
+                    )
+                    inserted += cur.rowcount or 0
+                    # Mirror into lead_emails if present
+                    if has_email and email:
+                        try:
+                            cur.execute(
+                                """
+                                INSERT INTO lead_emails (email, company_id, role_title, source)
+                                VALUES (%s,%s,%s,%s)
+                                ON CONFLICT (email) DO UPDATE SET company_id=EXCLUDED.company_id,
+                                  role_title=COALESCE(EXCLUDED.role_title, lead_emails.role_title),
+                                  source=EXCLUDED.source
+                                """,
+                                (email, company_id, row.get("title"), "site_page"),
+                            )
+                        except Exception:
+                            pass
+    except Exception:
+        return (inserted, updated)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return inserted, updated
 
 
 def store_enrichment(company_id: int, domain: str, data: dict):

@@ -22,6 +22,7 @@ from src.jobs import (
     run_icp_intake_process,  # re-export for tests to monkeypatch
 )
 from src.enrichment import enrich_company_with_tavily  # async enrich by company_id
+from src.chat_events import emit as emit_chat_event
 
 router = APIRouter(prefix="/icp", tags=["icp"])
 log = logging.getLogger("icp_endpoints")
@@ -79,11 +80,18 @@ async def post_intake(
     req: Request,
     user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    x_session_id: Optional[str] = Header(default=None, alias="X-Session-ID"),
 ):
     tid = _resolve_tenant_id(req, x_tenant_id)
     if tid is None:
         raise HTTPException(status_code=400, detail="tenant_id is required")
     resp_id = save_icp_intake(tid, str(user.get("user_id") or "api"), payload.model_dump())
+    # Emit intake saved and confirm pending for interactive chat
+    try:
+        emit_chat_event(x_session_id, tid, "icp:intake_saved", "Received your ICP answers and seeds. Normalizing and saving…", {"response_id": resp_id})
+        emit_chat_event(x_session_id, tid, "icp:confirm_pending", "I’ll crawl your site + seed sites… Reply ‘confirm’ to proceed.", {})
+    except Exception:
+        pass
 
     # Enqueue full intake pipeline job and also attempt to run it immediately in background
     try:
@@ -106,6 +114,10 @@ async def post_intake(
             def _process():
                 try:
                     map_seeds_to_evidence(tid)
+                    try:
+                        emit_chat_event(x_session_id, tid, "icp:seeds_mapped", "Anchoring seeds to company records and ACRA. Extracting SSIC codes…", {})
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 try:
@@ -239,6 +251,7 @@ async def enrich_top10(
     req: Request,
     user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    x_session_id: Optional[str] = Header(default=None, alias="X-Session-ID"),
 ):
     """Enrich the persisted Top‑10 preview strictly by tenant.
 
@@ -330,11 +343,20 @@ async def enrich_top10(
         except Exception:
             company_ids = []
     processed = 0
+    # Emit enrichment start for interactive chat sessions
+    try:
+        emit_chat_event(x_session_id, tid, "enrich:start_top10", "Enriching Top‑10 now (require existing domains).", {"requested": len(company_ids)})
+    except Exception:
+        pass
     for cid in company_ids:
         try:
             # Top-10 enrichment expects domains already present; skip domain search
             await enrich_company_with_tavily(int(cid), search_policy="require_existing")
             processed += 1
+            try:
+                emit_chat_event(x_session_id, tid, "enrich:company_tick", f"Enriched company_id={cid}", {"company_id": int(cid)})
+            except Exception:
+                pass
         except Exception:
             # continue with best-effort behavior
             pass
@@ -398,6 +420,11 @@ async def enrich_top10(
                 bg_job_id = job.get("job_id") if isinstance(job, dict) else None
     except Exception:
         bg_job_id = None
+    # Emit enrichment summary
+    try:
+        emit_chat_event(x_session_id, tid, "enrich:summary", f"Enriched results ({processed}/{len(company_ids)} completed). Remaining queued.", {"processed": processed, "requested": len(company_ids), "next40_job_id": bg_job_id})
+    except Exception:
+        pass
     return {"ok": True, "requested": len(company_ids), "processed": processed, "next40_job_id": bg_job_id}
 
 
@@ -471,6 +498,7 @@ async def get_top10(
     req: Request,
     user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    x_session_id: Optional[str] = Header(default=None, alias="X-Session-ID"),
 ):
     """Return Top‑10 lookalikes with why/snippets using DDG+Jina discovery.
 
@@ -508,9 +536,19 @@ async def get_top10(
         from src.agents_icp import plan_top10_with_reasons as _top10
     except Exception:
         raise HTTPException(status_code=500, detail="agents unavailable")
+    # Planning start event (only when part of interactive chat session)
+    try:
+        emit_chat_event(x_session_id, tid, "icp:planning_start", "Confirmed. Gathering evidence and planning Top‑10…", {})
+    except Exception:
+        pass
     top = await asyncio.to_thread(_top10, icp_profile, tid)
     try:
         log.info("[top10] planned candidates count=%d tenant_id=%s", len(top or []), tid)
+    except Exception:
+        pass
+    # Emit toplikes ready event
+    try:
+        emit_chat_event(x_session_id, tid, "icp:toplikes_ready", "Top‑listed lookalikes (with why) produced.", {"count": len(top or [])})
     except Exception:
         pass
     items: List[Dict[str, Any]] = []
@@ -568,7 +606,37 @@ async def get_top10(
     except Exception:
         # Non-fatal: still return top list
         items = [{**it} for it in (top or [])]
+    # Emit profile ready and candidates found events (profile computed from evidence stats)
+    try:
+        from src.icp_pipeline import winner_profile
+        profile = winner_profile(int(tid)) if tid is not None else {}
+        emit_chat_event(x_session_id, tid, "icp:profile_ready", "ICP Profile produced.", {})
+        emit_chat_event(x_session_id, tid, "icp:candidates_found", f"Found {len(top or [])} ICP candidates. We can enrich 10 now…", {"count": len(top or [])})
+    except Exception:
+        pass
     return {"items": items}
+
+
+@router.post("/chat/confirm")
+async def post_chat_confirm(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    x_session_id: Optional[str] = Header(default=None, alias="X-Session-ID"),
+):
+    """Confirm gating for interactive chat flow.
+
+    Emits a planning start event and returns 202 to indicate the UI may proceed
+    to call /icp/top10. This endpoint does not block on planning or enrichment.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    try:
+        emit_chat_event(x_session_id, tid, "icp:planning_start", "Confirmed. Gathering evidence and planning Top‑10…", {})
+    except Exception:
+        pass
+    return {"ok": True, "status": 202}
 
 
 @router.post("/run")

@@ -156,6 +156,14 @@ try:
 except Exception as _e:
     logger.warning("ICP endpoints not mounted: %s", _e)
 
+# Mount chat SSE stream routes
+try:
+    from app.chat_stream import router as chat_router
+    app.include_router(chat_router)
+    logger.info("/chat SSE routes enabled")
+except Exception as _e:
+    logger.warning("Chat SSE routes not mounted: %s", _e)
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"
