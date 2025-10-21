@@ -33,6 +33,8 @@ from src.vendors.apify_linkedin import (
     build_queries as apify_build_queries,
     normalize_contacts as apify_normalize,
     contacts_via_company_chain as apify_contacts_via_chain,
+    contacts_via_domain_chain as apify_contacts_via_domain_chain,
+    company_url_from_domain as apify_company_url_from_domain,
 )
 from src.openai_client import get_embedding
 from src.settings import (
@@ -152,6 +154,21 @@ def _fallback_extract_from_text(text: str) -> dict:
             m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", text or "", re.I)
         if m:
             out["website_domain"] = m.group(0)
+    except Exception:
+        pass
+    try:
+        # linkedin company URL (best-effort)
+        lk = None
+        for pat in (
+            r"https?://(?:[a-z]+\.)?linkedin\.com/company/[^\s)]+",
+            r"https?://(?:[a-z]+\.)?linkedin\.com/companies/[^\s)]+",
+        ):
+            m2 = re.search(pat, text or "", flags=re.IGNORECASE)
+            if m2:
+                lk = m2.group(0)
+                break
+        if lk:
+            out["linkedin_url"] = lk
     except Exception:
         pass
     try:
@@ -669,8 +686,11 @@ def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
                     row["title"] = c.get("title")
                 if "linkedin_profile" in cols and c.get("linkedin_url"):
                     row["linkedin_profile"] = c.get("linkedin_url")
+                # Support either linkedin_url or linkedin_profile columns
                 if "linkedin_url" in cols and c.get("linkedin_url"):
                     row["linkedin_url"] = c.get("linkedin_url")
+                elif "linkedin_profile" in cols and c.get("linkedin_url"):
+                    row["linkedin_profile"] = c.get("linkedin_url")
                 if "location_city" in cols and c.get("location"):
                     row["location_city"] = c.get("location")
                 if "contact_source" in cols:
@@ -1167,6 +1187,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     text = ""
     try:
         for v in variants:
+            logger.info(f"[jina-home] trying {v}")
             text = jina_read(v, timeout=8) or ""
             if text:
                 pages.append({"url": v, "html": text})
@@ -1175,11 +1196,35 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     except Exception:
         text = ""
 
+    # 1a) Try r.jina for deterministic subpages (contact/about) before HTTP fallback
+    try:
+        if text:  # homepage present — enrich with 1–2 key subpages via Jina
+            sub_paths = ["contact-us", "about", "contact", "about-us"]
+            added = 0
+            for p in sub_paths:
+                u = f"{root}/{p}"
+                try:
+                    logger.info(f"[jina-sub] trying {u}")
+                    t = jina_read(u, timeout=6) or ""
+                    if t and len(t.strip()) > 100:
+                        logger.info(f"[jina-sub] ok {u} len={len(t)}")
+                        pages.append({"url": u, "html": t[:10000]})
+                        if not summary_text:
+                            summary_text = t
+                        added += 1
+                        if added >= 2:
+                            break
+                except Exception:
+                    logger.info(f"[jina-sub] failed {u}")
+                    continue
+    except Exception:
+        pass
+
     # 2) Direct HTTP GET fallback for homepage
     if not text:
         try:
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
-                resp = await client.get(variants[0], follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
+                resp = await client.get(variants[0], follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=8.0))
                 if getattr(resp, "text", ""):
                     body = resp.text
                     pages.append({"url": variants[0], "html": body})
@@ -1188,47 +1233,84 @@ async def _jina_snapshot_pages(company_id: int, url: str):
             pass
 
     # 3) Deterministic subpages if homepage still empty or to augment thin pages
-    need_more = not pages or len((summary_text or "").strip()) < 200
-    if need_more:
-        seeds = [
-            "about", "about-us", "aboutus", "company", "who-we-are",
-            "contact", "contact-us",
-            "team", "leadership",
-            "careers", "jobs",
-            "services", "solutions", "products",
-        ]
-        cand_urls = []
-        for p in seeds:
-            cand_urls.append(f"{root}/{p}")
-        # Fetch in parallel, keep first 2-3 that return content
-        try:
+    # Always attempt a minimal HTTP fetch of key subpages to capture footer links (e.g., LinkedIn)
+    # even when homepage is non-empty, to improve social link extraction robustness.
+    try:
+        seeds_min = ["about", "about-us", "contact", "contact-us"]
+        # avoid duplicates
+        existing = { (p.get("url") or "").rstrip("/") for p in pages }
+        targets = [f"{root}/{p}" for p in seeds_min]
+        fetch = [u for u in targets if u.rstrip("/") not in existing]
+        if fetch:
+            logger.info("[http-sub] attempting minimal HTTP subpages: %s", ", ".join(fetch[:4]))
             async with httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
                 resps = await asyncio.gather(
                     *(
-                        client.get(u, follow_redirects=True, timeout=CRAWLER_TIMEOUT_S)
-                        for u in cand_urls
+                        client.get(u, follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=6.0))
+                        for u in fetch
                     ),
                     return_exceptions=True,
                 )
             added = 0
-            for resp, u in zip(resps, cand_urls):
+            for resp, u in zip(resps, fetch):
                 if isinstance(resp, Exception):
+                    logger.info(f"[http-sub] exception {u}")
                     continue
                 body = getattr(resp, "text", "") or ""
-                # Skip obvious soft-404s
-                if not body or len(body.strip()) < 100:
+                if not body or len(body.strip()) < 80:
+                    logger.info(f"[http-sub] thin/empty {u}")
                     continue
-                pages.append({"url": u, "html": body})
+                logger.info(f"[http-sub] ok {u} len={len(body)}")
+                pages.append({"url": u, "html": body[:10000]})
                 if not summary_text:
                     summary_text = body
                 added += 1
-                if added >= 3:
+                if added >= 2:
                     break
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     if not pages:
         return None, []
+
+    # Extract LinkedIn company URL from collected pages (homepage + subpages)
+    def _normalize_linkedin_company(u: str) -> str:
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(u)
+            scheme = p.scheme or "https"
+            netloc = (p.netloc or "").lower()
+            if netloc.endswith("linkedin.com") and not netloc.startswith("www."):
+                netloc = "www.linkedin.com"
+            path = p.path or ""
+            # strip tracking params/fragments
+            return urlunparse((scheme, netloc, path, "", "", ""))
+        except Exception:
+            return u
+
+    lk_company = None
+    try:
+        for p in pages:
+            body = p.get("html") or p.get("raw_content") or p.get("content") or ""
+            if isinstance(body, dict):
+                body = body.get("text") or ""
+            # Prefer company URLs
+            m = re.search(r'https?://(?:[a-z]+\.)?linkedin\.com/company/[^\s)>"\']+', str(body), flags=re.IGNORECASE)
+            if m:
+                lk_company = _normalize_linkedin_company(m.group(0))
+                break
+        # Secondary pattern for plural /companies/
+        if not lk_company:
+            for p in pages:
+                body = p.get("html") or p.get("raw_content") or p.get("content") or ""
+                if isinstance(body, dict):
+                    body = body.get("text") or ""
+                m = re.search(r'https?://(?:[a-z]+\.)?linkedin\.com/companies/[^\s)>"\']+', str(body), flags=re.IGNORECASE)
+                if m:
+                    lk_company = _normalize_linkedin_company(m.group(0))
+                    break
+    except Exception:
+        lk_company = None
 
     # Project a minimal record into company_enrichment_runs
     try:
@@ -1240,7 +1322,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
                 "tech_stack": [],
                 "public_emails": [],
                 "jobs_count": 0,
-                "linkedin_url": None,
+                "linkedin_url": lk_company,
             }
             tid = _default_tenant_id()
             if tid is not None:
@@ -1257,7 +1339,7 @@ async def _jina_snapshot_pages(company_id: int, url: str):
             "tech_stack": [],
             "public_emails": [],
             "jobs_count": 0,
-            "linkedin_url": None,
+            "linkedin_url": lk_company,
             "phone_number": [],
             "hq_city": None,
             "hq_country": None,
@@ -1266,11 +1348,16 @@ async def _jina_snapshot_pages(company_id: int, url: str):
     except Exception:
         pass
 
-    return {"url": root, "content_summary": (summary_text or "")[:1000], "signals": {}}, pages
+    signals = {"linkedin_company_url": lk_company} if lk_company else {}
+    return {"url": root, "content_summary": (summary_text or "")[:1000], "signals": signals}, pages
 
 
 async def enrich_company_with_tavily(
-    company_id: int, company_name: str, uen: str | None = None
+    company_id: int,
+    company_name: str | None = None,
+    uen: str | None = None,
+    *,
+    search_policy: str = "auto",  # 'require_existing' for Top-10/Next-40, 'discover' for nightly ACRA
 ):
     """
     Orchestrated enrichment flow using LangGraph. This wrapper constructs
@@ -1278,7 +1365,7 @@ async def enrich_company_with_tavily(
     """
     initial_state = {
         "company_id": company_id,
-        "company_name": company_name,
+        "company_name": (company_name or ""),
         "uen": uen,
         "domains": [],
         "home": None,
@@ -1291,6 +1378,7 @@ async def enrich_company_with_tavily(
         "completed": False,
         "error": None,
         "degraded_reasons": [],
+        "search_policy": (search_policy or "auto"),
     }
     try:
         # Global skip logic to avoid re-enriching companies that already have
@@ -1377,12 +1465,14 @@ class EnrichmentState(TypedDict, total=False):
     completed: bool
     error: Optional[str]
     degraded_reasons: List[str]
+    search_policy: str
 
 
 async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed"):
         return state
     name = state.get("company_name") or ""
+    policy = (state.get("search_policy") or "auto").lower()
     # 0) DB fallback: use existing website_domain for this company if present
     try:
         cid = state.get("company_id")
@@ -1409,21 +1499,39 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
     except Exception:
         domains = []
 
-    # 1) Tavily search if available
-    if not domains and ENABLE_TAVILY_FALLBACK and tavily_client is not None:
+    # Fast-path: For Top-10/Next-40, require existing domain and skip search
+    if not domains and policy == "require_existing":
+        state["error"] = "no_domain_existing"
+        state["completed"] = True
+        logger.info("   ↳ No domain in DB for require_existing; stopping")
+        return state
+
+    # 1) Domain discovery (DDG primary, Tavily fallback)
+    if not domains:
         try:
             t0 = time.perf_counter()
-            domains = find_domain(name)
-            _obs_vendor("tavily", calls=1)
-            _obs_log("find_domain", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"query": name})
-        except Exception as e:
-            _obs_vendor("tavily", calls=1, errors=1)
-            _obs_log("find_domain", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(e).__name__)
-            logger.warning("   ↳ Tavily find_domain failed", exc_info=True)
-            try:
-                (state.setdefault("degraded_reasons", [])) .append("TAVILY_FAIL")
-            except Exception:
-                pass
+            # Use our DDG-backed finder (prefers .sg bias); includes Tavily as fallback internally
+            ddg_domains = find_domain(name)
+            if ddg_domains:
+                domains = ddg_domains
+                _obs_log(
+                    "find_domain",
+                    "discovery",
+                    "ok",
+                    company_id=state.get("company_id"),
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    extra={"query": name},
+                )
+                logger.info(f"   ↳ Domain discovery provided: {domains[0]}")
+        except Exception:
+            _obs_log(
+                "find_domain",
+                "discovery",
+                "error",
+                company_id=state.get("company_id"),
+                error_code="domain_discovery_error",
+            )
+            logger.warning("   ↳ Domain discovery failed", exc_info=True)
     # Lusha fallback if needed
     if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
         try:
@@ -1459,6 +1567,89 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
                 (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
             except Exception:
                 pass
+    # 3) DuckDuckGo HTML fallback (no API key required)
+    if not domains:
+        try:
+            from src.ddg_simple import search_domains as _ddg_simple  # lightweight HTML scrape
+            # Prefer SG results when dealing with ACRA/SSIC companies.
+            # Try with a site:.sg bias first, then without.
+            ddg_hosts: List[str] = _ddg_simple(f"{name} site:.sg", max_results=20, country="sg")
+            if not ddg_hosts:
+                ddg_hosts = _ddg_simple(name, max_results=20, country="sg")
+            if ddg_hosts:
+                # Choose first suitable host; build https URL
+                host = ddg_hosts[0]
+                dom = host if host.startswith("http") else f"https://{host}"
+                domains = [dom]
+                try:
+                    (state.setdefault("degraded_reasons", [])).append("DOMAIN_DDG_FALLBACK")
+                except Exception:
+                    pass
+                logger.info(f"   ↳ DDG provided domain: {dom}")
+        except Exception:
+            # Silent failure; proceed to graceful termination below
+            pass
+
+    # 4) Heuristic guess for .sg SMBs (no vendor calls)
+    if not domains and name:
+        try:
+            def _slugify_company(n: str) -> List[str]:
+                s = (n or "").lower()
+                # remove punctuation
+                s = re.sub(r"[^a-z0-9\s]", " ", s)
+                parts = [p for p in s.split() if p]
+                # drop common suffixes
+                drop = {"pte", "ltd", "ltd.", "private", "limited", "singapore", "plc", "llp", "llc", "inc", "inc."}
+                core = [p for p in parts if p not in drop]
+                if not core:
+                    core = parts
+                # try first 2-3 tokens
+                c2 = core[:2]
+                c3 = core[:3]
+                variants = []
+                if c3:
+                    variants.append("".join(c3))
+                    variants.append("-".join(c3))
+                if c2:
+                    variants.append("".join(c2))
+                    variants.append("-".join(c2))
+                return [v for v in variants if len(v) >= 3]
+
+            candidates: List[str] = []
+            for base in _slugify_company(name):
+                for tld in (".com.sg", ".sg", ".com"):
+                    for prefix in ("", "www."):
+                        candidates.append(prefix + base + tld)
+            # De-dup
+            seen: set[str] = set()
+            candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+            # Test candidates quickly with HTTP GET
+            import httpx as _httpx
+            ok_host: Optional[str] = None
+            try:
+                async with _httpx.AsyncClient(headers={"User-Agent": CRAWLER_USER_AGENT}) as client:
+                    for host in candidates[:12]:
+                        try:
+                            url = f"https://{host}"
+                            resp = await client.get(url, follow_redirects=True, timeout=5.0)
+                            if resp.status_code and resp.status_code < 500 and (len((resp.text or "").strip()) > 100):
+                                ok_host = host
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                ok_host = None
+            if ok_host:
+                dom = f"https://{ok_host}"
+                domains = [dom]
+                try:
+                    (state.setdefault("degraded_reasons", [])).append("DOMAIN_GUESS_FALLBACK")
+                except Exception:
+                    pass
+                logger.info(f"   ↳ Heuristic provided domain: {dom}")
+        except Exception:
+            pass
+
     if not domains:
         # Graceful termination: no domain available, nothing to crawl/extract.
         # Mark as completed so upstream pipeline can proceed to scoring/next steps.
@@ -1747,7 +1938,8 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
         except Exception as e:
             logger.warning("   ↳ Fallback HTTP fetch failed", exc_info=True)
     # If still nothing, inject a Jina homepage snapshot and finish
-    if not extracted_pages:
+    # Avoid duplicate Jina attempts when deterministic crawl already tried it
+    if not extracted_pages and not bool(state.get("jina_attempted")):
         try:
             if state.get("company_id") and state.get("home"):
                 text = jina_read(state["home"], timeout=8) or ""
@@ -1780,6 +1972,12 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
     try:
+        # Mark that we'll attempt a r.jina snapshot in this node to avoid
+        # re-attempting the same fetch in node_extract_pages fallback.
+        try:
+            state["jina_attempted"] = True
+        except Exception:
+            pass
         logger.info(f"[node_jina_snapshot] company_id={state['company_id']}, home={state['home']}")
         summary, pages = await _jina_snapshot_pages(state["company_id"], state["home"])
         if pages:
@@ -1791,6 +1989,13 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
         if summary:
             state["deterministic_summary"] = summary
             logger.info("[node_jina_snapshot] set deterministic_summary (jina)")
+            try:
+                sig = (summary or {}).get("signals") or {}
+                lk = sig.get("linkedin_company_url")
+                if lk and not (state.get("data") or {}).get("linkedin_url"):
+                    (state.setdefault("data", {}))["linkedin_url"] = lk
+            except Exception:
+                pass
     except Exception as exc:
         logger.warning("   ↳ jina snapshot failed", exc_info=True)
     return state
@@ -1956,11 +2161,81 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
         return state
     if state.get("completed") and state.get("error") == "no_domain":
         logger.info("[apify_contacts] No domain found; proceeding to Apify by company name")
+    # Single-shot guard per company/session: do not spam Apify within the same run
+    try:
+        attempts = int(state.get("apify_attempts") or 0)
+    except Exception:
+        attempts = 0
+    if attempts >= 1:
+        logger.info("[apify_contacts] already attempted; skipping further tries")
+        return state
+    state["apify_attempts"] = attempts + 1
     data = state.get("data") or {}
     company_id = state.get("company_id")
     if not company_id:
         return state
     try:
+        # First, attempt to extract contacts directly from deterministic site pages
+        try:
+            pages = state.get("extracted_pages") or []
+            site_contacts: list[dict] = []
+            home = (state.get("home") or "").lower()
+            # Consider About/Contact, and also homepage (footers often hold LinkedIn icons)
+            for p in pages:
+                u = (p.get("url") or "").lower()
+                is_about_contact = any(tok in u for tok in ("about", "contact"))
+                is_home = False
+                if home:
+                    try:
+                        from urllib.parse import urlparse
+                        up = urlparse(u)
+                        hp = urlparse(home)
+                        is_home = (up.netloc == hp.netloc) and ((up.path or "/").rstrip("/") in ("", "/"))
+                    except Exception:
+                        is_home = (u.rstrip("/") == home.rstrip("/"))
+                if is_about_contact or is_home:
+                    body = p.get("html") or p.get("raw_content") or p.get("content") or ""
+                    if isinstance(body, dict):
+                        body = body.get("text") or ""
+                    site_contacts.extend(_extract_contacts_from_text(str(body)))
+            if site_contacts:
+                ins, upd = upsert_contacts_from_site(company_id, site_contacts)
+                logger.info(f"[site_contacts] upserted from pages: inserted={ins}, updated={upd} company_id={company_id}")
+                # Verify any emails and mirror to lead_emails
+                emails = [c.get("email") for c in site_contacts if c.get("email")]
+                if emails:
+                    verification = verify_emails(emails)
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cur:
+                            for ver in verification:
+                                email_verified = True if ver.get("status") == "valid" else False
+                                cur.execute(
+                                    """
+                                    INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                    VALUES (%s,%s,%s,%s,%s, now())
+                                    ON CONFLICT (email) DO UPDATE SET
+                                      company_id=EXCLUDED.company_id,
+                                      verification_status=EXCLUDED.verification_status,
+                                      smtp_confidence=EXCLUDED.smtp_confidence,
+                                      source=EXCLUDED.source,
+                                      last_verified_at=EXCLUDED.last_verified_at
+                                    """,
+                                    (
+                                        ver["email"],
+                                        company_id,
+                                        ver.get("status"),
+                                        ver.get("confidence"),
+                                        "site_page",
+                                    ),
+                                )
+                # Recompute contact stats after site extraction; may skip vendor
+                total_contacts, has_named, founder_present = _get_contact_stats(company_id)
+                if total_contacts > 0 and has_named:
+                    logger.info("[site_contacts] sufficient contacts found; skipping Apify")
+                    state["data"] = data
+                    return state
+        except Exception:
+            pass
         need_emails = not (data.get("email") or [])
         need_phones = not (data.get("phone_number") or [])
         total_contacts, has_named, founder_present = _get_contact_stats(company_id)
@@ -2008,21 +2283,85 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                     try:
                         t0 = time.perf_counter()
                         # Prefer company -> employees -> profiles chain if enabled
-                        if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
-                            contacts_raw = await apify_contacts_via_chain(
-                                company_name,
-                                titles=(titles if isinstance(titles, list) else None),
-                                max_items=25,
-                                timeout_s=APIFY_SYNC_TIMEOUT_S,
-                            )
-                            raw = contacts_raw  # for count logging below; already normalized
+                        # For Top‑10 / Next‑40 (require_existing) use domain→company resolver before contacts
+                        policy = (state.get("search_policy") or "auto").lower()
+                        if policy == "require_existing":
+                            from urllib.parse import urlparse
+                            home = state.get("home") or ""
+                            dom = urlparse(home).netloc if home else ""
+                            if dom:
+                                # Try to resolve company LinkedIn URL and persist on company data for core upsert
+                                try:
+                                    comp_url = await apify_company_url_from_domain(dom, timeout_s=APIFY_SYNC_TIMEOUT_S, dataset_format=APIFY_DATASET_FORMAT)
+                                except Exception:
+                                    comp_url = None
+                                if comp_url:
+                                    try:
+                                        (state.setdefault("data", {}))["linkedin_url"] = comp_url
+                                    except Exception:
+                                        pass
+                                # Now attempt contacts via domain chain
+                                contacts_raw = await apify_contacts_via_domain_chain(
+                                    dom,
+                                    titles=(titles if isinstance(titles, list) else None),
+                                    max_items=25,
+                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                )
+                                raw = contacts_raw
+                                # Fallback to company-name chain when domain chain yields nothing
+                                if not contacts_raw:
+                                    try:
+                                        logger.info("[apify_contacts] domain chain empty; falling back to company-name chain")
+                                    except Exception:
+                                        pass
+                                    if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                        contacts_raw = await apify_contacts_via_chain(
+                                            company_name,
+                                            titles=(titles if isinstance(titles, list) else None),
+                                            max_items=25,
+                                            timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                        )
+                                        raw = contacts_raw
+                                    else:
+                                        raw = await apify_run(
+                                            {"queries": queries},
+                                            dataset_format=APIFY_DATASET_FORMAT,
+                                            timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                        )
+                                        contacts_raw = apify_normalize(raw)
+                            else:
+                                # No domain present; fall back to company-name chain if enabled
+                                if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                    contacts_raw = await apify_contacts_via_chain(
+                                        company_name,
+                                        titles=(titles if isinstance(titles, list) else None),
+                                        max_items=25,
+                                        timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                    )
+                                    raw = contacts_raw
+                                else:
+                                    raw = await apify_run(
+                                        {"queries": queries},
+                                        dataset_format=APIFY_DATASET_FORMAT,
+                                        timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                    )
+                                    contacts_raw = apify_normalize(raw)
                         else:
-                            raw = await apify_run(
-                                {"queries": queries},
-                                dataset_format=APIFY_DATASET_FORMAT,
-                                timeout_s=APIFY_SYNC_TIMEOUT_S,
-                            )
-                            contacts_raw = apify_normalize(raw)
+                            if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                contacts_raw = await apify_contacts_via_chain(
+                                    company_name,
+                                    titles=(titles if isinstance(titles, list) else None),
+                                    max_items=25,
+                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                )
+                                raw = contacts_raw
+                            else:
+                                raw = await apify_run(
+                                    {"queries": queries},
+                                    dataset_format=APIFY_DATASET_FORMAT,
+                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                )
+                                contacts_raw = apify_normalize(raw)
                         logger.info(
                             f"[apify_contacts] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
                         )
@@ -2590,6 +2929,39 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
 
         # keep routing overrides minimal
 
+        # If planner wants to persist/finish but we still need contacts, force Apify step first
+        try:
+            if action in ("persist_core", "persist_legacy", "finish"):
+                data = state.get("data") or {}
+                need_emails = not (data.get("email") or [])
+                need_phones = not (data.get("phone_number") or [])
+                company_id = state.get("company_id")
+                total_contacts, has_named, founder_present = _get_contact_stats(company_id) if company_id else (0, False, False)
+                needs_contacts = total_contacts == 0
+                missing_names = not has_named
+                missing_founder = not founder_present
+                prefer_apify = (
+                    ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
+                )
+                tid = int(_RUN_CTX.get("tenant_id") or 0)
+                # Do not force repeatedly if an attempt has already occurred in this run
+                prior_attempts = 0
+                try:
+                    prior_attempts = int(state.get("apify_attempts") or 0)
+                except Exception:
+                    prior_attempts = 0
+                if (
+                    prefer_apify
+                    and (need_emails or need_phones or needs_contacts or missing_names or missing_founder)
+                    and (prior_attempts < 1)
+                    and _dec_cap("contact_lookups", 1)
+                    and _apify_cap_ok(tid, need=1)
+                ):
+                    action = "apify_contacts"
+                    reason = "force_contacts_before_persist"
+        except Exception:
+            pass
+
         logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
         if action == "finish":
             break
@@ -2602,23 +2974,71 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
 
 
 def find_domain(company_name: str) -> list[str]:
-    print(f"    🔍 Search domain for '{company_name}'")
-    if tavily_client is None:
-        print("       ↳ Tavily client not initialized.")
-        return []
+    """Domain discovery using DuckDuckGo HTML (via r.jina) with SG bias.
 
+    Returns a small list of https URLs for likely official domains, preferring
+    .sg TLDs and brand-matching labels.
+    """
+    print(f"    🔍 Search domain for '{company_name}' (DDG)")
     core = _normalize_company_name(company_name)
-    normalized_query = " ".join(core)
     name_nospace = "".join(core)
     name_hyphen = "-".join(core)
 
-    # 1) Use normalized name first, fall back to quoted variants
+    try:
+        from src.ddg_simple import search_domains as _ddg
+    except Exception:
+        return []
+
+    try:
+        hosts = _ddg(f"{company_name} site:.sg", max_results=20, country="sg")
+        if not hosts:
+            hosts = _ddg(company_name, max_results=20, country="sg")
+    except Exception:
+        hosts = []
+
+    if not hosts:
+        print("       ↳ No domains from DDG.")
+        # Fallback to Tavily search if configured
+        try:
+            tv = _find_domain_tavily(company_name)
+            if tv:
+                return tv
+        except Exception:
+            pass
+        return []
+
+    # Rank hosts: prefer brand-exact labels and .sg
+    def _rank_host(h: str) -> tuple:
+        host = h.lower()
+        label = host.split(".")[0]
+        is_brand_exact = (label.replace("-", "") == name_nospace)
+        tld_sg = host.endswith(".sg")
+        parts = host.split(".")
+        return (
+            0 if is_brand_exact else 1,
+            0 if tld_sg else 1,
+            len(parts),
+            host,
+        )
+
+    ranked = sorted(dict.fromkeys(hosts), key=_rank_host)
+    urls = [h if h.startswith("http") else f"https://{h}" for h in ranked[:2]]
+    print(f"       ↳ DDG domains: {urls}")
+    return urls
+
+
+def _find_domain_tavily(company_name: str) -> list[str]:
+    """Tavily-based domain discovery as a fallback path."""
+    if tavily_client is None:
+        return []
+    core = _normalize_company_name(company_name)
+    name_nospace = "".join(core)
+    name_hyphen = "-".join(core)
     try:
         queries = [
-            f"{normalized_query} official website",
+            f"{' '.join(core)} official website",
             f'"{company_name}" "official website"',
             f'"{company_name}" site:.sg',
-            f"{company_name} official website",
         ]
         response = None
         for q in queries:
@@ -2633,14 +3053,10 @@ def find_domain(company_name: str) -> list[str]:
             if isinstance(response, dict) and response.get("results"):
                 break
         if not isinstance(response, dict) or not response.get("results"):
-            print("       ↳ No results from Tavily search.")
             return []
-    except Exception as exc:
-        print(f"       ↳ Search error: {exc}")
+    except Exception:
         return []
 
-    # Filter URLs to those containing the core company name (first two words)
-    filtered_urls: list[str] = []
     AGGREGATORS = {
         "linkedin.com",
         "facebook.com",
@@ -2676,39 +3092,24 @@ def find_domain(company_name: str) -> list[str]:
         "yelp.com",
         "recordowl.com",
         "sgpgrid.com",
-        # Add common non-official/aggregator content domains observed
-        "made-in-china.com",
-        "morepaper.org",
-        "artbarblog.com",
-        "jumpfrompaper.com",
     }
+    filtered_urls: list[str] = []
     for h in response["results"]:
         url = h.get("url") if isinstance(h, dict) else None
-        print("       ↳ Found URL:", url)
         if not url:
             continue
         parsed = urlparse(url)
         netloc = parsed.netloc.lower()
-        if netloc.startswith("www."):
-            netloc_stripped = netloc[4:]
-        else:
-            netloc_stripped = netloc
-        apex = (
-            ".".join(netloc_stripped.split(".")[-2:])
-            if "." in netloc_stripped
-            else netloc_stripped
-        )
+        netloc_stripped = netloc[4:] if netloc.startswith("www.") else netloc
+        apex = ".".join(netloc_stripped.split(".")[-2:]) if "." in netloc_stripped else netloc_stripped
         apex_label = apex.split(".")[0]
         domain_label = netloc_stripped.split(".")[0]
 
         is_aggregator = apex in AGGREGATORS
-        is_sg = netloc_stripped.endswith(".sg") or apex.endswith(".sg")
         is_brand_exact = (
-            apex_label == name_nospace
-            or domain_label.replace("-", "") == name_nospace
+            apex_label == name_nospace or domain_label.replace("-", "") == name_nospace
         )
 
-        # page text signals
         title = (h.get("title") or "").lower()
         snippet = (h.get("content") or h.get("snippet") or "").lower()
         text = f"{title} {snippet}"
@@ -2718,20 +3119,12 @@ def find_domain(company_name: str) -> list[str]:
             or (core and core[0] in domain_label)
         )
         text_match = all(part in text for part in core)
-
-        # Enforce heuristics:
-        # - Reject marketplaces/aggregators (unless the brand name equals the aggregator apex e.g., Amazon)
         if is_aggregator and not is_brand_exact:
             continue
-        # - Require name evidence in domain label or page text (or exact brand apex)
         if not (label_match or text_match or is_brand_exact):
             continue
-        # Previously we forced .sg or exact brand; relax to accept legitimate non-.sg brand domains
-        # as long as aggregator is excluded and name evidence is present.
-
         filtered_urls.append(url)
 
-    # Rank: prefer .sg TLD, then shorter apex domains, then https
     def _rank(u: str) -> tuple:
         p = urlparse(u)
         host = p.netloc.lower()
@@ -2753,12 +3146,8 @@ def find_domain(company_name: str) -> list[str]:
         )
 
     if filtered_urls:
-        filtered_urls = sorted(set(filtered_urls), key=_rank)
-        # Only keep top 2 that most likely represent the official company website
-        filtered_urls = filtered_urls[:2]
-        print(f"       ↳ Filtered URLs: {filtered_urls}")
+        filtered_urls = sorted(set(filtered_urls), key=_rank)[:2]
         return filtered_urls
-    print("       ↳ No matching URLs found after heuristics.")
     return []
 
 
@@ -3103,6 +3492,200 @@ def _normalize_phone_list(values: list[str]) -> list[str]:
         if num and num not in out:
             out.append(num)
     return out
+
+
+def _extract_contacts_from_text(text: str) -> List[Dict[str, Any]]:
+    """Heuristic contact extraction from About/Contact page text.
+
+    Returns a list of contacts with keys: full_name?, title?, email?, phone?
+    Conservative patterns to minimize false positives.
+    """
+    if not text or len((text or "").strip()) < 80:
+        return []
+    s = text
+    out: list[dict] = []
+    # Emails first as anchors
+    emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s)
+    # Filter out asset-like false positives (e.g., image@2x.png)
+    def _is_asset_like_email(addr: str) -> bool:
+        try:
+            _, post = addr.split("@", 1)
+            post_l = post.lower()
+            if "/" in post_l:
+                return True
+            bad_ext = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico")
+            return any(post_l.endswith(ext) for ext in bad_ext)
+        except Exception:
+            return False
+    emails = [e for e in emails if not _is_asset_like_email(e)]
+    # Common senior titles (lowercase for matching)
+    titles = [
+        "founder", "co-founder", "ceo", "cto", "cfo", "coo",
+        "owner", "director", "managing director", "managing partner",
+        "head of", "principal", "vp", "vice president", "lead",
+        "manager", "partner", "chairman", "chief ", "head",
+    ]
+    # LinkedIn profile patterns
+    linkedin = re.findall(r"https?://(?:www\.)?linkedin\.com/(?:in|pub|company)/[^\s)]+", s, flags=re.IGNORECASE)
+
+    # Helper to guess name near an anchor position
+    def _guess_name_around(pos: int) -> str | None:
+        window = s[max(0, pos - 120): pos + 120]
+        # Look for patterns like "Name, Title" or "Title: Name"
+        # Try "Name, Title"
+        m = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*,\s*([A-Za-z][^,\n]{2,40})", window)
+        if m:
+            return m.group(1)
+        # Try "Title: Name"
+        m = re.search(r"([A-Za-z][^:]{2,40}):\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", window)
+        if m:
+            return m.group(2)
+        # As a last resort, take two capitalized words right before
+        m = re.search(r"([A-Z][a-z]+\s+[A-Z][a-z]+)$", window)
+        if m:
+            return m.group(1)
+        return None
+
+    def _guess_title_around(pos: int) -> str | None:
+        window = (s[max(0, pos - 120): pos + 120] or "").lower()
+        for t in titles:
+            if t in window:
+                return t
+        return None
+
+    seen_emails: set[str] = set()
+    for e in emails[:10]:
+        if e.lower() in seen_emails:
+            continue
+        seen_emails.add(e.lower())
+        pos = s.find(e)
+        name = _guess_name_around(pos) or None
+        title = _guess_title_around(pos) or None
+        out.append({"full_name": name, "title": title, "email": e})
+
+    # Also harvest LinkedIn profiles with adjacent names
+    for lk in linkedin[:10]:
+        pos = s.lower().find(lk.lower())
+        name = _guess_name_around(pos) or None
+        title = _guess_title_around(pos) or None
+        # Avoid duplicates by name+linkedin
+        if any((c.get("linkedin_url") == lk) or (name and c.get("full_name") == name) for c in out):
+            continue
+        out.append({"full_name": name, "title": title, "linkedin_url": lk})
+
+    # De-dup and filter empties
+    norm: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for c in out:
+        key = (c.get("full_name"), c.get("title"), c.get("email"), c.get("linkedin_url"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        # Keep only rows with at least one signal
+        if any([c.get("full_name"), c.get("title"), c.get("email"), c.get("linkedin_url")]):
+            norm.append(c)
+    return norm[:8]
+
+
+def upsert_contacts_from_site(company_id: int, contacts: List[Dict[str, Any]]):
+    """Upsert contacts parsed from site pages (About/Contact) into contacts.
+
+    Mirrors behavior of vendor upserts; sets contact_source='site_page'.
+    Also mirrors emails into lead_emails when available.
+    Returns (inserted, updated).
+    """
+    if not contacts:
+        return (0, 0)
+    inserted, updated = 0, 0
+    conn = get_db_connection()
+    try:
+        cols = _get_table_columns(conn, "contacts")
+        has_email = "email" in cols
+        has_updated_at = "updated_at" in cols
+        with conn, conn.cursor() as cur:
+            for c in contacts:
+                email = c.get("email")
+                row: Dict[str, Any] = {"company_id": company_id}
+                if "full_name" in cols and c.get("full_name"):
+                    row["full_name"] = c.get("full_name")
+                if "title" in cols and c.get("title"):
+                    row["title"] = c.get("title")
+                # Support either linkedin_url or linkedin_profile columns
+                if "linkedin_url" in cols and c.get("linkedin_url"):
+                    row["linkedin_url"] = c.get("linkedin_url")
+                elif "linkedin_profile" in cols and c.get("linkedin_url"):
+                    row["linkedin_profile"] = c.get("linkedin_url")
+                if has_email and email:
+                    row["email"] = email
+                # Optional phone field if schema has it
+                if "phone" in cols and c.get("phone"):
+                    row["phone"] = c.get("phone")
+                if "contact_source" in cols:
+                    row["contact_source"] = "site_page"
+
+                # Existence check by email first, else by linkedin_url
+                exists = False
+                if has_email and email:
+                    cur.execute(
+                        "SELECT 1 FROM contacts WHERE company_id=%s AND email IS NOT DISTINCT FROM %s LIMIT 1",
+                        (company_id, email),
+                    )
+                    exists = bool(cur.fetchone())
+                elif c.get("linkedin_url") and ("linkedin_url" in cols or "linkedin_profile" in cols):
+                    lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                    cur.execute(
+                        f"SELECT 1 FROM contacts WHERE company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s LIMIT 1",
+                        (company_id, c.get("linkedin_url")),
+                    )
+                    exists = bool(cur.fetchone())
+
+                if exists:
+                    set_cols = [k for k in row.keys() if k not in ("company_id", "email")]
+                    if set_cols:
+                        assignments = ", ".join([f"{k}=%s" for k in set_cols])
+                        params = [row[k] for k in set_cols]
+                        if has_email and email:
+                            where_clause = "company_id=%s AND email IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, email])
+                        else:
+                            lk_col = "linkedin_url" if "linkedin_url" in cols else "linkedin_profile"
+                            where_clause = f"company_id=%s AND {lk_col} IS NOT DISTINCT FROM %s"
+                            params.extend([company_id, c.get("linkedin_url")])
+                        if has_updated_at:
+                            assignments = assignments + ", updated_at=now()"
+                        cur.execute(f"UPDATE contacts SET {assignments} WHERE {where_clause}", params)
+                        updated += cur.rowcount or 0
+                else:
+                    cols_list = list(row.keys())
+                    placeholders = ",".join(["%s"] * len(cols_list))
+                    cur.execute(
+                        f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+                        [row[k] for k in cols_list],
+                    )
+                    inserted += cur.rowcount or 0
+                    # Mirror into lead_emails if present
+                    if has_email and email:
+                        try:
+                            cur.execute(
+                                """
+                                INSERT INTO lead_emails (email, company_id, role_title, source)
+                                VALUES (%s,%s,%s,%s)
+                                ON CONFLICT (email) DO UPDATE SET company_id=EXCLUDED.company_id,
+                                  role_title=COALESCE(EXCLUDED.role_title, lead_emails.role_title),
+                                  source=EXCLUDED.source
+                                """,
+                                (email, company_id, row.get("title"), "site_page"),
+                            )
+                        except Exception:
+                            pass
+    except Exception:
+        return (inserted, updated)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return inserted, updated
 
 
 def store_enrichment(company_id: int, domain: str, data: dict):

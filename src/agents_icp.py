@@ -158,7 +158,7 @@ def _apex_domain(h: str) -> str:
 def _ddg_search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
     """Perform domain discovery by fetching DuckDuckGo HTML directly and parsing anchors.
 
-    - Paginates up to 8 pages using the `s` offset, stops once `max_results` reached.
+    - Paginates up to 10 pages using the `s` offset, stops once `max_results` reached.
     - Parses DDG redirect anchors (`/l/?uddg=...`) or direct external hrefs.
     - Enforces `site:` filter (e.g., site:.sg) when present in the query.
     - Falls back to r.jina DDG snapshot + regex extraction only if all direct endpoints fail.
@@ -350,9 +350,9 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         except Exception:
             return True
 
-    # 1) Fetch up to 8 pages directly from DDG endpoints; parse anchors
+    # 1) Fetch up to 10 pages directly from DDG endpoints; parse anchors
     collected: List[str] = []
-    MAX_PAGES = 8
+    MAX_PAGES = 10
     PAGE_SIZE_GUESS = 30
     params_base = {"q": query}
     if (DDG_KL or kl):
@@ -671,24 +671,27 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             log.info("[plan] llm-query fail: %s", e)
             return None
 
-    # Compose a single perfect query (LLM → heuristic fallback → minimal fallback)
-    q_llm = _llm_compose_ddg_query()
-    if q_llm and len(q_llm) >= 4:
-        query = q_llm
+    # Compose query strictly from original industry text; do not add operators/alter phrases
+    q_llm = None  # disable LLM-driven query composition per request
+    terms: List[str] = []
+    for v in (icp.get("industries") or []):
+        if isinstance(v, str) and v.strip():
+            terms.append(v.strip())
+    inline_site = "site:.sg" if (country_hint == 'sg') else ""
+    # Preserve punctuation/ampersands; join as comma-separated per UX requirement
+    base_query = (
+        (", ".join(_uniq(terms)) + (" " + inline_site if inline_site else "")).strip()
+        if terms else ""
+    )
+    if base_query:
+        query = base_query
     else:
-        terms: List[str] = []
-        for v in (icp.get("industries") or []):
-            if isinstance(v, str) and v.strip():
-                terms.append(v.strip())
-        inline_site = "site:.sg" if (country_hint == 'sg') else ""
-        base_query = " ".join(_uniq([*terms, inline_site])).strip()
-        if base_query:
-            query = base_query
+        # Minimal fallback when ICP is empty
+        fallback = ", ".join([s for s in [inds, titles, sigs] if s]).strip(", ")
+        if country_hint == 'sg':
+            # Ensure we never emit a bare 'site:.sg' — include a sensible default head term
+            query = (f"{fallback} site:.sg" if fallback else "b2b distributors site:.sg").strip()
         else:
-            # Minimal fallback when ICP is empty
-            fallback = " ".join([s for s in [inds, titles, sigs] if s]).strip()
-            if country_hint == 'sg':
-                fallback = (fallback + " site:.sg").strip()
             query = fallback or "b2b distributors"
 
     # Single-query discovery: paginate up to 8 pages, stop at 50
@@ -700,6 +703,64 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.info("[plan] ddg fail: %s", e)
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+    # If nothing found, retry once with a safe default query focused on SG
+    if not uniq and (country_hint == 'sg'):
+        try:
+            _q2 = "b2b distributors site:.sg"
+            log.info("[plan] ddg retry with default query: %s", _q2)
+            more2: List[str] = []
+            for dom in _ddg_search_domains(_q2, max_results=50, country=country_hint):
+                more2.append(dom)
+            muniq = [d for d in _uniq(more2) if _is_probable_domain(str(d))]
+            if muniq:
+                domains.extend(muniq)
+                uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+        except Exception as _e2:
+            log.info("[plan] ddg default retry failed: %s", _e2)
+    # If SG-biased discovery is active, also include a relaxed pass without site:.sg to collect non-SG
+    try:
+        if country_hint == 'sg':
+            q_relaxed2 = re.sub(r"\bsite:[^\s]+", "", query).strip()
+            if q_relaxed2 and q_relaxed2 != query:
+                more2: List[str] = []
+                for dom in _ddg_search_domains(q_relaxed2, max_results=50, country=country_hint):
+                    more2.append(dom)
+                if more2:
+                    merged = [d for d in _uniq(uniq + more2) if _is_probable_domain(str(d))]
+                    # Prioritize .sg domains first, then the rest
+                    sg = [d for d in merged if str(d).endswith('.sg')]
+                    non = [d for d in merged if not str(d).endswith('.sg')]
+                    uniq = sg + non
+    except Exception as _e_relax:
+        pass
+
+    # Snapshot full set prior to seed exclusion for logging/audit
+    uniq_all: List[str] = list(uniq)
+    # Do not alter the original query; skip relaxed re-query unless explicitly enabled
+    try:
+        import os as _os
+        _relax = (_os.getenv("ENABLE_DDG_RELAX") or "").strip().lower() in {"1", "true", "yes"}
+    except Exception:
+        _relax = False
+    if _relax:
+        try:
+            if len(uniq) < 10:
+                q_relaxed = re.sub(r"\bsite:[^\s]+", "", query).strip()
+                if q_relaxed and q_relaxed != query:
+                    more: List[str] = []
+                    try:
+                        for dom in _ddg_search_domains(q_relaxed, max_results=50, country=country_hint):
+                            more.append(dom)
+                    except Exception:
+                        more = []
+                    if more:
+                        uniq = [d for d in _uniq(uniq + more) if _is_probable_domain(str(d))]
+                        try:
+                            log.info("[plan] ddg relaxed domains added=%d", len(more))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
     # Exclude seed domains (by apex) from discovery set to avoid reprocessing submitted customers
     try:
         seed_apex = {_apex_domain(s) for s in (SEED_HINTS or [])}
@@ -707,6 +768,11 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
     log.info("[plan] ddg domains found=%d (uniq=%d)", len(domains), len(uniq))
+    # Emit full discovery list (including any seeds) for observability
+    try:
+        log.info("[plan] discovery all urls=%s", ", ".join([f"https://{d}" for d in uniq_all]))
+    except Exception:
+        pass
     # Optional Jina Reader fetch for quick homepage snippets of first few domains
     # Industry-based filter: keep only candidates whose snippets mention industry terms
     def _industry_terms(profile: Dict[str, Any]) -> list[str]:
@@ -911,7 +977,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                 return []
         ind_toks = _ind_terms(icp_profile)
         # Analyze a smaller head to reduce latency while keeping quality reasonable
-        HEAD = 6
+        # Expand head to improve recall; we will still cap UI later
+        HEAD = 12
         for d in cand[:HEAD]:
             url = f"https://{d}"
             try:
@@ -930,10 +997,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                     if not fb_txt:
                         # Still record a minimal placeholder to keep candidate in flow
                         fb_txt = d
-                    low = str(fb_txt).lower()
-                    # Apply industry gating only when we have non-trivial text; otherwise allow for backfill
-                    if ind_toks and len(fb_txt) > 10 and not any(tok in low for tok in ind_toks):
-                        continue
+                    # Relax gating on fallback snippets: do not drop due to missing industry tokens
                     ev_list.append({"domain": d, "summary": str(fb_txt)[:4000]})
                 else:
                     low = str(summ).lower()
@@ -997,7 +1061,7 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             seen = {str((it.get("domain") or "").strip().lower()) for it in top}
             extra: List[Dict[str, Any]] = []
             # Cap additional checks to avoid long serial fetches
-            for d in cand[HEAD:HEAD+10]:
+            for d in cand[HEAD:HEAD+20]:
                 try:
                     if not d:
                         continue
@@ -1008,10 +1072,17 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                         continue
                     url = f"https://{d}"
                     body = jina_read(url, timeout=5) or ""
+                    from_fallback = False
                     if not body:
-                        continue
-                    clean = " ".join((body or "").split())
-                    low = clean.lower()
+                        # Use relaxed fallback when Jina times out or is rate limited
+                        try:
+                            clean = _fallback_home_snippet(d) or d
+                        except Exception:
+                            clean = d
+                        from_fallback = True
+                    else:
+                        clean = " ".join((body or "").split())
+                    low = str(clean or "").lower()
                     # Industry gating
                     def _ind_terms2(icp_prof: Dict[str, Any]) -> list[str]:
                         try:
@@ -1026,7 +1097,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                         except Exception:
                             return []
                     ind_toks2 = _ind_terms2(icp_profile)
-                    if ind_toks2 and not any(tok in low for tok in ind_toks2):
+                    # Relax gating when we are using fallback snippets
+                    if not from_fallback and ind_toks2 and not any(tok in low for tok in ind_toks2):
                         continue
                     score = 0
                     why_bits: List[str] = []
@@ -1063,6 +1135,30 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
             # 4b) Disable any additional DDG-based fallbacks to enforce single-query discovery.
             #     We intentionally do NOT run seed-competitor queries or legacy heuristic queries
             #     that would trigger extra DDG calls. Only the first r.jina+DDG query is used.
+        # Final fill: ensure all discovered candidates are collected (with minimal placeholders)
+        if len(top) < len(cand):
+            present = {str((it.get("domain") or "").strip().lower()) for it in top}
+            fillers: List[Dict[str, Any]] = []
+            for d in cand:
+                dn = str(d or "").strip().lower()
+                if not dn or dn in present:
+                    continue
+                snip = None
+                try:
+                    snip = (_fallback_home_snippet(d) or "").strip()[:180]
+                except Exception:
+                    snip = None
+                fillers.append({
+                    "domain": d,
+                    "score": 0,
+                    "bucket": "C",
+                    "why": "signal match",
+                    "snippet": snip,
+                })
+                if len(top) + len(fillers) >= DESIRED:
+                    break
+            if fillers:
+                top.extend(fillers)
         # Return at most 50 for persistence (UI will only show Top‑10)
         total_ret = min(DESIRED, len(top))
         top = top[:total_ret]

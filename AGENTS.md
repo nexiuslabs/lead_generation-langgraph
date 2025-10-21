@@ -21,6 +21,7 @@ Key Env Vars (src/settings.py)
 - Optional: APIFY_INPUT_JSON to pass a custom actor input JSON template.
   - Use placeholders: %%QUERY%% for a single query string, %%QUERIES%% for an array of queries.
 - Optional: APIFY_SEARCH_ACTOR_ID for resolving LinkedIn profile URLs when the main actor requires `profileUrls`.
+- Optional: APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID for resolving a LinkedIn company URL from a website domain (Top‑10/Next‑40). Default: `s-r~free-linkedin-company-finder---linkedin-address-from-any-site`.
 - Optional: APIFY_DEBUG_LOG_ITEMS=true to log a small sample of Apify dataset items and normalized contacts. Control size via APIFY_LOG_SAMPLE_SIZE (default 3).
 - Optional: APIFY_USE_COMPANY_EMPLOYEE_CHAIN=true to use the chain company-by-name → employees → profile-details.
 - APIFY_COMPANY_ACTOR_ID=harvestapi~linkedin-company, APIFY_EMPLOYEES_ACTOR_ID=harvestapi~linkedin-company-employees, APIFY_LINKEDIN_ACTOR_ID=dev_fusion~linkedin-profile-scraper
@@ -45,6 +46,10 @@ Common Ops
 Troubleshooting
 - Postgres connect errors: verify POSTGRES_DSN and DB reachable.
 - Tavily/Apify/ZeroBounce: missing keys → fallbacks/pathways skip gracefully; check settings flags.
+
+Apify Usage
+- Nightly ACRA/ACRA Direct: use existing Apify name→company→employees→profiles chain as before.
+- Top‑10/Next‑40: domain is known from ICP; resolve LinkedIn company URL via `APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID`, then employees→profiles with title filtering.
 
 Scheduler & Cron
 - Use the async scheduler entry: `python lead_generation-main/scripts/run_scheduler.py`

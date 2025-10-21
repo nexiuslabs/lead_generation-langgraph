@@ -9,6 +9,7 @@ from app.auth import require_auth, require_identity, require_optional_identity
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
 import os
+import shutil
 import csv
 from io import StringIO
 import logging
@@ -76,6 +77,30 @@ try:
 except Exception as e:
     logger.warning("Failed to ensure checkpoint dir %s: %s", CHECKPOINT_DIR, e)
 
+# Optional: clear any persisted LangGraph checkpoint/runs on server boot in local dev
+try:
+    _variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT") or "local_dev").strip().lower()
+    _clear_flag = (os.getenv("LANGGRAPH_CLEAR_ON_BOOT") or "").strip().lower()
+    # Default to clearing on boot in local_dev unless explicitly disabled
+    _should_clear = (_variant == "local_dev" and _clear_flag not in {"0", "false", "no", "off"}) or _clear_flag in {"1", "true", "yes", "on"}
+    if _should_clear and os.path.isdir(CHECKPOINT_DIR):
+        removed = 0
+        for name in os.listdir(CHECKPOINT_DIR):
+            p = os.path.join(CHECKPOINT_DIR, name)
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+                removed += 1
+            except Exception:
+                # Best-effort; continue
+                continue
+        if removed:
+            logger.info("Cleared %d checkpoint items from %s on boot", removed, CHECKPOINT_DIR)
+except Exception as _e:
+    logger.warning("Unable to clear checkpoint dir on boot: %s", _e)
+
 app = FastAPI(title="Pre-SDR LangGraph Server")
 
 # CORS allowlist (env-extensible)
@@ -130,6 +155,14 @@ try:
         logger.info("Skipping /icp endpoints (ENABLE_ICP_INTAKE is false)")
 except Exception as _e:
     logger.warning("ICP endpoints not mounted: %s", _e)
+
+# Mount chat SSE stream routes
+try:
+    from app.chat_stream import router as chat_router
+    app.include_router(chat_router)
+    logger.info("/chat SSE routes enabled")
+except Exception as _e:
+    logger.warning("Chat SSE routes not mounted: %s", _e)
 
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
@@ -1452,16 +1485,56 @@ async def export_latest_scores_json(limit: int = 200, request: Request = None, c
                 await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
+        # Require a resolved tenant id to avoid cross-tenant leakage
+        if tid is None:
+            return []
         rows = await conn.fetch(
             """
-            SELECT c.company_id, c.name, c.website_domain, c.industry_norm, c.employees_est,
-                   s.score, s.bucket, s.rationale
+            SELECT c.company_id,
+                   c.name,
+                   c.website_domain,
+                   c.industry_norm,
+                   c.employees_est,
+                   s.score,
+                   s.bucket,
+                   s.rationale,
+                   -- Primary email from discovered lead emails (best-effort)
+                   (
+                     SELECT e.email
+                     FROM lead_emails e
+                     WHERE e.company_id = s.company_id
+                     ORDER BY e.left_company NULLS FIRST, e.smtp_confidence DESC NULLS LAST
+                     LIMIT 1
+                   ) AS primary_email,
+                   -- Basic contact person details (best-effort)
+                   (
+                     SELECT c2.full_name FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_name,
+                   (
+                     SELECT c2.job_title FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_title,
+                   (
+                     SELECT c2.linkedin_profile FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_linkedin,
+                   (
+                     SELECT c2.phone_number FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_phone
             FROM companies c
             JOIN lead_scores s ON s.company_id = c.company_id
+            WHERE s.tenant_id = $2
             ORDER BY s.score DESC NULLS LAST
             LIMIT $1
             """,
             limit,
+            tid,
         )
     return [dict(r) for r in rows]
 
@@ -1481,20 +1554,62 @@ async def export_latest_scores_csv(limit: int = 200, request: Request = None, cl
                 await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
-        rows = await conn.fetch(
-            """
-            SELECT c.company_id, c.name, c.industry_norm, c.employees_est,
-                   s.score, s.bucket, s.rationale
-            FROM companies c
-            JOIN lead_scores s ON s.company_id = c.company_id
-            ORDER BY s.score DESC NULLS LAST
-            LIMIT $1
-            """,
-            limit,
-        )
+        # Require a resolved tenant id to avoid cross-tenant leakage
+        if tid is None:
+            # Return an empty CSV with headers
+            rows = []
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT c.company_id,
+                       c.name,
+                       c.industry_norm,
+                       c.employees_est,
+                       s.score,
+                       s.bucket,
+                       s.rationale,
+                       -- Primary email from discovered lead emails (best-effort)
+                       (
+                         SELECT e.email
+                         FROM lead_emails e
+                         WHERE e.company_id = s.company_id
+                         ORDER BY e.left_company NULLS FIRST, e.smtp_confidence DESC NULLS LAST
+                         LIMIT 1
+                       ) AS primary_email,
+                       -- Basic contact person details (best-effort)
+                       (
+                         SELECT c2.full_name FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_name,
+                       (
+                         SELECT c2.job_title FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_title,
+                       (
+                         SELECT c2.linkedin_profile FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_linkedin,
+                       (
+                         SELECT c2.phone_number FROM contacts c2
+                         WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                         LIMIT 1
+                       ) AS contact_phone
+                FROM companies c
+                JOIN lead_scores s ON s.company_id = c.company_id
+                WHERE s.tenant_id = $2
+                ORDER BY s.score DESC NULLS LAST
+                LIMIT $1
+                """,
+                limit,
+                tid,
+            )
     buf = StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else [
-        "company_id","name","industry_norm","employees_est","score","bucket","rationale"
+        "company_id","name","industry_norm","employees_est","score","bucket","rationale",
+        "primary_email","contact_name","contact_title","contact_linkedin","contact_phone"
     ])
     writer.writeheader()
     for r in rows:
@@ -1543,10 +1658,12 @@ async def export_odoo_sync(body: dict | None = None, request: Request = None, cl
                    (SELECT e.email FROM lead_emails e WHERE e.company_id=s.company_id LIMIT 1) AS primary_email
             FROM lead_scores s
             JOIN companies c ON c.company_id = s.company_id
+            WHERE s.tenant_id = $2
             ORDER BY s.score DESC NULLS LAST
             LIMIT $1
             """,
             limit,
+            tid,
         )
     # Use tenant-scoped Odoo mapping
     store = OdooStore(tenant_id=int(tid)) if tid is not None else OdooStore()
@@ -1668,34 +1785,32 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
                 await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
         except Exception:
             pass
-
-        # Count scored rows (RLS will scope if enabled)
-        try:
-            total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores"))
-        except Exception:
+        # If we cannot resolve tenant, do not leak global counts
+        if tid is None:
             total_scored = 0
+            last_ts: datetime | None = None
+            last_run_id = None
+            last_run_status = None
+            last_run_started_at = None
+            last_run_ended_at = None
+        else:
+            # Count only this tenant's scored rows
+            try:
+                total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = $1", tid))
+            except Exception:
+                total_scored = 0
 
-        # last_refreshed_at heuristics: prefer enrichment/company run timestamps if present,
-        # fallback to company last_seen joined to lead_scores, else None.
-        last_ts: datetime | None = None
-        last_run_id = None
-        last_run_status = None
-        last_run_started_at = None
-        last_run_ended_at = None
+            # Last activity from this tenant's enrichment runs
+            last_ts: datetime | None = None
+            last_run_id = None
+            last_run_status = None
+            last_run_started_at = None
+            last_run_ended_at = None
 
-        # Try company_enrichment_runs.run_timestamp
-        try:
-            ts = await conn.fetchval("SELECT MAX(run_timestamp) FROM company_enrichment_runs")
-            if isinstance(ts, datetime):
-                last_ts = ts
-        except Exception:
-            last_ts = last_ts
-
-        # Try enrichment_runs.started_at and include run fields (subject to RLS)
-        if last_ts is None:
             try:
                 row = await conn.fetchrow(
-                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs ORDER BY run_id DESC LIMIT 1"
+                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs WHERE tenant_id = $1 ORDER BY run_id DESC LIMIT 1",
+                    tid,
                 )
                 if row:
                     last_run_id = row["run_id"]
@@ -1704,21 +1819,6 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
                     last_run_ended_at = row["ended_at"]
                     if isinstance(last_run_started_at, datetime):
                         last_ts = last_run_started_at
-            except Exception:
-                last_ts = last_ts
-
-        # Fallback: companies.last_seen for rows that have scores
-        if last_ts is None:
-            try:
-                ts = await conn.fetchval(
-                    """
-                    SELECT MAX(c.last_seen)
-                    FROM companies c
-                    JOIN lead_scores s ON s.company_id = c.company_id
-                    """
-                )
-                if isinstance(ts, datetime):
-                    last_ts = ts
             except Exception:
                 last_ts = last_ts
 

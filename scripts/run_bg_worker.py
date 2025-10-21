@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import signal
+import logging
 from typing import Optional
 
 import asyncpg
@@ -25,12 +26,14 @@ class BGWorker:
             conn = await asyncpg.connect(dsn=self._dsn)
         except Exception:
             # Fallback to polling only
+            logging.getLogger("bg").info("[bg] LISTEN disabled (DB connect failed); polling only")
             return
         try:
             await conn.add_listener("bg_jobs", self._on_notify)  # type: ignore[attr-defined]
         except Exception:
             # Some asyncpg versions use different API; fallback to raw SQL LISTEN loop
             await conn.execute("LISTEN bg_jobs")
+        logging.getLogger("bg").info("[bg] LISTEN bg_jobs active")
         try:
             while not self._stop.is_set():
                 # Wait for notifications or timeout to keep connection alive
@@ -52,6 +55,7 @@ class BGWorker:
             pass
 
     async def _claim_one(self, conn: asyncpg.Connection, job_type: str) -> Optional[int]:
+        # Primary: safe claim using SKIP LOCKED
         sql = (
             """
             WITH cte AS (
@@ -70,10 +74,75 @@ class BGWorker:
             """
         )
         row = await conn.fetchrow(sql, job_type)
-        return int(row[0]) if row and row[0] is not None else None
+        if row and row[0] is not None:
+            return int(row[0])
+        # Fallback: simpler claim without SKIP LOCKED (single worker scenarios)
+        try:
+            row2 = await conn.fetchrow(
+                """
+                UPDATE background_jobs b
+                   SET status='running', started_at=now()
+                 WHERE b.job_type=$1 AND b.status='queued'
+                   AND b.job_id = (
+                        SELECT MIN(job_id) FROM background_jobs WHERE job_type=$1 AND status='queued'
+                   )
+             RETURNING b.job_id
+                """,
+                job_type,
+            )
+            return int(row2[0]) if row2 and row2[0] is not None else None
+        except Exception:
+            return None
 
     async def _spawn_until_full(self, pool: asyncpg.Pool) -> None:
         async with pool.acquire() as conn:
+            # Maintenance pass: requeue stale 'running' and bounded-retry 'error' jobs for this worker type
+            try:
+                import os
+                try:
+                    stale_minutes = int(os.getenv("BG_JOB_STALE_MINUTES", "20") or 20)
+                except Exception:
+                    stale_minutes = 20
+                try:
+                    max_retries = int(os.getenv("BG_JOB_MAX_RETRIES", "2") or 2)
+                except Exception:
+                    max_retries = 2
+                # Stale 'running' → 'queued'
+                await conn.execute(
+                    """
+                    UPDATE background_jobs b
+                       SET status='queued', started_at=NULL, ended_at=NULL
+                     WHERE b.status='running'
+                       AND b.job_type='web_discovery_bg_enrich'
+                       AND b.started_at IS NOT NULL
+                       AND b.started_at < now() - make_interval(mins => $1::int)
+                    """,
+                    stale_minutes,
+                )
+                # 'error' with retries left → 'queued' and increment params.retries
+                await conn.execute(
+                    """
+                    UPDATE background_jobs b
+                       SET status='queued', started_at=NULL, ended_at=NULL, error=NULL,
+                           params = jsonb_set(COALESCE(b.params, '{}'::jsonb), '{retries}',
+                                              to_jsonb(COALESCE((b.params->>'retries')::int, 0) + 1), true)
+                     WHERE b.status='error'
+                       AND b.job_type='web_discovery_bg_enrich'
+                       AND COALESCE((b.params->>'retries')::int, 0) < $1::int
+                    """,
+                    max_retries,
+                )
+            except Exception:
+                pass
+            # Best-effort log of queue depth for visibility
+            try:
+                q = await conn.fetchval(
+                    "SELECT COUNT(*) FROM background_jobs WHERE status='queued' AND job_type='web_discovery_bg_enrich'"
+                )
+                if q and int(q) > 0:
+                    print(f"[bg] queued web_discovery_bg_enrich jobs: {int(q)}")
+            except Exception:
+                pass
             while len(self._tasks) < self._max and not self._stop.is_set():
                 jid = await self._claim_one(conn, "web_discovery_bg_enrich")
                 if not jid:
@@ -84,7 +153,9 @@ class BGWorker:
 
     async def _run_job(self, job_id: int) -> None:
         try:
+            logging.getLogger("bg").info(f"[bg] start job id={int(job_id)} type=web_discovery_bg_enrich")
             await run_web_discovery_bg_enrich(int(job_id))
+            logging.getLogger("bg").info(f"[bg] done job id={int(job_id)}")
         except Exception:
             # Errors are handled inside the job call; ensure task finishes cleanly
             pass
@@ -131,6 +202,7 @@ class BGWorker:
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     def _parse_int(env: str, default: int) -> int:
         val = os.getenv(env)
         if val is None:
@@ -169,12 +241,20 @@ async def main() -> None:
 
     max_c = _parse_int("BG_WORKER_MAX_CONCURRENCY", 2)
     interval = _parse_interval("BG_WORKER_SWEEP_INTERVAL", 15.0)
-    worker = BGWorker(POSTGRES_DSN, max_concurrency=max_c, sweep_interval=interval)
+    dsn = POSTGRES_DSN or os.getenv("POSTGRES_DSN")
+    if not dsn:
+        print("[bg] ERROR: POSTGRES_DSN not configured. Set it in environment or .env.")
+        return
+    print(f"[bg] starting; sweep_interval={interval}s max_concurrency={max_c}")
+    worker = BGWorker(dsn, max_concurrency=max_c, sweep_interval=interval)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, worker.stop)
-    await worker.run()
+    try:
+        await worker.run()
+    except Exception as e:
+        print(f"[bg] fatal: {e}")
 
 
 if __name__ == "__main__":

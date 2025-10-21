@@ -13,12 +13,7 @@ from pydantic import BaseModel
 from src.database import get_conn
 from src.icp_intake import fuzzy_map_seed_to_acra
 from src.database import get_conn
-from src.settings import TAVILY_API_KEY
-
-try:
-    from tavily import TavilyClient  # type: ignore
-except Exception:  # pragma: no cover
-    TavilyClient = None  # type: ignore
+from src.ddg_simple import search_domains as _ddg_simple
 
 log = logging.getLogger("icp_pipeline")
 
@@ -78,43 +73,30 @@ def _is_vendor_or_directory(url: str) -> bool:
 # Step 2: Seed Normalization
 # -----------------------------
 
-def find_seed_domains_via_tavily(company: str, geo_hint: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Use Tavily to propose candidate domains for a seed company with evidence and confidence.
+def find_seed_domains_via_ddg(company: str, geo_hint: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Use DuckDuckGo HTML to propose candidate domains for a seed company.
 
-    Returns a list of {domain, url, confidence, why} sorted by confidence.
+    Returns a list of {domain, url, confidence, why} sorted by appearance order.
     """
     results: List[Dict[str, Any]] = []
-    if not TAVILY_API_KEY or TavilyClient is None or not company:
+    if not company:
         return results
     try:
-        client = TavilyClient(TAVILY_API_KEY)
-        queries = [f"{company} official site"]
-        if geo_hint:
-            queries.append(f"{company} official site {geo_hint}")
-            queries.append(f"{company} {geo_hint} careers press")
-        else:
-            queries.append(f"{company} careers press integrations")
+        hosts = _ddg_simple(company, max_results=25, country=geo_hint)
         seen = set()
-        for q in queries:
-            resp = client.search(q)
-            for item in (resp.get("results") or []):
-                url = (item.get("url") or "").strip()
-                if not url or _is_vendor_or_directory(url):
-                    continue
-                dom = _norm_domain(url)
-                if not dom:
-                    continue
-                if dom in seen:
-                    continue
-                seen.add(dom)
-                title = (item.get("title") or "").strip()
-                snippet = (item.get("content") or "").strip()
-                why = f"{title[:80]} – {snippet[:140]}" if (title or snippet) else "from search"
-                results.append({"domain": dom, "url": url, "confidence": "low", "why": why})
+        for h in hosts:
+            dom = _norm_domain(h)
+            if not dom or dom in seen or _is_vendor_or_directory(f"https://{dom}"):
+                continue
+            seen.add(dom)
+            results.append({
+                "domain": dom,
+                "url": f"https://{dom}",
+                "confidence": "low",
+                "why": "ddg",
+            })
     except Exception as e:
-        log.info("tavily search failed: %s", e)
-        return []
-
+        log.info("ddg search failed: %s", e)
     return results
 
 
@@ -160,7 +142,7 @@ async def build_resolver_cards(seeds: List[Dict[str, Any]]) -> List[ResolverCard
         why = "provided"
         conf = "medium"
         if not cand:
-            cands = find_seed_domains_via_tavily(name)
+            cands = find_seed_domains_via_ddg(name)
             if cands:
                 top = cands[0]
                 cand = top.get("domain")

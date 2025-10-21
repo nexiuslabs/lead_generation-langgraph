@@ -388,13 +388,6 @@ async def _resolve_tenant_id_for_write(state: dict) -> Optional[int]:
             return int(v)
     except Exception:
         pass
-    # Default tenant for server-side jobs (env)
-    try:
-        v = os.getenv("DEFAULT_TENANT_ID")
-        if v and v.isdigit():
-            return int(v)
-    except Exception:
-        pass
     # Infer from ODOO_POSTGRES_DSN via odoo_connections
     try:
         inferred_db = None
@@ -532,6 +525,60 @@ def _fmt_top10_md(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
+def _stash_top10_in_thread_memory(state: dict, top: list[dict]) -> None:
+    """Store Top-10 domains in thread memory (message additional_kwargs) for reuse.
+
+    We avoid relying on env DEFAULT_TENANT_ID by keeping shortlist in-thread.
+    """
+    try:
+        # Keep only first 10; store minimal fields to reduce payload size
+        rows = []
+        for it in (top or [])[:10]:
+            if not isinstance(it, dict):
+                continue
+            dom = (it.get("domain") or "").strip().lower()
+            if not dom:
+                continue
+            rows.append({
+                "domain": dom,
+                "score": it.get("score"),
+                "why": it.get("why"),
+                "snippet": it.get("snippet"),
+            })
+        if not rows:
+            return
+        mem_msg = AIMessage(content="", additional_kwargs={"top10_memory": rows})
+        state["messages"] = add_messages(state.get("messages") or [], [mem_msg])
+    except Exception:
+        # Never block routing on memory write
+        pass
+
+
+def _load_top10_from_thread_memory(state: dict) -> list[dict]:
+    """Read Top-10 shortlist from thread memory messages, newest-first."""
+    try:
+        for msg in reversed(state.get("messages") or []):
+            if not isinstance(msg, AIMessage):
+                continue
+            try:
+                extra = getattr(msg, "additional_kwargs", {}) or {}
+            except Exception:
+                extra = {}
+            mem = extra.get("top10_memory")
+            if isinstance(mem, list) and mem:
+                out = []
+                for it in mem:
+                    if isinstance(it, dict) and (it.get("domain")):
+                        out.append(it)
+                    elif isinstance(it, str):
+                        out.append({"domain": it})
+                if out:
+                    return out
+    except Exception:
+        return []
+    return []
+
+
 def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> None:
     # Upsert an ICP rule row for this tenant; rely on RLS via GUC
     with get_conn() as conn, conn.cursor() as cur:
@@ -612,12 +659,6 @@ def _resolve_tenant_id_for_write_sync(state: dict) -> Optional[int]:
     try:
         v = state.get("tenant_id") if isinstance(state, dict) else None
         if v is not None:
-            return int(v)
-    except Exception:
-        pass
-    try:
-        v = os.getenv("DEFAULT_TENANT_ID")
-        if v and v.isdigit():
             return int(v)
     except Exception:
         pass
@@ -746,7 +787,7 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
                 "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
             }
         _ = _persist_web_candidates_to_staging(
-            [str(it.get("domain")) for it in top if isinstance(it, dict) and it.get("domain")],
+            [str(it.get("domain")) for it in (top or [])[:10] if isinstance(it, dict) and it.get("domain")],
             int(tid) if isinstance(tid, int) else None,
             ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
             per_domain_meta=per_meta,
@@ -1324,12 +1365,29 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         pass
     # Build a concise status message with correct totals
     msg_lines: list[str] = []
+    # Compute discovered candidates (domain URLs) count for display
+    # Prefer in-memory discovery results strictly for accuracy per run
+    discovered_total = 0
     try:
-        # Prefer the total discovered via agent web discovery; else fall back to ICP-matched total in DB
-        total_web = int(state.get("web_discovery_total") or 0)
+        ac = state.get("agent_candidates") or []
+        if isinstance(ac, list) and ac:
+            discovered_total = len(ac)
     except Exception:
-        total_web = 0
-    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+        discovered_total = 0
+    if discovered_total <= 0:
+        try:
+            at = state.get("agent_top10") or []
+            if isinstance(at, list) and at:
+                discovered_total = len(at)
+        except Exception:
+            discovered_total = 0
+    if discovered_total <= 0:
+        # Last resort: use a cached count if present; avoid DB/staging totals to prevent mismatch
+        try:
+            discovered_total = int(state.get("web_discovery_total") or 0)
+        except Exception:
+            discovered_total = 0
+    display_total = discovered_total
     if display_total > 0:
         msg_lines.append(f"Found {display_total} ICP candidates. Showing Top‑10 preview below.")
     else:
@@ -1361,6 +1419,7 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
             if _agent_top10 is not None:
                 top = _agent_top10(state.get("icp_profile") or {}, state.get("tenant_id"))
                 if top:
+                    # Store full planned set in memory; UI will still show Top‑10
                     state["agent_top10"] = top
                     # Persist preview so later runs reuse the same Top‑10
                     try:
@@ -1878,7 +1937,7 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
-        await enrich_company_with_tavily(cid, name, uen)
+        await enrich_company_with_tavily(cid, name, uen, search_policy="require_existing")
         return {"company_id": cid, "name": name, "uen": uen}
 
     results = await asyncio.gather(*[_enrich_one(c) for c in candidates])
@@ -3854,7 +3913,8 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     pass
                                 logger.info("[confirm] invoking plan_top10_with_reasons; have_icp=%s", bool(icp_prof))
                                 top = await asyncio.to_thread(_agent_top10, icp_prof, tnet)
-                                logger.info("[confirm] agent top10 count=%d", len(top or []))
+                                # Log Top‑10 (cap to 10) for consistency with UI
+                                logger.info("[confirm] agent top10 count=%d", min(10, len(top or [])))
                                 if not top:
                                     # Seeds-based competitor query fallback is disabled when STRICT_INDUSTRY_QUERY_ONLY
                                     try:
@@ -3908,6 +3968,11 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         pass
                                     try:
                                         state["agent_top10"] = top
+                                    except Exception:
+                                        pass
+                                    # Also stash into thread memory so next turn can reuse without DB
+                                    try:
+                                        _stash_top10_in_thread_memory(state, top)
                                     except Exception:
                                         pass
                                     # Pretty Top‑10 table (separate message from ICP Profile)
@@ -4261,12 +4326,29 @@ async def confirm_node(state: GraphState) -> GraphState:
     ssic_matches = []
     msg_lines: list[str] = []
 
-    # Start with candidate count (prefer web discovery total, else DB ICP total, else local count)
+    # Start with discovered candidates count (domain URLs)
+    # Prefer in-memory discovery results strictly for accuracy per run
+    discovered_total = 0
     try:
-        total_web = int(state.get("web_discovery_total") or 0)
+        ac = state.get("agent_candidates") or []
+        if isinstance(ac, list) and ac:
+            discovered_total = len(ac)
     except Exception:
-        total_web = 0
-    display_total = total_web if total_web > 0 else (icp_total if icp_total > 0 else n)
+        discovered_total = 0
+    if discovered_total <= 0:
+        try:
+            at = state.get("agent_top10") or []
+            if isinstance(at, list) and at:
+                discovered_total = len(at)
+        except Exception:
+            discovered_total = 0
+    if discovered_total <= 0:
+        # Last resort: use cached state count if present; avoid DB/staging totals
+        try:
+            discovered_total = int(state.get("web_discovery_total") or 0)
+        except Exception:
+            discovered_total = 0
+    display_total = discovered_total
     if display_total > 0:
         msg_lines.append(f"Found {display_total} ICP candidates.")
     else:
@@ -4315,13 +4397,7 @@ async def enrich_node(state: GraphState) -> GraphState:
         state["last_routed_text"] = (_last_user_text(state) or "").strip().lower()
     except Exception:
         pass
-    try:
-        # Concise trace to correlate start of enrichment in logs
-        strict = bool(state.get("strict_top10"))
-        cand_n = len(state.get("candidates") or []) if isinstance(state.get("candidates"), list) else 0
-        logger.info("[enrich] begin strict_top10=%s candidates=%d", strict, cand_n)
-    except Exception:
-        pass
+    # Defer detailed begin log until after we resolve Top‑10 vs fallback candidates
     # Persist current ICP immediately when enrichment is requested, even if user skipped explicit confirm
     try:
         icp_cur = dict(state.get("icp") or {})
@@ -4342,7 +4418,13 @@ async def enrich_node(state: GraphState) -> GraphState:
         top10 = state.get("agent_top10") or []
     except Exception:
         top10 = []
-    # Try loading last persisted Top‑10 preview for this tenant if not present in memory
+    # Try loading Top‑10 from thread memory first (avoids re-discovery on 'run enrichment')
+    if not (isinstance(top10, list) and top10):
+        mem_top = _load_top10_from_thread_memory(state)
+        if isinstance(mem_top, list) and mem_top:
+            top10 = mem_top
+
+    # Try loading last persisted Top‑10 preview for this tenant if still not present
     if not (isinstance(top10, list) and top10):
         try:
             tid = await _resolve_tenant_id_for_write(state)
@@ -4366,17 +4448,43 @@ async def enrich_node(state: GraphState) -> GraphState:
                         top10 = regen
                 except Exception:
                     pass
-    # If Top‑10 is missing (e.g., new thread/session), do NOT re-run DDG discovery here.
-    # Strict policy: reuse persisted Top‑10. If unavailable, ask user to regenerate.
+    # If Top‑10 is still missing, regenerate a fresh Top‑10 now (fallback), persist, then proceed
     if not (isinstance(top10, list) and top10):
         try:
-            state["messages"] = add_messages(
-                state.get("messages") or [],
-                [AIMessage(content="I can’t find the Top‑10 shortlist to enrich. Please type ‘confirm’ to regenerate it, then use 'run enrichment'.")],
-            )
+            from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
         except Exception:
-            pass
-        return state
+            _agent_top10 = None  # type: ignore
+        if _agent_top10 is not None:
+            try:
+                icp_prof = dict(state.get("icp_profile") or {})
+            except Exception:
+                icp_prof = {}
+            try:
+                t_id = await _resolve_tenant_id_for_write(state)
+            except Exception:
+                t_id = None
+            try:
+                regenerated = await asyncio.to_thread(_agent_top10, icp_prof, (int(t_id) if isinstance(t_id, int) else None))
+            except Exception:
+                regenerated = []
+            if regenerated:
+                # Persist and stash full planned set; enrichment still caps run-now
+                try:
+                    state["agent_top10"] = regenerated
+                    _persist_top10_preview((int(t_id) if isinstance(t_id, int) else None), regenerated)
+                except Exception:
+                    pass
+                top10 = regenerated
+        # If still missing after regeneration, ask user to confirm again
+        if not (isinstance(top10, list) and top10):
+            try:
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [AIMessage(content="I can’t find the Top‑10 shortlist. I tried to regenerate it but got no results. Please type ‘confirm’ to rebuild it, then use 'run enrichment'.")],
+                )
+            except Exception:
+                pass
+            return state
     if isinstance(top10, list) and top10:
         try:
             from src.database import get_conn as _get_conn
@@ -4400,29 +4508,18 @@ async def enrich_node(state: GraphState) -> GraphState:
                         name = dom
                     cand.append({"id": cid, "name": name})
             if cand:
-                # Only override existing candidates when Top‑10 has at least the immediate enrichment limit
+                # Always use the discovered Top‑10 exclusively, even if fewer than limit
                 try:
                     enrich_now_limit = int(os.getenv("CHAT_ENRICH_LIMIT", os.getenv("RUN_NOW_LIMIT", "10") or 10))
                 except Exception:
                     enrich_now_limit = 10
-                existing = state.get("candidates") or []
-                if existing and len(cand) < enrich_now_limit:
-                    try:
-                        logger.info(
-                            "[enrich] keep existing candidates=%d; top10 too short=%d (limit=%d)",
-                            len(existing) if isinstance(existing, list) else 0,
-                            len(cand),
-                            enrich_now_limit,
-                        )
-                    except Exception:
-                        pass
-                else:
-                    state["candidates"] = cand
-                    state["strict_top10"] = True
-                    try:
-                        logger.info("[enrich] using persisted top10 count=%d", len(cand))
-                    except Exception:
-                        pass
+                sel = cand[:enrich_now_limit] if len(cand) > enrich_now_limit else cand
+                state["candidates"] = sel
+                state["strict_top10"] = True
+                try:
+                    logger.info("[enrich] using agent/persisted top10 count=%d", len(sel))
+                except Exception:
+                    pass
         except Exception:
             # Non-fatal; fall back to existing selection logic
             pass
@@ -4528,6 +4625,15 @@ async def enrich_node(state: GraphState) -> GraphState:
     if len(candidates) > enrich_now_limit:
         candidates = candidates[:enrich_now_limit]
         state["candidates"] = candidates
+    # Finalize start-of-enrichment log with strict flag after Top‑10 detection/regen and candidate selection
+    try:
+        logger.info(
+            "[enrich] begin strict_top10=%s candidates=%d",
+            str(bool(state.get("strict_top10"))),
+            int(len(state.get("candidates") or [])),
+        )
+    except Exception:
+        pass
     if not candidates:
         # Offer clear next steps when no candidates could be found
         state["messages"] = add_messages(
@@ -4578,7 +4684,7 @@ async def enrich_node(state: GraphState) -> GraphState:
         name = c["name"]
         cid = c.get("id") or await _ensure_company_row(pool, name)
         uen = c.get("uen")
-        final_state = await enrich_company_with_tavily(cid, name, uen)
+        final_state = await enrich_company_with_tavily(cid, name, uen, search_policy="require_existing")
         completed = (
             bool(final_state.get("completed"))
             if isinstance(final_state, dict)

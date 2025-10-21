@@ -168,7 +168,7 @@ CB_GLOBAL_EXEMPT_VENDORS = [
 ]
 
 # Fallback toggles
-ENABLE_TAVILY_FALLBACK = os.getenv("ENABLE_TAVILY_FALLBACK", "true").lower() in (
+ENABLE_TAVILY_FALLBACK = os.getenv("ENABLE_TAVILY_FALLBACK", "false").lower() in (
     "1",
     "true",
     "yes",
@@ -205,6 +205,11 @@ APIFY_USE_COMPANY_EMPLOYEE_CHAIN = os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN",
     "true",
     "yes",
     "on",
+)
+# Domain→LinkedIn company resolver (used for Top‑10/Next‑40)
+APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID = os.getenv(
+    "APIFY_COMPANY_FINDER_BY_DOMAIN_ACTOR_ID",
+    "s-r~free-linkedin-company-finder---linkedin-address-from-any-site",
 )
 
 # Per-run/daily caps. We reuse 'contact_lookups' vendor cap for simplicity.
