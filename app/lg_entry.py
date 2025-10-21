@@ -497,6 +497,27 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm_msgs = [_to_message(m) for m in msgs] or [HumanMessage(content="")]
     state: Dict[str, Any] = {"messages": norm_msgs}
 
+    # Bind SSE session for downstream progress events
+    try:
+        ctx = payload.get("context") or data.get("context") or {}
+        sid = (
+            data.get("session_id")
+            or ctx.get("session_id")
+            or payload.get("session_id")
+            or (payload.get("context") or {}).get("session_id")
+            or data.get("sse_session")
+            or data.get("chat_session_id")
+        )
+        if isinstance(sid, str) and sid.strip():
+            state["session_id"] = sid.strip()
+            try:
+                from app.event_bus import set_current_session as _set_sse_session  # lazy import to avoid cycles
+                _set_sse_session(state["session_id"])  # context-bound for this run
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # Propagate tenant_id from context or input for multi-user runs
     try:
         ctx = payload.get("context") or data.get("context") or {}

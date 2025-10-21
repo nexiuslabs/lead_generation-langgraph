@@ -29,6 +29,11 @@ try:
 except Exception:  # pragma: no cover
     _count_acra_by_ssic_codes = None  # type: ignore
 from src.enrichment import enrich_company_with_tavily
+try:
+    # Lightweight reader for quick homepage evidence
+    from src.jina_reader import read_url as _jina_read  # type: ignore
+except Exception:  # pragma: no cover
+    _jina_read = None  # type: ignore
 # ICP Finder helpers (Feature 17)
 try:
     from src.icp_intake import (
@@ -912,30 +917,41 @@ def _parse_website(text: str) -> Optional[str]:
 
 
 def _parse_seeds(text: str) -> list[dict]:
-    """Parse seeds in forms like 'Company — domain' separated by newlines/semicolons/commas."""
+    """Parse seeds in forms like 'Company — domain[, notes]' per line.
+
+    - Accepts free-text lines, finds the first domain in the line, treats
+      everything before as the name and everything after as optional notes.
+    - Also supports explicit separators '—' or ' - '.
+    - Returns a list of {seed_name, domain[, notes]}.
+    """
     out: list[dict] = []
     try:
         s = (text or "").strip()
         if not s:
             return out
-        # split into items generously
         parts = re.split(r"[\n;]+|\s{2,}", s)
         for p in parts:
             pp = p.strip().strip(",")
             if not pp or len(pp) < 3:
                 continue
-            # prefer em dash / hyphen separator
-            if "—" in pp:
-                name, dom = [x.strip() for x in pp.split("—", 1)]
-            elif " - " in pp:
-                name, dom = [x.strip() for x in pp.split(" - ", 1)]
+            # Find the first domain anywhere in the line
+            m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", pp, re.IGNORECASE)
+            dom = m.group(0) if m else None
+            name: str | None = None
+            notes: str | None = None
+            if dom:
+                i = pp.lower().find(dom.lower())
+                left = pp[:i].strip().strip(" -—,|:")
+                right = pp[i + len(dom):].strip().strip(" -—,|:")
+                name = left or None
+                notes = right or None
             else:
-                # fallback: take first token as name and look for domain inside
-                m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", pp, re.IGNORECASE)
-                dom = m.group(0) if m else None
-                name = pp if dom is None else pp.replace(dom, "").strip(" -—,|:")
+                # Separator-based fallback
+                if "—" in pp:
+                    name, dom = [x.strip() for x in pp.split("—", 1)]
+                elif " - " in pp:
+                    name, dom = [x.strip() for x in pp.split(" - ", 1)]
             if name and dom:
-                # Filter out protocol placeholders and too-short names (avoid parsing bare URLs as seeds)
                 low = name.strip().lower()
                 if low in {"http", "https", "www"}:
                     continue
@@ -943,7 +959,10 @@ def _parse_seeds(text: str) -> list[dict]:
                     continue
                 if len(low) < 3:
                     continue
-                out.append({"seed_name": name[:120], "domain": dom.lower()})
+                rec = {"seed_name": name[:120], "domain": dom.lower()}
+                if isinstance(notes, str) and notes:
+                    rec["notes"] = notes[:240]
+                out.append(rec)
         # dedupe by domain/name
         seen = set()
         dedup: list[dict] = []
@@ -956,6 +975,296 @@ def _parse_seeds(text: str) -> list[dict]:
         return dedup[:20]
     except Exception:
         return out
+
+def _augment_profile_from_seed_notes(state: dict) -> dict:
+    """Heuristic: reduce 'n/a' by deriving buyer_titles, integrations, and sizes from available hints.
+
+    Sources:
+    - seeds_list[].notes (text after domain)
+    - seeds_list[].seed_name (company text often contains domain context words)
+    - icp.industries / icp.industry free-text
+    - trivial domain hints (e.g., myshopify.com)
+    - icp.champion_titles / icp.signals
+    """
+    prof = dict(state.get("icp_profile") or {})
+    icp = dict(state.get("icp") or {})
+    seeds = icp.get("seeds_list") or []
+
+    # Build a combined corpus of hints
+    texts: list[str] = []
+    for s in (seeds if isinstance(seeds, list) else []):
+        try:
+            nm = (s.get("seed_name") or "").strip()
+            if nm:
+                texts.append(nm)
+        except Exception:
+            pass
+        try:
+            t = (s.get("notes") or "").strip()
+            if t:
+                texts.append(t)
+        except Exception:
+            pass
+        # Domain-based quick hints
+        try:
+            d = (s.get("domain") or "").lower()
+            if d:
+                if "myshopify.com" in d or d.endswith("shopify.com"):
+                    texts.append("shopify ecommerce")
+                if "woocommerce" in d:
+                    texts.append("woocommerce ecommerce")
+                if "magento" in d:
+                    texts.append("magento ecommerce")
+                if "bigcommerce" in d:
+                    texts.append("bigcommerce ecommerce")
+        except Exception:
+            pass
+    # ICP fields as additional hints
+    for k in ("industries", "industry", "signals"):
+        try:
+            v = icp.get(k)
+            if isinstance(v, list):
+                texts.extend([str(x) for x in v if isinstance(x, str)])
+            elif isinstance(v, str):
+                texts.append(v)
+        except Exception:
+            pass
+
+    corpus = (" \n".join(texts)).lower()
+    if not corpus:
+        # still merge champion_titles if provided
+        try:
+            champs = icp.get("champion_titles") or []
+            if isinstance(champs, list) and champs:
+                base_t = set([w.strip() for w in (prof.get("buyer_titles") or []) if isinstance(w, str)])
+                for t in champs:
+                    if isinstance(t, str) and t.strip():
+                        base_t.add(t.strip())
+                prof["buyer_titles"] = sorted(base_t)
+        except Exception:
+            pass
+        return prof
+
+    # Integrations/stack keywords (expanded)
+    integ_map = [
+        "ecommerce", "shopify", "woocommerce", "magento", "bigcommerce",
+        "stripe", "paypal", "payment", "erp", "sap", "netsuite", "oracle",
+        "odoo", "salesforce", "hubspot", "wms", "warehouse", "xero", "quickbooks",
+        "logistics", "shipping", "carrier", "api", "zapier", "klaviyo", "mailchimp",
+        "pos", "inventory", "wix", "squarespace",
+    ]
+    found_integ = [w for w in integ_map if w in corpus]
+    if found_integ:
+        base = set([w.strip() for w in (prof.get("integrations") or []) if isinstance(w, str)])
+        for w in found_integ:
+            base.add(w)
+        prof["integrations"] = sorted(base)
+
+    # Buyer titles heuristics: distribution/wholesale and ecom ops
+    dist_tokens = [
+        "distributor", "distribution", "wholesale", "wholesaler", "foodservice",
+        "retail", "fmcg", "ecommerce", "b2b food", "broadline",
+    ]
+    if any(t in corpus for t in dist_tokens):
+        titles_default = [
+            "Procurement Manager",
+            "Purchasing Manager",
+            "Operations Manager",
+            "Supply Chain Manager",
+            "Ecommerce Manager",
+            "Sales Manager",
+            "General Manager",
+        ]
+        base_t = set([w.strip() for w in (prof.get("buyer_titles") or []) if isinstance(w, str)])
+        for t in titles_default:
+            base_t.add(t)
+        # Merge explicit champion_titles when provided
+        try:
+            champs = icp.get("champion_titles") or []
+            for t in champs or []:
+                if isinstance(t, str) and t.strip():
+                    base_t.add(t.strip())
+        except Exception:
+            pass
+        prof["buyer_titles"] = sorted(base_t)
+
+    # Derive size_bands from explicit employees_min/max, if available
+    try:
+        e_min = icp.get("employees_min")
+        e_max = icp.get("employees_max")
+        band: list[str] = []
+        if isinstance(e_min, int) or isinstance(e_max, int):
+            lo = int(e_min) if isinstance(e_min, int) else None
+            hi = int(e_max) if isinstance(e_max, int) else None
+            if lo is not None and hi is not None:
+                band = [f"{lo}-{hi} employees"]
+            elif lo is not None:
+                band = [f"{lo}+ employees"]
+            elif hi is not None:
+                band = [f"1-{hi} employees"]
+        if band:
+            base_sz = set([w.strip() for w in (prof.get("size_bands") or []) if isinstance(w, str)])
+            for b in band:
+                base_sz.add(b)
+            prof["size_bands"] = sorted(base_sz)
+    except Exception:
+        pass
+
+    # Merge any user-provided signals into triggers/signals
+    try:
+        sigs = icp.get("signals") or []
+        if isinstance(sigs, list) and sigs:
+            base_sig = set([w.strip() for w in (prof.get("triggers") or []) if isinstance(w, str)])
+            for s in sigs:
+                if isinstance(s, str) and s.strip():
+                    base_sig.add(s.strip())
+            prof["triggers"] = sorted(base_sig)
+    except Exception:
+        pass
+
+    return prof
+
+
+def _enrich_icp_profile_from_websites_fast(state: dict) -> dict:
+    """Fast, web-backed enrichment to reduce 'n/a' before profile emission.
+
+    - Reads the user's website and a small head of seed websites via r.jina.
+    - Runs the existing agents_icp.evidence_extractor on snapshots to pull
+      buyer_titles and integrations; merges into state['icp_profile'].
+    - Derives common ecommerce stack keywords directly from text as a backstop.
+    - Keeps the pass very small to avoid delaying the early profile emit.
+    """
+    try:
+        prof = dict(state.get("icp_profile") or {})
+        icp = dict(state.get("icp") or {})
+        # Only run when key fields are sparse
+        missing_keys = []
+        for k in ("buyer_titles", "integrations"):
+            vals = prof.get(k) or []
+            if not (isinstance(vals, list) and any(isinstance(x, str) and x.strip() for x in vals)):
+                missing_keys.append(k)
+        if not missing_keys:
+            return prof
+        # Build a short domain list: user site + first few seeds
+        domains: list[str] = []
+        try:
+            url = (icp.get("website_url") or "").strip()
+            if url:
+                domains.append(url)
+        except Exception:
+            pass
+        try:
+            for s in (icp.get("seeds_list") or [])[:4]:
+                d = (s.get("domain") or "").strip()
+                if d:
+                    domains.append(d)
+        except Exception:
+            pass
+        # Nothing to read; return
+        if not domains or _jina_read is None:
+            return prof
+        # Collect short snapshots and extract evidence for each
+        texts: list[str] = []
+        for d in domains:
+            try:
+                body = _jina_read(d, timeout=6) or ""
+                if not body:
+                    continue
+                # Keep a concise window per site
+                texts.append(" ".join((body or "").split())[:3500])
+            except Exception:
+                continue
+        if not texts:
+            return prof
+        # Use the same structured extractor as discovery to pull titles/integrations
+        try:
+            from src.agents_icp import evidence_extractor as _agent_evidence_extractor  # type: ignore
+        except Exception:
+            _agent_evidence_extractor = None  # type: ignore
+        titles_acc: list[str] = [t for t in (prof.get("buyer_titles") or []) if isinstance(t, str)]
+        integ_acc: list[str] = [t for t in (prof.get("integrations") or []) if isinstance(t, str)]
+        trig_acc: list[str] = [t for t in (prof.get("triggers") or []) if isinstance(t, str)]
+        # Simple keyword backstop for ecommerce platforms
+        def _stack_keywords(txt: str) -> list[str]:
+            low = txt.lower()
+            kws = []
+            for w in [
+                "shopify", "woocommerce", "magento", "bigcommerce",
+                "wix", "squarespace", "wordpress", "erp", "sap",
+                "netsuite", "odoo", "salesforce", "hubspot", "xero",
+                "quickbooks", "wms", "inventory", "payment", "stripe", "paypal",
+            ]:
+                if w in low:
+                    kws.append(w)
+            return kws
+        for t in texts:
+            try:
+                if _agent_evidence_extractor is not None:
+                    ev_out = _agent_evidence_extractor({"evidence": [{"summary": t}]})
+                    items = ev_out.get("evidence") or []
+                    if items and isinstance(items[0], dict):
+                        bt = [x for x in (items[0].get("buyer_titles") or []) if isinstance(x, str)]
+                        it = [x for x in (items[0].get("integrations") or []) if isinstance(x, str)]
+                        if bt:
+                            titles_acc.extend(bt)
+                        if it:
+                            integ_acc.extend([x.lower() for x in it])
+                # Keyword backstop
+                kws = _stack_keywords(t)
+                integ_acc.extend(kws)
+                low = t.lower()
+                if any(k in low for k in ("shopify", "woocommerce", "magento", "bigcommerce")):
+                    trig_acc.append("ecommerce replatform")
+                if any(k in low for k in ("erp", "sap", "netsuite", "oracle", "odoo")):
+                    trig_acc.append("erp migration")
+                if any(k in low for k in ("wms", "warehouse", "inventory")):
+                    trig_acc.append("warehouse expansion")
+            except Exception:
+                # Ignore extraction errors and continue
+                integ_acc.extend(_stack_keywords(t))
+                continue
+        # Merge back, de-duped and normalized
+        def _dedup_titles(xs: list[str]) -> list[str]:
+            seen = set()
+            out: list[str] = []
+            for x in xs:
+                try:
+                    s = (x or "").strip()
+                    if not s:
+                        continue
+                    key = s.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(s)
+                except Exception:
+                    continue
+            return out
+        def _dedup_integs(xs: list[str]) -> list[str]:
+            seen = set()
+            out: list[str] = []
+            for x in xs:
+                try:
+                    s = (x or "").strip().lower()
+                    if not s:
+                        continue
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    out.append(s)
+                except Exception:
+                    continue
+            return out
+        if titles_acc:
+            prof["buyer_titles"] = _dedup_titles(titles_acc)[:12]
+        if integ_acc:
+            prof["integrations"] = _dedup_integs(integ_acc)[:12]
+        if trig_acc:
+            # Keep triggers lowercase concise phrases
+            prof["triggers"] = _dedup_integs(trig_acc)[:8]
+        return prof
+    except Exception:
+        return dict(state.get("icp_profile") or {})
 
 
 def _parse_lost_churned(text: str) -> list[dict]:
@@ -1324,6 +1633,22 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
         pass
     # Build a concise status message with correct totals
     msg_lines: list[str] = []
+    # 1) Show ICP Profile summary first, before discovery/Top‑10 planning
+    try:
+        icp_prof = dict(state.get("icp_profile") or {})
+        inds = (icp_prof.get("industries") or [])
+        titles_l = (icp_prof.get("buyer_titles") or [])
+        sizes_l = (icp_prof.get("size_bands") or [])
+        ints = (icp_prof.get("integrations") or [])
+        trigs = (icp_prof.get("triggers") or [])
+        msg_lines.append("ICP Profile")
+        msg_lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
+        msg_lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
+        msg_lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
+        sigs_arr = (ints or []) + (trigs or [])
+        msg_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
+    except Exception:
+        pass
     # Compute discovered candidates (domain URLs) count for display
     # Prefer in-memory discovery results strictly for accuracy per run
     discovered_total = 0
@@ -1417,20 +1742,9 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                         logger.info("[confirm] Skipping ICP enrichment-from-discovery to prevent duplicate DDG runs")
                     except Exception:
                         pass
-                    # After showing results, show a detailed ICP Profile summary for the user
+                    # Persist ICP profile (already shown above) to icp_rules for reuse across threads/API
                     try:
                         icp_prof = state.get("icp_profile") or {}
-                        inds = (icp_prof.get("industries") or [])
-                        titles_l = (icp_prof.get("buyer_titles") or [])
-                        sizes_l = (icp_prof.get("size_bands") or [])
-                        ints = (icp_prof.get("integrations") or [])
-                        trigs = (icp_prof.get("triggers") or [])
-                        msg_lines.append("ICP Profile")
-                        msg_lines.append(f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}")
-                        msg_lines.append(f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}")
-                        msg_lines.append(f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}")
-                        sigs_arr = (ints or []) + (trigs or [])
-                        msg_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
                         # Persist ICP profile to icp_rules for reuse across threads/API
                         try:
                             if isinstance(tid, int):
@@ -1442,7 +1756,7 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                         except Exception:
                             pass
                     except Exception:
-                        msg_lines.append("ICP Profile")
+                        pass
     except Exception:
         pass
 
@@ -2184,6 +2498,10 @@ class GraphState(TypedDict):
     icp_confirmed: bool
     ask_counts: Dict[str, int]  # how many times we asked each slot
     scored: List[Dict[str, Any]]
+    # Persistence flags across runs
+    autostart_discovery: bool
+    agent_discovery_done: bool
+    profile_shown: bool
 
 
 # ------------------------------
@@ -3560,7 +3878,27 @@ async def candidates_node(state: GraphState) -> GraphState:
         )
     else:
         lines.append("No candidates yet. I’ll keep collecting ICP details.")
-    msg = "\n".join([ln for ln in lines if ln])
+
+    # Prepend ICP Profile summary to the final confirm message so it always appears
+    try:
+        icp_prof = dict(state.get("icp_profile") or {})
+        _inds = ", ".join((icp_prof.get("industries") or [])[:6]) or "n/a"
+        _titles = ", ".join((icp_prof.get("buyer_titles") or [])[:6]) or "n/a"
+        _sizes = ", ".join((icp_prof.get("size_bands") or [])[:6]) or "n/a"
+        _sigs_arr = (icp_prof.get("integrations") or []) + (icp_prof.get("triggers") or [])
+        _sigs = ", ".join((_sigs_arr or [])[:8]) or "n/a"
+        profile_lines = [
+            "ICP Profile",
+            f"- Industries: {_inds}",
+            f"- Buyer titles: {_titles}",
+            f"- Company sizes: {_sizes}",
+            f"- Signals: {_sigs}",
+            "",
+        ]
+        lines = profile_lines + lines
+    except Exception:
+        pass
+        msg = "\n".join([ln for ln in lines if ln])
 
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=msg)])
     return state
@@ -3568,6 +3906,7 @@ async def candidates_node(state: GraphState) -> GraphState:
 
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
+    state["confirmed_once"] = True
     logger.info("[confirm] Entered confirm_node")
     # Emit a quick progress note so the user sees immediate feedback
     try:
@@ -3575,6 +3914,103 @@ async def confirm_node(state: GraphState) -> GraphState:
             state.get("messages") or [],
             [AIMessage(content="Confirm received. Gathering evidence and planning Top‑10…")],
         )
+    except Exception:
+        pass
+    # Fill a minimal ICP Profile from seeds quickly (fast LLM synth) before emitting
+    try:
+        prof = dict(state.get("icp_profile") or {})
+        needs_min = not any((prof.get("industries") or [])) and not any((prof.get("buyer_titles") or [])) and not any((prof.get("size_bands") or [])) and not any((prof.get("integrations") or [])) and not any((prof.get("triggers") or []))
+        if needs_min and ENABLE_AGENT_DISCOVERY:
+            try:
+                from src.agents_icp import icp_synthesizer as _agent_synth  # type: ignore
+            except Exception:
+                _agent_synth = None  # type: ignore
+            if _agent_synth is not None:
+                icp = dict(state.get("icp") or {})
+                seeds_ev = []
+                try:
+                    for s in (icp.get("seeds_list") or []):
+                        dom = (s.get("domain") or "").strip()
+                        nm = (s.get("seed_name") or "").strip()
+                        if dom:
+                            seeds_ev.append({"url": dom, "snippet": nm})
+                except Exception:
+                    seeds_ev = []
+                try:
+                    out = await asyncio.to_thread(_agent_synth, {"icp_profile": {}, "seeds": seeds_ev})
+                    if isinstance(out.get("icp_profile"), dict):
+                        state["icp_profile"] = out.get("icp_profile")
+                        prof = dict(state["icp_profile"])  # refresh
+                        logger.info("[confirm] Pre-synth icp_profile keys=%s", list(prof.keys()))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Heuristic augmentation from seed notes to reduce 'n/a' when LLM synth is sparse
+    try:
+        prof2 = _augment_profile_from_seed_notes(state)
+        if prof2:
+            state["icp_profile"] = prof2
+    except Exception:
+        pass
+
+    # Quick web-backed enrichment from user + seed sites to reduce 'n/a' before emit
+    try:
+        prof3 = _enrich_icp_profile_from_websites_fast(state)
+        if prof3:
+            state["icp_profile"] = prof3
+    except Exception:
+        pass
+
+    # Immediately show ICP Profile summary (before resolver/discovery begins), guarded
+    try:
+        if not bool(state.get("profile_shown")):
+            icp_prof = dict(state.get("icp_profile") or {})
+            inds = ", ".join((icp_prof.get("industries") or [])[:6]) or "n/a"
+            titles = ", ".join((icp_prof.get("buyer_titles") or [])[:6]) or "n/a"
+            sizes = ", ".join((icp_prof.get("size_bands") or [])[:6]) or "n/a"
+            sigs_arr = (icp_prof.get("integrations") or []) + (icp_prof.get("triggers") or [])
+            sigs = ", ".join((sigs_arr or [])[:8]) or "n/a"
+            profile_text = (
+                "ICP Profile\n"
+                f"- Industries: {inds}\n"
+                f"- Buyer titles: {titles}\n"
+                f"- Company sizes: {sizes}\n"
+                f"- Signals: {sigs}"
+            )
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(profile_text)])
+            state["profile_shown"] = True
+            state["icp_profile_emitted"] = True
+            try:
+                logger.info("[confirm] ICP Profile emitted to UI: inds=%s titles=%s sizes=%s", inds, titles, sizes)
+            except Exception:
+                pass
+            # Stream progress tick if session context exists
+            try:
+                from app.event_bus import emit_progress
+                await emit_progress(
+                    f"ICP Profile — Industries: {inds}; Buyer titles: {titles}; Sizes: {sizes}; Signals: {sigs}",
+                    label="icp:profile_ready",
+                    extra={"profile": icp_prof},
+                    session_id=state.get("session_id"),
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # For agentic discovery flows, return early after emitting the profile so the UI shows it
+    # before any long-running resolver/evidence tasks. We DEFER discovery to the NEXT run
+    # (confirm -> router; router detects autostart + pre_emit_returned and ends the run),
+    # so the UI can render the newly appended profile immediately.
+    try:
+        if ENABLE_AGENT_DISCOVERY and not bool(state.get("pre_emit_returned")):
+            state["pre_emit_returned"] = True
+            # mark autostart so the next run can continue discovery automatically
+            state["autostart_discovery"] = True
+            logger.info("[confirm] Early-return after profile emission (agent discovery enabled)")
+            logger.info("[confirm] deferring discovery to next run (router will end now)")
+            return state
     except Exception:
         pass
     try:
@@ -3779,8 +4215,47 @@ async def confirm_node(state: GraphState) -> GraphState:
                             chips.append("Evidence ✓")
                             if ENABLE_ACRA_IN_CHAT and acra_count:
                                 chips.append("ACRA ✓")
+                        # Emit ICP Profile BEFORE domain discovery
+                        try:
+                            if _icp_winner_profile and not state.get("icp_profile_emitted"):
+                                prof = await asyncio.to_thread(_icp_winner_profile, tid)
+                                # Merge into state profile
+                                try:
+                                    cur = dict(state.get("icp_profile") or {})
+                                    for k in ("industries","buyer_titles","size_bands","integrations","triggers"):
+                                        v = prof.get(k)
+                                        if isinstance(v, list) and v:
+                                            cur.setdefault(k, [])
+                                            cur[k] = sorted(set((cur.get(k) or []) + v))
+                                    state["icp_profile"] = cur or prof or {}
+                                except Exception:
+                                    state["icp_profile"] = prof or {}
+                                # Build and emit compact profile message
+                                try:
+                                    icp_prof = state.get("icp_profile") or {}
+                                    inds = (icp_prof.get("industries") or [])
+                                    titles_l = (icp_prof.get("buyer_titles") or [])
+                                    sizes_l = (icp_prof.get("size_bands") or [])
+                                    ints = (icp_prof.get("integrations") or [])
+                                    trigs = (icp_prof.get("triggers") or [])
+                                    profile_lines = [
+                                        "ICP Profile",
+                                        f"- Industries: {', '.join(inds[:6]) if inds else 'n/a'}",
+                                        f"- Buyer titles: {', '.join(titles_l[:6]) if titles_l else 'n/a'}",
+                                        f"- Company sizes: {', '.join(sizes_l[:6]) if sizes_l else 'n/a'}",
+                                        f"- Signals: {', '.join(((ints or []) + (trigs or []))[:8]) if (ints or trigs) else 'n/a'}",
+                                    ]
+                                except Exception:
+                                    profile_lines = ["ICP Profile"]
+                                state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(profile_lines))])
+                                state["icp_profile_emitted"] = True
+                        except Exception:
+                            pass
                     except Exception:
                         pass
+
+                    # Agent-driven discovery will run in the next node to stream profile first
+                    return state
 
                     # Agent-driven discovery Top-10 with "why" + Jina snippets (PRD19)
                     try:
@@ -3929,22 +4404,6 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         state["agent_top10"] = top
                                     except Exception:
                                         pass
-                                    # Pretty Top‑10 table (separate message from ICP Profile)
-                                    top_lines: list[str]
-                                    try:
-                                        table = _fmt_top10_md(top)
-                                        top_lines = ["Top‑listed lookalikes (with why):\n\n" + table]
-                                    except Exception:
-                                        top_lines = ["Top‑listed lookalikes (with why):"]
-                                        for i, row in enumerate(top, 1):
-                                            dom = row.get("domain")
-                                            why = row.get("why") or "signal match"
-                                            score = int(row.get("score") or 0)
-                                            snip = _clean_snippet(row.get("snippet") or "")
-                                            if snip:
-                                                top_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
-                                            else:
-                                                top_lines.append(f"{i}) {dom} — {why} (score {score})")
                                     # Enrich ICP from r.jina+ddg if sparse, then show a detailed profile summary
                                     try:
                                         from src.agents_icp import ensure_icp_enriched_with_jina as _icp_enrich  # type: ignore
@@ -3973,10 +4432,32 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         profile_lines.append(f"- Signals: {', '.join(sigs_arr[:8]) if sigs_arr else 'n/a'}")
                                     except Exception:
                                         profile_lines.append("ICP Profile")
-                                    # Emit Top‑10 table and ICP Profile as two separate messages
+                                    # Pretty Top‑10 table (separate message from ICP Profile)
+                                    top_lines: list[str]
+                                    try:
+                                        table = _fmt_top10_md(top)
+                                        top_lines = ["Top‑listed lookalikes (with why):\n\n" + table]
+                                    except Exception:
+                                        top_lines = ["Top‑listed lookalikes (with why):"]
+                                        for i, row in enumerate(top, 1):
+                                            dom = row.get("domain")
+                                            why = row.get("why") or "signal match"
+                                            score = int(row.get("score") or 0)
+                                            snip = _clean_snippet(row.get("snippet") or "")
+                                            if snip:
+                                                top_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                                            else:
+                                                top_lines.append(f"{i}) {dom} — {why} (score {score})")
+                                    # Emit ICP Profile first (if not already), then Top‑10 table to match UX sequencing
+                                    if not state.get("icp_profile_emitted"):
+                                        state["messages"] = add_messages(
+                                            state.get("messages") or [],
+                                            [AIMessage("\n".join(profile_lines))],
+                                        )
+                                        state["icp_profile_emitted"] = True
                                     state["messages"] = add_messages(
                                         state.get("messages") or [],
-                                        [AIMessage("\n".join(top_lines)), AIMessage("\n".join(profile_lines))],
+                                        [AIMessage("\n".join(top_lines))],
                                     )
                                     chips.append("Top‑10 ✓")
                                 else:
@@ -5294,6 +5775,25 @@ def router(state: GraphState) -> str:
 
     text = _last_user_text(state).lower()
 
+    # If autostart is set (profile was emitted), decide whether to continue now or in next run
+    try:
+        if bool(state.get("autostart_discovery")) and not bool(state.get("agent_discovery_done")):
+            # If we just emitted the profile in this same run, end now so the UI can render it,
+            # and keep autostart flag for the NEXT run (no extra user input needed).
+            if bool(state.get("pre_emit_returned")):
+                logger.info("router -> end (post-profile; defer autostart to next run)")
+                try:
+                    state["pre_emit_returned"] = False
+                except Exception:
+                    pass
+                return "end"
+            logger.info("router -> confirm_discovery (autostart)")
+            # avoid re-triggering repeatedly across runs once routed
+            state["autostart_discovery"] = False
+            return "confirm_discovery"
+    except Exception:
+        pass
+
     # Boot-session initialization: record current message count and STOP
     # any resumed run immediately after server restart. We only honor commands
     # after a NEW human message arrives post-boot.
@@ -5499,16 +5999,29 @@ def router(state: GraphState) -> str:
 
     # 6) User said confirm: proceed forward once (avoid loops)
     if _user_just_confirmed(state):
+        # If we've already emitted the profile, continue to discovery
+        try:
+            if state.get("icp_profile_emitted") and not state.get("agent_discovery_done"):
+                logger.info("router -> confirm_discovery (profile already emitted)")
+                return "confirm_discovery"
+        except Exception:
+            pass
+        # First-time confirm goes to confirm node (profile phase)
+        if not state.get("confirmed_once"):
+            logger.info("router -> confirm (Finder minimal intake present; proceeding to profile phase)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "confirm"
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
         if ENABLE_ICP_INTAKE:
             has_minimal = bool(icp.get("website_url")) and bool(icp.get("seeds_list"))
             if has_minimal:
-                logger.info("router -> confirm (Finder minimal intake present; proceeding to confirm pipeline)")
-                try:
-                    state["last_routed_text"] = text
-                except Exception:
-                    pass
-                return "confirm"
+                # Already confirmed; if discovery not done, route to confirm_discovery
+                if not state.get("agent_discovery_done"):
+                    logger.info("router -> confirm_discovery (continue discovery)")
+                    return "confirm_discovery"
             # Otherwise continue asking for missing pieces
             if not _icp_complete(icp):
                 logger.info("router -> icp (Finder gating: need website + seeds before confirm)")
@@ -5610,6 +6123,181 @@ def build_graph():
     g.add_node("icp", icp_node)
     g.add_node("candidates", candidates_node)
     g.add_node("confirm", confirm_node)
+    # Announce ICP Profile (lightweight) node to stream profile before heavy discovery
+    async def confirm_announce(state: GraphState) -> GraphState:
+        try:
+            # De-dup: skip if profile already shown
+            if bool(state.get("profile_shown")):
+                return state
+            icp_prof = dict(state.get("icp_profile") or {})
+            inds = ", ".join((icp_prof.get("industries") or [])[:6]) or "n/a"
+            titles = ", ".join((icp_prof.get("buyer_titles") or [])[:6]) or "n/a"
+            sizes = ", ".join((icp_prof.get("size_bands") or [])[:6]) or "n/a"
+            sigs_arr = (icp_prof.get("integrations") or []) + (icp_prof.get("triggers") or [])
+            sigs = ", ".join((sigs_arr or [])[:8]) or "n/a"
+            text = (
+                "ICP Profile\n"
+                f"- Industries: {inds}\n"
+                f"- Buyer titles: {titles}\n"
+                f"- Company sizes: {sizes}\n"
+                f"- Signals: {sigs}"
+            )
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(text)])
+            state["profile_shown"] = True
+            state["icp_profile_emitted"] = True
+            try:
+                logger.info("[confirm_announce] ICP Profile emitted to UI: inds=%s titles=%s sizes=%s", inds, titles, sizes)
+            except Exception:
+                pass
+            # Best-effort streaming progress
+            try:
+                from app.event_bus import emit_progress
+                await emit_progress(
+                    f"ICP Profile — Industries: {inds}; Buyer titles: {titles}; Sizes: {sizes}; Signals: {sigs}",
+                    label="icp:profile_ready",
+                    extra={"profile": icp_prof},
+                    session_id=state.get("session_id"),
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return state
+
+    # Post-profile discovery node
+    async def confirm_discovery(state: GraphState) -> GraphState:
+        # Announce discovery start for UI timelines
+        try:
+            from app.event_bus import emit_progress
+            prof = dict(state.get("icp_profile") or {})
+            prof_keys = [k for k, v in prof.items() if v] if isinstance(prof, dict) else []
+            await emit_progress(
+                "Discovery started — planning Top‑10 lookalikes…",
+                label="discovery:started",
+                extra={"profile_keys": prof_keys[:8]},
+                session_id=state.get("session_id"),
+            )
+        except Exception:
+            pass
+        # If the profile hasn't been shown yet, attempt a quick web-backed enrichment
+        try:
+            if not bool(state.get("profile_shown")):
+                prof3 = _enrich_icp_profile_from_websites_fast(state)
+                if prof3:
+                    state["icp_profile"] = prof3
+        except Exception:
+            pass
+        # Emit ICP Profile summary first so UI shows it before discovery work.
+        # Re-echo once on autostart if the earlier emit was missed by the UI.
+        try:
+            should_echo = (not bool(state.get("profile_shown"))) or (
+                bool(state.get("pre_emit_returned")) and not bool(state.get("re_echoed_profile"))
+            )
+            if should_echo:
+                icp_prof = dict(state.get("icp_profile") or {})
+                inds = ", ".join((icp_prof.get("industries") or [])[:6]) or "n/a"
+                titles = ", ".join((icp_prof.get("buyer_titles") or [])[:6]) or "n/a"
+                sizes = ", ".join((icp_prof.get("size_bands") or [])[:6]) or "n/a"
+                sigs_arr = (icp_prof.get("integrations") or []) + (icp_prof.get("triggers") or [])
+                sigs = ", ".join((sigs_arr or [])[:8]) or "n/a"
+                profile_text = (
+                    "ICP Profile\n"
+                    f"- Industries: {inds}\n"
+                    f"- Buyer titles: {titles}\n"
+                    f"- Company sizes: {sizes}\n"
+                    f"- Signals: {sigs}"
+                )
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(profile_text)])
+                state["profile_shown"] = True
+                state["icp_profile_emitted"] = True
+                state["re_echoed_profile"] = True
+                try:
+                    logger.info("[confirm_discovery] ICP Profile emitted to UI: inds=%s titles=%s sizes=%s", inds, titles, sizes)
+                except Exception:
+                    pass
+                # Best-effort: stream a progress tick if session context exists
+                try:
+                    from app.event_bus import emit_progress
+                    await emit_progress(
+                        f"ICP Profile — Industries: {inds}; Buyer titles: {titles}; Sizes: {sizes}; Signals: {sigs}",
+                        label="icp:profile_ready",
+                        extra={"profile": icp_prof},
+                        session_id=state.get("session_id"),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            from src.agents_icp import plan_top10_with_reasons as _agent_top10  # type: ignore
+        except Exception:
+            _agent_top10 = None  # type: ignore
+        top = []
+        try:
+            if _agent_top10 is not None:
+                top = _agent_top10(state.get("icp_profile") or {}, state.get("tenant_id"))
+        except Exception:
+            top = []
+        # Render Top-likes table/message (without repeating ICP Profile)
+        try:
+            if top:
+                try:
+                    from app.pre_sdr_graph import _clean_snippet as _clean_snippet  # self-ref helper
+                except Exception:
+                    def _clean_snippet(s: str) -> str: return s
+                try:
+                    def _fmt_top10_md(rows: list[dict]) -> str:
+                        lines = ["| # | Domain | Why | Score |", "|---|---|---|---|"]
+                        for i, row in enumerate(rows[:10], 1):
+                            dom = row.get("domain")
+                            why = (row.get("why") or "").replace("|", "\|")
+                            score = int(row.get("score") or 0)
+                            lines.append(f"| {i} | {dom} | {why} | {score} |")
+                        return "\n".join(lines)
+                    table = _fmt_top10_md(top)
+                    top_lines = ["Top‑listed lookalikes (with why):\n\n" + table]
+                except Exception:
+                    top_lines = ["Top‑listed lookalikes (with why):"]
+                    for i, row in enumerate(top, 1):
+                        dom = row.get("domain")
+                        why = row.get("why") or "signal match"
+                        score = int(row.get("score") or 0)
+                        snip = _clean_snippet(row.get("snippet") or "")
+                        if snip:
+                            top_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
+                        else:
+                            top_lines.append(f"{i}) {dom} — {why} (score {score})")
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(top_lines))])
+                state["agent_discovery_done"] = True
+                # Announce discovery completion with summary
+                try:
+                    from app.event_bus import emit_progress
+                    domains = [str(r.get("domain")) for r in top[:10] if isinstance(r, dict) and r.get("domain")]
+                    await emit_progress(
+                        f"Discovery done — {len(top)} candidates, showing top {min(len(top),10)}",
+                        label="discovery:done",
+                        extra={"count": len(top), "domains": domains},
+                        session_id=state.get("session_id"),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # If no results, still emit a done event so the UI can conclude the bracket
+        try:
+            if not top:
+                from app.event_bus import emit_progress
+                await emit_progress(
+                    "Discovery done — 0 candidates",
+                    label="discovery:done",
+                    extra={"count": 0, "domains": []},
+                    session_id=state.get("session_id"),
+                )
+        except Exception:
+            pass
+        return state
+    g.add_node("confirm_announce", confirm_announce)
+    g.add_node("confirm_discovery", confirm_discovery)
     g.add_node("enrich", enrich_node)
     g.add_node("score", score_node)
     # Welcome node for greetings without kicking off lead-gen automatically
@@ -5669,6 +6357,7 @@ def build_graph():
         "icp": "icp",
         "candidates": "candidates",
         "confirm": "confirm",
+        "confirm_discovery": "confirm_discovery",
         "accept": "accept",
         "enrich": "enrich",
         "score": "score",
@@ -5680,8 +6369,30 @@ def build_graph():
     g.set_entry_point("router")
     g.add_conditional_edges("router", router, mapping)
     # Every worker node loops back to the router
-    # Route all worker nodes back to router EXCEPT welcome, which should end the run
-    for node in ("icp", "candidates", "confirm", "accept", "enrich", "score"):
+    # After confirm, if we just emitted the profile (pre_emit_returned), end the run now
+    # so the UI can render it immediately. The next run will autostart discovery.
+    def _after_confirm_route(state: GraphState) -> str:
+        try:
+            if bool(state.get("pre_emit_returned")) and bool(state.get("autostart_discovery")):
+                logger.info("after_confirm -> end (post-profile; defer autostart to next run)")
+                # Clear the one-shot guard so next run can proceed
+                try:
+                    state["pre_emit_returned"] = False
+                except Exception:
+                    pass
+                return "end"
+        except Exception:
+            pass
+        return "router"
+    g.add_conditional_edges(
+        "confirm",
+        _after_confirm_route,
+        {
+            "end": END,
+            "router": "router",
+        },
+    )
+    for node in ("icp", "candidates", "accept", "enrich", "score", "confirm_discovery"):
         g.add_edge(node, "router")
     return g.compile()
 

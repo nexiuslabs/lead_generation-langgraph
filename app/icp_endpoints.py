@@ -85,6 +85,31 @@ async def post_intake(
         raise HTTPException(status_code=400, detail="tenant_id is required")
     resp_id = save_icp_intake(tid, str(user.get("user_id") or "api"), payload.model_dump())
 
+    # Optional: emit chat progress events if a session context is provided
+    try:
+        from app.event_bus import emit_progress
+        sess = (
+            req.headers.get("X-Session-ID")
+            or req.headers.get("X-Chat-Session")
+            or req.query_params.get("session_id")
+        )
+        if sess:
+            # intake_saved + confirm_pending to mirror the script
+            await emit_progress(
+                "Received your ICP answers and seeds. Normalizing and saving…",
+                label="icp:intake_saved",
+                extra={"tenant_id": tid, "response_id": resp_id},
+                session_id=sess,
+            )
+            await emit_progress(
+                "Reply ‘confirm’ to proceed.",
+                label="icp:confirm_pending",
+                extra={"tenant_id": tid},
+                session_id=sess,
+            )
+    except Exception:
+        pass
+
     # Enqueue full intake pipeline job and also attempt to run it immediately in background
     try:
         # Use module-scoped symbols so tests can monkeypatch ep.enqueue_icp_intake_process
@@ -248,6 +273,12 @@ async def enrich_top10(
     tid = _resolve_tenant_id(req, x_tenant_id)
     if tid is None:
         raise HTTPException(status_code=400, detail="tenant_id is required")
+    # Capture optional chat session context for SSE progress
+    sess = (
+        req.headers.get("X-Session-ID")
+        or req.headers.get("X-Chat-Session")
+        or req.query_params.get("session_id")
+    )
     try:
         run_now_limit = int(os.getenv("RUN_NOW_LIMIT", "10") or 10)
     except Exception:
@@ -301,6 +332,38 @@ async def enrich_top10(
             _top10 = None  # type: ignore
         if _top10 is None:
             raise HTTPException(status_code=412, detail="top10 preview not found and agents unavailable")
+        # Emit planning start
+        try:
+            if sess:
+                from app.event_bus import emit_progress
+                await emit_progress(
+                    "Confirmed. Gathering evidence and planning Top-10…",
+                    label="icp:planning_start",
+                    extra={"tenant_id": tid},
+                    session_id=sess,
+                )
+        except Exception:
+            pass
+        # Emit ICP Profile first for UX ordering
+        try:
+            if sess:
+                from src.icp_pipeline import winner_profile as _winner_profile  # type: ignore
+                prof = await asyncio.to_thread(_winner_profile, tid)
+                # compact summary for chat; include raw profile as data
+                inds = ", ".join((prof.get("industries") or [])[:6]) if isinstance(prof.get("industries"), list) else ""
+                titles = ", ".join((prof.get("buyer_titles") or [])[:6]) if isinstance(prof.get("buyer_titles"), list) else ""
+                sizes = ", ".join((prof.get("size_bands") or [])[:6]) if isinstance(prof.get("size_bands"), list) else ""
+                sigs = (prof.get("integrations") or []) + (prof.get("triggers") or [])
+                sigs_s = ", ".join((sigs or [])[:8]) if isinstance(sigs, list) else ""
+                summary = f"ICP Profile — Industries: {inds or 'n/a'}; Buyer titles: {titles or 'n/a'}; Sizes: {sizes or 'n/a'}; Signals: {sigs_s or 'n/a'}"
+                await emit_progress(
+                    summary,
+                    label="icp:profile_ready",
+                    extra={"profile": prof},
+                    session_id=sess,
+                )
+        except Exception:
+            pass
         top = await asyncio.to_thread(_top10, icp_profile, tid)
         if not top:
             raise HTTPException(status_code=412, detail="top10 preview not found; please confirm to regenerate")
@@ -316,6 +379,29 @@ async def enrich_top10(
         except Exception:
             # Best-effort: proceed with enrichment even if persistence fails
             pass
+        # Emit toplikes produced and overall progress
+        try:
+            if sess:
+                from app.event_bus import emit_progress
+                await emit_progress(
+                    "Top-listed lookalikes (with why) produced.",
+                    label="icp:toplikes_ready",
+                    extra={"count": len(top or [])},
+                    session_id=sess,
+                )
+                await emit_progress(
+                    f"Found {len(top or [])} ICP candidates. We can enrich 10 now; nightly runner will process the rest. Accept a micro-ICP, then type ‘run enrichment’.",
+                    label="icp:candidates_found",
+                    extra={"count": len(top or [])},
+                    session_id=sess,
+                )
+                await emit_progress(
+                    "Progress: Intake saved → Evidence → Domain resolve → Evidence → Top-10 ✓",
+                    label="icp:progress_summary",
+                    session_id=sess,
+                )
+        except Exception:
+            pass
         domains = [str(it.get("domain")) for it in (top or [])[:run_now_limit] if isinstance(it, dict) and it.get("domain")]
     # Map to company_ids
     company_ids: list[int] = []
@@ -330,11 +416,48 @@ async def enrich_top10(
         except Exception:
             company_ids = []
     processed = 0
+    total = len(company_ids)
+    # Announce enrichment start
+    try:
+        if sess:
+            from app.event_bus import emit_progress, set_current_session
+            set_current_session(sess)
+            await emit_progress(
+                "Enriching Top-10 now (require existing domains).",
+                label="enrich:start_top10",
+                extra={"requested": total, "tenant_id": tid},
+            )
+    except Exception:
+        pass
     for cid in company_ids:
         try:
             # Top-10 enrichment expects domains already present; skip domain search
+            # Tick: company start
+            try:
+                if sess:
+                    from app.event_bus import emit_progress
+                    await emit_progress(
+                        f"Enriching company {cid}…",
+                        label="enrich:company_tick",
+                        extra={"company_id": int(cid), "stage": "start"},
+                        session_id=sess,
+                    )
+            except Exception:
+                pass
             await enrich_company_with_tavily(int(cid), search_policy="require_existing")
             processed += 1
+            # Tick: company done
+            try:
+                if sess:
+                    from app.event_bus import emit_progress
+                    await emit_progress(
+                        f"Done {processed}/{total}",
+                        label="enrich:company_tick",
+                        extra={"company_id": int(cid), "stage": "done", "processed": processed, "total": total},
+                        session_id=sess,
+                    )
+            except Exception:
+                pass
         except Exception:
             # continue with best-effort behavior
             pass
@@ -398,6 +521,18 @@ async def enrich_top10(
                 bg_job_id = job.get("job_id") if isinstance(job, dict) else None
     except Exception:
         bg_job_id = None
+    # Summary event
+    try:
+        if sess:
+            from app.event_bus import emit_progress
+            await emit_progress(
+                f"Enriched results ({processed}/{min(total, run_now_limit)} completed). Remaining queued.",
+                label="enrich:summary",
+                extra={"processed": processed, "requested": min(total, run_now_limit), "queued_next40_job_id": bg_job_id},
+                session_id=sess,
+            )
+    except Exception:
+        pass
     return {"ok": True, "requested": len(company_ids), "processed": processed, "next40_job_id": bg_job_id}
 
 

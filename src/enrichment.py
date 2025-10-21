@@ -329,6 +329,49 @@ def _obs_log(stage: str, event: str, status: str, *, company_id: Optional[int] =
             _log_obs_event(int(rid), int(tid), stage, event, status, company_id=company_id, error_code=error_code, duration_ms=duration_ms, trace_id=None, extra=extra)
     except Exception:
         pass
+    # Forward as a lightweight chat progress tick when a session is active
+    try:
+        # Import lazily to avoid circular imports at module load time
+        from app.event_bus import emit as _emit
+        # Compose a compact payload; avoid leaking sensitive fields
+        payload = {
+            "stage": stage,
+            "event": event,
+            "status": status,
+            **({"company_id": int(company_id)} if company_id is not None else {}),
+        }
+        if duration_ms is not None:
+            payload["duration_ms"] = int(duration_ms)
+        # Only include whitelisted extras when present and safe
+        if isinstance(extra, dict):
+            safe = {}
+            for k, v in extra.items():
+                if k in {"root", "url", "pages", "emails", "phone", "jobs_count"}:
+                    try:
+                        safe[k] = v
+                    except Exception:
+                        continue
+            if safe:
+                payload["extra"] = safe
+        # Use a generic enrich tick label for UI compatibility
+        # Do not block on await here; schedule the emit
+        import asyncio as _asyncio
+        async def _send():
+            try:
+                await _emit("enrich:company_tick", payload)
+            except Exception:
+                pass
+        try:
+            loop = _asyncio.get_running_loop()
+            loop.create_task(_send())
+        except RuntimeError:
+            # No running loop; best-effort synchronous fallback
+            try:
+                _asyncio.run(_send())
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 # Initialize LangChain LLM for AI extraction
 # Use configured model; some models (e.g., gpt-5) do not accept an explicit
@@ -2124,6 +2167,9 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                 else:
                     try:
                         t0 = time.perf_counter()
+                        # Avoid repeated vendor calls in Top‑10 loops once we've attempted
+                        if (state.get("search_policy") or "auto").lower() == "require_existing" and state.get("apify_attempted"):
+                            return state
                         # Prefer company -> employees -> profiles chain if enabled
                         # For Top‑10 / Next‑40 (require_existing) use domain→company resolver before contacts
                         policy = (state.get("search_policy") or "auto").lower()
@@ -2131,32 +2177,92 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                             from urllib.parse import urlparse
                             home = state.get("home") or ""
                             dom = urlparse(home).netloc if home else ""
+                            # Ensure locals are defined for subsequent fallbacks
+                            raw = []
+                            contacts_raw = []
                             if dom:
-                                # Try to resolve company LinkedIn URL and persist on company data for core upsert
+                                # Resolve LinkedIn company URL via Apify domain→company actor
+                                comp_url = None
                                 try:
-                                    comp_url = await apify_company_url_from_domain(dom, timeout_s=APIFY_SYNC_TIMEOUT_S, dataset_format=APIFY_DATASET_FORMAT)
+                                    comp_url = await apify_company_url_from_domain(
+                                        dom, timeout_s=APIFY_SYNC_TIMEOUT_S, dataset_format=APIFY_DATASET_FORMAT
+                                    )
                                 except Exception:
                                     comp_url = None
                                 if comp_url:
                                     try:
                                         (state.setdefault("data", {}))["linkedin_url"] = comp_url
+                                        logger.info(
+                                            "[apify_contacts] company linkedin_url resolved=%s company_id=%s",
+                                            comp_url,
+                                            company_id,
+                                        )
+                                        # Best-effort immediate persist of LinkedIn URL
+                                        try:
+                                            update_company_core_fields(company_id, {"linkedin_url": comp_url})
+                                        except Exception:
+                                            logger.warning("[apify_contacts] immediate persist of linkedin_url failed", exc_info=True)
                                     except Exception:
                                         pass
-                                # Now attempt contacts via domain chain
-                                contacts_raw = await apify_contacts_via_domain_chain(
-                                    dom,
-                                    titles=(titles if isinstance(titles, list) else None),
-                                    max_items=25,
-                                    timeout_s=APIFY_SYNC_TIMEOUT_S,
-                                )
-                                raw = contacts_raw
+                                    # If we have a company URL, call employees actor directly per Top‑10 spec
+                                    try:
+                                        emp_url = "https://api.apify.com/v2/acts/harvestapi~linkedin-company-employees/run-sync-get-dataset-items"
+                                        params = {"format": "json"}
+                                        _tok = os.getenv("APIFY_TOKEN")
+                                        if _tok:
+                                            params["token"] = _tok
+                                        payload = {"companies": [comp_url], "maxItems": 50}
+                                        mode = os.getenv("APIFY_EMPLOYEES_SCRAPER_MODE")
+                                        if mode:
+                                            payload["profileScraperMode"] = mode
+                                        async with httpx.AsyncClient(timeout=APIFY_SYNC_TIMEOUT_S) as client:
+                                            rr = await client.post(emp_url, params=params, json=payload, headers={"Content-Type": "application/json"})
+                                            rr.raise_for_status()
+                                        data_emp = rr.json()
+                                        # Detailed logs for employees actor response
+                                        try:
+                                            items_tmp = data_emp if isinstance(data_emp, list) else (data_emp.get("items") if isinstance(data_emp, dict) else [])
+                                            sample_n = int(os.getenv("APIFY_LOG_SAMPLE_SIZE", "5") or 5)
+                                            sample = []
+                                            for it in (items_tmp or [])[:sample_n]:
+                                                if not isinstance(it, dict):
+                                                    continue
+                                                sample.append({
+                                                    k: it.get(k)
+                                                    for k in (
+                                                        "linkedinUrl","profileUrl","url",
+                                                        "firstName","lastName","fullName",
+                                                        "headline","jobTitle","companyName","email"
+                                                    ) if it.get(k) is not None
+                                                })
+                                            logger.info("Apify employees: n=%d sample=%s", len(items_tmp or []), sample)
+                                        except Exception:
+                                            pass
+                                        if isinstance(data_emp, list):
+                                            raw = data_emp
+                                        elif isinstance(data_emp, dict) and isinstance(data_emp.get("items"), list):
+                                            raw = data_emp.get("items")
+                                        else:
+                                            raw = []
+                                        contacts_raw = apify_normalize(raw)
+                                    except Exception:
+                                        contacts_raw = []
                                 # Fallback to company-name chain when domain chain yields nothing
                                 if not contacts_raw:
                                     try:
                                         logger.info("[apify_contacts] domain chain empty; falling back to company-name chain")
                                     except Exception:
                                         pass
-                                    if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                                    # If we have a resolved LinkedIn URL but employees returned no items,
+                                    # try profile search via generic queries to avoid being stuck.
+                                    if (state.get("data") or {}).get("linkedin_url") and (os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() not in ("1","true","yes","on")):
+                                        raw = await apify_run(
+                                            {"queries": queries},
+                                            dataset_format=APIFY_DATASET_FORMAT,
+                                            timeout_s=APIFY_SYNC_TIMEOUT_S,
+                                        )
+                                        contacts_raw = apify_normalize(raw)
+                                    elif os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
                                         contacts_raw = await apify_contacts_via_chain(
                                             company_name,
                                             titles=(titles if isinstance(titles, list) else None),
@@ -2310,6 +2416,8 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                         except Exception:
                             pass
                         state["apify_used"] = True
+                        if policy == "require_existing":
+                            state["apify_attempted"] = True
                         # Consider contacts added as mitigating trigger
                         if contacts_raw:
                             need_emails = need_emails and (len(emails or []) == 0)
@@ -2769,28 +2877,42 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
                 action = "persist_legacy"
                 reason = "override_progress_persist"
 
-        # keep routing overrides minimal
+            # Top‑10 safeguard: ensure Apify runs early when domain exists but crawl stalls
+            try:
+                policy = (state.get("search_policy") or "auto").lower()
+                apify_attempted = bool(state.get("apify_attempted"))
+                # If strict Top‑10 (require_existing), we have a domain, and steps have advanced
+                # without yielding chunks/data, force apify_contacts (once) assuming caps allow.
+                if policy == "require_existing" and have_domain and not apify_attempted and steps >= 2:
+                    tid = int(_RUN_CTX.get("tenant_id") or 0)
+                    if _dec_cap("contact_lookups", 1) and _apify_cap_ok(tid, need=1):
+                        action = "apify_contacts"
+                        reason = "top10_force_apify_early"
+            except Exception:
+                pass
 
-        # If planner wants to persist/finish but we still need contacts, force Apify step first
-        try:
-            if action in ("persist_core", "persist_legacy", "finish"):
-                data = state.get("data") or {}
-                need_emails = not (data.get("email") or [])
-                need_phones = not (data.get("phone_number") or [])
-                company_id = state.get("company_id")
-                total_contacts, has_named, founder_present = _get_contact_stats(company_id) if company_id else (0, False, False)
-                needs_contacts = total_contacts == 0
-                missing_names = not has_named
-                missing_founder = not founder_present
-                prefer_apify = (
-                    ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
-                )
-                tid = int(_RUN_CTX.get("tenant_id") or 0)
-                if prefer_apify and (need_emails or need_phones or needs_contacts or missing_names or missing_founder) and _dec_cap("contact_lookups", 1) and _apify_cap_ok(tid, need=1):
-                    action = "apify_contacts"
-                    reason = "force_contacts_before_persist"
-        except Exception:
-            pass
+            # keep routing overrides minimal
+
+            # If planner wants to persist/finish but we still need contacts, force Apify step first
+            try:
+                if action in ("persist_core", "persist_legacy", "finish"):
+                    data = state.get("data") or {}
+                    need_emails = not (data.get("email") or [])
+                    need_phones = not (data.get("phone_number") or [])
+                    company_id = state.get("company_id")
+                    total_contacts, has_named, founder_present = _get_contact_stats(company_id) if company_id else (0, False, False)
+                    needs_contacts = total_contacts == 0
+                    missing_names = not has_named
+                    missing_founder = not founder_present
+                    prefer_apify = (
+                        ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
+                    )
+                    tid = int(_RUN_CTX.get("tenant_id") or 0)
+                    if prefer_apify and (need_emails or need_phones or needs_contacts or missing_names or missing_founder) and _dec_cap("contact_lookups", 1) and _apify_cap_ok(tid, need=1):
+                        action = "apify_contacts"
+                        reason = "force_contacts_before_persist"
+            except Exception:
+                pass
 
         logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
         if action == "finish":

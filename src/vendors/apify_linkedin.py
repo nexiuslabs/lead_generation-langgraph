@@ -498,6 +498,25 @@ async def company_url_from_domain(domain: str, *, timeout_s: int = 600, dataset_
                 items = data
             else:
                 items = []
+            # Detailed logging of response items (domain and linkedin fields) for visibility
+            try:
+                details: List[Dict[str, Any]] = []
+                for it in items[: int(os.getenv("APIFY_LOG_SAMPLE_SIZE", "5") or 5)]:
+                    if not isinstance(it, dict):
+                        continue
+                    rec = {
+                        "domain": it.get("domain") or it.get("inputDomain") or it.get("sourceDomain"),
+                        "linkedinUrl": it.get("linkedinUrl") or it.get("companyUrl") or it.get("url") or it.get("linkedin_url") or it.get("linkedinCompanyUrl") or it.get("linkedin_company_url"),
+                    }
+                    # include all keys when APIFY_DEBUG_LOG_ITEMS=true
+                    if os.getenv("APIFY_DEBUG_LOG_ITEMS", "").lower() in ("1","true","yes","on"):
+                        # keep compact view of first few keys
+                        subset = {k: it.get(k) for k in list(it.keys())[:8]}
+                        rec["_subset"] = subset
+                    details.append(rec)
+                logger.info("Apify domain→company items n=%d details=%s", len(items), details)
+            except Exception:
+                pass
             # Extract a LinkedIn company URL from items
             for it in items:
                 if not isinstance(it, dict):
@@ -512,7 +531,8 @@ async def company_url_from_domain(domain: str, *, timeout_s: int = 600, dataset_
                     "linkedin_company_url",
                 ):
                     v = it.get(k)
-                    if isinstance(v, str) and "/linkedin.com/company/" in v:
+                    # Accept regional subdomains (e.g., sg.linkedin.com/company/...). Do not require a leading slash.
+                    if isinstance(v, str) and "linkedin.com/company/" in v:
                         try:
                             # Normalize regional subdomains to www for better actor compatibility
                             # e.g., https://sg.linkedin.com/company/... -> https://www.linkedin.com/company/...

@@ -1,5 +1,6 @@
 # app/main.py
 from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
@@ -156,6 +157,8 @@ try:
 except Exception as _e:
     logger.warning("ICP endpoints not mounted: %s", _e)
 
+ 
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"
@@ -267,6 +270,28 @@ def _extract_industry_terms(text: str) -> list[str]:
         singles = {s for s in singles if any(s in m.split() for m in multi)}
         out = [t for t in out if not (" " not in t and t in singles)]
     return out[:10]
+
+
+# --- SSE: Chat progress stream ---
+@app.get("/chat/stream/{session_id}")
+async def chat_stream(session_id: str):
+    """Server-Sent Events stream for realtime chat progress.
+
+    The client should connect using EventSource and include cookies/headers
+    for auth as usual. Events are emitted using app.event_bus.emit/emit_progress.
+    """
+    from app.event_bus import subscribe as _subscribe
+
+    async def _gen():
+        async for chunk in _subscribe(session_id):
+            yield chunk
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers=headers)
 
 
 """Feature 18 flags: sync-head limit and mode"""
@@ -1255,7 +1280,14 @@ async def onboarding_verify_admin_login(body: dict, _: dict = Depends(require_au
 async def onboarding_first_login(
     background: BackgroundTasks, claims: dict = Depends(require_optional_identity)
 ):
-    email = claims.get("email") or claims.get("preferred_username")
+    # Accept email from standard claims; fall back to 'sub' for dev-bypass, and
+    # finally synthesize a local dev email to avoid NULL user_id writes.
+    email = claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    if not email:
+        email = "dev-bypass@local"
+    elif "@" not in str(email):
+        # Make sure we always have an email-like identifier for user_id
+        email = f"{email}@local"
     # Ignore tenant_id from token to avoid reliance on claim
     tenant_id_claim = None
 
