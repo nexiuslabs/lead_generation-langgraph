@@ -786,12 +786,25 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
                 "snippet": (it.get("snippet") or "")[:200],
                 "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
             }
+        # Persist Top‑10 preview rows
         _ = _persist_web_candidates_to_staging(
             [str(it.get("domain")) for it in (top or [])[:10] if isinstance(it, dict) and it.get("domain")],
             int(tid) if isinstance(tid, int) else None,
             ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
             per_domain_meta=per_meta,
         )
+        # Persist remainder (beyond Top‑10) as non‑preview rows so Next‑40 can be enqueued reliably
+        rest = [
+            str(it.get("domain")).strip().lower()
+            for it in (top[10:] if isinstance(top, list) and len(top) > 10 else [])
+            if isinstance(it, dict) and it.get("domain")
+        ]
+        if rest:
+            _persist_web_candidates_to_staging(
+                rest,
+                int(tid) if isinstance(tid, int) else None,
+                ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}},
+            )
     except Exception:
         pass
     try:

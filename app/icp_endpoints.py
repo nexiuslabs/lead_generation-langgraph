@@ -418,6 +418,16 @@ async def enrich_top10(
             if ids:
                 job = _enqueue_bg(int(tid), ids)
                 bg_job_id = job.get("job_id") if isinstance(job, dict) else None
+                try:
+                    emit_chat_event(
+                        x_session_id,
+                        tid,
+                        "enrich:next40_enqueued",
+                        "Queued background enrichment for the next 40 candidates.",
+                        {"job_id": bg_job_id, "count": len(ids)},
+                    )
+                except Exception:
+                    pass
     except Exception:
         bg_job_id = None
     # Emit enrichment summary
@@ -550,6 +560,54 @@ async def get_top10(
     try:
         emit_chat_event(x_session_id, tid, "icp:toplikes_ready", "Top‑listed lookalikes (with why) produced.", {"count": len(top or [])})
     except Exception:
+        pass
+    # Persist to staging so Next‑40 can always be enqueued later
+    try:
+        from app.pre_sdr_graph import _persist_web_candidates_to_staging  # type: ignore
+        # Build per-domain preview metadata for Top‑10
+        per_meta: Dict[str, Dict[str, Any]] = {}
+        for it in (top or [])[:10]:
+            try:
+                dom = (it.get("domain") or "").strip().lower() if isinstance(it, dict) else ""
+                if not dom:
+                    continue
+                per_meta[dom] = {
+                    "preview": True,
+                    "score": it.get("score"),
+                    "bucket": it.get("bucket"),
+                    "why": it.get("why"),
+                    "snippet": (it.get("snippet") or "")[:200],
+                    "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
+                }
+            except Exception:
+                continue
+        # Persist Top‑10 preview rows
+        try:
+            _persist_web_candidates_to_staging(
+                [str(it.get("domain")).strip().lower() for it in (top or [])[:10] if isinstance(it, dict) and it.get("domain")],
+                tid,
+                ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
+                per_domain_meta=per_meta,
+            )
+        except Exception:
+            pass
+        # Persist remainder (beyond Top‑10) as non‑preview rows
+        rest = [
+            str(it.get("domain")).strip().lower()
+            for it in (top[10:] if isinstance(top, list) and len(top) > 10 else [])
+            if isinstance(it, dict) and it.get("domain")
+        ]
+        if rest:
+            try:
+                _persist_web_candidates_to_staging(
+                    rest,
+                    tid,
+                    ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}},
+                )
+            except Exception:
+                pass
+    except Exception:
+        # Best-effort; do not block Top‑10 response
         pass
     items: List[Dict[str, Any]] = []
     # Persist preview evidence and ensure company rows (Top‑10 only)
