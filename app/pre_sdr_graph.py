@@ -388,13 +388,6 @@ async def _resolve_tenant_id_for_write(state: dict) -> Optional[int]:
             return int(v)
     except Exception:
         pass
-    # Default tenant for server-side jobs (env)
-    try:
-        v = os.getenv("DEFAULT_TENANT_ID")
-        if v and v.isdigit():
-            return int(v)
-    except Exception:
-        pass
     # Infer from ODOO_POSTGRES_DSN via odoo_connections
     try:
         inferred_db = None
@@ -532,6 +525,60 @@ def _fmt_top10_md(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
+def _stash_top10_in_thread_memory(state: dict, top: list[dict]) -> None:
+    """Store Top-10 domains in thread memory (message additional_kwargs) for reuse.
+
+    We avoid relying on env DEFAULT_TENANT_ID by keeping shortlist in-thread.
+    """
+    try:
+        # Keep only first 10; store minimal fields to reduce payload size
+        rows = []
+        for it in (top or [])[:10]:
+            if not isinstance(it, dict):
+                continue
+            dom = (it.get("domain") or "").strip().lower()
+            if not dom:
+                continue
+            rows.append({
+                "domain": dom,
+                "score": it.get("score"),
+                "why": it.get("why"),
+                "snippet": it.get("snippet"),
+            })
+        if not rows:
+            return
+        mem_msg = AIMessage(content="", additional_kwargs={"top10_memory": rows})
+        state["messages"] = add_messages(state.get("messages") or [], [mem_msg])
+    except Exception:
+        # Never block routing on memory write
+        pass
+
+
+def _load_top10_from_thread_memory(state: dict) -> list[dict]:
+    """Read Top-10 shortlist from thread memory messages, newest-first."""
+    try:
+        for msg in reversed(state.get("messages") or []):
+            if not isinstance(msg, AIMessage):
+                continue
+            try:
+                extra = getattr(msg, "additional_kwargs", {}) or {}
+            except Exception:
+                extra = {}
+            mem = extra.get("top10_memory")
+            if isinstance(mem, list) and mem:
+                out = []
+                for it in mem:
+                    if isinstance(it, dict) and (it.get("domain")):
+                        out.append(it)
+                    elif isinstance(it, str):
+                        out.append({"domain": it})
+                if out:
+                    return out
+    except Exception:
+        return []
+    return []
+
+
 def _save_icp_rule_sync(tid: int, payload: dict, name: str = "Default ICP") -> None:
     # Upsert an ICP rule row for this tenant; rely on RLS via GUC
     with get_conn() as conn, conn.cursor() as cur:
@@ -612,12 +659,6 @@ def _resolve_tenant_id_for_write_sync(state: dict) -> Optional[int]:
     try:
         v = state.get("tenant_id") if isinstance(state, dict) else None
         if v is not None:
-            return int(v)
-    except Exception:
-        pass
-    try:
-        v = os.getenv("DEFAULT_TENANT_ID")
-        if v and v.isdigit():
             return int(v)
     except Exception:
         pass
@@ -3929,6 +3970,11 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         state["agent_top10"] = top
                                     except Exception:
                                         pass
+                                    # Also stash into thread memory so next turn can reuse without DB
+                                    try:
+                                        _stash_top10_in_thread_memory(state, top)
+                                    except Exception:
+                                        pass
                                     # Pretty Top‑10 table (separate message from ICP Profile)
                                     top_lines: list[str]
                                     try:
@@ -4372,7 +4418,13 @@ async def enrich_node(state: GraphState) -> GraphState:
         top10 = state.get("agent_top10") or []
     except Exception:
         top10 = []
-    # Try loading last persisted Top‑10 preview for this tenant if not present in memory
+    # Try loading Top‑10 from thread memory first (avoids re-discovery on 'run enrichment')
+    if not (isinstance(top10, list) and top10):
+        mem_top = _load_top10_from_thread_memory(state)
+        if isinstance(mem_top, list) and mem_top:
+            top10 = mem_top
+
+    # Try loading last persisted Top‑10 preview for this tenant if still not present
     if not (isinstance(top10, list) and top10):
         try:
             tid = await _resolve_tenant_id_for_write(state)
