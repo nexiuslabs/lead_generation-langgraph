@@ -162,6 +162,14 @@ class BGWorker:
 
     async def run(self) -> None:
         pool = await asyncpg.create_pool(dsn=self._dsn, min_size=1, max_size=max(2, self._max))
+        try:
+            import urllib.parse as _up
+            pr = _up.urlparse(self._dsn)
+            logging.getLogger("bg").info(
+                "[bg] connected dsn host=%s db=%s", pr.hostname or "", (pr.path or "/").lstrip("/")
+            )
+        except Exception:
+            pass
         listen_task = asyncio.create_task(self._listen())
         try:
             while not self._stop.is_set():

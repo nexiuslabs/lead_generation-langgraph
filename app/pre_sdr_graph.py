@@ -198,39 +198,88 @@ def _enqueue_next40_if_applicable(state) -> None:
         preview_doms: list[str] = []
         with __get_conn() as __c2, __c2.cursor() as __cur2:
             try:
-                # Collect preview Top‑10 first (for total + exclusion)
+                # Fetch latest preview batch_id for this tenant (most recent preview row)
                 __cur2.execute(
                     """
-                    SELECT domain
-                    FROM staging_global_companies
-                    WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
-                    ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
-                    LIMIT 10
+                    SELECT ai_metadata->>'batch_id'
+                      FROM staging_global_companies
+                     WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                     ORDER BY created_at DESC
+                     LIMIT 1
                     """,
                     (_tidv,),
                 )
-                _p = __cur2.fetchall() or []
-                preview_doms = [str(r[0]) for r in _p if r and r[0]]
-                # Now select the next 40 from staged web discovery excluding preview
-                __cur2.execute(
-                    """
-                    SELECT domain
-                    FROM staging_global_companies
-                    WHERE tenant_id=%s
-                      AND source = 'web_discovery'
-                      AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
-                      AND NOT LOWER(domain) = ANY(%s)
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (_tidv, [d.lower() for d in preview_doms] or [''], bg_limit),
-                )
+                row_bid = __cur2.fetchone()
+                batch_id = (row_bid and row_bid[0]) or None
+                preview_doms = []
+                if batch_id:
+                    __cur2.execute(
+                        """
+                        SELECT domain
+                          FROM staging_global_companies
+                         WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                           AND ai_metadata->>'batch_id'=%s
+                         ORDER BY created_at DESC
+                         LIMIT 10
+                        """,
+                        (_tidv, batch_id),
+                    )
+                    _p = __cur2.fetchall() or []
+                    preview_doms = [str(r[0]) for r in _p if r and r[0]]
+                    __cur2.execute(
+                        """
+                        SELECT domain
+                          FROM staging_global_companies
+                         WHERE tenant_id=%s
+                           AND source = 'web_discovery'
+                           AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                           AND ai_metadata->>'batch_id'=%s
+                           AND NOT LOWER(domain) = ANY(%s)
+                         ORDER BY created_at DESC
+                         LIMIT %s
+                        """,
+                        (_tidv, batch_id, [d.lower() for d in preview_doms] or [''], bg_limit),
+                    )
+                else:
+                    # Fallback for older runs without batch_id (use recent preview as exclusion)
+                    __cur2.execute(
+                        """
+                        SELECT domain
+                          FROM staging_global_companies
+                         WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                         ORDER BY created_at DESC
+                         LIMIT 10
+                        """,
+                        (_tidv,),
+                    )
+                    _p = __cur2.fetchall() or []
+                    preview_doms = [str(r[0]) for r in _p if r and r[0]]
+                    __cur2.execute(
+                        """
+                        SELECT domain
+                          FROM staging_global_companies
+                         WHERE tenant_id=%s
+                           AND source = 'web_discovery'
+                           AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                           AND NOT LOWER(domain) = ANY(%s)
+                         ORDER BY created_at DESC
+                         LIMIT %s
+                        """,
+                        (_tidv, [d.lower() for d in preview_doms] or [''], bg_limit),
+                    )
                 rows = __cur2.fetchall() or []
                 doms = [str(r[0]) for r in rows if r and r[0]]
-                __cur2.execute(
-                    "SELECT COUNT(*) FROM staging_global_companies WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true",
-                    (_tidv,),
-                )
+                # Compute preview_total within this batch when available
+                if batch_id:
+                    __cur2.execute(
+                        "SELECT COUNT(*) FROM staging_global_companies WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true AND ai_metadata->>'batch_id'=%s",
+                        (_tidv, batch_id),
+                    )
+                else:
+                    __cur2.execute(
+                        "SELECT COUNT(*) FROM staging_global_companies WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true",
+                        (_tidv,),
+                    )
                 cr = __cur2.fetchone()
                 preview_total = int(cr[0] or 0) if cr else 0
             except Exception:
@@ -772,6 +821,16 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
     try:
         # Staging with per-domain ai_metadata (score/why/snippet provenance)
         per_meta: dict[str, dict] = {}
+        # Detect a lead_profile from any item (agents may attach it), else omit
+        _lead_profile = None
+        for it in (top or [])[:10]:
+            try:
+                lp = it.get("lead_profile") if isinstance(it, dict) else None
+                if isinstance(lp, str) and lp.strip():
+                    _lead_profile = lp.strip()
+                    break
+            except Exception:
+                continue
         for it in (top or [])[:10]:
             if not isinstance(it, dict):
                 continue
@@ -785,12 +844,13 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
                 "why": it.get("why"),
                 "snippet": (it.get("snippet") or "")[:200],
                 "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
+                **({"lead_profile": _lead_profile} if _lead_profile else {}),
             }
         # Persist Top‑10 preview rows
         _ = _persist_web_candidates_to_staging(
             [str(it.get("domain")) for it in (top or [])[:10] if isinstance(it, dict) and it.get("domain")],
             int(tid) if isinstance(tid, int) else None,
-            ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
+            ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}, **({"lead_profile": _lead_profile} if _lead_profile else {})},
             per_domain_meta=per_meta,
         )
         # Persist remainder (beyond Top‑10) as non‑preview rows so Next‑40 can be enqueued reliably
@@ -803,7 +863,7 @@ def _persist_top10_preview(tid: Optional[int], top: list[dict]) -> None:
             _persist_web_candidates_to_staging(
                 rest,
                 int(tid) if isinstance(tid, int) else None,
-                ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}},
+                ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}, **({"lead_profile": _lead_profile} if _lead_profile else {})},
             )
     except Exception:
         pass

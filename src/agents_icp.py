@@ -17,6 +17,10 @@ from bs4 import BeautifulSoup
 from langchain_openai import ChatOpenAI
 from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
 try:
+    from src.settings import ICP_SG_PROFILES  # type: ignore
+except Exception:  # pragma: no cover
+    ICP_SG_PROFILES = False  # type: ignore
+try:
     from src.settings import STRICT_INDUSTRY_QUERY_ONLY  # type: ignore
 except Exception:  # pragma: no cover
     STRICT_INDUSTRY_QUERY_ONLY = True  # type: ignore
@@ -61,6 +65,20 @@ def set_seed_hints(hints: List[str] | None):
 
 from src.icp_pipeline import collect_evidence_for_domain
 from src.jina_reader import read_url as jina_read
+try:
+    from src.config_profiles import (
+        load_profiles as _load_sg_cfg,
+        is_singapore_page as _is_sg_page,
+        is_valid_fqdn as _is_valid_fqdn,
+        is_denied_host as _is_denied_host,
+        score_profile as _score_profile,
+        bucket as _bucket,
+    )
+except Exception:  # pragma: no cover
+    _load_sg_cfg = None  # type: ignore
+    _is_sg_page = None  # type: ignore
+    _is_valid_fqdn = None  # type: ignore
+    _is_denied_host = None  # type: ignore
 
 
 # Core state keys (subset)
@@ -620,6 +638,13 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             country_hint = 'sg'
     except Exception:
         country_hint = None
+    # If SG profiles feature is enabled, force SG region bias
+    try:
+        if ICP_SG_PROFILES:
+            country_hint = 'sg'
+    except Exception:
+        pass
+
     # Compose one concise DDG query from ICP via LLM (fallback to heuristic terms join)
     def _llm_compose_ddg_query() -> Optional[str]:
         try:
@@ -703,6 +728,40 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.info("[plan] ddg fail: %s", e)
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
+    # Apply deny/host hygiene for SG profiles
+    if ICP_SG_PROFILES and uniq:
+        cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+        _f: list[str] = []
+        counts = {"kept": 0, "DOMAIN_HYGIENE": 0, "DENY_HOST": 0}
+        for d in uniq:
+            try:
+                dn = str(d).strip().lower()
+                if _is_valid_fqdn and not _is_valid_fqdn(dn):
+                    try:
+                        log.info("[plan] drop %s reason=DOMAIN_HYGIENE", dn)
+                    except Exception:
+                        pass
+                    counts["DOMAIN_HYGIENE"] += 1
+                    continue
+                if _is_denied_host and _is_denied_host(dn, cfg):
+                    try:
+                        log.info("[plan] drop %s reason=DENY_HOST", dn)
+                    except Exception:
+                        pass
+                    counts["DENY_HOST"] += 1
+                    continue
+                _f.append(dn)
+                counts["kept"] += 1
+            except Exception:
+                continue
+        uniq = _f
+        try:
+            log.info(
+                "[plan] sg_filter kept=%s drop_hygiene=%s drop_deny=%s",
+                counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST")
+            )
+        except Exception:
+            pass
     # If nothing found, retry once with a safe default query focused on SG
     if not uniq and (country_hint == 'sg'):
         try:
@@ -979,6 +1038,8 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
         # Analyze a smaller head to reduce latency while keeping quality reasonable
         # Expand head to improve recall; we will still cap UI later
         HEAD = 12
+        # SG config (optional)
+        cfg = (_load_sg_cfg() if _load_sg_cfg else {})
         for d in cand[:HEAD]:
             url = f"https://{d}"
             try:
@@ -998,12 +1059,49 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                         # Still record a minimal placeholder to keep candidate in flow
                         fb_txt = d
                     # Relax gating on fallback snippets: do not drop due to missing industry tokens
-                    ev_list.append({"domain": d, "summary": str(fb_txt)[:4000]})
+                    # SG gating: accept .sg; for non-.sg require SG markers in fallback text when feature is on
+                    allow = True
+                    if ICP_SG_PROFILES:
+                        try:
+                            allow = (str(d).lower().endswith('.sg')) or (
+                                _is_sg_page and _is_sg_page(str(fb_txt), cfg)
+                            )
+                        except Exception:
+                            allow = str(d).lower().endswith('.sg')
+                    if allow:
+                        ev_list.append({"domain": d, "summary": str(fb_txt)[:4000]})
+                    else:
+                        try:
+                            log.info("[mini] drop %s reason=NO_SG_MARKERS_FALLBACK", d)
+                        except Exception:
+                            pass
                 else:
                     low = str(summ).lower()
+                    # Industry gating
                     if ind_toks and not any(tok in low for tok in ind_toks):
                         # Skip off-industry entries
+                        try:
+                            log.info("[mini] drop %s reason=INDUSTRY_GATING", d)
+                        except Exception:
+                            pass
                         continue
+                    # SG gating when feature is enabled: accept .sg or require SG markers in text
+                    if ICP_SG_PROFILES:
+                        try:
+                            if (not str(d).lower().endswith('.sg')) and not (_is_sg_page and _is_sg_page(str(summ), cfg)):
+                                # Skip non-SG pages with no SG markers
+                                try:
+                                    log.info("[mini] drop %s reason=NO_SG_MARKERS", d)
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception:
+                            if not str(d).lower().endswith('.sg'):
+                                try:
+                                    log.info("[mini] drop %s reason=NO_SG_MARKERS", d)
+                                except Exception:
+                                    pass
+                                continue
                     ev_list.append({"domain": d, "summary": str(summ)[:4000]})
             except Exception as e:
                 log.info("[mini] jina fail domain=%s err=%s", d, e)
@@ -1017,43 +1115,46 @@ def plan_top10_with_reasons(icp_profile: Dict[str, Any], tenant_id: int | None =
                     fb = d
                 if fb:
                     ev_list.append({"domain": d, "summary": str(fb)[:4000]})
-        # 3) extract
+        # 3) extract (micro-ICP signals) then 4) score using profile-weighted helper
         st2 = {"evidence": ev_list}
         st2 = evidence_extractor(st2)
-        # 4) score
-        st3 = scoring_and_gating(st2)
-        scores = st3.get("scores") or []
-        # Build reason lines for scored head
+        cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+        profile_name = None
+        try:
+            p = (icp_profile or {}).get("lead_profile")
+            if isinstance(p, str) and p.strip():
+                profile_name = p.strip()
+            else:
+                profile_name = (cfg.get("profile") or "sg_employer_buyers")
+        except Exception:
+            profile_name = (cfg.get("profile") or "sg_employer_buyers")
+        # Build items by rescoring each evidence summary
         top: List[Dict[str, Any]] = []
-        for srow in scores:
-            why_bits = []
-            r = srow.get("reason") or {}
-            ints = r.get("integrations") or []
-            if ints:
-                why_bits.append(f"integrations: {', '.join(ints[:3])}")
-            titles = r.get("titles") or []
-            if titles:
-                why_bits.append(f"titles: {', '.join(titles[:3])}")
-            if r.get("pricing"):
-                why_bits.append("pricing page found")
-            if r.get("case_studies"):
-                why_bits.append("case studies")
-            dom = srow.get("domain")
-            # Surface Jina snippet (short)
-            snip_raw = jina_snips.get(dom) if isinstance(jina_snips, dict) else None
+        for ev in (st2.get("evidence") or []):
             try:
-                snip = (" ".join((snip_raw or "").split()))[:180]
-            except Exception:
+                dom = ev.get("domain")
+                summ = ev.get("summary") or ""
+                sc, why_bits, br = _score_profile(str(summ), str(dom), profile_name, cfg)
+                # Prefer Jina short snippet if available
+                snip_raw = jina_snips.get(dom) if isinstance(jina_snips, dict) else None
                 snip = None
-            top.append({
-                "domain": srow.get("domain"),
-                "score": srow.get("score"),
-                "bucket": srow.get("bucket"),
-                "why": "; ".join(why_bits) if why_bits else "signal match",
-                "snippet": snip,
-            })
-        # Sort by score desc
-        top = sorted(top, key=lambda x: int(x.get("score") or 0), reverse=True)
+                try:
+                    snip = (" ".join((snip_raw or "").split()))[:180]
+                except Exception:
+                    snip = None
+                top.append({
+                    "domain": dom,
+                    "score": int(sc),
+                    "bucket": _bucket(sc),
+                    "why": "; ".join(why_bits) if why_bits else "signal match",
+                    "snippet": snip,
+                    "breakdown": br,
+                    "lead_profile": profile_name,
+                })
+            except Exception:
+                continue
+        # Sort by score desc and cap
+        top = sorted([it for it in top if it.get("domain")], key=lambda x: int(x.get("score") or 0), reverse=True)
         # If fewer than desired, backfill using additional candidates (heuristic scoring) and seeds/legacy fallbacks
         DESIRED = 50
         if len(top) < DESIRED:

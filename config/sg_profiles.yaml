@@ -1,0 +1,28 @@
+region: sg
+sg_markers:
+  - "\\bSingapore\\b"
+  - "\\+65"
+  - "\\b\\d{6}\\b"
+deny:
+  apex:
+    - w3.org
+    - ifrs.org
+    - ilo.org
+    - oecd.org
+    - deloitte.com
+    - grandviewresearch.com
+    - umbrex.com
+    - 10times.com
+    - tradefairdates.com
+    - interpack.com
+    - pack-print.de
+    - exhibitorsvoice.com
+    - expotobi.com
+    - cantonfair.net
+  host_suffix:
+    - gov.sg
+    - edu.sg
+    - mil
+    - int
+  path_regex: "(?i)/(standards?|regulations?|policy|association|directory|glossary|wiki|expo|tradefair|event|conference|exhibition|exhibitors)/"
+

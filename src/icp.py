@@ -174,11 +174,52 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
     year = _parse_year(raw_year)
     # Founded year mirrors incorporation if available
     founded = year
-    # sg_registered heuristic if missing
+    def _norm_company_name(s: Optional[str]) -> list[str]:
+        if not s:
+            return []
+        import re as _re
+        t = (s or "").lower()
+        t = _re.sub(r"[^a-z0-9\s]", " ", t)
+        # remove common legal suffixes and stopwords
+        stop = {
+            "pte", "ltd", "pte ltd", "private", "limited", "llc", "inc", "co", "plc",
+            "the", "company", "singapore",
+        }
+        toks = [w for w in t.split() if w and w not in stop]
+        return toks
+
+    def _name_match_confidence(a: Optional[str], b: Optional[str]) -> float:
+        ta = set(_norm_company_name(a))
+        tb = set(_norm_company_name(b))
+        if not ta or not tb:
+            return 0.0
+        inter = len(ta & tb)
+        denom = len(ta) + len(tb)
+        # Sørensen–Dice like similarity
+        return (2.0 * inter / denom) if denom else 0.0
+
+    # sg_registered gating: only consider True when UEN is present and name match is reasonable
     sg = r.get("sg_registered")
     if sg is None:
+        uen = (r.get("uen") or "").strip() if r.get("uen") is not None else ""
         status = (r.get("entity_status_description") or "").lower()
-        sg = True if status and ("live" in status or "active" in status) else None
+        if uen:
+            sg = True if ("live" in status or "active" in status) else None
+        else:
+            sg = None
+
+    # Compute UEN confidence using name similarity when available
+    try:
+        uen_conf = None
+        if (r.get("uen") or "").strip():
+            # Compare staging entity_name vs normalized final name if both present
+            e_name = r.get("entity_name") or r.get("name")
+            f_name = name or r.get("name")
+            c = _name_match_confidence(str(e_name) if e_name else None, str(f_name) if f_name else None)
+            # If we lack one side, keep a high default; else use computed similarity scaled to [0,1]
+            uen_conf = c if (e_name and f_name) else 1.0
+    except Exception:
+        uen_conf = 1.0 if r.get("uen") else None
 
     norm = {
         "company_id": r.get("company_id"),
@@ -191,6 +232,8 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "founded_year": founded,
         "ownership_type": _norm_str(r.get("ownership_type")),
         "sg_registered": sg,
+        # Confidence derived from name similarity when possible
+        "uen_confidence": uen_conf,
     }
     return norm
 
