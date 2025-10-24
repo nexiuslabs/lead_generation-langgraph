@@ -3,12 +3,19 @@
 import logging
 import re
 from typing import Any, Dict, List, Optional, Set, TypedDict
+import os
 
 from langgraph.graph import END, StateGraph
 
 from src.database import get_conn
 
 log = logging.getLogger(__name__)
+
+# Minimum confidence required to set sg_registered based on UEN resolution
+try:
+    UEN_CONFIDENCE_MIN: float = float(os.getenv("UEN_CONFIDENCE_MIN", "0.7") or 0.7)
+except Exception:
+    UEN_CONFIDENCE_MIN = 0.7
 
 # ---------- State types ----------
 
@@ -198,16 +205,6 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
         # Sørensen–Dice like similarity
         return (2.0 * inter / denom) if denom else 0.0
 
-    # sg_registered gating: only consider True when UEN is present and name match is reasonable
-    sg = r.get("sg_registered")
-    if sg is None:
-        uen = (r.get("uen") or "").strip() if r.get("uen") is not None else ""
-        status = (r.get("entity_status_description") or "").lower()
-        if uen:
-            sg = True if ("live" in status or "active" in status) else None
-        else:
-            sg = None
-
     # Compute UEN confidence using name similarity when available
     try:
         uen_conf = None
@@ -220,6 +217,17 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
             uen_conf = c if (e_name and f_name) else 1.0
     except Exception:
         uen_conf = 1.0 if r.get("uen") else None
+
+    # sg_registered gating: only consider True when UEN is present, status is live/active,
+    # and confidence meets minimum threshold
+    sg = r.get("sg_registered")
+    if sg is None:
+        uen = (r.get("uen") or "").strip() if r.get("uen") is not None else ""
+        status = (r.get("entity_status_description") or "").lower()
+        if uen and ("live" in status or "active" in status) and (uen_conf is not None) and (float(uen_conf) >= float(UEN_CONFIDENCE_MIN)):
+            sg = True
+        else:
+            sg = None
 
     norm = {
         "company_id": r.get("company_id"),
@@ -307,6 +315,9 @@ def _upsert_companies_batch(rows: List[Dict[str, Any]]) -> int:
             if r.get("uen") is not None and "uen" in cols:
                 insert_cols.append("uen")
                 params.append(r.get("uen"))
+            if r.get("uen_confidence") is not None and "uen_confidence" in cols:
+                insert_cols.append("uen_confidence")
+                params.append(r.get("uen_confidence"))
             if r.get("name") is not None and "name" in cols:
                 insert_cols.append("name")
                 params.append(r.get("name"))

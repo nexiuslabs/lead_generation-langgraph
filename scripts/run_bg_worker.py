@@ -29,7 +29,17 @@ class BGWorker:
             logging.getLogger("bg").info("[bg] LISTEN disabled (DB connect failed); polling only")
             return
         try:
-            await conn.add_listener("bg_jobs", self._on_notify)  # type: ignore[attr-defined]
+            # asyncpg.add_listener is a sync API; do not await
+            try:
+                conn.add_listener("bg_jobs", self._on_notify)  # type: ignore[attr-defined]
+            except TypeError:
+                # Some asyncpg variants use a different signature; wrap to ignore extra args
+                def _cb(*_args):
+                    try:
+                        self._on_notify()
+                    except Exception:
+                        pass
+                conn.add_listener("bg_jobs", _cb)  # type: ignore[attr-defined]
         except Exception:
             # Some asyncpg versions use different API; fallback to raw SQL LISTEN loop
             await conn.execute("LISTEN bg_jobs")
