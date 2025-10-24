@@ -728,8 +728,8 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.info("[plan] ddg fail: %s", e)
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
-    # Apply deny/host hygiene for SG profiles
-    if ICP_SG_PROFILES and uniq:
+    # Apply deny/host hygiene using profiles config (always on; not gated by ICP_SG_PROFILES)
+    if uniq:
         cfg = (_load_sg_cfg() if _load_sg_cfg else {})
         _f: list[str] = []
         counts = {"kept": 0, "DOMAIN_HYGIENE": 0, "DENY_HOST": 0}
@@ -757,7 +757,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         uniq = _f
         try:
             log.info(
-                "[plan] sg_filter kept=%s drop_hygiene=%s drop_deny=%s",
+                "[plan] host_filter kept=%s drop_hygiene=%s drop_deny=%s",
                 counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST")
             )
         except Exception:
