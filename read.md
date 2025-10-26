@@ -51,6 +51,18 @@ Optional / Recommended
 - CRAWL_MAX_PAGES: default `6` (total site pages after homepage)
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
 - ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
+
+PRD‑Opt (SG Profiles)
+- ICP_SG_PROFILES: set to `1` to enable Singapore‑focused discovery gating, denylists, and markers.
+- SG_PROFILES_CONFIG: path to YAML (default `config/sg_profiles.yaml`) to override profiles/weights/deny rules.
+- DDG_KL: optional region hint like `sg-en` (automatically applied when SG profiles are enabled).
+
+Examples:
+```
+ICP_SG_PROFILES=1
+SG_PROFILES_CONFIG=config/sg_profiles.yaml
+DDG_KL=sg-en
+```
  
 
 Example `.env` (do not use real keys here)
@@ -198,6 +210,22 @@ Logs & Output
 
 ## Scheduler & Cron
 - Start the async scheduler: `python lead_generation-main/scripts/run_scheduler.py`
+
+## PRD‑Opt Lead Profiles
+- Default lead profile is `sg_employer_buyers`. Available profiles: `sg_employer_buyers`, `sg_referral_partners`, `sg_generic_leads`.
+- To change the default globally, set `profile:` in `config/sg_profiles.yaml`:
+```
+profile: sg_referral_partners
+```
+- To override per‑run programmatically (advanced), pass a `lead_profile` key into the `icp_profile` you send to the agent Top‑10 planner (e.g., when invoking `src.agents_icp.plan_top10_with_reasons(icp_profile, tenant_id)`). The planner will carry `lead_profile` into `ai_metadata` for Top‑10 and the staged remainder.
+
+## Running Tests
+Run tests from the repo root, pointing `PYTHONPATH` at the backend package:
+```
+PYTHONPATH=lead_generation-main pytest -q
+```
+If your environment disallows writing to `/tmp`, configure a tmpdir for `pytest` via `--basetemp`.
+
 - Control start time via `SCHED_START_CRON` (default `0 1 * * *` for 01:00 SGT)
 - Limits & caps:
   - `SCHED_DAILY_CAP_PER_TENANT` (default 20)

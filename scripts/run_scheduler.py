@@ -21,10 +21,20 @@ async def main_async():
         )
         return
 
-    from run_nightly import run_all, list_active_tenants
+    # Load environment from .env so schedule can be controlled there
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()  # default search (cwd)
+        load_dotenv(os.path.join(_ROOT, ".env"))  # project root
+    except Exception:
+        pass
+
+    # Import nightly runner with a package-qualified path
+    from scripts.run_nightly import run_all, list_active_tenants
 
     logging.basicConfig(level=logging.INFO)
-    tz = ZoneInfo("Asia/Singapore")
+    # Adjustable timezone and cron from env/.env
+    tz = ZoneInfo(os.getenv("SCHED_TZ", "Asia/Singapore"))
     cron = os.getenv("SCHED_START_CRON", "0 1 * * *")
     try:
         minute, hour, dom, month, dow = cron.split()

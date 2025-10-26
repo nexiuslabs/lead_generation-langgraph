@@ -303,3 +303,11 @@ try:
 except Exception:
     DDG_MAX_CALLS = 2
 DDG_KL = os.getenv("DDG_KL", "")  # e.g., 'sg-en', 'us-en'
+
+# Feature flag: enable SG-focused profiles (discovery gating, deny lists, markers)
+ICP_SG_PROFILES = os.getenv("ICP_SG_PROFILES", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

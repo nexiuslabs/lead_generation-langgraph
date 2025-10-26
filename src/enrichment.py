@@ -75,6 +75,7 @@ from src.settings import (
 )
 from src.settings import ENRICH_RECHECK_DAYS, ENRICH_SKIP_IF_ANY_HISTORY
 from src.settings import ENRICH_AGENTIC, ENRICH_AGENTIC_MAX_STEPS
+from src.config_profiles import deny_path_regex as _deny_path_regex
 
 load_dotenv()
 
@@ -409,6 +410,113 @@ def _cache_get(conn, email: str) -> Optional[dict]:
     except Exception:
         return None
     return None
+
+# ---- SG cue extraction helpers -----------------------------------------------
+_RE_SG_PHONE = re.compile(r"\+65[\s\-]?(?:\d\s?){8}")
+_RE_SG_POSTCODE = re.compile(r"\b\d{6}\b")
+
+
+def _extract_sg_cues(text: str) -> dict:
+    out: dict[str, Any] = {}
+    try:
+        if not text:
+            return out
+        phs = _RE_SG_PHONE.findall(text)
+        if phs:
+            out["sg_phone"] = sorted(set([p.strip() for p in phs]))[0]
+        m_pc = _RE_SG_POSTCODE.search(text)
+        if m_pc:
+            out["sg_postcode"] = m_pc.group(0)
+        # markers array: Singapore text marker, plus65, postcode
+        markers: list[str] = []
+        if re.search(r"\bSingapore\b", text, re.I):
+            markers.append("singapore_text")
+        if phs:
+            markers.append("plus65")
+        if m_pc:
+            markers.append("postcode6")
+        if markers:
+            out["sg_markers"] = sorted(set(markers))
+    except Exception:
+        pass
+    return out
+
+_COMPLIANCE_TOKENS = [
+    ("mom", "MOM"),
+    ("tafep", "TAFEP"),
+    ("tadm", "TADM"),
+    ("wfl", "WFL"),
+    ("wica", "WICA"),
+    ("wsh", "WSH"),
+    ("cpf", "CPF"),
+    ("pdpa", "PDPA"),
+]
+_HRIS_TOKENS = [
+    "hris",
+    "payroll",
+    "leave management",
+    "claims",
+    "timesheets",
+    "workday",
+    "successfactors",
+    "bamboohr",
+    "rippling",
+    "deel",
+    "gusto",
+]
+
+
+def _extract_compliance_and_hris(text: str) -> dict:
+    """Detect SG compliance bodies and HRIS hints from combined text corpus.
+
+    Returns keys: sg_compliance_triggers (list), hris_hints (list), hiring_intensity (int)
+    """
+    out: dict[str, Any] = {}
+    try:
+        low = (text or "").lower()
+        if not low:
+            return out
+        comps = []
+        for pat, label in _COMPLIANCE_TOKENS:
+            if pat in low:
+                comps.append(label)
+        if comps:
+            out["sg_compliance_triggers"] = sorted(set(comps))
+        hints = []
+        for tok in _HRIS_TOKENS:
+            if tok in low:
+                hints.append(tok)
+        if hints:
+            out["hris_hints"] = sorted(set(hints))
+        # lightweight hiring intensity: count occurrences
+        out["hiring_intensity"] = sum(low.count(k) for k in ["hiring", "careers", "jobs"])
+    except Exception:
+        pass
+    return out
+
+
+def _update_company_sg_fields(conn, company_id: int, fields: dict) -> None:
+    try:
+        cols = _get_table_columns(conn, "companies")
+        to_set: list[tuple[str, Any]] = []
+        if "sg_phone" in cols and fields.get("sg_phone"):
+            to_set.append(("sg_phone", fields.get("sg_phone")))
+        if "sg_postcode" in cols and fields.get("sg_postcode"):
+            to_set.append(("sg_postcode", fields.get("sg_postcode")))
+        if "sg_markers" in cols and fields.get("sg_markers"):
+            to_set.append(("sg_markers", fields.get("sg_markers")))
+        if "domain_hygiene" in cols and fields.get("domain_hygiene") is not None:
+            to_set.append(("domain_hygiene", bool(fields.get("domain_hygiene"))))
+        if not to_set:
+            return
+        with conn.cursor() as cur:
+            set_sql = ", ".join([f"{k}=%s" for k, _ in to_set])
+            cur.execute(
+                f"UPDATE companies SET {set_sql} WHERE company_id=%s",
+                tuple([v for _, v in to_set] + [company_id]),
+            )
+    except Exception:
+        pass
 
 
 def _cache_set(conn, email: str, status: str, confidence: float) -> None:
@@ -904,6 +1012,7 @@ async def _discover_relevant_urls(home_url: str, max_pages: int) -> list[str]:
             return urls
         soup = BeautifulSoup(html, "html.parser")
         found = set()
+        deny_pat = _deny_path_regex()
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if (
@@ -915,6 +1024,11 @@ async def _discover_relevant_urls(home_url: str, max_pages: int) -> list[str]:
             full = urljoin(base, href)
             if urlparse(full).netloc != urlparse(base).netloc:
                 continue
+            try:
+                if deny_pat.search(urlparse(full).path or ""):
+                    continue
+            except Exception:
+                pass
             label = (a.get_text(" ", strip=True) or href).lower()
             if any(k in label for k in CRAWL_KEYWORDS) or any(
                 k in full.lower() for k in CRAWL_KEYWORDS
@@ -2150,6 +2264,35 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
         logger.warning("   ↳ jina merge timed out; skipping")
     except Exception:
         logger.warning("   ↳ jina merge skipped", exc_info=True)
+    # SG cues post-processing from combined chunks/pages
+    try:
+        all_text = "\n\n".join([c for c in (state.get("chunks") or []) if isinstance(c, str)])
+        if not all_text and state.get("extracted_pages"):
+            bodies: list[str] = []
+            for p in state.get("extracted_pages") or []:
+                b = p.get("html") or p.get("raw_content") or p.get("content")
+                if isinstance(b, dict):
+                    b = b.get("text")
+                if isinstance(b, str):
+                    bodies.append(b)
+            all_text = "\n\n".join(bodies)
+        cues = _extract_sg_cues(all_text or "") if all_text else {}
+        if cues:
+            if not data.get("hq_city") and (cues.get("sg_markers") or cues.get("sg_postcode") or cues.get("sg_phone")):
+                data.setdefault("hq_city", "Singapore")
+            # Merge cue fields into data for persistence
+            for k in ("sg_phone", "sg_postcode", "sg_markers"):
+                v = cues.get(k)
+                if v:
+                    data[k] = v
+        # Compliance + HRIS hints
+        ch = _extract_compliance_and_hris(all_text or "") if all_text else {}
+        for k in ("sg_compliance_triggers", "hris_hints", "hiring_intensity"):
+            v = ch.get(k)
+            if v:
+                data[k] = v
+    except Exception:
+        pass
     state["data"] = data
     return state
 
@@ -2627,6 +2770,69 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
             update_company_core_fields(company_id, data)
         except Exception as exc:
             logger.exception("   ↳ update_company_core_fields failed")
+        # Log SG cues snapshot for observability
+        try:
+            if data.get("sg_markers") or data.get("sg_phone") or data.get("sg_postcode"):
+                logger.info(
+                    "[sg_cues] company_id=%s markers=%s phone=%s postcode=%s hq_city=%s",
+                    company_id,
+                    ",".join(data.get("sg_markers") or []),
+                    (data.get("sg_phone") or ""),
+                    (data.get("sg_postcode") or ""),
+                    (data.get("hq_city") or ""),
+                )
+        except Exception:
+            pass
+        # Persist SG-specific fields and domain hygiene if schema supports it
+        try:
+            # Compute domain hygiene: basic FQDN validation
+            dom = (data.get("website_domain") or state.get("home") or "").strip()
+            dom_ok = None
+            try:
+                if dom:
+                    from urllib.parse import urlparse
+                    net = urlparse(dom).netloc or dom
+                    # conservative check: must contain a dot and valid labels
+                    dom_ok = bool(re.match(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$", net))
+            except Exception:
+                dom_ok = None
+            fields = {
+                "sg_phone": data.get("sg_phone"),
+                "sg_postcode": data.get("sg_postcode"),
+                "sg_markers": data.get("sg_markers"),
+                "domain_hygiene": dom_ok if dom_ok is not None else None,
+            }
+            conn = get_db_connection()
+            with conn:
+                _update_company_sg_fields(conn, int(company_id), fields)
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            logger.warning("   ↳ sg fields persistence skipped", exc_info=True)
+        # Persist compliance/HRIS evidence snapshot into icp_evidence (best-effort)
+        try:
+            comps = data.get("sg_compliance_triggers") or []
+            hris = data.get("hris_hints") or []
+            if comps or hris:
+                hint = {
+                    "sg_compliance_triggers": comps,
+                    "hris_hints": hris,
+                    "hiring_intensity": data.get("hiring_intensity"),
+                }
+                with get_db_connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s,%s,%s,%s,'web_preview')",
+                        (
+                            _default_tenant_id(),
+                            int(company_id),
+                            "sg_compliance",
+                            Json(hint),
+                        ),
+                    )
+        except Exception:
+            pass
         # Best-effort projection of degradation reasons for this company
         try:
             reasons = ",".join(state.get("degraded_reasons") or []) or None

@@ -88,6 +88,7 @@ def upsert_company_from_staging(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any
     has_industry_col = _table_has_column("companies", "industry")
     has_status_col = _table_has_column("companies", "status")
     has_web_col = _table_has_column("companies", "website_domain")
+    has_acra_source_col = _table_has_column("companies", "acra_source")
 
     with get_conn() as conn, conn.cursor() as cur:
         cid: Optional[int] = None
@@ -104,6 +105,9 @@ def upsert_company_from_staging(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any
             if has_industry_col:
                 cols.append("industry")
                 vals.append(industry_title or None)
+            if has_acra_source_col:
+                cols.append("acra_source")
+                vals.append("staging_acra_companies")
             ph = ",".join(["%s"] * len(cols))
             cur.execute(
                 f"INSERT INTO companies({','.join(cols)}) VALUES ({ph}) "
@@ -113,6 +117,7 @@ def upsert_company_from_staging(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any
                 + (", status=EXCLUDED.status" if has_status_col else "")
                 + (", website_domain=COALESCE(companies.website_domain, EXCLUDED.website_domain)" if has_web_col else "")
                 + (", industry=EXCLUDED.industry" if has_industry_col else "")
+                + (", acra_source=EXCLUDED.acra_source" if has_acra_source_col else "")
                 + " RETURNING company_id",
                 tuple(vals),
             )
@@ -139,6 +144,8 @@ def upsert_company_from_staging(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any
                     sets.append(("website_domain", website_hint))
                 if has_industry_col:
                     sets.append(("industry", industry_title or None))
+                if has_acra_source_col:
+                    sets.append(("acra_source", "staging_acra_companies"))
                 set_sql = ", ".join([f"{k}=%s" for k, _ in sets])
                 cur.execute(
                     f"UPDATE companies SET {set_sql} WHERE company_id=%s",
@@ -156,6 +163,9 @@ def upsert_company_from_staging(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any
                 if has_industry_col:
                     cols.append("industry")
                     vals.append(industry_title or None)
+                if has_acra_source_col:
+                    cols.append("acra_source")
+                    vals.append("staging_acra_companies")
                 ph = ",".join(["%s"] * len(cols))
                 cur.execute(
                     f"INSERT INTO companies({','.join(cols)}) VALUES ({ph}) RETURNING company_id",

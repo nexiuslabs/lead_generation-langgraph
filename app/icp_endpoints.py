@@ -367,27 +367,49 @@ async def enrich_top10(
         next_domains: list[str] = []
         try:
             with get_conn() as conn, conn.cursor() as cur:
-                # Prefer staged web discovery rows excluding preview to select the next set
+                # Use the latest preview batch_id for this tenant to select remainder of this plan
                 cur.execute(
-                    """
-                    WITH preview AS (
-                      SELECT LOWER(domain) AS d
-                      FROM staging_global_companies
-                      WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
-                      ORDER BY COALESCE((ai_metadata->>'score')::float,0) DESC
-                      LIMIT %s
-                    )
-                    SELECT domain
-                      FROM staging_global_companies
-                     WHERE tenant_id=%s
-                       AND source='web_discovery'
-                       AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
-                       AND LOWER(domain) NOT IN (SELECT d FROM preview)
-                     ORDER BY created_at DESC
-                     LIMIT %s
-                    """,
-                    (tid, run_now_limit, tid, int(os.getenv("BG_NEXT_COUNT", "40") or 40)),
+                    "SELECT ai_metadata->>'batch_id' FROM staging_global_companies WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true ORDER BY created_at DESC LIMIT 1",
+                    (tid,),
                 )
+                rb = cur.fetchone()
+                batch_id = (rb and rb[0]) or None
+                if batch_id:
+                    cur.execute(
+                        """
+                        SELECT domain
+                          FROM staging_global_companies
+                         WHERE tenant_id=%s
+                           AND source='web_discovery'
+                           AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                           AND ai_metadata->>'batch_id'=%s
+                         ORDER BY created_at DESC
+                         LIMIT %s
+                        """,
+                        (tid, batch_id, int(os.getenv("BG_NEXT_COUNT", "40") or 40)),
+                    )
+                else:
+                    # Fallback: legacy behavior (exclude Top‑10 by recent preview table)
+                    cur.execute(
+                        """
+                        WITH preview AS (
+                          SELECT LOWER(domain) AS d
+                          FROM staging_global_companies
+                          WHERE tenant_id=%s AND COALESCE((ai_metadata->>'preview')::boolean,false)=true
+                          ORDER BY created_at DESC
+                          LIMIT %s
+                        )
+                        SELECT domain
+                          FROM staging_global_companies
+                         WHERE tenant_id=%s
+                           AND source='web_discovery'
+                           AND COALESCE((ai_metadata->>'preview')::boolean,false)=false
+                           AND LOWER(domain) NOT IN (SELECT d FROM preview)
+                         ORDER BY created_at DESC
+                         LIMIT %s
+                        """,
+                        (tid, run_now_limit, tid, int(os.getenv("BG_NEXT_COUNT", "40") or 40)),
+                    )
                 rows2 = cur.fetchall() or []
                 next_domains = [str(r[0]) for r in rows2 if r and r[0]]
         except Exception:
@@ -564,6 +586,16 @@ async def get_top10(
     # Persist to staging so Next‑40 can always be enqueued later
     try:
         from app.pre_sdr_graph import _persist_web_candidates_to_staging  # type: ignore
+        import uuid as _uuid
+        batch_id = str(_uuid.uuid4())
+        # Determine lead_profile used (if any)
+        lead_profile = None
+        try:
+            lp = (icp_profile or {}).get("lead_profile")
+            if isinstance(lp, str) and lp.strip():
+                lead_profile = lp.strip()
+        except Exception:
+            lead_profile = None
         # Build per-domain preview metadata for Top‑10
         per_meta: Dict[str, Dict[str, Any]] = {}
         for it in (top or [])[:10]:
@@ -578,6 +610,8 @@ async def get_top10(
                     "why": it.get("why"),
                     "snippet": (it.get("snippet") or "")[:200],
                     "provenance": {"agent": "agents_icp.plan_top10", "stage": "preview"},
+                    "batch_id": batch_id,
+                    **({"lead_profile": lead_profile} if lead_profile else {}),
                 }
             except Exception:
                 continue
@@ -586,7 +620,7 @@ async def get_top10(
             _persist_web_candidates_to_staging(
                 [str(it.get("domain")).strip().lower() for it in (top or [])[:10] if isinstance(it, dict) and it.get("domain")],
                 tid,
-                ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}},
+                ai_metadata={"provenance": {"agent": "agents_icp.plan_top10"}, "batch_id": batch_id, **({"lead_profile": lead_profile} if lead_profile else {})},
                 per_domain_meta=per_meta,
             )
         except Exception:
@@ -602,10 +636,20 @@ async def get_top10(
                 _persist_web_candidates_to_staging(
                     rest,
                     tid,
-                    ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}},
+                    ai_metadata={"provenance": {"agent": "agents_icp.plan_top10", "stage": "staging"}, "batch_id": batch_id, **({"lead_profile": lead_profile} if lead_profile else {})},
                 )
             except Exception:
                 pass
+        try:
+            log.info(
+                "[top10] persisted batch_id=%s preview_count=%s remainder_count=%s tenant_id=%s",
+                batch_id,
+                len((top or [])[:10]),
+                len(rest or []),
+                tid,
+            )
+        except Exception:
+            pass
     except Exception:
         # Best-effort; do not block Top‑10 response
         pass
