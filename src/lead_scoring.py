@@ -4,6 +4,7 @@ import json
 from langgraph.graph import StateGraph
 import os
 from src.database import get_pg_pool
+from src.settings import MISSING_FIRMO_PENALTY, FIRMO_MIN_COMPLETENESS_FOR_BONUS
 from sklearn.linear_model import LogisticRegression
 from src.openai_client import generate_rationale
 
@@ -21,7 +22,7 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT company_id, employees_est, revenue_bucket, sg_registered, incorporation_year FROM companies WHERE company_id = ANY($1)",
+            "SELECT company_id, employees_est, revenue_bucket, sg_registered, incorporation_year, industry_code FROM companies WHERE company_id = ANY($1)",
             state['candidate_ids']
         )
         # ResearchOps evidence counts for manual bonus (DevPlan19)
@@ -44,6 +45,7 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
             'sg_registered': row['sg_registered'],
             'incorporation_year': row['incorporation_year'],
             'research_ev_count': by_ev.get(row['company_id'], 0),
+            'industry_code': row['industry_code'],
         })
     state['lead_features'] = features
     return state
@@ -117,14 +119,28 @@ async def train_and_score(state: LeadScoringState) -> LeadScoringState:
         base = max(0.0, min(1.0, float(p)))
         base100 = int(round(base * 100))
         ev_cnt = int(feat.get('research_ev_count') or 0)
-        bonus = min(bonus_cap, ev_cnt * 5) if ev_cnt > 0 else 0
+        # Gate bonus by firmographics completeness (employees or industry present)
+        firmo_present = 0
+        if feat.get('employees_est') is not None:
+            firmo_present += 1
+        if feat.get('industry_code') is not None:
+            firmo_present += 1
+        if firmo_present >= max(1, int(FIRMO_MIN_COMPLETENESS_FOR_BONUS)):
+            bonus = min(bonus_cap, ev_cnt * 5) if ev_cnt > 0 else 0
+        else:
+            bonus = min(5, ev_cnt * 5) if ev_cnt > 0 else 0
         final = max(0, min(100, base100 + bonus))
+        # Apply penalty for missing firmographics and mark flag
+        firmo_missing = (feat.get('industry_code') is None) or (feat.get('employees_est') is None)
+        if firmo_missing:
+            final = max(0, final - int(MISSING_FIRMO_PENALTY))
         # A/B/C thresholds per DevPlan19
         bucket = 'A' if final >= 70 else ('B' if final >= 50 else 'C')
         lead_scores.append({
             'company_id': feat['company_id'],
             'score': float(final),
             'bucket': bucket,
+            'firmo_missing': bool(firmo_missing),
         })
     state['lead_scores'] = lead_scores
     return state
@@ -141,6 +157,12 @@ def assign_buckets(state: LeadScoringState) -> LeadScoringState:
             bucket = 'medium'
         else:
             bucket = 'low'
+        # Enforce demotion when firmographics missing: never allow 'high'
+        try:
+            if bucket == 'high' and bool(s.get('firmo_missing')):
+                bucket = 'medium'
+        except Exception:
+            pass
         s['bucket'] = bucket
     return state
 
@@ -158,6 +180,15 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
             "provide a concise 2-sentence justification referencing the top signals and research evidence if present."
         )
         rationale = await generate_rationale(prompt)
+        # Append demotion reason when firmographics missing
+        try:
+            if bool(score.get('firmo_missing')):
+                rationale = (rationale or '')
+                if rationale:
+                    rationale += "\n"
+                rationale += "demoted due to missing firmographics (industry/employees)"
+        except Exception:
+            pass
         score['rationale'] = rationale
         score['cache_key'] = cache_key
     return state

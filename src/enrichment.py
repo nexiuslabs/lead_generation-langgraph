@@ -106,6 +106,127 @@ def _mask_email(e: str) -> str:
 def _redact_email_list(emails: list[str]) -> list[str]:
     return [_mask_email(e) for e in emails]
 
+
+# ---------------- PRD Opt-2 helpers: firmographics recovery ----------------
+
+def _jsonld_number(value: Any) -> Optional[int]:
+    try:
+        if isinstance(value, (int, float)):
+            v = int(value)
+            return v if v > 0 else None
+        if isinstance(value, str):
+            s = value.strip().replace(",", "")
+            v = int(s)
+            return v if v > 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def _parse_jsonld_for_org(pages: list[dict]) -> dict:
+    """Parse application/ld+json blocks for Organization fields.
+
+    Returns dict with optional keys: employees_est, industry_norm, hq_country, hq_city.
+    """
+    out: dict = {}
+    try:
+        for p in pages or []:
+            html = p.get("html") or p.get("raw_content") or ""
+            if not isinstance(html, str) or "application/ld+json" not in html:
+                continue
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                for sc in soup.find_all("script", {"type": "application/ld+json"}):
+                    try:
+                        payload = json.loads(sc.get_text(strip=True) or "{}")
+                    except Exception:
+                        continue
+                    items = payload if isinstance(payload, list) else [payload]
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        t = (it.get("@type") or it.get("type") or "").lower()
+                        if "organization" not in t:
+                            continue
+                        # employees
+                        emp = it.get("numberOfEmployees") or it.get("employee") or it.get("employees")
+                        est = _jsonld_number(emp)
+                        if est and not out.get("employees_est"):
+                            out["employees_est"] = est
+                        # address
+                        addr = it.get("address") or {}
+                        if isinstance(addr, dict):
+                            cc = addr.get("addressCountry")
+                            lc = addr.get("addressLocality") or addr.get("addressRegion")
+                            if isinstance(cc, str) and not out.get("hq_country"):
+                                out["hq_country"] = cc
+                            if isinstance(lc, str) and not out.get("hq_city"):
+                                out["hq_city"] = lc
+                        # industry name hints
+                        ind = it.get("industry") or it.get("category")
+                        if isinstance(ind, str) and not out.get("industry_norm"):
+                            out["industry_norm"] = ind.strip().lower()
+            except Exception:
+                continue
+    except Exception:
+        return out
+    return out
+
+
+def _infer_industry_from_corpus(text: str) -> dict:
+    """Best-effort industry inference from text when LLM misses it.
+
+    Returns optional keys: industry_norm, industry_code, industry_confidence.
+    """
+    try:
+        low = (text or "").lower()
+        if not low:
+            return {}
+        # naive keyword mapping; can be replaced with SSIC resolver
+        table = {
+            "packaging": "packaging",
+            "printing": "printing",
+            "brand": "branding",
+            "consultancy": "consultancy",
+            "food & beverage": "food & beverage",
+            "restaurant": "food & beverage",
+            "maid": "domestic services",
+            "software": "software",
+            "saas": "software",
+        }
+        for k, v in table.items():
+            if k in low:
+                return {"industry_norm": v, "industry_code": None, "industry_confidence": 0.5}
+        return {}
+    except Exception:
+        return {}
+
+
+def _headcount_from_text(text: str) -> Optional[int]:
+    """Extract approximate headcount from free text using simple patterns."""
+    try:
+        low = (text or "").lower()
+        # ranges like 11-50 employees → mid-point
+        m = re.search(r"(\d{1,3})(?:,?\d{3})?\s*[-–]\s*(\d{1,3})(?:,?\d{3})?\s+employees", low)
+        if m:
+            a = int(m.group(1).replace(",", ""))
+            b = int(m.group(2).replace(",", ""))
+            if a > 0 and b >= a:
+                return int((a + b) / 2)
+        # phrases like "over 200 employees" / "team of 120"
+        m2 = re.search(r"(?:over|more than|about|around|team of)\s+(\d{1,4})(?:,?\d{3})?\s+(?:employees|people|staff)", low)
+        if m2:
+            v = int(m2.group(1).replace(",", ""))
+            return v if v > 0 else None
+        # simple "200 employees"
+        m3 = re.search(r"\b(\d{1,4})(?:,?\d{3})?\s+employees\b", low)
+        if m3:
+            v = int(m3.group(1).replace(",", ""))
+            return v if v > 0 else None
+    except Exception:
+        return None
+    return None
+
 def _default_tenant_id() -> int | None:
     try:
         v = os.getenv("DEFAULT_TENANT_ID")
@@ -2291,6 +2412,39 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
             v = ch.get(k)
             if v:
                 data[k] = v
+        # JSON-LD Organization parse for employees/address/industry fallback
+        try:
+            if state.get("extracted_pages"):
+                jld = _parse_jsonld_for_org(state.get("extracted_pages") or [])
+                if jld:
+                    if data.get("employees_est") is None and jld.get("employees_est") is not None:
+                        data["employees_est"] = jld.get("employees_est")
+                    for k in ("hq_country", "hq_city"):
+                        if not data.get(k) and jld.get(k):
+                            data[k] = jld.get(k)
+                    if not data.get("industry_norm") and jld.get("industry_norm"):
+                        data["industry_norm"] = jld.get("industry_norm")
+        except Exception:
+            pass
+        # Footer/text heuristics for headcount
+        try:
+            if data.get("employees_est") is None:
+                est = _headcount_from_text(all_text or "")
+                if est:
+                    data["employees_est"] = est
+        except Exception:
+            pass
+        # Infer industry from corpus when missing
+        try:
+            if not data.get("industry_norm"):
+                guess = _infer_industry_from_corpus(all_text or "")
+                if guess.get("industry_norm"):
+                    data["industry_norm"] = guess.get("industry_norm")
+                    if guess.get("industry_code") is not None:
+                        data["industry_code"] = guess.get("industry_code")
+                    data["industry_confidence"] = guess.get("industry_confidence") or 0.5
+        except Exception:
+            pass
     except Exception:
         pass
     state["data"] = data
