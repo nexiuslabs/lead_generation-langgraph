@@ -40,8 +40,11 @@ Sales operations wants to unlock richer data gathering and tooling from Jina by 
 4. **Adopt Jina's official `jina-mcp` Python client as the foundation.** Delivers protocol compliance quickly while allowing upstream contributions if we need enhanced telemetry or retry hooks.
 5. **Expose MCP through synchronous-friendly wrappers backed by thread pools.** Lets legacy pipelines upgrade with minimal refactors while we assess longer-term async adoption.
 6. **Enable the full MCP tool suite (`read_url`, `parallel_search_web`, `search_web`) during initial rollout.** Provides comprehensive coverage to validate MCP's value despite the heavier QA lift.
+7. **Credential scope for MCP sessions.** Use the shared workspace-wide Jina API key for all MCP traffic, leaning on in-app tenant routing while we validate value and hardening the approach with tenant-level monitoring and a rapid rotation playbook.
+8. **Primary telemetry pipeline.** Continue publishing MCP metrics through the existing Prometheus scrape path to minimize rollout complexity, with a scheduled checkpoint to revisit OTLP expansion once usage stabilizes.
 
-## Open Questions
+## Follow-up Actions
 
-None. All previously identified questions have been resolved via the decisions listed above; new uncertainties will be captured here with TODO owners if they arise.
+- Document the monitoring thresholds and rotation runbook that make the shared key safe for MCP traffic. <!-- TODO(Codex Agent – Frontend Generator, 2025-03-28) -->
+- Capture the Prometheus metric additions required for MCP and define the checkpoint for revisiting OTLP expansion. <!-- TODO(Codex Agent – Frontend Generator, 2025-04-02) -->
 
