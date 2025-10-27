@@ -23,6 +23,7 @@ Our lead generation platform currently depends on Jina's r.jina.ai proxy for det
 1. **MCP Client Service** — A dedicated module (planned `src/services/mcp_reader.py`) encapsulating authentication, retries, telemetry hooks, and thread-backed synchronous wrappers over the Jina MCP server.
 2. **Consumer Integrations** — Updates to `src/jina_reader.read_url`, resolver card builders, enrichment mergers, and ICP agents so they can toggle between HTTP and MCP transport under a feature flag.
 3. **Configuration & Observability** — Environment variables, rollout toggles (`ENABLE_MCP_READER`), Prometheus/log metrics, and operational runbooks covering rollout, validation, and rollback steps.
+<!-- TODO(Codex Agent – Frontend Generator, 2025-03-31): Confirm whether email delivery for enrichment results remains within the MCP adoption roadmap or should track under a separate master PRD to avoid scope drift. -->
 
 ## User Flow
 1. **Greeting & Intent Detection.** Sessions begin in a welcome state that only surfaces guidance until the user explicitly issues a lead-generation command such as “start lead gen,” “find leads,” or “run enrichment,” preventing surprise automation after greetings.【F:app/pre_sdr_graph.py†L5754-L5769】【F:src/conversation_agent.py†L37-L66】
