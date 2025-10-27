@@ -76,6 +76,7 @@ try:
         is_singapore_page as _is_sg_page,
         is_valid_fqdn as _is_valid_fqdn,
         is_denied_host as _is_denied_host,
+        deny_path_regex as _deny_path_regex,
         score_profile as _score_profile,
         bucket as _bucket,
     )
@@ -253,10 +254,10 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 kl = "uk-en"
     except Exception:
         kl = None
-    def _extract_domains_from_html(raw_html: str) -> List[str]:
+    def _extract_domains_from_html(raw_html: str) -> List[tuple[str, str]]:
         text = raw_html or ""
         text = html_lib.unescape(text)
-        found: List[str] = []
+        found: List[tuple[str, str]] = []
         try:
             # Parse only anchor tags for performance
             soup = BeautifulSoup(text, "html.parser")
@@ -269,6 +270,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     href_abs = urljoin("https://duckduckgo.com", href)
                     u = urlparse(href_abs)
                     host = (u.netloc or "").lower()
+                    path = u.path or ""
                     if not host:
                         continue
                     # Handle DDG redirect pattern
@@ -277,13 +279,15 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                         target = q.get("uddg", [None])[0]
                         if target:
                             target_url = unquote(str(target))
-                            host = (urlparse(target_url).netloc or "").lower()
+                            u2 = urlparse(target_url)
+                            host = (u2.netloc or "").lower()
+                            path = u2.path or ""
                             if not host:
                                 continue
-                            found.append(host)
+                            found.append((host, path))
                             continue
                     # External direct link
-                    found.append(host)
+                    found.append((host, path))
                 except Exception:
                     continue
         except Exception:
@@ -291,9 +295,11 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             for m in re.findall(r"/l/\?[^\s\"']*uddg=([^&\"']+)", text):
                 try:
                     target_url = unquote(m)
-                    host = (urlparse(target_url).netloc or "").lower()
+                    u2 = urlparse(target_url)
+                    host = (u2.netloc or "").lower()
+                    path = u2.path or ""
                     if host:
-                        found.append(host)
+                        found.append((host, path))
                 except Exception:
                     continue
             for href in re.findall(r'href=[\"\']([^\"\']+)[\"\']', text):
@@ -301,36 +307,44 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     href_abs = urljoin("https://duckduckgo.com", href.strip())
                     u = urlparse(href_abs)
                     host = (u.netloc or "").lower()
+                    path = u.path or ""
                     if not host:
                         continue
-                    found.append(host)
+                    found.append((host, path))
                 except Exception:
                     continue
         # Normalize and filter noisy/search/CDN/wiki hosts
-        out: List[str] = []
-        for h in _uniq(found):
+        out: List[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for host, path in found:
+            h = host
             if any(x in h for x in (
                 "duckduckgo.", "google.", "bing.", "brave.", "yahoo.", "yandex.", "mojeek.",
                 "cloudflare.", "wikipedia.", "wikimedia.", "github.", "stackexchange.",
             )):
                 continue
             if _is_probable_domain(h):
-                out.append(h)
-            if len(out) >= max_results:
-                break
+                tup = (h, path or "")
+                if tup not in seen:
+                    seen.add(tup)
+                    out.append(tup)
+                if len(out) >= max_results:
+                    break
         # If no domains extracted via hrefs/redirects, fall back to text-based domain scanning
         if not out:
             try:
                 text_domains = _extract_domains_from_text(text)
                 # Preserve order and cap
-                tmp: List[str] = []
+                tmp: List[tuple[str, str]] = []
                 for d in text_domains:
                     if any(x in d for x in (
                         "duckduckgo.", "cloudflare.", "wikipedia.", "wikimedia.",
                     )):
                         continue
-                    if _is_probable_domain(d) and d not in tmp:
-                        tmp.append(d)
+                    if _is_probable_domain(d):
+                        tup = (d, "")
+                        if tup not in tmp:
+                            tmp.append(tup)
                     if len(tmp) >= max_results:
                         break
                 if tmp:
@@ -428,6 +442,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html/
         DDG_LITE_GET,       # lite.duckduckgo.com/lite/
     ]
+    drop_path_count = 0
     for page in range(MAX_PAGES):
         if len(collected) >= max_results:
             break
@@ -444,10 +459,20 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 page_hosts = _extract_domains_from_html(r.text)
                 # Enforce site: filter and apex normalization
                 page_domains: List[str] = []
-                for h in page_hosts:
-                    d = _apex_domain(_clean_possible_percent_encoded(h))
-                    if d and _is_probable_domain(d) and _site_filter(d):
-                        page_domains.append(d)
+                cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+                deny_pat = _deny_path_regex(cfg) if _deny_path_regex else None
+                for (host, path) in page_hosts:
+                    d = _apex_domain(_clean_possible_percent_encoded(host))
+                    if not (d and _is_probable_domain(d) and _site_filter(d)):
+                        continue
+                    # Drop directory/portal paths early
+                    try:
+                        if deny_pat is not None and path and deny_pat.search(path):
+                            drop_path_count += 1
+                            continue
+                    except Exception:
+                        pass
+                    page_domains.append(d)
                 # Log and merge
                 try:
                     log.info(
@@ -475,10 +500,19 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             if snapshot:
                 snap_hosts = _extract_domains_from_html(snapshot)
                 page_domains: List[str] = []
-                for h in snap_hosts:
-                    d = _apex_domain(_clean_possible_percent_encoded(h))
-                    if d and _is_probable_domain(d) and _site_filter(d):
-                        page_domains.append(d)
+                cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+                deny_pat = _deny_path_regex(cfg) if _deny_path_regex else None
+                for (host, path) in snap_hosts:
+                    d = _apex_domain(_clean_possible_percent_encoded(host))
+                    if not (d and _is_probable_domain(d) and _site_filter(d)):
+                        continue
+                    try:
+                        if deny_pat is not None and path and deny_pat.search(path):
+                            drop_path_count += 1
+                            continue
+                    except Exception:
+                        pass
+                    page_domains.append(d)
                 try:
                     log.info(
                         "[ddg] page %d domains: %s",
@@ -833,6 +867,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 continue
         uniq = _f
         try:
+            counts["DENY_PATH"] = int(counts.get("DENY_PATH") or 0) + int(drop_path_count)
             log.info(
                 "[plan] host_filter kept=%s drop_hygiene=%s drop_deny=%s drop_path=%s",
                 counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST"), counts.get("DENY_PATH")

@@ -1,0 +1,260 @@
+Feature PRD — Section 6: Multi‑Tenant, SSO & Odoo Integration
+
+Version: v1.0
+Owner: Platform + RevOps
+Scope: Section 6 only (Multi‑Tenant, SSO, Odoo alignment, first‑login auto‑provisioning)
+
+1) Objective
+- Provide secure, multi‑tenant access to the Pre‑SDR system via Nexius SSO, with strict tenant isolation and seamless alignment with Odoo per tenant. On first login, provision a tenant workspace and Odoo mapping automatically, then expose status in the Agent Chat UI.
+
+2) Non‑Goals
+- Full sequencing/sync of campaigns or SDR actions (covered later).
+- Replacing Odoo auth: Odoo uses the same Nexius SSO, but server‑to‑Odoo credentials remain server‑side only.
+- Building a general tenant switcher for external users (SSO determines tenant; dev‑only override allowed).
+
+3) Personas & Roles
+- External user (viewer): Can use Chat UI read‑only; can see shortlist, explanations.
+- Ops/admin: Can change ICP, trigger refresh, manage provisioning.
+- System components: Agent Chat UI (Next.js), Pre‑SDR Backend (LangGraph Server + FastAPI custom routes), Odoo.
+
+4) High‑Level Architecture
+- Identity Provider: Nexius SSO (Keycloak OIDC). Tokens carry sub, email, roles[]; tenant_id may be resolved by the gateway from DB when not present.
+- Agent Chat UI (repo: agent-chat-ui):
+  - UI‑first sign‑up and login forms (no direct IdP screens). Posts to FastAPI `/auth/*` and stores session via HTTP‑only cookies.
+  - Calls the backend gateway for everything, including chat/streaming. No access tokens stored in JS; no Authorization headers required from the browser.
+  - Dev‑only tenant switcher can set `X‑Tenant‑ID` for local testing.
+- Gateway + LangGraph (repo: lead_generation-main):
+  - FastAPI acts as Auth/API gateway: implements `/auth/*`, tenant lifecycle, onboarding, and proxies `/graph/*` to LangGraph Server.
+  - Gateway verifies cookies, injects `Authorization: Bearer <access_token>` when proxying to LangGraph; LangGraph Custom Auth enforces per‑user/tenant access on assistants/threads/runs.
+  - FastAPI custom routes share origin with LangGraph (preferred) or sit beside it behind a reverse proxy.
+  - Enforces tenant isolation in Postgres via RLS and/or `WHERE tenant_id = :tenant_id`.
+- Odoo: Per‑tenant DB (or scoped company) with a technical service account/API key stored in `odoo_connections`. Human users SSO into their tenant’s Odoo via Keycloak.
+
+Deployment patterns (choose one):
+- Single origin (recommended): Run LangGraph Server and mount FastAPI via `langgraph.json` (`http.app`) so `/graph/*` and custom routes share domain and cookies.
+- Split services: Run LangGraph Server and FastAPI separately; route `/graph/*` and `/assistants|/threads|/runs|/events` to LangGraph through the gateway proxy; route `/api/*` (custom routes) to FastAPI.
+
+Graph Proxy
+- UI → FastAPI `/graph/*` → LangGraph (assistants/threads/runs/events). Gateway injects `Authorization: Bearer` and preserves SSE.
+
+5) User Flows
+5.1 Sign‑up (Happy Path)
+- UI posts `POST /auth/register { email, password, full_name, workspace_name }`.
+- Backend creates Keycloak user, inserts tenant rows, enqueues provisioner, mints tokens (Direct Grant), and sets HTTP‑only cookies. Returns `{ tenant_id }`.
+- UI shows onboarding and polls `GET /tenants/{tenant_id}` until ready.
+
+5.2 Login (Happy Path)
+- UI posts `POST /auth/login { email, password, otp? }`.
+- Backend validates via Direct Grant (and optional MFA), sets cookies, returns `{ tenant_id, roles, tenant_status }`.
+- If `tenant_status='active'` → route to chat; else → onboarding screen; poll status.
+
+5.3 First‑Login Provisioning
+- Provisioner creates per‑tenant Odoo DB (or scoped company), service user/API key, configures OIDC, seeds baseline entities, and updates `odoo_connections`.
+- UI polls `GET /tenants/{tenant_id}` (or `/onboarding/status`) until `{status:"ready"}`.
+
+5.4 Normal Usage
+- Chat calls go to `/graph/*` on the gateway; gateway proxies to LangGraph and streams back to UI; no Authorization header needed from UI (cookies only).
+- “Open Odoo” button navigates to the tenant Odoo URL; OIDC logs in the human user.
+- “Verify Odoo” button calls GET /onboarding/verify_odoo and displays current mapping status.
+
+6) Functional Requirements
+- SSO & Tokens
+  - Verify Keycloak access tokens (RS256) via JWKS; tokens are minted server‑side via Direct Grant.
+  - Claims required for protected endpoints: sub, email, roles[]; tenant_id may be resolved by the gateway from DB when not present.
+  - UI submits credentials to `/auth/*` and never stores tokens in JS; the gateway sets HTTP‑only cookies; the browser does not send Authorization headers.
+- Tenant Isolation
+  - All tenant‑owned tables enforce isolation via RLS (lead_scores, lead_features, enrichment_runs). request.tenant_id must be set per request.
+  - Queries that bypass RLS must include WHERE tenant_id = :tenant_id.
+  - Exports and UI data must reflect only the caller’s tenant context.
+- Odoo Alignment
+  - Odoo configured as an OIDC client of Nexius SSO; same user session across systems.
+  - Server resolves odoo_connections by tenant_id; never exposes Odoo creds/DSNs to the browser.
+  - Connectivity smoke test and minimal seeding must run during onboarding; failures surface in status.
+- First‑Login Auto‑Provisioning
+  - If tenant does not exist: create tenants row; link user in tenant_users with default role(s).
+  - Ensure icp_rules default exists; insert default template if empty.
+  - Ensure odoo_connections entry exists and is active; validate connectivity.
+  - Status transitions: starting → creating_odoo → configuring_oidc → seeding → ready (with error field retained if seeding had partial failure).
+- Roles & Authorization
+  - Role checks available via roles[] claim (viewer, ops, admin). Viewer = read‑only; ops/admin can modify ICP and run enrichments.
+  - Unauthorized actions → 403 with a structured error.
+
+7) API Contracts (Pre‑SDR Backend)
+Protected endpoints require a valid session via HTTP‑only cookies (no tokens in JS). Dev‑only may accept `Authorization: Bearer` and/or `X‑Tenant‑ID`.
+
+- POST /auth/register
+  - Purpose: Create identity + tenant and start provisioning.
+  - Body: { email, password, full_name, workspace_name }
+  - 201: { tenant_id } and sets HTTP‑only cookies (access + refresh)
+
+- POST /auth/login
+  - Purpose: Login with credentials (and optional TOTP) to create a session.
+  - Body: { email, password, otp? }
+  - 200: { tenant_id, roles, tenant_status } and sets HTTP‑only cookies
+
+- POST /auth/refresh
+  - Purpose: Rotate access token from refresh cookie.
+  - 200: { ok: true } (cookies updated)
+
+- POST /auth/logout
+  - Purpose: Revoke session and clear cookies.
+  - 204: No content
+
+- GET /tenants/{tenant_id}
+  - Purpose: Poll onboarding/provisioning status for the tenant.
+  - 200: { status: "starting|creating_odoo|configuring_oidc|seeding|ready|error", error?: string }
+
+- POST /tenants/{tenant_id}/odoo/api-key/rotate
+  - Purpose: Rotate per‑tenant Odoo service API key.
+  - 204: No content
+
+- ANY /graph/* (proxy to LangGraph)
+  - Purpose: Drive chat via assistants/threads/runs/events through the gateway.
+  - Notes: Gateway injects Authorization: Bearer to LangGraph; preserves SSE streaming.
+
+- GET /info
+  - Purpose: Health + capabilities for UI (expose checkpoint_enabled).
+  - Auth: Optional (validate if present). 401 in prod when auth required by deployment policy.
+  - 200: { ok: true, checkpoint_enabled: boolean }
+
+- GET /whoami
+  - Purpose: Echo identity context for debugging.
+  - 200: { sub, email, tenant_id, roles }
+
+- (Legacy) POST /onboarding/first_login
+  - Purpose: Backward‑compatible kickoff for first‑login provisioning.
+  - 202/200: { status: "provisioning" | "syncing" | "ready" }
+
+- (Legacy) GET /onboarding/status
+  - Purpose: Backward‑compatible status poller.
+  - 200: { tenant_id, status: "provisioning"|"syncing"|"ready"|"error", error?: string }
+
+- GET /onboarding/verify_odoo
+  - Purpose: On‑demand verification of Odoo mapping + connectivity.
+  - 200: { tenant_id, exists: boolean, smoke: boolean, ready: boolean, error?: string }
+
+- GET /session/odoo_info
+  - Purpose: Summarize session + Odoo mapping for UI (used to short‑circuit FirstLoginGate when already ready).
+  - 200: { email, tenant_id?, roles[], odoo: { exists, db_name?, ready, error? } }
+
+- LangGraph Server endpoints (behind `/graph/*`)
+  - Purpose: Standard assistants/threads/runs/events API (exact surface owned by LangGraph Server).
+  - Notes: The gateway attaches the Authorization bearer to LangGraph; UI uses cookies only.
+
+- GET /export/latest_scores.(json|csv)
+  - Purpose: Tenant‑scoped export for latest scores.
+  - 200: returns only rows for request.state.tenant_id.
+
+8) UI Requirements (agent-chat-ui)
+- Auth & Session
+  - UI‑first sign‑up and login forms posting to FastAPI `/auth/*` (no direct IdP screens).
+  - Session via HTTP‑only cookies; no tokens in JS; no NextAuth in production.
+- Request Signing
+  - Do not add Authorization headers from the browser; rely on cookies.
+  - Ensure `credentials: 'include'` on fetch/stream (SSE) so cookies are sent.
+  - Add X‑Tenant‑ID only when NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=true (dev/testing). In production, disable via env and ignore at server.
+- First‑Login UX
+  - FirstLoginGate polls `GET /tenants/{tenant_id}` (or legacy `/onboarding/status`) every 2s until ready; show status copy:
+    - starting: “Preparing your workspace…”
+    - creating_odoo: “Creating Odoo DB and base modules…”
+    - configuring_oidc: “Configuring SSO for your Odoo…”
+    - seeding: “Seeding baseline entities and running checks…”
+    - ready: render chat
+    - error: display error text
+  - “Verify Odoo” button calls /onboarding/verify_odoo and displays status.
+- Chat Operation
+  - Use LangGraph Server threads/runs (+ events) via NEXT_PUBLIC_API_URL and NEXT_PUBLIC_ASSISTANT_ID; rely on cookies for auth on REST and streaming.
+  - Next.js API proxy (/api/*) should forward cookies and, in dev only, X‑Tenant‑ID when enabled.
+
+9) Backend Requirements (lead_generation-main)
+- Auth
+  - Implement JWT verification via JWKS discovery: app/auth.py (verify_jwt, require_auth, require_identity, require_optional_identity).
+  - In prod, require session via HTTP‑only cookies; verify tokens from cookies; set request.state.tenant_id and roles from claims; reject missing tenant_id for protected endpoints.
+  - Dev bypass allowed with DEV_AUTH_BYPASS=true and X‑Tenant‑ID and/or Authorization bearer; never enable in prod.
+  - LangGraph Custom Auth: verify the same JWT for assistants/threads/runs; attach identity/tenant to context and enforce per‑user/tenant filtering.
+- Tenancy
+  - Set DB GUC request.tenant_id per request for RLS policies.
+  - Ensure INSERT/UPDATE include tenant_id on tenant‑owned tables.
+- Onboarding
+  - Implement in app/onboarding.py: ensure tenants, tenant_users, icp_rules, odoo_connections and onboarding_status; run Odoo connectivity smoke test; seed baseline entities; write status transitions.
+- Odoo Store
+  - OdooStore uses per‑tenant mapping (odoo_connections) and server‑side DSN (never exposed to UI). Provide connectivity_smoke_test and seed_baseline_entities.
+- Chat Endpoint
+  - Expose graph via LangGraph Server (langgraph.json). Mount FastAPI into the same origin via langgraph.json http.app or serve behind a proxy.
+  - Tools or FastAPI routes may call Odoo via XML‑RPC/JSON‑RPC using server‑side credentials; never expose to the browser.
+
+10) Data Model & RLS
+- Tenants & Users
+  - tenants(tenant_id, name, status)
+  - tenant_users(tenant_id, user_id, roles[])
+  - odoo_connections(tenant_id, base_url?, db_name, auth_type, secret?, active)
+- ICP & Candidates
+  - icp_rules adds tenant_id; materialized view icp_candidate_companies includes tenant_id and rule_id.
+- Tenant‑Owned Tables
+  - lead_scores, lead_features, enrichment_runs include tenant_id column and enable RLS:
+    - USING and WITH CHECK: tenant_id::text = current_setting('request.tenant_id', true)
+- Migrations
+  - See app/migrations/001_presdr_odoo.sql, 004_multi_tenant_icp.sql, 005_tenant_rls.sql, 007_rls_icp.sql.
+
+11) Security & Privacy
+- Production: Reject requests without a valid session (HTTP‑only cookies). Ignore X‑Tenant‑ID. Never accept Authorization from the browser in prod. Do not store tokens server‑side.
+- JWKS and OIDC discovery cached in memory; refresh on process restart. Handle network errors gracefully with 401/500 as appropriate.
+- Log tenant_id, email (where appropriate), and event types; redact secrets and tool args. Never log credentials.
+- Serve UI/API over HTTPS in staging/prod; set CORS allowlist via EXTRA_CORS_ORIGINS.
+
+12) Configuration
+- UI (agent-chat-ui)
+  - NEXT_PUBLIC_API_URL (LangGraph base or API proxy), NEXT_PUBLIC_ASSISTANT_ID
+  - NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=false (prod), true (dev)
+- API (lead_generation-main)
+  - NEXIUS_ISSUER (Keycloak realm issuer), NEXIUS_AUDIENCE (optional)
+  - DEV_AUTH_BYPASS (dev only), DEFAULT_TENANT_ID (dev), DEV_USER_EMAIL (dev)
+  - ODOO_POSTGRES_DSN or ODOO_BASE_DSN_TEMPLATE
+  - OPENAI_API_KEY (to enable /agent routes)
+  - LANGGRAPH_CHECKPOINT_DIR, EXTRA_CORS_ORIGINS
+  - langgraph.json: configure graphs, auth.path (Custom Auth), and http.app (FastAPI) for single-origin deployment
+
+13) Acceptance Criteria
+- Auth
+  - Requests without session cookies → 401; with invalid token in cookies → 401; with valid session but missing tenant_id on protected routes → 403.
+  - /whoami returns correct sub, email, tenant_id, roles.
+- Tenant Isolation
+  - With two tokens A/B (different tenant_id), export endpoints return only rows for their tenant; DB current_setting('request.tenant_id') reflects the caller.
+- First‑Login Provisioning
+  - POST /onboarding/first_login returns provisioning; status transitions to ready; UI exits FirstLoginGate.
+  - onboarding_status reflects error if seeding fails but Odoo connectivity passes (non‑fatal), and still reaches ready.
+- Odoo Alignment
+  - /onboarding/verify_odoo returns exists=true, smoke=true for a configured tenant; false for unconfigured.
+- UI Behavior
+  - Header shows authenticated email and tenant; dev switcher hidden when NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=false.
+  - All API and streaming calls rely on cookies (no Authorization header from UI); 401 triggers sign‑in redirect.
+  - LangGraph Server endpoints reachable at NEXT_PUBLIC_API_URL; assistant/graph id set via NEXT_PUBLIC_ASSISTANT_ID.
+
+14) Rollout & Phasing
+- M3.5: First‑login auto‑provisioning GA (tenant + Odoo + initial sync) — server + UI gate.
+- M5: Agent Chat UI SSO, SSE, role‑based commands (UI/Server hardening).
+- V1 (now): Standardize on LangGraph Server assistants/threads/runs with Custom Auth; optional /agent adapter only for dev.
+- V2 (later): Enable persistent threads in UI and expand advanced streaming features; keep reverse‑proxy option as needed.
+
+15) Risks & Mitigations
+- Risk: Token lacks tenant_id. Mitigation: reject protected routes in prod; onboarding endpoints resolve via email mapping if needed.
+- Risk: JWKS outage. Mitigation: cache JWKS; return 500/401 and prompt re‑auth; optional dev bypass.
+- Risk: Cookies not included on fetch/stream. Mitigation: ensure `credentials: include` and prefer single origin or configure CORS for SSE.
+- Risk: CORS/SSE issues (split origin). Mitigation: prefer single origin or configure proxy for proper CORS and header pass‑through.
+- Risk: Odoo connectivity failures. Mitigation: surface status, allow retries; infer db from DSN where possible.
+- Risk: Data leakage. Mitigation: enforce RLS and set request.tenant_id; add tests (docs/testing_acceptance_section6.md).
+
+16) Testing
+- Follow lead_generation-main/docs/testing_acceptance_section6.md for smoke, isolation, Odoo sync, and security checks.
+
+17) References (repo paths)
+- agent-chat-ui/src/lib/useAuthFetch.ts (cookie‑based fetch + optional X‑Tenant‑ID in dev)
+- agent-chat-ui/src/providers/Stream.tsx (cookie‑based streaming/SSE)
+- agent-chat-ui/src/app/api/[..._path]/route.ts (API proxy to LangGraph)
+- agent-chat-ui/src/components/onboarding/FirstLoginGate.tsx (first‑login flow)
+- lead_generation-main/app/auth.py (JWT/JWKS verification)
+- lead_generation-main/app/main.py (/agent, /info, /onboarding/*, exports)
+- lead_generation-main/app/onboarding.py (provisioning logic)
+- lead_generation-main/app/migrations/* (tenants, RLS, Odoo schema)
+- lead_generation-main/docs/odoo_oidc_setup.md (Odoo SSO setup)
+- lead_generation-main/langgraph.json (graphs + custom auth + http.app)

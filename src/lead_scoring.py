@@ -5,6 +5,7 @@ from langgraph.graph import StateGraph
 import os
 from src.database import get_pg_pool
 from src.settings import MISSING_FIRMO_PENALTY, FIRMO_MIN_COMPLETENESS_FOR_BONUS
+from langchain_openai import ChatOpenAI
 from sklearn.linear_model import LogisticRegression
 from src.openai_client import generate_rationale
 
@@ -115,9 +116,39 @@ async def train_and_score(state: LeadScoringState) -> LeadScoringState:
         bonus_cap = int(os.getenv("MANUAL_RESEARCH_BONUS_MAX", "20") or 20)
     except Exception:
         bonus_cap = 20
+    # Optional LLM structured scoring ensemble
+    use_llm_score = (os.getenv("ENABLE_LLM_STRUCTURED_SCORING", "").lower() in ("1","true","yes","on"))
+    llm = ChatOpenAI(model=os.getenv("AGENT_MODEL_DISCOVERY", os.getenv("LANGCHAIN_MODEL", "gpt-4o-mini")), temperature=0) if use_llm_score else None
+
+    def _llm_structured_score(_feat: Dict[str, Any], _icp: Dict[str, Any]) -> int:
+        try:
+            if not llm:
+                return 0
+            prompt = (
+                "Given these company features and ICP preferences, return a single integer 0-100 representing fit. "
+                "Company features: {feat}\nICP: {icp}\nOutput only the integer."
+            )
+            out = llm.invoke(prompt.format(feat=_feat, icp=_icp))
+            txt = (getattr(out, 'content', None) or '').strip()
+            import re as _re
+            m = _re.search(r"\b(\d{1,3})\b", txt)
+            if not m:
+                return 0
+            val = int(m.group(1))
+            return max(0, min(100, val))
+        except Exception:
+            return 0
+
     for feat, p in zip(state['lead_features'], probs):
         base = max(0.0, min(1.0, float(p)))
         base100 = int(round(base * 100))
+        # Optional ensemble: blend baseline with LLM score (30% weight)
+        if use_llm_score:
+            try:
+                llm_score = _llm_structured_score(feat, state.get('icp_payload', {}))
+                base100 = int(round(0.7 * base100 + 0.3 * llm_score))
+            except Exception:
+                pass
         ev_cnt = int(feat.get('research_ev_count') or 0)
         # Gate bonus by firmographics completeness (employees or industry present)
         firmo_present = 0
