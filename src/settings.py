@@ -311,3 +311,25 @@ ICP_SG_PROFILES = os.getenv("ICP_SG_PROFILES", "false").lower() in (
     "yes",
     "on",
 )
+
+# PRD Opt-2: strict hygiene and scoring guards
+ENABLE_STRICT_DOMAIN_HYGIENE = os.getenv("ENABLE_STRICT_DOMAIN_HYGIENE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DISCOVERY_ALLOW_PORTALS = os.getenv("DISCOVERY_ALLOW_PORTALS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    MISSING_FIRMO_PENALTY = int(os.getenv("MISSING_FIRMO_PENALTY", "30") or 30)
+except Exception:
+    MISSING_FIRMO_PENALTY = 30
+try:
+    FIRMO_MIN_COMPLETENESS_FOR_BONUS = int(os.getenv("FIRMO_MIN_COMPLETENESS_FOR_BONUS", "1") or 1)
+except Exception:
+    FIRMO_MIN_COMPLETENESS_FOR_BONUS = 1

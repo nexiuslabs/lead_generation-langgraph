@@ -1411,11 +1411,26 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
     # Optionally plan agent-driven discovery candidates for preview (non-blocking)
     try:
         if ENABLE_AGENT_DISCOVERY and _agent_plan_discovery is not None:
+            # Plan discovery and then apply compliance guard before persisting
             s = {"icp_profile": state.get("icp_profile") or {}}
-            acand = _agent_plan_discovery(s).get("discovery_candidates") or []
+            planned = _agent_plan_discovery(s)
+            acand = planned.get("discovery_candidates") or []
+            # Try compliance guard if available
+            try:
+                from src.agents_icp import compliance_guard as _agent_compliance_guard  # type: ignore
+            except Exception:
+                _agent_compliance_guard = None  # type: ignore
+            if _agent_compliance_guard is not None and acand:
+                try:
+                    guard_in = dict(planned)
+                    guarded = _agent_compliance_guard(guard_in) or {}
+                    gcand = guarded.get("discovery_candidates") or acand
+                    acand = [str(d).strip().lower() for d in gcand if isinstance(d, str) and d.strip()]
+                except Exception:
+                    pass
             if acand:
                 state["agent_candidates"] = acand
-                # Persist all discovered domains into global staging for audit/queueing (with provenance ai_metadata)
+                # Persist all discovered (guarded) domains into staging for audit/queueing
                 try:
                     tid = _resolve_tenant_id_for_write_sync(state)
                     icp_prof = dict(state.get("icp_profile") or {})

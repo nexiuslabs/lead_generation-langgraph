@@ -24,6 +24,11 @@ try:
     from src.settings import STRICT_INDUSTRY_QUERY_ONLY  # type: ignore
 except Exception:  # pragma: no cover
     STRICT_INDUSTRY_QUERY_ONLY = True  # type: ignore
+try:
+    from src.settings import ENABLE_STRICT_DOMAIN_HYGIENE, DISCOVERY_ALLOW_PORTALS  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_STRICT_DOMAIN_HYGIENE = True  # type: ignore
+    DISCOVERY_ALLOW_PORTALS = False  # type: ignore
 import logging
 import requests
 import os
@@ -171,6 +176,48 @@ def _apex_domain(h: str) -> str:
         return last2
     except Exception:
         return _normalize_host(h)
+
+
+def _clean_possible_percent_encoded(s: str) -> str:
+    """One-pass cleanup for percent-encoded and stray '2f' artifacts.
+
+    - Unquote once
+    - If URL-shaped, take netloc
+    - Strip leading 'www.' and repeated '2f' prefixes
+    - Lowercase and trim
+    """
+    try:
+        raw = (s or "").strip()
+        if not raw:
+            return ""
+        try:
+            from urllib.parse import unquote as _unq, urlparse as _up
+            u = _unq(raw)
+            # If still contains a schema, extract host
+            if "://" in u:
+                host = (_up(u).netloc or u)
+            else:
+                host = u
+        except Exception:
+            host = raw
+        host = host.strip().lower()
+        # Remove protocol if any leaked through
+        if host.startswith("http://"):
+            host = host[7:]
+        elif host.startswith("https://"):
+            host = host[8:]
+        # Trim path/query/fragment indicators
+        for sep in ["/", "?", "#"]:
+            if sep in host:
+                host = host.split(sep, 1)[0]
+        if host.startswith("www."):
+            host = host[4:]
+        # Strip leading repeated '2f' artifacts (from %2F)
+        while host.startswith("2f"):
+            host = host[2:]
+        return host
+    except Exception:
+        return (s or "").strip().lower()
 
 
 def _ddg_search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
@@ -398,7 +445,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 # Enforce site: filter and apex normalization
                 page_domains: List[str] = []
                 for h in page_hosts:
-                    d = _apex_domain(h)
+                    d = _apex_domain(_clean_possible_percent_encoded(h))
                     if d and _is_probable_domain(d) and _site_filter(d):
                         page_domains.append(d)
                 # Log and merge
@@ -429,7 +476,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 snap_hosts = _extract_domains_from_html(snapshot)
                 page_domains: List[str] = []
                 for h in snap_hosts:
-                    d = _apex_domain(h)
+                    d = _apex_domain(_clean_possible_percent_encoded(h))
                     if d and _is_probable_domain(d) and _site_filter(d):
                         page_domains.append(d)
                 try:
@@ -645,23 +692,22 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Compose one concise DDG query from ICP via LLM (fallback to heuristic terms join)
-    def _llm_compose_ddg_query() -> Optional[str]:
+    # Compose one concise DDG query from ICP + website via LLM (fallback to heuristic)
+    def _llm_compose_ddg_query(website_text: Optional[str]) -> Optional[str]:
         try:
             llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
             inds = ", ".join([s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()])
             site = "site:.sg" if (country_hint == 'sg') else ""
             sys = (
-                "Compose ONE DuckDuckGo query to find companies strictly within the provided TARGET INDUSTRY terms. "
-                "Only use words that appear in the 'industries' list (no buyer titles, no triggers, no vendor names, no generic examples). "
+                "Compose exactly ONE DuckDuckGo query to find companies strictly within the TARGET INDUSTRY, derived from the customer's WEBSITE TEXT and the industries list. "
+                "Strict rules: use only industry words found in the website text or the given industries list; do not invent competitors or seeds; avoid buyer titles and triggers. "
                 "Keep it concise (<= 12 words). Include the site filter verbatim if provided. "
-                "If 'industries' is empty, output exactly: b2b distributors (plus the site filter if provided). "
+                "If both website text and industries are empty, output exactly: b2b distributors (plus the site filter if provided). "
                 "Output JUST the query."
             )
-            human = (
-                f"industries: {inds}\n"
-                f"site_filter: {site}"
-            )
+            human = (f"website_text: {(website_text or '')[:800]}\n"
+                     f"industries: {inds}\n"
+                     f"site_filter: {site}")
             from langchain_core.messages import SystemMessage, HumanMessage
             messages = [SystemMessage(content=sys), HumanMessage(content=human)]
             out = llm.invoke(messages)
@@ -696,54 +742,85 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             log.info("[plan] llm-query fail: %s", e)
             return None
 
-    # Compose query strictly from original industry text; do not add operators/alter phrases
-    q_llm = None  # disable LLM-driven query composition per request
-    terms: List[str] = []
-    for v in (icp.get("industries") or []):
-        if isinstance(v, str) and v.strip():
-            terms.append(v.strip())
-    inline_site = "site:.sg" if (country_hint == 'sg') else ""
-    # Preserve punctuation/ampersands; join as comma-separated per UX requirement
-    base_query = (
-        (", ".join(_uniq(terms)) + (" " + inline_site if inline_site else "")).strip()
-        if terms else ""
-    )
-    if base_query:
-        query = base_query
-    else:
-        # Minimal fallback when ICP is empty
-        fallback = ", ".join([s for s in [inds, titles, sigs] if s]).strip(", ")
-        if country_hint == 'sg':
-            # Ensure we never emit a bare 'site:.sg' — include a sensible default head term
-            query = (f"{fallback} site:.sg" if fallback else "b2b distributors site:.sg").strip()
+    # Derive website text when available to ground the LLM query
+    website_hint = None
+    for k in ("website_domain", "website", "website_url", "home", "url", "site"):
+        try:
+            v = (icp.get(k) if isinstance(icp, dict) else None) or (state.get(k) if isinstance(state, dict) else None)
+            if isinstance(v, str) and v.strip():
+                website_hint = v.strip()
+                break
+        except Exception:
+            continue
+    website_text = None
+    if website_hint:
+        try:
+            u = website_hint if website_hint.startswith("http") else ("https://" + website_hint)
+            website_text = jina_read(u, timeout=6) or _fallback_home_snippet(u)
+        except Exception:
+            website_text = None
+    # Prefer LLM-composed, single strict query; fallback to heuristic join
+    query = None
+    try:
+        q_llm = _llm_compose_ddg_query(website_text)
+        if q_llm and len(q_llm) >= 4:
+            query = q_llm
+            try:
+                log.info("[planner] llm=1 website_used=%s", bool(website_text))
+            except Exception:
+                pass
+    except Exception:
+        query = None
+    if not query:
+        terms: List[str] = []
+        for v in (icp.get("industries") or []):
+            if isinstance(v, str) and v.strip():
+                terms.append(v.strip())
+        inline_site = "site:.sg" if (country_hint == 'sg') else ""
+        base_query = (
+            (", ".join(_uniq(terms)) + (" " + inline_site if inline_site else "")).strip()
+            if terms else ""
+        )
+        if base_query:
+            query = base_query
         else:
-            query = fallback or "b2b distributors"
+            fallback = ", ".join([s for s in [inds, titles, sigs] if s]).strip(", ")
+            if country_hint == 'sg':
+                query = (f"{fallback} site:.sg" if fallback else "b2b distributors site:.sg").strip()
+            else:
+                query = fallback or "b2b distributors"
 
     # Single-query discovery: paginate up to 8 pages, stop at 50
     log.info("[plan] ddg-only query: %s", query)
     domains: List[str] = []
+    ddg_count = 0
     try:
         for dom in _ddg_search_domains(query, max_results=50, country=country_hint):
             domains.append(dom)
+            ddg_count += 1
     except Exception as e:
         log.info("[plan] ddg fail: %s", e)
+    try:
+        log.info("[planner] tools.ddg=%d", ddg_count)
+    except Exception:
+        pass
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
     # Apply deny/host hygiene using profiles config (always on; not gated by ICP_SG_PROFILES)
     if uniq:
         cfg = (_load_sg_cfg() if _load_sg_cfg else {})
         _f: list[str] = []
-        counts = {"kept": 0, "DOMAIN_HYGIENE": 0, "DENY_HOST": 0}
+        counts = {"kept": 0, "DOMAIN_HYGIENE": 0, "DENY_HOST": 0, "DENY_PATH": 0}
         for d in uniq:
             try:
                 dn = str(d).strip().lower()
-                if _is_valid_fqdn and not _is_valid_fqdn(dn):
+                if ENABLE_STRICT_DOMAIN_HYGIENE and _is_valid_fqdn and not _is_valid_fqdn(dn):
                     try:
                         log.info("[plan] drop %s reason=DOMAIN_HYGIENE", dn)
                     except Exception:
                         pass
                     counts["DOMAIN_HYGIENE"] += 1
                     continue
-                if _is_denied_host and _is_denied_host(dn, cfg):
+                if (not DISCOVERY_ALLOW_PORTALS) and _is_denied_host and _is_denied_host(dn, cfg):
                     try:
                         log.info("[plan] drop %s reason=DENY_HOST", dn)
                     except Exception:
@@ -757,8 +834,8 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         uniq = _f
         try:
             log.info(
-                "[plan] host_filter kept=%s drop_hygiene=%s drop_deny=%s",
-                counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST")
+                "[plan] host_filter kept=%s drop_hygiene=%s drop_deny=%s drop_path=%s",
+                counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST"), counts.get("DENY_PATH")
             )
         except Exception:
             pass
@@ -887,6 +964,99 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     if jina_snips:
         state["jina_snippets"] = jina_snips
     return state
+
+
+def compliance_guard(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Compliance guard to prune discovery candidates prior to enrichment.
+
+    - Enforces FQDN hygiene and deny host/suffix.
+    - Applies SG markers gating when ICP_SG_PROFILES is enabled.
+    - Emits drop counters and replaces state['discovery_candidates'] with filtered list.
+    """
+    try:
+        cand = [str(d).strip().lower() for d in (state.get("discovery_candidates") or []) if isinstance(d, str) and d.strip()]
+        if not cand:
+            return state
+        cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+        # Prepare optional SG marker check inputs
+        jina_snips: Dict[str, str] = state.get("jina_snippets") or {}
+        kept: list[str] = []
+        counts = {"DOMAIN_HYGIENE": 0, "DENY_HOST": 0, "NO_SG_MARKERS": 0, "kept": 0}
+        # Exclude seed apexes if provided via hints
+        try:
+            seed_apex = {_apex_domain(s) for s in (SEED_HINTS or [])}
+        except Exception:
+            seed_apex = set()
+        ambiguous: list[str] = []
+        for d in cand:
+            try:
+                dn = _apex_domain(_clean_possible_percent_encoded(d))
+                if ENABLE_STRICT_DOMAIN_HYGIENE and _is_valid_fqdn and not _is_valid_fqdn(dn):
+                    counts["DOMAIN_HYGIENE"] += 1
+                    continue
+                if _apex_domain(dn) in seed_apex:
+                    counts.setdefault("SEED_EXCLUDED", 0)
+                    counts["SEED_EXCLUDED"] += 1
+                    continue
+                if (not DISCOVERY_ALLOW_PORTALS) and _is_denied_host and _is_denied_host(dn, cfg):
+                    counts["DENY_HOST"] += 1
+                    continue
+                # SG markers gating when enabled
+                if ICP_SG_PROFILES:
+                    if (not dn.endswith('.sg')):
+                        snip = jina_snips.get(dn) or ""
+                        try:
+                            if not (_is_sg_page and _is_sg_page(snip or dn, cfg)):
+                                counts["NO_SG_MARKERS"] += 1
+                                ambiguous.append(dn)
+                                continue
+                        except Exception:
+                            counts["NO_SG_MARKERS"] += 1
+                            ambiguous.append(dn)
+                            continue
+                kept.append(dn)
+                counts["kept"] += 1
+            except Exception:
+                counts["DOMAIN_HYGIENE"] += 1
+                continue
+        # LLM tie-breaker for up to 3 ambiguous non-.sg candidates lacking SG markers
+        llm_tiebreak = 0
+        try:
+            if ambiguous:
+                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+                for dn in ambiguous[:3]:
+                    snip = jina_snips.get(dn) or ""
+                    if not snip:
+                        try:
+                            snip = jina_read(f"https://{dn}", timeout=6) or ""
+                        except Exception:
+                            snip = ""
+                    prompt = ChatPromptTemplate.from_messages([
+                        ("system", "Decide if this company is based in or primarily targeting Singapore. Reply 'keep' or 'drop' and a short reason."),
+                        ("human", f"Domain: {dn}\nSnippet: {(snip or '')[:800]}"),
+                    ])
+                    out = llm.invoke(prompt)
+                    txt = (getattr(out, "content", None) or "").lower()
+                    if "keep" in txt and dn not in kept:
+                        kept.append(dn)
+                        counts["kept"] += 1
+                        llm_tiebreak += 1
+        except Exception:
+            pass
+        kept = _uniq(kept)
+        state["discovery_candidates"] = kept
+        state["guard_kept"] = counts.get("kept")
+        state["guard_drops"] = {k: v for k, v in counts.items() if k != "kept"}
+        try:
+            log.info(
+                "[guard] kept=%s drop_hygiene=%s drop_deny=%s drop_sg=%s guard.llm_tiebreak=%s",
+                counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST"), counts.get("NO_SG_MARKERS"), llm_tiebreak
+            )
+        except Exception:
+            pass
+        return state
+    except Exception:
+        return state
 
 
 async def mini_crawl_worker(state: Dict[str, Any]) -> Dict[str, Any]:
