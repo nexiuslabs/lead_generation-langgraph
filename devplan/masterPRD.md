@@ -21,8 +21,10 @@ Our lead generation platform currently depends on Jina's r.jina.ai proxy for det
 
 ## Scope & Deliverables
 1. **MCP Client Service** — A dedicated module (planned `src/services/mcp_reader.py`) encapsulating authentication, retries, telemetry hooks, and thread-backed synchronous wrappers over the Jina MCP server.
+   - **Credential scope decision.** Proceed with **Option A — Workspace-wide API key.** Reuse the shared Jina key for all tenants, leaning on our internal tenant routing for segmentation while MCP value is validated. Bolster the shared-secret posture with tenant-level monitoring and a documented key rotation procedure to uphold isolation expectations. <!-- TODO(Codex Agent – Frontend Generator, 2025-03-28): Draft the shared-key rotation SOP and monitoring thresholds that uphold tenant isolation expectations. -->
 2. **Consumer Integrations** — Updates to `src/jina_reader.read_url`, resolver card builders, enrichment mergers, and ICP agents so they can toggle between HTTP and MCP transport under a feature flag.
 3. **Configuration & Observability** — Environment variables, rollout toggles (`ENABLE_MCP_READER`), Prometheus/log metrics, and operational runbooks covering rollout, validation, and rollback steps.
+   - **Telemetry sink alignment.** Continue with the Prometheus-first path, extending existing exporters and dashboards to cover MCP metrics so the rollout can iterate quickly, and schedule a checkpoint to reassess OTLP adoption once load patterns are well understood. <!-- TODO(Codex Agent – Frontend Generator, 2025-04-02): Outline the Prometheus metric extensions and define the criteria/timeline for the OTLP reassessment. -->
 
 ## User Flow
 1. **Greeting & Intent Detection.** Sessions begin in a welcome state that only surfaces guidance until the user explicitly issues a lead-generation command such as “start lead gen,” “find leads,” or “run enrichment,” preventing surprise automation after greetings.【F:app/pre_sdr_graph.py†L5754-L5769】【F:src/conversation_agent.py†L37-L66】
