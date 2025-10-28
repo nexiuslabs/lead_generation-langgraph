@@ -164,6 +164,29 @@ try:
 except Exception as _e:
     logger.warning("Chat SSE routes not mounted: %s", _e)
 
+# Mount MCP bridge routes for Jina tools
+try:
+    from app.mcp_routes import router as mcp_router
+    app.include_router(mcp_router)
+    logger.info("/mcp bridge routes enabled")
+except Exception as _e:
+    logger.warning("MCP bridge routes not mounted: %s", _e)
+
+# MCP health probe (optional)
+@app.get("/health/mcp")
+def mcp_health():
+    try:
+        from src.settings import ENABLE_MCP_READER
+        if not ENABLE_MCP_READER:
+            return {"ok": False, "disabled": True}
+        from src.services.mcp_reader import read_url as _mcp_read
+        txt = _mcp_read("https://example.com", timeout=1.0)
+        if not txt:
+            raise RuntimeError("empty")
+        return {"ok": True}
+    except Exception:
+        raise HTTPException(status_code=503, detail="mcp_unhealthy")
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"

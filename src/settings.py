@@ -31,6 +31,8 @@ APP_POSTGRES_DSN = POSTGRES_DSN
 
 # OpenAI / LangChain config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Jina API key (used for MCP auth). Prefer MCP_API_KEY if set, else fall back to JINA_API_KEY
+JINA_API_KEY = os.getenv("JINA_API_KEY", "")
 ICP_RULE_NAME = os.getenv("ICP_RULE_NAME", "default")
 LANGCHAIN_MODEL = os.getenv("LANGCHAIN_MODEL", "gpt-4o-mini")
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
@@ -333,3 +335,68 @@ try:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = int(os.getenv("FIRMO_MIN_COMPLETENESS_FOR_BONUS", "1") or 1)
 except Exception:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = 1
+
+# --- Jina MCP integration -----------------------------------------------------
+# Feature flag to enable MCP-backed reader/search
+ENABLE_MCP_READER = os.getenv("ENABLE_MCP_READER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "https://mcp.jina.ai/sse")
+MCP_API_KEY = os.getenv("MCP_API_KEY", "") or JINA_API_KEY
+try:
+    MCP_TIMEOUT_S = float(os.getenv("MCP_TIMEOUT_S", "15") or 15)
+except Exception:
+    MCP_TIMEOUT_S = 15.0
+try:
+    MCP_MAX_PARALLEL = int(os.getenv("MCP_MAX_PARALLEL", "4") or 4)
+except Exception:
+    MCP_MAX_PARALLEL = 4
+try:
+    MCP_DUAL_READ_SAMPLE_PCT = int(os.getenv("MCP_DUAL_READ_SAMPLE_PCT", "0") or 0)
+except Exception:
+    MCP_DUAL_READ_SAMPLE_PCT = 0
+
+# Use LangGraph Server's MCP bridge (works on Python 3.12)
+ENABLE_SERVER_MCP_BRIDGE = os.getenv("ENABLE_SERVER_MCP_BRIDGE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Name used in /mcp UI (e.g., 'jina')
+MCP_SERVER_NAME = os.getenv("MCP_SERVER_NAME", "jina")
+# Base URL for LangGraph Server (where /mcp is hosted)
+LGS_BASE_URL = os.getenv("LGS_BASE_URL", "http://127.0.0.1:8001")
+# Optional explicit invoke URL template; supports {server} and {tool}
+# Example: http://127.0.0.1:8001/mcp/servers/{server}/tools/{tool}/invoke
+MCP_BRIDGE_INVOKE_URL = os.getenv("MCP_BRIDGE_INVOKE_URL", "")
+# Optional JSON string of extra headers for bridge calls (e.g., auth)
+MCP_BRIDGE_HEADERS_JSON = os.getenv("MCP_BRIDGE_HEADERS_JSON", "")
+MCP_BRIDGE_FORCE_AUTH = os.getenv("MCP_BRIDGE_FORCE_AUTH", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# MCP bridge timeouts and cooldown controls
+try:
+    MCP_BRIDGE_COOL_OFF_S = float(os.getenv("MCP_BRIDGE_COOL_OFF_S", "180") or 180)
+except Exception:
+    MCP_BRIDGE_COOL_OFF_S = 180.0
+try:
+    MCP_BRIDGE_CONNECT_TIMEOUT_S = float(
+        os.getenv("MCP_BRIDGE_CONNECT_TIMEOUT_S", "3.05") or 3.05
+    )
+except Exception:
+    MCP_BRIDGE_CONNECT_TIMEOUT_S = 3.05
+try:
+    MCP_BRIDGE_READ_TIMEOUT_S = float(os.getenv("MCP_BRIDGE_READ_TIMEOUT_S", "12") or 12)
+except Exception:
+    MCP_BRIDGE_READ_TIMEOUT_S = 12.0
+
+# Optional: direct remote MCP JSON-RPC endpoint (bypasses LangGraph bridge when needed)
+MCP_REMOTE_URL = os.getenv("MCP_REMOTE_URL", "https://mcp.jina.ai/mcp")

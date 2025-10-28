@@ -2,7 +2,8 @@
   "dependencies": ["."],
   "env": ".env",
   "graphs": {
-    "agent": "./app/lg_entry.py:make_graph"
+    "agent": "./app/lg_entry.py:make_graph",
+    "mcp_health": "./app/mcp_health_graph.py:make_graph"
   },
   "auth": {
     "path": "./app/lg_auth.py:auth"

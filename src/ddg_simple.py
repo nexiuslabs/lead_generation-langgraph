@@ -4,7 +4,9 @@ from typing import List, Optional
 from urllib.parse import urlparse, urljoin, parse_qs, unquote, quote
 
 import requests
+import logging
 from bs4 import BeautifulSoup
+from src.settings import ENABLE_MCP_READER, ENABLE_SERVER_MCP_BRIDGE
 
 
 def _apex(host: str) -> str:
@@ -100,6 +102,61 @@ def search_domains(query: str, max_results: int = 20, country: Optional[str] = N
     """
     if not query or not isinstance(query, str):
         return []
+    # Server MCP bridge path when enabled
+    if ENABLE_SERVER_MCP_BRIDGE:
+        try:
+            from src.services.mcp_server_bridge import search_web as _bridge_search
+            logging.getLogger("ddg").info("[mcp-bridge] selected search_web query=%s", query)
+            urls = _bridge_search(query, country=country, max_results=max_results)
+            hosts: List[str] = []
+            for u in urls:
+                try:
+                    h = (urlparse(u).netloc or "").lower()
+                    if h:
+                        hosts.append(h)
+                except Exception:
+                    continue
+            # Normalize to apex and dedupe
+            uniq: List[str] = []
+            seen: set[str] = set()
+            for h in hosts:
+                a = _apex(h)
+                if a and a not in seen:
+                    seen.add(a)
+                    uniq.append(a)
+                if len(uniq) >= max_results:
+                    break
+            if uniq:
+                return uniq[:max_results]
+        except Exception:
+            pass
+    # Python MCP client path when enabled
+    if ENABLE_MCP_READER:
+        try:
+            from src.services.mcp_reader import search_web as _mcp_search
+            urls = _mcp_search(query, country=country, max_results=max_results)
+            hosts: List[str] = []
+            for u in urls:
+                try:
+                    h = (urlparse(u).netloc or "").lower()
+                    if h:
+                        hosts.append(h)
+                except Exception:
+                    continue
+            # Normalize to apex and dedupe
+            uniq: List[str] = []
+            seen: set[str] = set()
+            for h in hosts:
+                a = _apex(h)
+                if a and a not in seen:
+                    seen.add(a)
+                    uniq.append(a)
+                if len(uniq) >= max_results:
+                    break
+            if uniq:
+                return uniq[:max_results]
+        except Exception:
+            pass
     kl = None
     try:
         if country:
@@ -137,4 +194,3 @@ def search_domains(query: str, max_results: int = 20, country: Optional[str] = N
         if len(collected) >= max_results:
             break
     return collected[:max_results]
-

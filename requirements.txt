@@ -29,6 +29,11 @@ langchain-tavily>=0.2.11
 tavily-python
 ddgs
 
+# MCP client (optional; client code falls back to server bridge if not installed)
+
+# Prometheus metrics (optional; guarded import in code)
+prometheus-client>=0.20
+
 # Data / DB / utils
 asyncpg
 psycopg2

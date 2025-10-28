@@ -15,7 +15,7 @@ import html as html_lib
 from bs4 import BeautifulSoup
 
 from langchain_openai import ChatOpenAI
-from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
+from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS, ENABLE_MCP_READER, ENABLE_SERVER_MCP_BRIDGE
 try:
     from src.settings import ICP_SG_PROFILES  # type: ignore
 except Exception:  # pragma: no cover
@@ -229,6 +229,61 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
     - Enforces `site:` filter (e.g., site:.sg) when present in the query.
     - Falls back to r.jina DDG snapshot + regex extraction only if all direct endpoints fail.
     """
+    # Server MCP bridge path to unify search across agents when enabled
+    if ENABLE_SERVER_MCP_BRIDGE:
+        try:
+            from urllib.parse import urlparse as _urlparse
+            from src.services.mcp_server_bridge import search_web as _bridge_search
+            log.info("[mcp-bridge] selected search_web query=%s", query)
+            urls = _bridge_search(query, country=country, max_results=max_results)
+            hosts: List[str] = []
+            for u in urls:
+                try:
+                    h = (_urlparse(u).netloc or "").lower()
+                    if h:
+                        hosts.append(h)
+                except Exception:
+                    continue
+            uniq: List[str] = []
+            seen: set[str] = set()
+            for h in hosts:
+                a = _apex_domain(h)
+                if a and a not in seen and _is_probable_domain(a):
+                    seen.add(a)
+                    uniq.append(a)
+                if len(uniq) >= max_results:
+                    break
+            if uniq:
+                return uniq[:max_results]
+        except Exception:
+            pass
+    # Python MCP client path
+    if ENABLE_MCP_READER:
+        try:
+            from urllib.parse import urlparse as _urlparse
+            from src.services.mcp_reader import search_web as _mcp_search
+            urls = _mcp_search(query, country=country, max_results=max_results)
+            hosts: List[str] = []
+            for u in urls:
+                try:
+                    h = (_urlparse(u).netloc or "").lower()
+                    if h:
+                        hosts.append(h)
+                except Exception:
+                    continue
+            uniq: List[str] = []
+            seen: set[str] = set()
+            for h in hosts:
+                a = _apex_domain(h)
+                if a and a not in seen and _is_probable_domain(a):
+                    seen.add(a)
+                    uniq.append(a)
+                if len(uniq) >= max_results:
+                    break
+            if uniq:
+                return uniq[:max_results]
+        except Exception:
+            pass
     if not ENABLE_DDG_DISCOVERY:
         return []
     headers = {

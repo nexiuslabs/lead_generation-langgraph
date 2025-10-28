@@ -4,6 +4,8 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import requests
+from src.settings import ENABLE_MCP_READER, MCP_DUAL_READ_SAMPLE_PCT, ENABLE_SERVER_MCP_BRIDGE
+import random
 
 log = logging.getLogger("jina_reader")
 if not log.handlers:
@@ -58,6 +60,49 @@ def _host_of(u: str) -> str:
 
 
 def read_url(url: str, timeout: float = 12.0) -> Optional[str]:
+    # Try Server MCP bridge first when enabled (works on Py3.12)
+    if ENABLE_SERVER_MCP_BRIDGE:
+        try:
+            from src.services.mcp_server_bridge import read_url as bridge_read
+            log.info("[mcp-bridge] selected read_url url=%s", url)
+            btxt = bridge_read(url, timeout=timeout)
+            if btxt:
+                return clean_jina_text(btxt)[:10000]
+            else:
+                try:
+                    log.info("[mcp-bridge] no content; falling back url=%s", url)
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                log.info("[mcp-bridge] import/bridge error url=%s err=%s", url, e)
+            except Exception:
+                pass
+    else:
+        try:
+            log.info("[mcp-bridge] disabled; using legacy r.jina for url=%s", url)
+        except Exception:
+            pass
+    # Try Python MCP client-backed reader when enabled
+    if ENABLE_MCP_READER:
+        try:
+            from src.services.mcp_reader import read_url as mcp_read_url
+            try:
+                log.info("[mcp] selected read_url url=%s", url)
+            except Exception:
+                pass
+            # Optional probabilistic dual-read parity sampling (simple winner-takes-any)
+            if MCP_DUAL_READ_SAMPLE_PCT and random.randint(1, 100) <= MCP_DUAL_READ_SAMPLE_PCT:
+                mtxt = mcp_read_url(url, timeout=timeout) or ""
+                if mtxt.strip():
+                    return clean_jina_text(mtxt)[:10000]
+                # fall through to legacy if MCP empty
+            else:
+                mtxt = mcp_read_url(url, timeout=timeout)
+                if mtxt:
+                    return clean_jina_text(mtxt)[:10000]
+        except Exception:
+            pass
     try:
         # Skip known-bad hosts for a cooling period to avoid tight retry loops
         ttl = 60.0 * 60.0 * 6  # 6 hours default
