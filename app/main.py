@@ -164,6 +164,68 @@ try:
 except Exception as _e:
     logger.warning("Chat SSE routes not mounted: %s", _e)
 
+# ---------------------------------------------------------------
+# Utilities: SendGrid email smoke test (no enrichment required)
+# ---------------------------------------------------------------
+from typing import Optional
+from fastapi import Body
+
+
+@app.post("/email/test")
+async def email_test(
+    to: Optional[str] = Query(default=None, description="Recipient email"),
+    subject: Optional[str] = Query(default="Test: Lead shortlist delivery", description="Email subject"),
+    simple: bool = Query(default=True, description="Use simple payload (no DB/LLM)"),
+    tenant_id: Optional[int] = Query(default=None, description="Tenant id (only used when simple=false)"),
+    body: Optional[str] = Body(default=None, description="Optional HTML body for simple mode"),
+):
+    """Send a minimal test email via SendGrid to verify configuration.
+
+    - simple=true (default): sends a static HTML payload; no DB or LLM involved.
+    - simple=false: uses the agentic sender with render+LLM; requires tenant_id and DB data.
+    """
+    try:
+        from src.settings import EMAIL_ENABLED, DEFAULT_NOTIFY_EMAIL, SENDGRID_API_KEY, SENDGRID_FROM_EMAIL
+        if not EMAIL_ENABLED:
+            raise HTTPException(status_code=400, detail="email disabled: ENABLE_EMAIL_RESULTS is false")
+        if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
+            raise HTTPException(status_code=400, detail="sendgrid not configured: missing API key or from email")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"email config error: {e}")
+
+    to_final = (to or "").strip() if isinstance(to, str) else None
+    if not to_final:
+        try:
+            from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+            if _DEF_TO and ("@" in str(_DEF_TO)):
+                to_final = str(_DEF_TO)
+        except Exception:
+            pass
+    if not to_final:
+        raise HTTPException(status_code=400, detail="missing 'to' and DEFAULT_NOTIFY_EMAIL not set")
+
+    if not simple:
+        if tenant_id is None:
+            raise HTTPException(status_code=400, detail="tenant_id is required when simple=false")
+        try:
+            from src.notifications.agentic_email import agentic_send_results
+            res = await agentic_send_results(to_final, int(tenant_id))
+            return {"ok": True, **(res or {})}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"agentic send failed: {e}")
+
+    # Simple path: no DB, send minimal HTML
+    html = body or (
+        "<p>This is a SendGrid configuration test from Lead Generation backend.</p>"
+        "<p>If you received this email, your SendGrid credentials are valid.</p>"
+    )
+    try:
+        from src.notifications.sendgrid import send_leads_email
+        res = await send_leads_email(to_final, subject or "Test", html)
+        return {"ok": True, **(res or {})}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"sendgrid send failed: {e}")
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"

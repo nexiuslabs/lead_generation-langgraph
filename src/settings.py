@@ -57,6 +57,30 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # ZeroBounce API Key
 ZEROBOUNCE_API_KEY = os.getenv("ZEROBOUNCE_API_KEY")
 
+# --- Email / SendGrid configuration -------------------------------------------
+# Feature flag to enable emailing enrichment results
+EMAIL_ENABLED = os.getenv("ENABLE_EMAIL_RESULTS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# SendGrid credentials and optional template
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
+SENDGRID_TEMPLATE_ID = os.getenv("SENDGRID_TEMPLATE_ID")
+
+# Optional dev/ops fallback recipient when no JWT email is present (e.g., dev-bypass)
+DEFAULT_NOTIFY_EMAIL = os.getenv("DEFAULT_NOTIFY_EMAIL")
+
+# Dev-only guard: accept tenant_users.user_id as an email if it contains '@'
+# When false, values from tenant_users.user_id will be ignored unless another
+# source provides a valid email (notify_email payload, JWT, or DEFAULT_NOTIFY_EMAIL).
+EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL = (
+    os.getenv("EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL", "true").lower()
+    in ("1", "true", "yes", "on")
+)
+
 # Add new settings below this line if needed
 CRAWLER_USER_AGENT = "ICPFinder-Bot/1.0 (+https://nexiuslabs.com)"
 CRAWLER_TIMEOUT_S = 30

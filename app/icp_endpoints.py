@@ -252,6 +252,7 @@ async def enrich_top10(
     user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
     x_session_id: Optional[str] = Header(default=None, alias="X-Session-ID"),
+    x_notify_email: Optional[str] = Header(default=None, alias="X-Notify-Email"),
 ):
     """Enrich the persisted Top‑10 preview strictly by tenant.
 
@@ -438,7 +439,44 @@ async def enrich_top10(
                 except Exception:
                     ids = []
             if ids:
-                job = _enqueue_bg(int(tid), ids)
+                # propagate notify_email so background can email on completion
+                to_email = (
+                    user.get("email")
+                    or user.get("preferred_username")
+                    or user.get("sub")
+                ) if isinstance(user, dict) else None
+                # Allow explicit override via X-Notify-Email header (useful in dev-bypass)
+                override_to = (x_notify_email or "").strip() if isinstance(x_notify_email, str) else None
+                if override_to and ("@" in override_to):
+                    to_email = override_to
+                # If still missing, try resolve from tenant_users table
+                if not to_email:
+                    try:
+                        with get_conn() as _c, _c.cursor() as _cur:
+                            _cur.execute(
+                                "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
+                                (tid,),
+                            )
+                            _r = _cur.fetchone()
+                            if _r and _r[0]:
+                                candidate = str(_r[0])
+                                try:
+                                    from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL
+                                except Exception:
+                                    _ACCEPT_TU_EMAIL = True
+                                if _ACCEPT_TU_EMAIL and ("@" in candidate):
+                                    to_email = candidate
+                    except Exception:
+                        pass
+                # Dev/ops fallback recipient via env when none present
+                if not to_email:
+                    try:
+                        from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+                        if _DEF_TO and ("@" in str(_DEF_TO)):
+                            to_email = str(_DEF_TO)
+                    except Exception:
+                        pass
+                job = _enqueue_bg(int(tid), ids, notify_email=to_email)
                 bg_job_id = job.get("job_id") if isinstance(job, dict) else None
                 try:
                     emit_chat_event(
@@ -457,7 +495,67 @@ async def enrich_top10(
         emit_chat_event(x_session_id, tid, "enrich:summary", f"Enriched results ({processed}/{len(company_ids)} completed). Remaining queued.", {"processed": processed, "requested": len(company_ids), "next40_job_id": bg_job_id})
     except Exception:
         pass
-    return {"ok": True, "requested": len(company_ids), "processed": processed, "next40_job_id": bg_job_id}
+    # Attempt to send an email with the Top‑10 summary to the requester
+    emailed = False
+    email_status = None
+    emailed_to = None
+    try:
+        to_email = (
+            user.get("email")
+            or user.get("preferred_username")
+            or user.get("sub")
+        ) if isinstance(user, dict) else None
+        # Allow explicit override via X-Notify-Email header (useful in dev-bypass)
+        override_to = (x_notify_email or "").strip() if isinstance(x_notify_email, str) else None
+        if override_to and ("@" in override_to):
+            to_email = override_to
+        # If still missing, try resolve from tenant_users table
+        if not to_email:
+            try:
+                with get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
+                        (tid,),
+                    )
+                    _r = _cur.fetchone()
+                    if _r and _r[0]:
+                        candidate = str(_r[0])
+                        try:
+                            from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL
+                        except Exception:
+                            _ACCEPT_TU_EMAIL = True
+                        if _ACCEPT_TU_EMAIL and ("@" in candidate):
+                            to_email = candidate
+            except Exception:
+                pass
+        # Dev/ops fallback recipient via env when none present
+        if not to_email:
+            try:
+                from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+                if _DEF_TO and ("@" in str(_DEF_TO)):
+                    to_email = str(_DEF_TO)
+            except Exception:
+                pass
+        if to_email:
+            from src.notifications.agentic_email import agentic_send_results
+            res = await agentic_send_results(str(to_email), int(tid))
+            email_status = (res or {}).get("status")
+            emailed = email_status == "sent"
+            emailed_to = str(to_email)
+            # Emit SSE acknowledgement for active chat sessions
+            try:
+                msg = (
+                    f"Sent results to {to_email}"
+                    if emailed
+                    else ("Email skipped (no config)" if email_status == "skipped_no_config" else "Email failed")
+                )
+                emit_chat_event(x_session_id, tid, "email:status", msg, {"status": email_status, "to": to_email, "link": (res or {}).get("csv_link") or "/export/latest_scores.csv?limit=500"})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {"ok": True, "requested": len(company_ids), "processed": processed, "next40_job_id": bg_job_id, "emailed": emailed, "email_status": email_status, "emailed_to": emailed_to}
 
 
 @router.post("/enrich/next40")
@@ -465,6 +563,7 @@ async def enrich_next40(
     req: Request,
     user=Depends(_auth_dep),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    x_notify_email: Optional[str] = Header(default=None, alias="X-Notify-Email"),
 ):
     """Enqueue background enrichment for the next 40 preview domains (Non‑SG only).
 
@@ -516,10 +615,44 @@ async def enrich_next40(
             company_ids = []
     if not company_ids:
         raise HTTPException(status_code=404, detail="no company_ids resolved for next40")
-    # Enqueue background job
+    # Enqueue background job (carry notify_email like Top-10 flow)
     try:
         from src.jobs import enqueue_web_discovery_bg_enrich
-        job = enqueue_web_discovery_bg_enrich(int(tid), company_ids)
+        # Resolve recipient: JWT → header override → tenant_users (guarded) → DEFAULT_NOTIFY_EMAIL
+        to_email = (
+            user.get("email")
+            or user.get("preferred_username")
+            or user.get("sub")
+        ) if isinstance(user, dict) else None
+        override_to = (x_notify_email or "").strip() if isinstance(x_notify_email, str) else None
+        if override_to and ("@" in override_to):
+            to_email = override_to
+        if not to_email:
+            try:
+                with get_conn() as _c, _c.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
+                        (tid,),
+                    )
+                    _r = _cur.fetchone()
+                    if _r and _r[0]:
+                        candidate = str(_r[0])
+                        try:
+                            from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL
+                        except Exception:
+                            _ACCEPT_TU_EMAIL = True
+                        if _ACCEPT_TU_EMAIL and ("@" in candidate):
+                            to_email = candidate
+            except Exception:
+                pass
+        if not to_email:
+            try:
+                from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+                if _DEF_TO and ("@" in str(_DEF_TO)):
+                    to_email = str(_DEF_TO)
+            except Exception:
+                pass
+        job = enqueue_web_discovery_bg_enrich(int(tid), company_ids, notify_email=to_email)
         return {"ok": True, "job_id": job.get("job_id")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")

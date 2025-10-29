@@ -289,7 +289,7 @@ async def run_manual_research_enrich(job_id: int) -> None:
         log.info("{\"job\":\"manual_research_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
 
 
-def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int]) -> dict:
+def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int], notify_email: Optional[str] = None) -> dict:
     """Queue background enrichment for next‑40 web_discovery preview companies.
 
     Stores the company_ids list in background_jobs.params for processing by the nightly dispatcher.
@@ -300,7 +300,7 @@ def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int]) -> d
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'web_discovery_bg_enrich','queued', %s) RETURNING job_id",
-            (tenant_id, Json({"company_ids": ids})),
+            (tenant_id, Json({"company_ids": ids, **({"notify_email": notify_email} if notify_email else {})})),
         )
         row = cur.fetchone()
         jid = int(row[0]) if row and row[0] is not None else 0
@@ -434,6 +434,89 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                 await _asyncio.sleep(0.5 * (attempt + 1))
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
+    # After completion (success or failure on some items), send email once if requested and not already sent
+    try:
+        to_email = None
+        sent_at = None
+        try:
+            to_email = (params or {}).get("notify_email")
+            sent_at = (params or {}).get("email_sent_at")
+        except Exception:
+            to_email = None
+        # Resolve from tenant_users when missing
+        if tenant_id and not to_email:
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
+                        (int(tenant_id),),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        candidate = str(row[0])
+                        # Only accept tenant_users.user_id as email when it contains '@' (dev-only guard)
+                        try:
+                            from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL
+                        except Exception:
+                            _ACCEPT_TU_EMAIL = True
+                        if _ACCEPT_TU_EMAIL and ("@" in candidate):
+                            to_email = candidate
+                            # persist source
+                            cur.execute(
+                                "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source', 'tenant_users') WHERE job_id=%s",
+                                (to_email, job_id),
+                            )
+            except Exception:
+                pass
+        # Fallback to DEFAULT_NOTIFY_EMAIL when still missing (useful in dev-bypass)
+        if tenant_id and not to_email:
+            try:
+                from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+                if _DEF_TO and ("@" in str(_DEF_TO)):
+                    to_email = str(_DEF_TO)
+                    # persist fallback into params to avoid repeated lookups and document provenance
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source', 'default_env') WHERE job_id=%s",
+                            (to_email, job_id),
+                        )
+            except Exception:
+                pass
+        if tenant_id and to_email and not sent_at:
+            from src.notifications.agentic_email import agentic_send_results
+            res = await agentic_send_results(str(to_email), int(tenant_id))
+            # Log outcome for observability
+            try:
+                log.info(
+                    "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"email\",\"job_id\":%s,\"tenant_id\":%s,\"to\":\"%s\",\"status\":%s}",
+                    job_id,
+                    tenant_id,
+                    (to_email or "").replace("\"", "'")[:200],
+                    (res or {}).get("status"),
+                )
+            except Exception:
+                pass
+            # Mark as sent if success to prevent duplicates
+            if (res or {}).get("status") == "sent":
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('email_sent_at', now(), 'email_to', %s) WHERE job_id=%s",
+                        (to_email, job_id),
+                    )
+        else:
+            try:
+                reason = "already_sent" if sent_at else "missing_to"
+                log.info(
+                    "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"email_skip\",\"job_id\":%s,\"tenant_id\":%s,\"reason\":\"%s\"}",
+                    job_id,
+                    tenant_id,
+                    reason,
+                )
+            except Exception:
+                pass
+    except Exception:
+        # Non-fatal
+        pass
 
 
 def enqueue_enrich_candidates(tenant_id: Optional[int], ssic_codes: List[str]) -> dict:

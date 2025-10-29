@@ -73,6 +73,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Enqueue Next-40 web discovery enrichment for latest preview batch")
     ap.add_argument("--tenant-id", type=int, required=True, help="Tenant ID")
     ap.add_argument("--limit", type=int, default=int(os.getenv("BG_NEXT_COUNT", "40") or 40), help="Max domains to enqueue (default from BG_NEXT_COUNT or 40)")
+    ap.add_argument("--notify-email", type=str, default=None, help="Optional recipient email to notify on completion")
     args = ap.parse_args()
 
     tenant_id: int = int(args.tenant_id)
@@ -109,11 +110,16 @@ def main() -> int:
 
     # Enqueue the job (this will NOTIFY bg_jobs)
     from src.jobs import enqueue_web_discovery_bg_enrich
-    job = enqueue_web_discovery_bg_enrich(tenant_id, ids)
-    print(f"[next40-debug] enqueued job_id={job.get('job_id')} count={len(ids)} tenant_id={tenant_id}")
+    to_email = (args.notify_email or "").strip() if isinstance(args.notify_email, str) else None
+    if not to_email:
+        # Fallback to env default when provided (dev convenience)
+        from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+        if _DEF_TO and ("@" in str(_DEF_TO)):
+            to_email = str(_DEF_TO)
+    job = enqueue_web_discovery_bg_enrich(tenant_id, ids, notify_email=to_email)
+    print(f"[next40-debug] enqueued job_id={job.get('job_id')} count={len(ids)} tenant_id={tenant_id} notify_email={to_email}")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
