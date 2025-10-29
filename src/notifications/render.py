@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as _dt
 from typing import Tuple, List, Dict, Any
+import csv as _csv
+from io import StringIO as _StringIO
 
 from src.database import get_conn
 
@@ -111,11 +113,84 @@ def render_summary_html(tenant_id: int, limit: int = 200) -> Tuple[str, str, str
     <p style='font-family:system-ui,Segoe UI,Arial,Sans-Serif;font-size:14px;'>
       <strong>Generated:</strong> {now}<br/>
       <strong>Tenant:</strong> {tenant_id}<br/>
-      <strong>Bucket counts:</strong> {counts_txt}
+      <strong>Bucket counts:</strong> {counts_txt}<br/>
+      <em>Note: Full CSV is attached to this email.</em>
     </p>
-    <p><a href='{csv_link}' style='display:inline-block;padding:8px 12px;background:#0d6efd;color:#fff;text-decoration:none;border-radius:6px;'>Download CSV</a></p>
     <hr style='border:none;border-top:1px solid #eee;margin:12px 0;' />
     """
 
     html = header + _render_table(rows)
     return subject, html, csv_link
+
+
+def build_csv_bytes(tenant_id: int, limit: int = 500) -> Tuple[bytes, str]:
+    """Build CSV bytes for the tenant’s latest scores.
+
+    Returns (csv_bytes, filename)
+    """
+    # Query the same columns as export_latest_scores_csv
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        cur.execute(
+            """
+            SELECT c.company_id,
+                   c.name,
+                   c.industry_norm,
+                   c.employees_est,
+                   s.score,
+                   s.bucket,
+                   s.rationale,
+                   (
+                     SELECT e.email
+                     FROM lead_emails e
+                     WHERE e.company_id = s.company_id
+                     ORDER BY e.left_company NULLS FIRST, e.smtp_confidence DESC NULLS LAST
+                     LIMIT 1
+                   ) AS primary_email,
+                   (
+                     SELECT c2.full_name FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_name,
+                   (
+                     SELECT c2.job_title FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_title,
+                   (
+                     SELECT c2.linkedin_profile FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_linkedin,
+                   (
+                     SELECT c2.phone_number FROM contacts c2
+                     WHERE c2.company_id = s.company_id AND c2.email IS NOT NULL
+                     LIMIT 1
+                   ) AS contact_phone
+            FROM companies c
+            JOIN lead_scores s ON s.company_id = c.company_id
+            WHERE s.tenant_id = %s
+            ORDER BY s.score DESC NULLS LAST
+            LIMIT %s
+            """,
+            (int(tenant_id), int(limit)),
+        )
+        rows = cur.fetchall() or []
+        headers = [
+            "company_id","name","industry_norm","employees_est","score","bucket","rationale",
+            "primary_email","contact_name","contact_title","contact_linkedin","contact_phone"
+        ]
+        buf = _StringIO()
+        writer = _csv.writer(buf)
+        writer.writerow(headers)
+        for rec in rows:
+            writer.writerow([rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], rec[7], rec[8], rec[9], rec[10], rec[11]])
+        data = buf.getvalue().encode("utf-8")
+    fname = f"shortlist_tenant_{int(tenant_id)}.csv"
+    return data, fname

@@ -7,7 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from src.notifications.render import render_summary_html
+from src.notifications.render import render_summary_html, build_csv_bytes
 from src.notifications.sendgrid import send_leads_email
 from src.settings import LANGCHAIN_MODEL, TEMPERATURE, EMAIL_ENABLED
 
@@ -27,7 +27,19 @@ async def send_email_tool(to: str, subject: str, intro_html: str, tenant_id: int
     subj_auto, table_html, csv_link = render_summary_html(int(tenant_id), int(limit))
     subject_final = subject or subj_auto
     html = f"{intro_html}{table_html}"
-    res = await send_leads_email(to, subject_final, html)
+    # Build CSV attachment
+    try:
+        csv_bytes, csv_name = build_csv_bytes(int(tenant_id), 500)
+    except Exception:
+        csv_bytes, csv_name = None, None  # type: ignore[assignment]
+    res = await send_leads_email(
+        to,
+        subject_final,
+        html,
+        attachment_bytes=csv_bytes,
+        attachment_filename=csv_name,
+        attachment_content_type="text/csv",
+    )
     # attach csv_link hint for caller telemetry
     try:
         res["csv_link"] = csv_link

@@ -52,6 +52,14 @@ Optional / Recommended
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
 - ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
 
+Email results (SendGrid)
+- ENABLE_EMAIL_RESULTS: set to `true` to enable emails
+- SENDGRID_API_KEY: your SendGrid API key
+- SENDGRID_FROM_EMAIL: verified sender (Single Sender or authenticated domain)
+- SENDGRID_TEMPLATE_ID: optional dynamic template id (not required)
+- DEFAULT_NOTIFY_EMAIL: optional fallback recipient when no JWT/header email is present (useful in dev)
+- EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL: default `true`; if `true`, accept `tenant_users.user_id` as an email when it contains `@` (dev convenience)
+
 PRD‑Opt (SG Profiles)
 - ICP_SG_PROFILES: set to `1` to enable Singapore‑focused discovery gating, denylists, and markers.
 - SG_PROFILES_CONFIG: path to YAML (default `config/sg_profiles.yaml`) to override profiles/weights/deny rules.
@@ -77,6 +85,11 @@ LANGCHAIN_MODEL=gpt-4o-mini
 TEMPERATURE=0.3
 CRAWL_MAX_PAGES=6
 EXTRACT_CORPUS_CHAR_LIMIT=35000
+ENABLE_EMAIL_RESULTS=true
+SENDGRID_API_KEY=SG.xxxxxx
+SENDGRID_FROM_EMAIL=no-reply@yourdomain.com
+DEFAULT_NOTIFY_EMAIL=ops@yourdomain.com
+EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL=true
  
 ```
 
@@ -218,6 +231,36 @@ Logs & Output
 profile: sg_referral_partners
 ```
 - To override per‑run programmatically (advanced), pass a `lead_profile` key into the `icp_profile` you send to the agent Top‑10 planner (e.g., when invoking `src.agents_icp.plan_top10_with_reasons(icp_profile, tenant_id)`). The planner will carry `lead_profile` into `ai_metadata` for Top‑10 and the staged remainder.
+
+## Email Results (SendGrid)
+
+Overview
+- When enabled, the backend emails a shortlist summary and attaches a CSV.
+- Top‑10 (chat) sends immediately after enrichment; Next‑40 (background) sends once the job completes.
+- Recipient resolution: header `X-Notify-Email` (dev override) → JWT email → `tenant_users.user_id` (when it contains `@` and the dev guard is enabled) → `DEFAULT_NOTIFY_EMAIL`.
+
+Configuration
+- Set `ENABLE_EMAIL_RESULTS=true` and provide `SENDGRID_API_KEY` and `SENDGRID_FROM_EMAIL`.
+- `SENDGRID_FROM_EMAIL` must be a verified Single Sender or from an authenticated domain (SPF/DKIM) in SendGrid.
+- Optional: `DEFAULT_NOTIFY_EMAIL` for dev/staging convenience.
+
+Test endpoints
+- Simple SendGrid smoke test (no DB/LLM):
+  - `curl -X POST "http://localhost:8000/email/test?to=you@example.com&simple=true"`
+- Agentic email (uses DB renderer + LLM intro/subject):
+  - `curl -X POST "http://localhost:8000/email/test?to=you@example.com&simple=false&tenant_id=1104"`
+
+Notes on delivery
+- A 202 from SendGrid means “accepted”; delivery can still be delayed or filtered.
+- If emails aren’t received:
+  - Check Gmail Spam/Promotions.
+  - Verify the sender in SendGrid (Single Sender or domain authentication).
+  - Check SendGrid Email Activity for events (processed/delivered/deferred/dropped).
+  - Inspect suppression lists (bounces/blocks/invalid/spam_reports) and remove entries if appropriate.
+
+Attachment behavior
+- Emails include a CSV attachment (`shortlist_tenant_<ID>.csv`).
+- Attachment row cap defaults to 500 to keep size reasonable. If you need a different limit, update the sender tool to pass a different limit for `build_csv_bytes`.
 
 ## Running Tests
 Run tests from the repo root, pointing `PYTHONPATH` at the backend package:

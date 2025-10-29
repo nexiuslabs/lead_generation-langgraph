@@ -31,6 +31,9 @@ async def send_leads_email(
     *,
     template_id: Optional[str] = None,
     substitutions: Optional[Dict[str, Any]] = None,
+    attachment_bytes: Optional[bytes] = None,
+    attachment_filename: Optional[str] = None,
+    attachment_content_type: str = "text/csv",
 ) -> Dict[str, Any]:
     """Send an email via SendGrid.
 
@@ -58,6 +61,23 @@ async def send_leads_email(
             payload["personalizations"][0]["dynamic_template_data"] = {}
     else:
         payload["content"] = [{"type": "text/html", "value": html}]
+
+    # Optional single attachment (CSV)
+    if attachment_bytes and attachment_filename:
+        try:
+            import base64
+            b64 = base64.b64encode(attachment_bytes).decode("ascii")
+            payload["attachments"] = [
+                {
+                    "content": b64,
+                    "type": attachment_content_type,
+                    "filename": attachment_filename,
+                    "disposition": "attachment",
+                }
+            ]
+        except Exception:
+            # If encoding fails, continue without attachment to avoid blocking the email
+            pass
 
     headers = {"Authorization": f"Bearer {SENDGRID_API_KEY}"}
 
@@ -95,4 +115,3 @@ async def send_leads_email(
         except Exception:
             pass
         return {"status": "failed", "error": str(e)}
-
