@@ -358,9 +358,17 @@ try:
 except Exception:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = 1
 
-# --- Jina MCP Reader (read_url only) -----------------------------------------
+# --- Jina MCP (read_url + search) --------------------------------------------
 # Feature flag to enable MCP transport for read_url (fallback remains HTTP)
 ENABLE_MCP_READER = os.getenv("ENABLE_MCP_READER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Feature flag to enable MCP search tools in discovery/resolver flows
+ENABLE_MCP_SEARCH = os.getenv("ENABLE_MCP_SEARCH", "false").lower() in (
     "1",
     "true",
     "yes",
@@ -380,3 +388,20 @@ try:
     MCP_DUAL_READ_PCT = int(os.getenv("MCP_DUAL_READ_PCT", "0") or 0)
 except Exception:
     MCP_DUAL_READ_PCT = 0
+
+# Optional: default country hint for MCP search_web
+MCP_SEARCH_COUNTRY = os.getenv("MCP_SEARCH_COUNTRY", "")
+
+# Thread pool size for MCP parallel operations
+try:
+    MCP_POOL_MAX_WORKERS = int(os.getenv("MCP_POOL_MAX_WORKERS", "4") or 4)
+except Exception:
+    MCP_POOL_MAX_WORKERS = 4
+
+# Optional Prometheus exporter toggle (metrics are no-op when disabled)
+PROM_ENABLE = os.getenv("PROM_ENABLE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

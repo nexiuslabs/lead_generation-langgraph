@@ -17,6 +17,10 @@ from bs4 import BeautifulSoup
 from langchain_openai import ChatOpenAI
 from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
 try:
+    from src.settings import ENABLE_MCP_SEARCH  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_MCP_SEARCH = False  # type: ignore
+try:
     from src.settings import ICP_SG_PROFILES  # type: ignore
 except Exception:  # pragma: no cover
     ICP_SG_PROFILES = False  # type: ignore
@@ -534,6 +538,49 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
     return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
 
 
+def _mcp_search_domains(query: str, max_results: int = 25, country: str | None = None) -> List[str]:
+    """Use MCP search_web to get URLs and convert to domains.
+
+    Falls back to DDG on error.
+    """
+    try:
+        from urllib.parse import urlparse as _up
+        from src.services import mcp_reader as _mcp  # type: ignore
+        urls = _mcp.search_web(query, country=country, max_results=max_results) or []
+        doms: List[str] = []
+        for u in urls:
+            try:
+                s = str(u or "").strip()
+                if not s:
+                    continue
+                if not s.startswith("http"):
+                    s = "https://" + s
+                host = (_up(s).netloc or s).lower()
+                host = _normalize_host(host)
+                if host and _is_probable_domain(host):
+                    doms.append(host)
+            except Exception:
+                continue
+        doms = _uniq(doms)
+        try:
+            log.info("[mcp] search domains=%d", len(doms))
+        except Exception:
+            pass
+        return doms[:max_results]
+    except Exception as e:
+        try:
+            log.info("[mcp] search fallback to DDG due to: %s", (str(e) or type(e).__name__))
+        except Exception:
+            pass
+        return _search_domains(query, max_results=max_results, country=country)
+
+
+def _search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
+    if ENABLE_MCP_SEARCH:
+        return _mcp_search_domains(query, max_results=max_results, country=country)
+    return _search_domains(query, max_results=max_results, country=country, lang=lang)
+
+
 log = logging.getLogger("agents.icp")
 if not log.handlers:
     h = logging.StreamHandler()
@@ -825,17 +872,17 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 query = fallback or "b2b distributors"
 
     # Single-query discovery: paginate up to 8 pages, stop at 50
-    log.info("[plan] ddg-only query: %s", query)
+    log.info("[plan] query: %s (search=%s)", query, ("mcp" if ENABLE_MCP_SEARCH else "ddg"))
     domains: List[str] = []
     ddg_count = 0
     try:
-        for dom in _ddg_search_domains(query, max_results=50, country=country_hint):
+        for dom in _search_domains(query, max_results=50, country=country_hint):
             domains.append(dom)
             ddg_count += 1
     except Exception as e:
-        log.info("[plan] ddg fail: %s", e)
+        log.info("[plan] search fail: %s", e)
     try:
-        log.info("[planner] tools.ddg=%d", ddg_count)
+        log.info("[planner] tools.search.count=%d", ddg_count)
     except Exception:
         pass
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
@@ -878,9 +925,9 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     if not uniq and (country_hint == 'sg'):
         try:
             _q2 = "b2b distributors site:.sg"
-            log.info("[plan] ddg retry with default query: %s", _q2)
+            log.info("[plan] retry with default query: %s", _q2)
             more2: List[str] = []
-            for dom in _ddg_search_domains(_q2, max_results=50, country=country_hint):
+            for dom in _search_domains(_q2, max_results=50, country=country_hint):
                 more2.append(dom)
             muniq = [d for d in _uniq(more2) if _is_probable_domain(str(d))]
             if muniq:
@@ -894,7 +941,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             q_relaxed2 = re.sub(r"\bsite:[^\s]+", "", query).strip()
             if q_relaxed2 and q_relaxed2 != query:
                 more2: List[str] = []
-                for dom in _ddg_search_domains(q_relaxed2, max_results=50, country=country_hint):
+                for dom in _search_domains(q_relaxed2, max_results=50, country=country_hint):
                     more2.append(dom)
                 if more2:
                     merged = [d for d in _uniq(uniq + more2) if _is_probable_domain(str(d))]
@@ -920,7 +967,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 if q_relaxed and q_relaxed != query:
                     more: List[str] = []
                     try:
-                        for dom in _ddg_search_domains(q_relaxed, max_results=50, country=country_hint):
+                        for dom in _search_domains(q_relaxed, max_results=50, country=country_hint):
                             more.append(dom)
                     except Exception:
                         more = []
@@ -1498,7 +1545,7 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         # Discover domains strictly via DDG
         domains: List[str] = []
         for q in queries[:3]:
-            for dom in _ddg_search_domains(q, max_results=25):
+            for dom in _search_domains(q, max_results=25):
                 domains.append(dom)
         uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))][:20]
         if not uniq:
@@ -1596,10 +1643,10 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
         use_sg = any(s.endswith(".sg") for s in seeds)
         if use_sg:
             qset = [q + " site:.sg" for q in qset]
-        # Run DDG for each query (cap)
+        # Run search for each query (cap)
         cand: List[str] = []
         for q in qset[:6]:
-            for dom in _ddg_search_domains(q, max_results=25):
+            for dom in _search_domains(q, max_results=25):
                 cand.append(dom)
         uniq = [h for h in _uniq(cand) if _is_probable_domain(h) and h not in seed_set][:60]
         if not uniq:

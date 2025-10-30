@@ -3,8 +3,10 @@ import time
 import json
 import threading
 import logging
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Tuple, List
 import subprocess
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from src import obs  # type: ignore
@@ -17,6 +19,37 @@ if not log.handlers:
     log.addHandler(h)
 log.setLevel(logging.INFO)
 
+# Optional Prometheus metrics
+_PROM_ENABLE = os.getenv("PROM_ENABLE", "false").lower() in ("1", "true", "yes", "on")
+try:  # pragma: no cover - metrics optional
+    if _PROM_ENABLE:
+        from prometheus_client import Counter as _PCounter, Histogram as _PHistogram  # type: ignore
+        _MCP_CALLS = _PCounter("mcp_calls_total", "Total MCP tool calls", ["tool", "status"])  # type: ignore
+        _MCP_LAT = _PHistogram("mcp_latency_seconds", "MCP tool latency (seconds)", ["tool"])  # type: ignore
+    else:
+        _MCP_CALLS = None  # type: ignore
+        _MCP_LAT = None  # type: ignore
+except Exception:  # pragma: no cover
+    _PROM_ENABLE = False
+    _MCP_CALLS = None  # type: ignore
+    _MCP_LAT = None  # type: ignore
+
+def _metrics_record(tool: str, status: str, duration_s: Optional[float]) -> None:
+    try:
+        if not _PROM_ENABLE or _MCP_CALLS is None or _MCP_LAT is None:
+            return
+        try:
+            _MCP_CALLS.labels(tool=tool, status=status).inc()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            if isinstance(duration_s, (int, float)):
+                _MCP_LAT.labels(tool=tool).observe(float(duration_s))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 
 class MCPClientNotImplemented(RuntimeError):
     pass
@@ -27,6 +60,14 @@ def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
         return os.getenv(key, default)
     except Exception:
         return default
+
+
+def _get_server_url() -> str:
+    try:
+        v = os.getenv("MCP_SERVER_URL") or os.getenv("MCP_ENDPOINT")
+        return (v or "https://mcp.jina.ai/sse").strip()
+    except Exception:
+        return "https://mcp.jina.ai/sse"
 
 
 class _RPCError(RuntimeError):
@@ -69,6 +110,28 @@ class _MCPRemote:
                     if s:
                         # escalate to info for visibility during integration
                         log.info("[mcp-remote stderr] %s", s)
+                        # Proactive recovery on known SSE disconnect/timeout patterns
+                        try:
+                            line_l = s.lower()
+                            if (
+                                "sse error" in line_l
+                                or "body timeout" in line_l
+                                or "connect timeout" in line_l
+                                or "econnreset" in line_l
+                            ):
+                                # Mark session inactive so the pool will restart on next use;
+                                # also attempt a clean close to avoid process leaks.
+                                log.info("[mcp] stderr indicates SSE disconnect; closing session for restart")
+                                try:
+                                    self._active = False
+                                except Exception:
+                                    pass
+                                try:
+                                    self.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
             except Exception:
                 pass
         self._stderr_thread = threading.Thread(target=_run, daemon=True)
@@ -288,6 +351,24 @@ _POOL = _ClientPool()
 import atexit as _atexit
 _atexit.register(_POOL.shutdown)
 
+# Thread pool for parallel operations (Phase 2)
+_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        try:
+            max_workers = int(os.getenv("MCP_POOL_MAX_WORKERS", "4") or 4)
+            max_workers = max(1, min(32, max_workers))
+        except Exception:
+            max_workers = 4
+        _EXECUTOR = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mcp-pool")
+        try:
+            _atexit.register(_EXECUTOR.shutdown, wait=False, cancel_futures=True)
+        except Exception:
+            _atexit.register(_EXECUTOR.shutdown)
+    return _EXECUTOR
+
 
 def _extract_text_from_result(result: Any) -> Optional[str]:
     if isinstance(result, dict):
@@ -305,6 +386,50 @@ def _extract_text_from_result(result: Any) -> Optional[str]:
         return None
 
 
+def _extract_urls_from_text(text: str) -> List[str]:
+    try:
+        # Simple URL regex, http(s) only. Use regular string to avoid raw-string quoting pitfalls.
+        pat = re.compile("https?://[^\\s\\)\\]\\}\\\"'>]+", flags=re.I)
+        return [m.group(0) for m in pat.finditer(text or "")][:200]
+    except Exception:
+        return []
+
+
+def _extract_list_from_result(result: Any) -> List[str]:
+    # Accept multiple shapes: dict with results, list, or content text with URLs/JSON
+    try:
+        if isinstance(result, dict):
+            if isinstance(result.get("results"), list):
+                return [str(x) for x in result["results"] if isinstance(x, (str, bytes))][:200]
+            content = result.get("content")
+            if isinstance(content, list):
+                texts: List[str] = []
+                for p in content:
+                    if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
+                        texts.append(p["text"])  
+                if texts:
+                    joined = "\n".join(texts)
+                    # Try parse JSON list
+                    try:
+                        j = json.loads(joined)
+                        if isinstance(j, list):
+                            return [str(x) for x in j if isinstance(x, (str, bytes))][:200]
+                    except Exception:
+                        pass
+                    # Fallback: URL extraction
+                    return _extract_urls_from_text(joined)
+        elif isinstance(result, list):
+            return [str(x) for x in result if isinstance(x, (str, bytes))][:200]
+        # Fallback: treat as text and extract URLs
+        try:
+            txt = json.dumps(result, ensure_ascii=False)
+        except Exception:
+            txt = str(result)
+        return _extract_urls_from_text(txt)
+    except Exception:
+        return []
+
+
 def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
     """Read page content via Jina MCP `read_url` tool using `mcp-remote` transport.
 
@@ -315,7 +440,7 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
     tenant: Optional[int] = None
     run_id: Optional[int] = None
     t0 = time.perf_counter()
-    server_url = _get_env("MCP_SERVER_URL", "https://mcp.jina.ai/sse") or "https://mcp.jina.ai/sse"
+    server_url = _get_server_url()
     api_key = _get_env("JINA_API_KEY")
     if not api_key:
         raise MCPClientNotImplemented("JINA_API_KEY not set; MCP client unavailable")
@@ -326,6 +451,7 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
             run_id, tenant = obs.get_run_context()
         except Exception:
             run_id, tenant = None, None
+    tool = "read_url"
     try:
         log.info("[mcp] starting read_url transport=remote (cfg=%s) server=%s", transport_cfg, server_url)
         if transport_cfg not in ("remote", "python"):
@@ -349,9 +475,12 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                     )
                 _POOL.set_cached_tool(server_url, api_key, purpose="read_url", name=tool_name)
             log.info("[mcp] calling tool=%s url=%s", tool_name, url)
+            tcall0 = time.perf_counter()
             result = client.call_tool(tool_name, {"url": url}, timeout_s=timeout_s or 30.0)
+            tcall1 = time.perf_counter()
             text = _extract_text_from_result(result)
             log.info("[mcp] call done tool=%s url=%s text_len=%s", tool_name, url, len(text) if isinstance(text, str) else None)
+            _metrics_record(tool, "ok", (tcall1 - tcall0))
         except Exception as _e1:
             # Auto-recover on SSE disconnects/remote timeouts: restart session once and retry
             try:
@@ -371,8 +500,11 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                 if not tool_name:
                     raise
                 _POOL.set_cached_tool(server_url, api_key, purpose="read_url", name=tool_name)
+            tcall0 = time.perf_counter()
             result = client.call_tool(tool_name, {"url": url}, timeout_s=timeout_s or 30.0)
+            tcall1 = time.perf_counter()
             text = _extract_text_from_result(result)
+            _metrics_record(tool, "ok", (tcall1 - tcall0))
         # Telemetry: success
         try:
             if obs is not None and run_id is not None and tenant is not None:
@@ -395,6 +527,10 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
             log.info("[mcp] error transport=remote msg=%s", (str(e) or type(e).__name__))
         except Exception:
             pass
+        try:
+            _metrics_record(tool, "error", None)
+        except Exception:
+            pass
         # Telemetry: record error
         try:
             if obs is not None and run_id is not None and tenant is not None:
@@ -413,3 +549,191 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
         except Exception:
             pass
         raise
+
+
+def search_web(query: str, *, country: Optional[str] = None, max_results: int = 20, timeout_s: Optional[float] = None) -> List[str]:
+    """Search the web via Jina MCP `search_web` tool.
+
+    Returns a list of URLs (strings). Extracts from multiple possible result shapes.
+    """
+    t0 = time.perf_counter()
+    server_url = _get_server_url()
+    api_key = _get_env("JINA_API_KEY")
+    if not api_key:
+        raise MCPClientNotImplemented("JINA_API_KEY not set; MCP client unavailable")
+    tool = "search_web"
+    try:
+        client = _POOL.get(server_url, api_key)
+        tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
+        if not tool_name:
+            tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+            for candidate in ("search_web", "jina_search_web", "search"):
+                if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
+                    tool_name = candidate
+                    break
+            if not tool_name:
+                raise RuntimeError("No compatible search_web tool found")
+            _POOL.set_cached_tool(server_url, api_key, purpose=tool, name=tool_name)
+        args: Dict[str, Any] = {"query": query, "limit": max_results}
+        if country:
+            args["country"] = country
+        log.info("[mcp] calling tool=%s query=%s limit=%s", tool_name, query, max_results)
+        tcall0 = time.perf_counter()
+        res = client.call_tool(tool_name, args, timeout_s=timeout_s or 30.0)
+        tcall1 = time.perf_counter()
+        urls = _extract_list_from_result(res)
+        log.info("[mcp] search done tool=%s urls=%s", tool_name, len(urls))
+        _metrics_record(tool, "ok", (tcall1 - tcall0))
+        # Telemetry
+        try:
+            if obs is not None:
+                run_id, tenant = obs.get_run_context()
+                if run_id is not None and tenant is not None:
+                    dur = int((time.perf_counter() - t0) * 1000)
+                    obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=1, errors=0)
+                    obs.log_event(run_id, tenant, stage="mcp_search_web", event="finish", status="ok", duration_ms=dur)
+        except Exception:
+            pass
+        return urls[:max_results]
+    except Exception as e:
+        try:
+            log.info("[mcp] error in search_web: %s", (str(e) or type(e).__name__))
+        except Exception:
+            pass
+        _metrics_record(tool, "error", None)
+        try:
+            if obs is not None:
+                run_id, tenant = obs.get_run_context()
+                if run_id is not None and tenant is not None:
+                    dur = int((time.perf_counter() - t0) * 1000)
+                    obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=1, errors=1)
+                    obs.log_event(run_id, tenant, stage="mcp_search_web", event="error", status="error", duration_ms=dur, error_code=type(e).__name__)
+        except Exception:
+            pass
+        # Retry once after invalidate
+        try:
+            _POOL.invalidate(server_url, api_key)
+            client = _POOL.get(server_url, api_key)
+            tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
+            if not tool_name:
+                tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+                for candidate in ("search_web", "jina_search_web", "search"):
+                    if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
+                        tool_name = candidate
+                        break
+                if not tool_name:
+                    raise
+                _POOL.set_cached_tool(server_url, api_key, purpose=tool, name=tool_name)
+            tcall0 = time.perf_counter()
+            res = client.call_tool(tool_name, {"query": query, "limit": max_results, **({"country": country} if country else {})}, timeout_s=timeout_s or 30.0)
+            tcall1 = time.perf_counter()
+            urls = _extract_list_from_result(res)
+            _metrics_record(tool, "ok", (tcall1 - tcall0))
+            return urls[:max_results]
+        except Exception:
+            raise
+
+
+def parallel_search_web(queries: List[str], *, per_query: int = 10, timeout_s: Optional[float] = None) -> Dict[str, List[str]]:
+    """Parallel search using MCP `parallel_search_web` if available, else fan out `search_web` with a thread pool.
+    Returns a dict query -> list[URLs].
+    """
+    t0 = time.perf_counter()
+    server_url = _get_server_url()
+    api_key = _get_env("JINA_API_KEY")
+    if not api_key:
+        raise MCPClientNotImplemented("JINA_API_KEY not set; MCP client unavailable")
+    tool = "parallel_search_web"
+    try:
+        client = _POOL.get(server_url, api_key)
+        tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
+        if not tool_name:
+            tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+            for candidate in ("parallel_search_web", "jina_parallel_search_web"):
+                if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
+                    tool_name = candidate
+                    break
+            # If no parallel tool, fallback to thread pool fan-out
+            if tool_name:
+                _POOL.set_cached_tool(server_url, api_key, purpose=tool, name=tool_name)
+        if tool_name:
+            log.info("[mcp] calling tool=%s queries=%d per_query=%d", tool_name, len(queries), per_query)
+            tcall0 = time.perf_counter()
+            res = client.call_tool(tool_name, {"queries": queries, "per_query": per_query}, timeout_s=timeout_s or 45.0)
+            tcall1 = time.perf_counter()
+            _metrics_record(tool, "ok", (tcall1 - tcall0))
+            # Expect dict-like response
+            if isinstance(res, dict):
+                out: Dict[str, List[str]] = {}
+                for q, v in res.items():
+                    out[str(q)] = [str(x) for x in (v or []) if isinstance(x, (str, bytes))][:per_query]
+                return out
+            # Fallback attempt to parse content
+            txt = _extract_text_from_result(res) or ""
+            try:
+                j = json.loads(txt)
+                if isinstance(j, dict):
+                    return {str(k): [str(x) for x in (v or []) if isinstance(x, (str, bytes))][:per_query] for k, v in j.items()}
+            except Exception:
+                pass
+            # Last resort: run serially
+        # Fallback: thread pool fan-out of search_web
+        exec = _get_executor()
+        futs = {exec.submit(search_web, q, country=os.getenv("MCP_SEARCH_COUNTRY") or None, max_results=per_query, timeout_s=timeout_s): q for q in queries}
+        out: Dict[str, List[str]] = {}
+        for f in as_completed(futs):
+            q = futs[f]
+            try:
+                out[q] = list(f.result() or [])[:per_query]
+            except Exception:
+                out[q] = []
+        # Telemetry
+        try:
+            if obs is not None:
+                run_id, tenant = obs.get_run_context()
+                if run_id is not None and tenant is not None:
+                    dur = int((time.perf_counter() - t0) * 1000)
+                    obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=len(queries), errors=0)
+                    obs.log_event(run_id, tenant, stage="mcp_parallel_search_web", event="finish", status="ok", duration_ms=dur)
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        _metrics_record(tool, "error", None)
+        try:
+            if obs is not None:
+                run_id, tenant = obs.get_run_context()
+                if run_id is not None and tenant is not None:
+                    dur = int((time.perf_counter() - t0) * 1000)
+                    obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=1, errors=1)
+                    obs.log_event(run_id, tenant, stage="mcp_parallel_search_web", event="error", status="error", duration_ms=dur, error_code=type(e).__name__)
+        except Exception:
+            pass
+        # Retry once after invalidate (parallel tool path only)
+        try:
+            _POOL.invalidate(server_url, api_key)
+            client = _POOL.get(server_url, api_key)
+            tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
+            if tool_name:
+                tcall0 = time.perf_counter()
+                res = client.call_tool(tool_name, {"queries": queries, "per_query": per_query}, timeout_s=timeout_s or 45.0)
+                tcall1 = time.perf_counter()
+                _metrics_record(tool, "ok", (tcall1 - tcall0))
+                if isinstance(res, dict):
+                    out2: Dict[str, List[str]] = {}
+                    for q, v in res.items():
+                        out2[str(q)] = [str(x) for x in (v or []) if isinstance(x, (str, bytes))][:per_query]
+                    return out2
+        except Exception:
+            pass
+        # Final fallback: thread pool
+        exec = _get_executor()
+        futs = {exec.submit(search_web, q, country=os.getenv("MCP_SEARCH_COUNTRY") or None, max_results=per_query, timeout_s=timeout_s): q for q in queries}
+        out: Dict[str, List[str]] = {}
+        for f in as_completed(futs):
+            q = futs[f]
+            try:
+                out[q] = list(f.result() or [])[:per_query]
+            except Exception:
+                out[q] = []
+        return out
