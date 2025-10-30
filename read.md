@@ -52,6 +52,38 @@ Optional / Recommended
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
 - ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
 
+MCP Reader (Jina) — Read URL
+- ENABLE_MCP_READER: set to `true` to use Jina MCP `read_url` instead of HTTP `r.jina.ai` (default `false`)
+- JINA_API_KEY: required when MCP is enabled (Authorization: Bearer)
+- MCP_SERVER_URL: MCP server endpoint (default `https://mcp.jina.ai/sse`)
+- MCP_TRANSPORT: `python` or `remote` (default `python`; project uses `remote` via `npx mcp-remote` when enabled)
+- MCP_TIMEOUT_S: per-call timeout in seconds (default `12.0`)
+- MCP_DUAL_READ_PCT: `0..100`; when >0, runs MCP and HTTP in parallel and returns HTTP for parity checks (default `0`)
+- MCP_INIT_TIMEOUT_S: initialize handshake timeout in seconds (default `25`)
+- MCP_NPX_PATH: override `npx` executable path if needed (default `npx`)
+- MCP_PROTOCOL_VERSION: override protocol version sent in `initialize` (default `2024-10-07`)
+- MCP_EXEC: optional path/name of a globally installed `mcp-remote` binary. If set (e.g., `mcp-remote`), the backend skips `npx` and executes it directly to reduce spawn overhead.
+
+Rollout guidance
+1) Set `ENABLE_MCP_READER=true` and `MCP_DUAL_READ_PCT=50` in staging; verify dashboards for success rate (≥95%), latency, and content variance.
+2) Increase or tune cleaner if variance >5%. When stable, set `MCP_DUAL_READ_PCT=0` to return MCP responses end-to-end.
+3) For production, canary on a low-risk tenant; target ≥98% success before full cutover. Keep HTTP path available for quick rollback by flipping `ENABLE_MCP_READER=false`.
+4) If using `MCP_TRANSPORT=remote`, ensure Node.js and `npx` are available on the host. The client spawns `mcp-remote` with `Authorization: Bearer $JINA_API_KEY`.
+   - First run may take longer while `npx` fetches `mcp-remote`; consider increasing `MCP_INIT_TIMEOUT_S` (e.g., `30`).
+   - Sanity check: `npx -y mcp-remote --help` should print usage.
+   - Performance: Install `mcp-remote` globally and set `MCP_EXEC=mcp-remote` to avoid `npx` startup cost per call.
+
+Session reuse
+- The backend now reuses a single `mcp-remote` stdio session per `(MCP_SERVER_URL, JINA_API_KEY)` pair and caches the selected `read_url` tool.
+- This eliminates per-call process spawn and tool discovery costs during a run.
+
+Quick MCP check
+- Verify config and wiring with:
+```
+python scripts/check_mcp_read_url.py https://example.com --force-mcp
+```
+- Expected logs (info): lines starting with `[mcp]` such as `starting read_url`, `calling tool=read_url`, and `call done ... text_len=...`. The script prints config snapshot, result length, and a short preview.
+
 Email results (SendGrid)
 - ENABLE_EMAIL_RESULTS: set to `true` to enable emails
 - SENDGRID_API_KEY: your SendGrid API key

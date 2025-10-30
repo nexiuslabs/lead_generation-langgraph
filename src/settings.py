@@ -357,3 +357,26 @@ try:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = int(os.getenv("FIRMO_MIN_COMPLETENESS_FOR_BONUS", "1") or 1)
 except Exception:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = 1
+
+# --- Jina MCP Reader (read_url only) -----------------------------------------
+# Feature flag to enable MCP transport for read_url (fallback remains HTTP)
+ENABLE_MCP_READER = os.getenv("ENABLE_MCP_READER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# MCP server endpoint and transport selection
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.jina.ai/sse")
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "python")  # or 'remote' for mcp-remote
+
+try:
+    MCP_TIMEOUT_S = float(os.getenv("MCP_TIMEOUT_S", "12.0") or 12.0)
+except Exception:
+    MCP_TIMEOUT_S = 12.0
+
+try:
+    MCP_DUAL_READ_PCT = int(os.getenv("MCP_DUAL_READ_PCT", "0") or 0)
+except Exception:
+    MCP_DUAL_READ_PCT = 0

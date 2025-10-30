@@ -964,18 +964,9 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     for d in uniq[:5]:
         try:
             url = f"https://{d}"
-            reader = f"https://r.jina.ai/http://{d}"
-            log.info("[jina] GET %s", reader)
-            # Shorter timeout to avoid long stalls during planning
-            r = requests.get(reader, timeout=6)
-            txt = (r.text or "")[:8000]
-            # Clean noisy prefixes often present in r.jina output
-            lines = [ln.strip() for ln in (txt or "").splitlines() if ln.strip()]
-            filtered = [
-                ln for ln in lines
-                if not re.match(r"^(Title:|URL Source:|Published Time:|Markdown Content:|Warning:)", ln, flags=re.I)
-            ]
-            clean = " ".join(filtered) if filtered else " ".join((txt or "").split())
+            # Use unified reader (MCP read_url when enabled; falls back to HTTP)
+            from src.jina_reader import read_url as _jina_read  # local import to avoid cycles
+            clean = _jina_read(url, timeout=6) or ""
             snip = clean[:400]
             low = clean.lower()
             if ind_toks:
@@ -983,9 +974,9 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                     # Skip off-industry candidates early
                     continue
             jina_snips[d] = snip
-            log.info("[jina] ok len=%d domain=%s", len(txt), d)
+            log.info("[jina/mcp] ok len=%d domain=%s", len(clean), d)
         except Exception as e:
-            log.info("[jina] fail domain=%s err=%s", d, e)
+            log.info("[jina/mcp] fail domain=%s err=%s", d, e)
             continue
     # Final list of discovery candidates (cap at 50)
     state["discovery_candidates"] = uniq[:50]
@@ -1517,11 +1508,8 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         out: List[Dict[str, Any]] = []
         for d in uniq[:10]:
             try:
-                reader = f"https://r.jina.ai/http://{d}"
-                r = requests.get(reader, timeout=10)
-                txt = (r.text or "")[:8000]
-                from src.jina_reader import clean_jina_text as _clean
-                clean = _clean(txt)
+                from src.jina_reader import read_url as _jina_read
+                clean = _jina_read(f"https://{d}", timeout=10) or ""
                 snip = clean[:180]
                 # Heuristic scoring
                 low = clean.lower()
@@ -1634,13 +1622,10 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
         ind_toks3 = _ind_terms3(icp_profile)
         for d in uniq[:30]:
             try:
-                # Prefer Jina but fall back to direct homepage title/description on 429/network errors
+                # Prefer Jina MCP via unified reader; fallback to simple snippet on error
                 try:
-                    reader = f"https://r.jina.ai/http://{d}"
-                    r = requests.get(reader, timeout=10)
-                    raw = (r.text or "")[:8000]
-                    from src.jina_reader import clean_jina_text as _clean
-                    clean = _clean(raw)
+                    from src.jina_reader import read_url as _jina_read
+                    clean = _jina_read(f"https://{d}", timeout=10) or ""
                 except Exception:
                     clean = _fallback_home_snippet(d) or d
                 snip = (clean or "")[:180]
@@ -1701,16 +1686,13 @@ def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[
         cand: List[str] = []
         for s in seeds[:6]:
             try:
-                reader = f"https://r.jina.ai/http://{_normalize_host(s)}"
-                log.info("[jina] GET %s", reader)
-                r = requests.get(reader, timeout=10)
-                raw = (r.text or "")[:10000]
-                from src.jina_reader import clean_jina_text as _clean
-                clean = _clean(raw)
+                from src.jina_reader import read_url as _jina_read
+                url = f"https://{_normalize_host(s)}"
+                clean = _jina_read(url, timeout=10) or ""
                 for h in _extract_domains_from_text(clean):
                     cand.append(h)
             except Exception as e:
-                log.info("[jina] seed read fail %s err=%s", s, e)
+                log.info("[jina/mcp] seed read fail %s err=%s", s, e)
                 continue
         uniq: List[str] = []
         seen = set()
@@ -1752,10 +1734,8 @@ def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[
         for d in uniq[:20]:
             try:
                 try:
-                    reader = f"https://r.jina.ai/http://{d}"
-                    r = requests.get(reader, timeout=10)
-                    from src.jina_reader import clean_jina_text as _clean
-                    clean = _clean((r.text or "")[:8000])
+                    from src.jina_reader import read_url as _jina_read
+                    clean = _jina_read(f"https://{d}", timeout=10) or ""
                 except Exception:
                     clean = _fallback_home_snippet(d) or d
                 low = (clean or "").lower()
