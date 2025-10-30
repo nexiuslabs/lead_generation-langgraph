@@ -70,6 +70,27 @@ def _get_server_url() -> str:
         return "https://mcp.jina.ai/sse"
 
 
+def _get_env_timeout_default() -> float:
+    try:
+        return float(os.getenv("MCP_TIMEOUT_S", "12.0") or 12.0)
+    except Exception:
+        return 12.0
+
+
+def _effective_timeout(timeout_s: Optional[float], default_s: float) -> float:
+    """Use env MCP_TIMEOUT_S as a floor so ops can raise deadlines centrally.
+
+    - If caller passes a timeout, return max(caller, env_default)
+    - If caller omits, return max(default_s, env_default)
+    """
+    env_default = _get_env_timeout_default()
+    base = default_s if (timeout_s is None) else float(timeout_s)
+    try:
+        return max(base, env_default)
+    except Exception:
+        return env_default
+
+
 class _RPCError(RuntimeError):
     pass
 
@@ -178,13 +199,26 @@ class _MCPRemote:
         env = os.environ.copy()
         # Prefer direct executable if provided; else call via npx
         exec_prog = os.getenv("MCP_EXEC", "").strip()
+        # Optional: force SSE-only to avoid 'http-first' 404 then fallback
+        force_sse = (os.getenv("MCP_SSE_ONLY", "false").lower() in ("1", "true", "yes", "on"))
+        extra_args: list[str] = []
+        # Allow power users to inject arbitrary args (e.g., "--transport sse-only")
+        try:
+            raw = os.getenv("MCP_REMOTE_ARGS", "").strip()
+            if raw:
+                extra_args.extend([x for x in raw.split() if x])
+        except Exception:
+            pass
+        if force_sse and "--sse-only" not in extra_args:
+            extra_args.append("--sse-only")
+
         if exec_prog:
             cmd = [
                 exec_prog,
                 self.server_url,
                 "--header",
                 f"Authorization: Bearer {self.api_key}",
-            ]
+            ] + extra_args
         else:
             # Call mcp-remote directly via npx (as used in demo_mcp_agent)
             cmd = [
@@ -194,7 +228,7 @@ class _MCPRemote:
                 self.server_url,
                 "--header",
                 f"Authorization: Bearer {self.api_key}",
-            ]
+            ] + extra_args
         log.info("[mcp] spawning: %s", " ".join(cmd))
         self.proc = subprocess.Popen(
             cmd,
@@ -463,7 +497,7 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
         try:
             if not tool_name:
                 log.info("[mcp] session initialized; listing tools…")
-                tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+                tools = client.list_tools(timeout_s=_effective_timeout(timeout_s, 15.0)) or []
                 log.info("[mcp] tools discovered count=%s", len(tools) if isinstance(tools, list) else 0)
                 for candidate in ("jina_read_url", "read_url", "read"):
                     if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
@@ -476,7 +510,7 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                 _POOL.set_cached_tool(server_url, api_key, purpose="read_url", name=tool_name)
             log.info("[mcp] calling tool=%s url=%s", tool_name, url)
             tcall0 = time.perf_counter()
-            result = client.call_tool(tool_name, {"url": url}, timeout_s=timeout_s or 30.0)
+            result = client.call_tool(tool_name, {"url": url}, timeout_s=_effective_timeout(timeout_s, 30.0))
             tcall1 = time.perf_counter()
             text = _extract_text_from_result(result)
             log.info("[mcp] call done tool=%s url=%s text_len=%s", tool_name, url, len(text) if isinstance(text, str) else None)
@@ -487,12 +521,14 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                 log.info("[mcp] call failed (%s); restarting session and retrying once", type(_e1).__name__)
             except Exception:
                 pass
-            _POOL.invalidate(server_url, api_key)
+            # Only invalidate the session on non-timeout errors to avoid overhead
+            if not isinstance(_e1, TimeoutError):
+                _POOL.invalidate(server_url, api_key)
             client = _POOL.get(server_url, api_key)
             # Reacquire tool name if not cached
             tool_name = _POOL.get_cached_tool(server_url, api_key, purpose="read_url")
             if not tool_name:
-                tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+                tools = client.list_tools(timeout_s=_effective_timeout(timeout_s, 15.0)) or []
                 for candidate in ("jina_read_url", "read_url", "read"):
                     if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
                         tool_name = candidate
@@ -501,7 +537,7 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                     raise
                 _POOL.set_cached_tool(server_url, api_key, purpose="read_url", name=tool_name)
             tcall0 = time.perf_counter()
-            result = client.call_tool(tool_name, {"url": url}, timeout_s=timeout_s or 30.0)
+            result = client.call_tool(tool_name, {"url": url}, timeout_s=_effective_timeout(timeout_s, 30.0))
             tcall1 = time.perf_counter()
             text = _extract_text_from_result(result)
             _metrics_record(tool, "ok", (tcall1 - tcall0))
@@ -566,7 +602,7 @@ def search_web(query: str, *, country: Optional[str] = None, max_results: int = 
         client = _POOL.get(server_url, api_key)
         tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
         if not tool_name:
-            tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+            tools = client.list_tools(timeout_s=_effective_timeout(timeout_s, 15.0)) or []
             for candidate in ("search_web", "jina_search_web", "search"):
                 if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
                     tool_name = candidate
@@ -579,7 +615,7 @@ def search_web(query: str, *, country: Optional[str] = None, max_results: int = 
             args["country"] = country
         log.info("[mcp] calling tool=%s query=%s limit=%s", tool_name, query, max_results)
         tcall0 = time.perf_counter()
-        res = client.call_tool(tool_name, args, timeout_s=timeout_s or 30.0)
+        res = client.call_tool(tool_name, args, timeout_s=_effective_timeout(timeout_s, 30.0))
         tcall1 = time.perf_counter()
         urls = _extract_list_from_result(res)
         log.info("[mcp] search done tool=%s urls=%s", tool_name, len(urls))
@@ -610,13 +646,14 @@ def search_web(query: str, *, country: Optional[str] = None, max_results: int = 
                     obs.log_event(run_id, tenant, stage="mcp_search_web", event="error", status="error", duration_ms=dur, error_code=type(e).__name__)
         except Exception:
             pass
-        # Retry once after invalidate
+        # Retry once; invalidate only for non-timeout
         try:
-            _POOL.invalidate(server_url, api_key)
+            if not isinstance(e, TimeoutError):
+                _POOL.invalidate(server_url, api_key)
             client = _POOL.get(server_url, api_key)
             tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
             if not tool_name:
-                tools = client.list_tools(timeout_s=timeout_s or 15.0) or []
+                tools = client.list_tools(timeout_s=_effective_timeout(timeout_s, 15.0)) or []
                 for candidate in ("search_web", "jina_search_web", "search"):
                     if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
                         tool_name = candidate
@@ -625,7 +662,7 @@ def search_web(query: str, *, country: Optional[str] = None, max_results: int = 
                     raise
                 _POOL.set_cached_tool(server_url, api_key, purpose=tool, name=tool_name)
             tcall0 = time.perf_counter()
-            res = client.call_tool(tool_name, {"query": query, "limit": max_results, **({"country": country} if country else {})}, timeout_s=timeout_s or 30.0)
+            res = client.call_tool(tool_name, {"query": query, "limit": max_results, **({"country": country} if country else {})}, timeout_s=_effective_timeout(timeout_s, 30.0))
             tcall1 = time.perf_counter()
             urls = _extract_list_from_result(res)
             _metrics_record(tool, "ok", (tcall1 - tcall0))
@@ -659,7 +696,7 @@ def parallel_search_web(queries: List[str], *, per_query: int = 10, timeout_s: O
         if tool_name:
             log.info("[mcp] calling tool=%s queries=%d per_query=%d", tool_name, len(queries), per_query)
             tcall0 = time.perf_counter()
-            res = client.call_tool(tool_name, {"queries": queries, "per_query": per_query}, timeout_s=timeout_s or 45.0)
+            res = client.call_tool(tool_name, {"queries": queries, "per_query": per_query}, timeout_s=_effective_timeout(timeout_s, 45.0))
             tcall1 = time.perf_counter()
             _metrics_record(tool, "ok", (tcall1 - tcall0))
             # Expect dict-like response
@@ -711,12 +748,13 @@ def parallel_search_web(queries: List[str], *, per_query: int = 10, timeout_s: O
             pass
         # Retry once after invalidate (parallel tool path only)
         try:
-            _POOL.invalidate(server_url, api_key)
+            if not isinstance(e, TimeoutError):
+                _POOL.invalidate(server_url, api_key)
             client = _POOL.get(server_url, api_key)
             tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
             if tool_name:
                 tcall0 = time.perf_counter()
-                res = client.call_tool(tool_name, {"queries": queries, "per_query": per_query}, timeout_s=timeout_s or 45.0)
+                res = client.call_tool(tool_name, {"queries": queries, "per_query": per_query}, timeout_s=_effective_timeout(timeout_s, 45.0))
                 tcall1 = time.perf_counter()
                 _metrics_record(tool, "ok", (tcall1 - tcall0))
                 if isinstance(res, dict):
