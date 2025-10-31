@@ -32,7 +32,23 @@ APP_POSTGRES_DSN = POSTGRES_DSN
 # OpenAI / LangChain config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ICP_RULE_NAME = os.getenv("ICP_RULE_NAME", "default")
-LANGCHAIN_MODEL = os.getenv("LANGCHAIN_MODEL", "gpt-4o-mini")
+
+# Convenience switch: When MODEL_FAMILY is set and per-model vars are absent,
+# use it for both LANGCHAIN_MODEL and AGENT_MODEL_DISCOVERY.
+_MODEL_FAMILY = (os.getenv("MODEL_FAMILY") or "").strip() or None
+
+# Base chat model selection (order of precedence):
+# 1) explicit LANGCHAIN_MODEL
+# 2) MODEL_FAMILY (if provided)
+# 3) fallback default
+_BASE_MODEL = (os.getenv("LANGCHAIN_MODEL") or (_MODEL_FAMILY or "gpt-4o-mini"))
+LANGCHAIN_MODEL = _BASE_MODEL
+
+# Agent/planner model selection (order of precedence):
+# 1) explicit AGENT_MODEL_DISCOVERY
+# 2) base model from above
+AGENT_MODEL_DISCOVERY = os.getenv("AGENT_MODEL_DISCOVERY", LANGCHAIN_MODEL)
+
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 
 # Agent discovery toggle (use LLM-based planning/extraction in preview flows)

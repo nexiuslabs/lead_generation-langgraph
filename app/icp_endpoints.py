@@ -10,6 +10,7 @@ from app.auth import require_auth  # noqa: F401  # exposed for monkeypatching in
 from schemas.icp import IntakePayload, SuggestionCard, AcceptRequest
 from schemas.research import ResearchImportRequest, ResearchImportResult
 from src.database import get_conn
+from src.database import get_pg_pool
 from src.icp_intake import (
     save_icp_intake,
     generate_suggestions,
@@ -927,3 +928,78 @@ async def get_patterns(
             return row[0] if row and row[0] is not None else {}
         except Exception:
             return {}
+
+
+@router.get("/smoke/top10-scored")
+async def smoke_top10_scored(
+    req: Request,
+    user=Depends(require_auth),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+):
+    """Return top 10 scored leads for the current tenant (smoke test).
+
+    - Sets request.tenant_id so RLS-aware schemas scope results.
+    - If `lead_scores.tenant_id` exists, filter by it directly as a fallback.
+    """
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    pool = await get_pg_pool()
+    async with pool.acquire() as conn:
+        # Apply tenant GUC for RLS if available
+        try:
+            if tid is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", str(tid))
+        except Exception:
+            pass
+        # Detect tenant_id column presence for direct filtering
+        try:
+            has_tenant = bool(
+                await conn.fetchval(
+                    """
+                    SELECT 1
+                      FROM information_schema.columns
+                     WHERE table_schema='public'
+                       AND table_name='lead_scores'
+                       AND column_name='tenant_id'
+                     LIMIT 1
+                    """
+                )
+            )
+        except Exception:
+            has_tenant = False
+        if has_tenant and tid is not None:
+            rows = await conn.fetch(
+                """
+                SELECT s.company_id, s.score, s.bucket, s.rationale,
+                       c.name, c.website_domain
+                  FROM public.lead_scores s
+                  LEFT JOIN public.companies c ON c.company_id = s.company_id
+                 WHERE s.tenant_id = $1
+                 ORDER BY s.score DESC NULLS LAST, s.company_id DESC
+                 LIMIT 10
+                """,
+                int(tid),
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT s.company_id, s.score, s.bucket, s.rationale,
+                       c.name, c.website_domain
+                  FROM public.lead_scores s
+                  LEFT JOIN public.companies c ON c.company_id = s.company_id
+                 ORDER BY s.score DESC NULLS LAST, s.company_id DESC
+                 LIMIT 10
+                """
+            )
+    items: List[Dict[str, Any]] = []
+    for r in rows or []:
+        items.append(
+            {
+                "company_id": r["company_id"],
+                "name": r.get("name"),
+                "domain": r.get("website_domain"),
+                "score": (float(r.get("score")) if r.get("score") is not None else None),
+                "bucket": r.get("bucket"),
+                "rationale": r.get("rationale"),
+            }
+        )
+    return {"tenant_id": tid, "items": items}

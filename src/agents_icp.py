@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from langchain_openai import ChatOpenAI
 from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
+from src.settings import AGENT_MODEL_DISCOVERY
 try:
     from src.settings import ENABLE_MCP_SEARCH  # type: ignore
 except Exception:  # pragma: no cover
@@ -645,7 +646,7 @@ def ensure_icp_enriched_with_jina(state: Dict[str, Any]) -> Dict[str, Any]:
         evidence = "\n\n".join(parts)
         if not evidence.strip():
             return state
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
         structured = llm.with_structured_output(MicroICP)
         msgs = ChatPromptTemplate.from_messages([
             ("system", "Extract micro-ICP lists from web page snippets. Return arrays for industries, integrations, buyer_titles, size_bands, triggers. Keep items concise but meaningful; dedupe and lowercase."),
@@ -719,7 +720,7 @@ def icp_synthesizer(state: Dict[str, Any]) -> Dict[str, Any]:
     Outputs:
       state['icp_profile'] = { 'industries': [...], 'integrations': [...], 'buyer_titles': [...], 'size_bands': [...], 'triggers': [...] }
     """
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
     seeds_text = "\n\n".join([f"URL: {s.get('url','')}\n{(s.get('snippet') or '')[:1000]}" for s in (state.get("seeds") or [])])
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You extract micro-ICP from short evidence. Return JSON with keys: industries[], integrations[], buyer_titles[], size_bands[], triggers[]. Keep values short, lowercase, and deduplicated."),
@@ -776,7 +777,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     # Compose one concise DDG query from ICP + website via LLM (fallback to heuristic)
     def _llm_compose_ddg_query(website_text: Optional[str]) -> Optional[str]:
         try:
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
             inds = ", ".join([s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()])
             site = "site:.sg" if (country_hint == 'sg') else ""
             sys = (
@@ -1096,7 +1097,7 @@ def compliance_guard(state: Dict[str, Any]) -> Dict[str, Any]:
         llm_tiebreak = 0
         try:
             if ambiguous:
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+                llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
                 for dn in ambiguous[:3]:
                     snip = jina_snips.get(dn) or ""
                     if not snip:
@@ -1164,7 +1165,7 @@ def evidence_extractor(state: Dict[str, Any]) -> Dict[str, Any]:
     Inputs: state['evidence']
     Outputs: state['evidence'] augmented with 'signals' and normalized fields.
     """
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
 
     class EvidenceOut(BaseModel):
         evidence_types: Optional[int] = None

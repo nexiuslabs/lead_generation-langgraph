@@ -1839,50 +1839,64 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         if cached is not None and (time.time() - float(ts)) <= _ttl:
             return cached
 
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        # Apply RLS tenant context if known
+    # Try to talk to the app DB, but fail fast and return a safe fallback when offline.
+    try:
+        pool = await get_pg_pool()
         try:
-            if tid is not None:
-                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+            _acq_timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
         except Exception:
-            pass
-        # If we cannot resolve tenant, do not leak global counts
-        if tid is None:
-            total_scored = 0
-            last_ts: datetime | None = None
-            last_run_id = None
-            last_run_status = None
-            last_run_started_at = None
-            last_run_ended_at = None
-        else:
-            # Count only this tenant's scored rows
+            _acq_timeout = 3.0
+        async with pool.acquire(timeout=_acq_timeout) as conn:
+            # Apply RLS tenant context if known
             try:
-                total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = $1", tid))
+                if tid is not None:
+                    await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
             except Exception:
+                pass
+            # If we cannot resolve tenant, do not leak global counts
+            if tid is None:
                 total_scored = 0
+                last_ts: datetime | None = None
+                last_run_id = None
+                last_run_status = None
+                last_run_started_at = None
+                last_run_ended_at = None
+            else:
+                # Count only this tenant's scored rows
+                try:
+                    total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = $1", tid))
+                except Exception:
+                    total_scored = 0
 
-            # Last activity from this tenant's enrichment runs
-            last_ts: datetime | None = None
-            last_run_id = None
-            last_run_status = None
-            last_run_started_at = None
-            last_run_ended_at = None
+                # Last activity from this tenant's enrichment runs
+                last_ts: datetime | None = None
+                last_run_id = None
+                last_run_status = None
+                last_run_started_at = None
+                last_run_ended_at = None
 
-            try:
-                row = await conn.fetchrow(
-                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs WHERE tenant_id = $1 ORDER BY run_id DESC LIMIT 1",
-                    tid,
-                )
-                if row:
-                    last_run_id = row["run_id"]
-                    last_run_status = row["status"]
-                    last_run_started_at = row["started_at"]
-                    last_run_ended_at = row["ended_at"]
-                    if isinstance(last_run_started_at, datetime):
-                        last_ts = last_run_started_at
-            except Exception:
-                last_ts = last_ts
+                try:
+                    row = await conn.fetchrow(
+                        "SELECT run_id, status, started_at, ended_at FROM enrichment_runs WHERE tenant_id = $1 ORDER BY run_id DESC LIMIT 1",
+                        tid,
+                    )
+                    if row:
+                        last_run_id = row["run_id"]
+                        last_run_status = row["status"]
+                        last_run_started_at = row["started_at"]
+                        last_run_ended_at = row["ended_at"]
+                        if isinstance(last_run_started_at, datetime):
+                            last_ts = last_run_started_at
+                except Exception:
+                    last_ts = last_ts
+    except Exception as _db_exc:
+        # DB offline/unresolvable host. Return a safe, non-failing fallback that the UI can handle.
+        total_scored = 0
+        last_ts = None
+        last_run_id = None
+        last_run_status = "unknown"
+        last_run_started_at = None
+        last_run_ended_at = None
 
     out = {
         "tenant_id": tid,

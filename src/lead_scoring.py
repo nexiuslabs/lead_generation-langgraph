@@ -201,16 +201,67 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
     """
     Generate concise 2-sentence rationale for each lead score and cache key.
     """
-    for feat, score in zip(state['lead_features'], state['lead_scores']):
-        # Create cache key based on sorted feature items
+    # Precompute cache keys per company and attempt a DB-backed cache lookup
+    cids: List[int] = []
+    cache_by_cid: Dict[int, str] = {}
+    for feat in state['lead_features']:
+        try:
+            cid = int(feat.get('company_id'))
+        except Exception:
+            continue
         items = sorted(feat.items())
         key_str = json.dumps(items, sort_keys=True)
-        cache_key = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
-        prompt = (
-            f"Given the features {feat} with score {score['score']:.2f}, "
-            "provide a concise 2-sentence justification referencing the top signals and research evidence if present."
-        )
-        rationale = await generate_rationale(prompt)
+        cache_by_cid[cid] = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
+        cids.append(cid)
+
+    # Fetch any existing rationales for these (company_id, cache_key)
+    cached_rationales: Dict[int, str] = {}
+    try:
+        if cids:
+            pool = await get_pg_pool()
+            async with pool.acquire() as conn:
+                # Apply tenant id from env if present (RLS-friendly like persist_results)
+                try:
+                    import os as _os
+                    _tenant_env = _os.getenv('DEFAULT_TENANT_ID')
+                    if _tenant_env:
+                        await conn.execute("SELECT set_config('request.tenant_id', $1, true)", _tenant_env)
+                except Exception:
+                    pass
+                rows = await conn.fetch(
+                    "SELECT company_id, cache_key, rationale FROM public.lead_scores WHERE company_id = ANY($1::int[])",
+                    cids,
+                )
+                for r in rows:
+                    cid = int(r['company_id'])
+                    rkey = r.get('cache_key')
+                    if rkey and cache_by_cid.get(cid) == rkey and r.get('rationale'):
+                        cached_rationales[cid] = r['rationale']
+    except Exception:
+        # Cache lookup is best-effort; continue without it on any error
+        cached_rationales = {}
+
+    for feat, score in zip(state['lead_features'], state['lead_scores']):
+        try:
+            cid = int(feat.get('company_id'))
+        except Exception:
+            cid = None
+        cache_key = cache_by_cid.get(cid) if cid is not None else None
+        # Prefer cached rationale when cache_key matches
+        rationale = None
+        if cid is not None and cache_key and cid in cached_rationales:
+            rationale = cached_rationales[cid]
+        else:
+            # Create prompt and call LLM best-effort
+            prompt = (
+                f"Given the features {feat} with score {score['score']:.2f}, "
+                "provide a concise 2-sentence justification referencing the top signals and research evidence if present."
+            )
+            try:
+                rationale = await generate_rationale(prompt)
+            except Exception:
+                rationale = "Rationale unavailable."
+
         # Append demotion reason when firmographics missing
         try:
             if bool(score.get('firmo_missing')):
@@ -221,7 +272,16 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
         except Exception:
             pass
         score['rationale'] = rationale
-        score['cache_key'] = cache_key
+        if cache_key:
+            score['cache_key'] = cache_key
+        else:
+            # Fallback if we couldn't precompute
+            try:
+                items = sorted(feat.items())
+                key_str = json.dumps(items, sort_keys=True)
+                score['cache_key'] = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
+            except Exception:
+                pass
     return state
 
 async def persist_results(state: LeadScoringState) -> LeadScoringState:

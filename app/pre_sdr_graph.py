@@ -2353,8 +2353,9 @@ class GraphState(TypedDict):
 # LLMs
 # ------------------------------
 
-QUESTION_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-EXTRACT_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+from src.settings import LANGCHAIN_MODEL
+QUESTION_LLM = ChatOpenAI(model=LANGCHAIN_MODEL, temperature=0.2)
+EXTRACT_LLM = ChatOpenAI(model=LANGCHAIN_MODEL, temperature=0)
 
 # ------------------------------
 # Helpers
