@@ -13,6 +13,15 @@ try:
 except Exception:  # pragma: no cover - obs is optional in import time
     obs = None  # type: ignore
 
+# Optional Python adapters (LangGraph/LangChain MCP Adapters)
+try:  # pragma: no cover
+    # Python package per docs/langgraph_mcp.md
+    from langchain_mcp_adapters.client import MultiServerMCPClient as _AdaptersClient
+    _ADAPTERS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _ADAPTERS_AVAILABLE = False
+    _AdaptersClient = None  # type: ignore
+
 log = logging.getLogger("mcp_reader")
 if not log.handlers:
     h = logging.StreamHandler()
@@ -63,6 +72,18 @@ def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def _get_server_url() -> str:
+    """Resolve server URL preferring settings.MCP_SERVER_URL, then env vars.
+
+    Defaults to https://mcp.jina.ai/sse.
+    """
+    try:
+        # Prefer settings override when present
+        from src import settings as _settings  # type: ignore
+        v = getattr(_settings, "MCP_SERVER_URL", None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    except Exception:
+        pass
     try:
         v = os.getenv("MCP_SERVER_URL") or os.getenv("MCP_ENDPOINT")
         return (v or "https://mcp.jina.ai/sse").strip()
@@ -93,6 +114,164 @@ def _effective_timeout(timeout_s: Optional[float], default_s: float) -> float:
 
 class _RPCError(RuntimeError):
     pass
+
+
+# -----------------------
+# Adapters transport (Python)
+# -----------------------
+_ADAPTORS_LOOP = None  # type: ignore
+_ADAPTORS_THREAD = None  # type: ignore
+_ADAPTORS_CLIENT = None  # type: ignore
+_ADAPTORS_READ_TOOL = None  # type: ignore
+_ADAPTORS_TOOL_CACHE: Dict[str, Any] = {}
+_ADAPTORS_LOCK = threading.Lock()
+
+def _ensure_adapters_client() -> None:
+    """Initialize a background asyncio loop and a MultiServerMCPClient singleton.
+
+    This function is idempotent. It creates a background event loop in a thread and
+    initializes a MultiServerMCPClient connected to the configured Jina MCP server
+    using streamable HTTP (or SSE) with Authorization header.
+    """
+    global _ADAPTORS_LOOP, _ADAPTORS_THREAD, _ADAPTORS_CLIENT
+    if _ADAPTERS_AVAILABLE is False:
+        raise MCPClientNotImplemented("langchain_mcp_adapters not installed")
+    if _ADAPTORS_CLIENT is not None:
+        return
+    import asyncio
+
+    with _ADAPTORS_LOCK:
+        if _ADAPTORS_CLIENT is not None:
+            return
+
+        # Create background loop
+        loop = asyncio.new_event_loop()
+
+        def _run_loop(l):
+            asyncio.set_event_loop(l)
+            l.run_forever()
+
+        th = threading.Thread(target=_run_loop, args=(loop,), name="mcp-adapters-loop", daemon=True)
+        th.start()
+
+        # Build client config
+        server_url = _get_server_url()
+        api_key = _get_env("JINA_API_KEY") or ""
+        # Transport selection: default to streamable_http; allow override to SSE
+        try:
+            from src import settings as _settings  # type: ignore
+            use_sse = bool(getattr(_settings, "MCP_ADAPTER_USE_SSE", False))
+            use_std_blocks = bool(getattr(_settings, "MCP_ADAPTER_USE_STANDARD_BLOCKS", True))
+        except Exception:
+            use_sse = False
+            use_std_blocks = True
+
+        transport = "sse" if use_sse else "streamable_http"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+        config = {
+            "use_standard_content_blocks": use_std_blocks,
+            "servers": {
+                "jina": {
+                    "transport": transport,
+                    "url": server_url,
+                    "headers": headers,
+                }
+            },
+        }
+
+        # Instantiate client on loop
+        async def _mk_client():
+            # Python API uses dict positional per docs
+            return _AdaptersClient(
+                {"jina": {"transport": transport, "url": server_url, "headers": headers}}
+            )
+
+        fut = asyncio.run_coroutine_threadsafe(_mk_client(), loop)
+        client = fut.result(timeout=10)
+
+        _ADAPTORS_LOOP = loop
+        _ADAPTORS_THREAD = th
+        _ADAPTORS_CLIENT = client
+
+
+def _adapters_run_coro(coro, timeout_s: float = 15.0):  # pragma: no cover
+    import asyncio
+    if _ADAPTORS_LOOP is None:
+        raise RuntimeError("adapters loop not initialized")
+    fut = asyncio.run_coroutine_threadsafe(coro, _ADAPTORS_LOOP)
+    return fut.result(timeout=timeout_s)
+
+
+def _adapters_get_tool(purpose: str, candidates: List[str], timeout_s: float = 15.0):  # pragma: no cover
+    # General-purpose adapters tool resolver with per-purpose cache
+    t = _ADAPTORS_TOOL_CACHE.get(purpose)
+    if t is not None:
+        return t
+    _ensure_adapters_client()
+    # MultiServerMCPClient.get_tools() is async; returns LangChain tools
+    tools = _adapters_run_coro(_ADAPTORS_CLIENT.get_tools(), timeout_s=timeout_s)
+    picked = None
+    # Tools likely have .name attribute
+    for name in candidates:
+        picked = next((t for t in tools if getattr(t, "name", None) == name), None)
+        if picked:
+            break
+    if picked is None and tools:
+        # Last resort: first tool containing 'read'
+        picked = next((x for x in tools if any(s in str(getattr(x, "name", "")).lower() for s in ("read", "search"))), None)
+    if picked is None:
+        raise RuntimeError(f"No compatible tool found for {purpose} via adapters")
+    _ADAPTORS_TOOL_CACHE[purpose] = picked
+    return picked
+
+
+def _adapters_get_read_tool(timeout_s: float = 15.0):  # pragma: no cover
+    global _ADAPTORS_READ_TOOL
+    if _ADAPTORS_READ_TOOL is not None:
+        return _ADAPTORS_READ_TOOL
+    t = _adapters_get_tool("read_url", ["read_url", "jina_read_url", "read"], timeout_s=timeout_s)
+    _ADAPTORS_READ_TOOL = t
+    return t
+
+
+def _adapters_call_read_url(url: str, timeout_s: float = 12.0) -> Optional[str]:  # pragma: no cover
+    tool = _adapters_get_read_tool(timeout_s=timeout_s)
+    # Tool may support .ainvoke (async) or .invoke (sync). Prefer async if present.
+    if hasattr(tool, "ainvoke"):
+        res = _adapters_run_coro(tool.ainvoke({"url": url}), timeout_s=timeout_s)
+    elif hasattr(tool, "invoke"):
+        res = tool.invoke({"url": url})
+    else:
+        raise RuntimeError("Adapter tool does not support invoke/ainvoke")
+
+    # Extract text content: handle string or ToolMessage/content blocks
+    if isinstance(res, str):
+        return res
+    # LangChain ToolMessage-like: try common fields
+    content = None
+    try:
+        content = getattr(res, "content", None)
+    except Exception:
+        content = None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for c in content:
+            if isinstance(c, dict):
+                if c.get("type") == "text" and isinstance(c.get("text"), str):
+                    parts.append(c["text"])  # standard
+                elif c.get("type") == "text" and isinstance(c.get("data"), str):
+                    parts.append(c["data"])  # legacy
+        if parts:
+            return "".join(parts)
+    # Fallback to JSON dumps if needed
+    try:
+        import json
+        return json.dumps(res, ensure_ascii=False)
+    except Exception:
+        return None
 
 
 class _MCPRemote:
@@ -471,6 +650,8 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
     is set to `python`, callers may inject an alternate implementation via tests;
     the default production path uses `mcp-remote`.
     """
+    # Allow resetting adapter singletons on retry
+    global _ADAPTORS_CLIENT, _ADAPTORS_READ_TOOL
     tenant: Optional[int] = None
     run_id: Optional[int] = None
     t0 = time.perf_counter()
@@ -478,8 +659,17 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
     api_key = _get_env("JINA_API_KEY")
     if not api_key:
         raise MCPClientNotImplemented("JINA_API_KEY not set; MCP client unavailable")
-    # Respect env, but current implementation uses the remote transport under the hood
-    transport_cfg = (_get_env("MCP_TRANSPORT", "python") or "python").lower()
+    # Resolve transport preferring settings.MCP_TRANSPORT (for in-process overrides),
+    # then falling back to env MCP_TRANSPORT. Default remains 'python'.
+    try:
+        from src import settings as _settings  # type: ignore
+        _trn = getattr(_settings, "MCP_TRANSPORT", None)
+        if isinstance(_trn, str) and _trn.strip():
+            transport_cfg = _trn.strip().lower()
+        else:
+            transport_cfg = (_get_env("MCP_TRANSPORT", "python") or "python").lower()
+    except Exception:
+        transport_cfg = (_get_env("MCP_TRANSPORT", "python") or "python").lower()
     if obs is not None:
         try:
             run_id, tenant = obs.get_run_context()
@@ -487,6 +677,66 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
             run_id, tenant = None, None
     tool = "read_url"
     try:
+        # Adapters transport (Python): use langchain_mcp_adapters client
+        if transport_cfg == "adapters_http":
+            tcall0 = time.perf_counter()
+            # Wrap with stage_timer when run context is available
+            _use_timer = obs is not None and run_id is not None and tenant is not None
+            if _use_timer:
+                try:
+                    ctx = obs.stage_timer(run_id, tenant, "mcp_read_url")  # type: ignore[attr-defined]
+                except Exception:
+                    ctx = None
+            else:
+                ctx = None
+            try:
+                if ctx is None:
+                    # Attempt call; allow one retry on failure after re-init
+                    try:
+                        text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
+                    except Exception as _e1:
+                        # Reset cached tool and client then retry once
+                        try:
+                            _ADAPTORS_READ_TOOL = None
+                            _ADAPTORS_CLIENT = None
+                        except Exception:
+                            pass
+                        _ensure_adapters_client()
+                        text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
+                else:
+                    with ctx:
+                        try:
+                            text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
+                        except Exception as _e1:
+                            try:
+                                _ADAPTORS_READ_TOOL = None
+                                _ADAPTORS_CLIENT = None
+                            except Exception:
+                                pass
+                            _ensure_adapters_client()
+                            text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
+            finally:
+                pass
+            tcall1 = time.perf_counter()
+            _metrics_record(tool, "ok", (tcall1 - tcall0))
+            # Telemetry: success
+            try:
+                if obs is not None and run_id is not None and tenant is not None:
+                    dur = int((time.perf_counter() - t0) * 1000)
+                    obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=1, errors=0)
+                    obs.log_event(
+                        run_id,
+                        tenant,
+                        stage="mcp_read_url",
+                        event="finish",
+                        status="ok",
+                        duration_ms=dur,
+                        extra={"transport": "adapters_http"},
+                    )
+            except Exception:
+                pass
+            return text
+
         log.info("[mcp] starting read_url transport=remote (cfg=%s) server=%s", transport_cfg, server_url)
         if transport_cfg not in ("remote", "python"):
             transport_cfg = "remote"
@@ -560,7 +810,12 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
         return text
     except Exception as e:
         try:
-            log.info("[mcp] error transport=remote msg=%s", (str(e) or type(e).__name__))
+            # Reflect the chosen transport for accurate diagnostics
+            try:
+                _t = transport_cfg
+            except Exception:
+                _t = "remote"
+            log.info("[mcp] error transport=%s msg=%s", _t, (str(e) or type(e).__name__))
         except Exception:
             pass
         try:
@@ -587,6 +842,59 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
         raise
 
 
+def _adapters_call_search_web(query: str, *, country: Optional[str], max_results: int, timeout_s: float) -> List[str]:  # pragma: no cover
+    tool = _adapters_get_tool("search_web", ["search_web", "jina_search_web", "search"], timeout_s=timeout_s)
+    # Invoke
+    if hasattr(tool, "ainvoke"):
+        res = _adapters_run_coro(tool.ainvoke({"query": query, "limit": max_results, **({"country": country} if country else {})}), timeout_s=timeout_s)
+    else:
+        res = tool.invoke({"query": query, "limit": max_results, **({"country": country} if country else {})})
+    # Extract URLs: try JSON list, else URL mining from text
+    try:
+        if isinstance(res, str):
+            try:
+                j = json.loads(res)
+                if isinstance(j, list):
+                    return [str(x) for x in j][:max_results]
+            except Exception:
+                pass
+            return _extract_urls_from_text(res)[:max_results]
+        content = getattr(res, "content", None)
+        if isinstance(content, str):
+            try:
+                j = json.loads(content)
+                if isinstance(j, list):
+                    return [str(x) for x in j][:max_results]
+            except Exception:
+                pass
+            return _extract_urls_from_text(content)[:max_results]
+        if isinstance(content, list):
+            texts: List[str] = []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    if isinstance(c.get("text"), str):
+                        texts.append(c["text"])  # standard
+                    elif isinstance(c.get("data"), str):
+                        texts.append(c["data"])  # legacy
+            if texts:
+                joined = "\n".join(texts)
+                try:
+                    j = json.loads(joined)
+                    if isinstance(j, list):
+                        return [str(x) for x in j][:max_results]
+                except Exception:
+                    pass
+                return _extract_urls_from_text(joined)[:max_results]
+        # Fallback stringify
+        try:
+            s = json.dumps(res, ensure_ascii=False)
+        except Exception:
+            s = str(res)
+        return _extract_urls_from_text(s)[:max_results]
+    except Exception:
+        return []
+
+
 def search_web(query: str, *, country: Optional[str] = None, max_results: int = 20, timeout_s: Optional[float] = None) -> List[str]:
     """Search the web via Jina MCP `search_web` tool.
 
@@ -599,6 +907,40 @@ def search_web(query: str, *, country: Optional[str] = None, max_results: int = 
         raise MCPClientNotImplemented("JINA_API_KEY not set; MCP client unavailable")
     tool = "search_web"
     try:
+        # Adapters transport branch
+        try:
+            from src import settings as _settings  # type: ignore
+            transport_cfg = str(getattr(_settings, "MCP_TRANSPORT", "") or "").lower()
+        except Exception:
+            transport_cfg = (os.getenv("MCP_TRANSPORT", "") or "").lower()
+        if transport_cfg == "adapters_http":
+            # Stage timer
+            ctx = None
+            if obs is not None:
+                try:
+                    run_id, tenant = obs.get_run_context()
+                    if run_id is not None and tenant is not None:
+                        ctx = obs.stage_timer(run_id, tenant, "mcp_search_web")  # type: ignore[attr-defined]
+                except Exception:
+                    ctx = None
+            if ctx is None:
+                urls = _adapters_call_search_web(query, country=country, max_results=max_results, timeout_s=_effective_timeout(timeout_s, 30.0))
+            else:
+                with ctx:
+                    urls = _adapters_call_search_web(query, country=country, max_results=max_results, timeout_s=_effective_timeout(timeout_s, 30.0))
+            # Telemetry
+            try:
+                if obs is not None:
+                    run_id, tenant = obs.get_run_context()
+                    if run_id is not None and tenant is not None:
+                        dur = int((time.perf_counter() - t0) * 1000)
+                        obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=1, errors=0)
+                        obs.log_event(run_id, tenant, stage="mcp_search_web", event="finish", status="ok", duration_ms=dur, extra={"transport": "adapters_http"})
+            except Exception:
+                pass
+            return urls[:max_results]
+
+        # Remote transport fallback (mcp-remote)
         client = _POOL.get(server_url, api_key)
         tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
         if not tool_name:
@@ -671,6 +1013,37 @@ def search_web(query: str, *, country: Optional[str] = None, max_results: int = 
             raise
 
 
+def _adapters_call_parallel_search_web(queries: List[str], *, per_query: int, timeout_s: float) -> Dict[str, List[str]]:  # pragma: no cover
+    # Try parallel tool first, else fan out using adapters search_web
+    try:
+        tool = _adapters_get_tool("parallel_search_web", ["parallel_search_web", "jina_parallel_search_web"], timeout_s=timeout_s)
+    except Exception:
+        tool = None
+    if tool is not None:
+        if hasattr(tool, "ainvoke"):
+            res = _adapters_run_coro(tool.ainvoke({"queries": queries, "per_query": per_query}), timeout_s=timeout_s)
+        else:
+            res = tool.invoke({"queries": queries, "per_query": per_query})
+        # Expect dict-like mapping query->list[urls]
+        if isinstance(res, dict):
+            out: Dict[str, List[str]] = {}
+            for q, v in res.items():
+                out[str(q)] = [str(x) for x in (v or []) if isinstance(x, (str, bytes))][:per_query]
+            return out
+        # Fallback attempt via text
+        try:
+            s = json.dumps(res, ensure_ascii=False)
+        except Exception:
+            s = str(res)
+        # Not ideal; return empty mapping when not parseable
+        return {q: [] for q in queries}
+    # Fan out
+    out: Dict[str, List[str]] = {}
+    for q in queries:
+        out[q] = _adapters_call_search_web(q, country=os.getenv("MCP_SEARCH_COUNTRY") or None, max_results=per_query, timeout_s=timeout_s)
+    return out
+
+
 def parallel_search_web(queries: List[str], *, per_query: int = 10, timeout_s: Optional[float] = None) -> Dict[str, List[str]]:
     """Parallel search using MCP `parallel_search_web` if available, else fan out `search_web` with a thread pool.
     Returns a dict query -> list[URLs].
@@ -682,6 +1055,37 @@ def parallel_search_web(queries: List[str], *, per_query: int = 10, timeout_s: O
         raise MCPClientNotImplemented("JINA_API_KEY not set; MCP client unavailable")
     tool = "parallel_search_web"
     try:
+        # Adapters transport branch
+        try:
+            from src import settings as _settings  # type: ignore
+            transport_cfg = str(getattr(_settings, "MCP_TRANSPORT", "") or "").lower()
+        except Exception:
+            transport_cfg = (os.getenv("MCP_TRANSPORT", "") or "").lower()
+        if transport_cfg == "adapters_http":
+            ctx = None
+            if obs is not None:
+                try:
+                    run_id, tenant = obs.get_run_context()
+                    if run_id is not None and tenant is not None:
+                        ctx = obs.stage_timer(run_id, tenant, "mcp_parallel_search_web")  # type: ignore[attr-defined]
+                except Exception:
+                    ctx = None
+            if ctx is None:
+                out = _adapters_call_parallel_search_web(queries, per_query=per_query, timeout_s=_effective_timeout(timeout_s, 45.0))
+            else:
+                with ctx:
+                    out = _adapters_call_parallel_search_web(queries, per_query=per_query, timeout_s=_effective_timeout(timeout_s, 45.0))
+            try:
+                if obs is not None:
+                    run_id, tenant = obs.get_run_context()
+                    if run_id is not None and tenant is not None:
+                        dur = int((time.perf_counter() - t0) * 1000)
+                        obs.bump_vendor(run_id, tenant, vendor="jina_mcp", calls=len(queries), errors=0)
+                        obs.log_event(run_id, tenant, stage="mcp_parallel_search_web", event="finish", status="ok", duration_ms=dur, extra={"transport": "adapters_http"})
+            except Exception:
+                pass
+            return out
+
         client = _POOL.get(server_url, api_key)
         tool_name = _POOL.get_cached_tool(server_url, api_key, purpose=tool)
         if not tool_name:

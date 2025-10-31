@@ -377,7 +377,7 @@ ENABLE_MCP_SEARCH = os.getenv("ENABLE_MCP_SEARCH", "false").lower() in (
 
 # MCP server endpoint and transport selection
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.jina.ai/sse")
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "python")  # or 'remote' for mcp-remote
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "python")  # 'remote' (mcp-remote) or 'adapters_http'
 
 try:
     MCP_TIMEOUT_S = float(os.getenv("MCP_TIMEOUT_S", "12.0") or 12.0)
@@ -391,6 +391,15 @@ except Exception:
 
 # Optional: default country hint for MCP search_web
 MCP_SEARCH_COUNTRY = os.getenv("MCP_SEARCH_COUNTRY", "")
+
+# Adapters (Python) tuning
+MCP_ADAPTER_USE_SSE = os.getenv("MCP_ADAPTER_USE_SSE", "false").lower() in ("1", "true", "yes", "on")
+MCP_ADAPTER_USE_STANDARD_BLOCKS = os.getenv("MCP_ADAPTER_USE_STANDARD_BLOCKS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Thread pool size for MCP parallel operations
 try:

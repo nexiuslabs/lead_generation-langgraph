@@ -52,17 +52,34 @@ Optional / Recommended
 - EXTRACT_CORPUS_CHAR_LIMIT: default `35000`
 - ODOO_POSTGRES_DSN: connection string for your Odoo database; keep separate from `POSTGRES_DSN`
 
+.env example (MCP adapters)
+Create `.env` at project root with at least these keys (see `.env.example`):
+```
+JINA_API_KEY=your_jina_api_key_here
+MCP_SERVER_URL=https://mcp.jina.ai/sse
+ENABLE_MCP_READER=true
+MCP_TRANSPORT=adapters_http
+MCP_TIMEOUT_S=12.0
+MCP_DUAL_READ_PCT=0
+MCP_ADAPTER_USE_SSE=false
+MCP_ADAPTER_USE_STANDARD_BLOCKS=true
+```
+
 MCP Reader (Jina) — Read URL
 - ENABLE_MCP_READER: set to `true` to use Jina MCP `read_url` instead of HTTP `r.jina.ai` (default `false`)
 - JINA_API_KEY: required when MCP is enabled (Authorization: Bearer)
 - MCP_SERVER_URL: MCP server endpoint (default `https://mcp.jina.ai/sse`)
-- MCP_TRANSPORT: `python` or `remote` (default `python`; project uses `remote` via `npx mcp-remote` when enabled)
+- MCP_TRANSPORT: `python`, `remote`, or `adapters_http` (default `python`; `remote` uses `npx mcp-remote`; `adapters_http` uses Python LangGraph MCP adapters)
 - MCP_TIMEOUT_S: per-call timeout in seconds (default `12.0`)
 - MCP_DUAL_READ_PCT: `0..100`; when >0, runs MCP and HTTP in parallel and returns HTTP for parity checks (default `0`)
 - MCP_INIT_TIMEOUT_S: initialize handshake timeout in seconds (default `25`)
 - MCP_NPX_PATH: override `npx` executable path if needed (default `npx`)
 - MCP_PROTOCOL_VERSION: override protocol version sent in `initialize` (default `2024-10-07`)
 - MCP_EXEC: optional path/name of a globally installed `mcp-remote` binary. If set (e.g., `mcp-remote`), the backend skips `npx` and executes it directly to reduce spawn overhead.
+Adapters (Python) — Optional
+- MCP_ADAPTER_USE_SSE: when `true`, use SSE transport; otherwise use streamable HTTP (default `false`)
+- MCP_ADAPTER_USE_STANDARD_BLOCKS: when `true`, standardize tool outputs for robust text extraction (default `true`)
+
 
 Rollout guidance
 1) Set `ENABLE_MCP_READER=true` and `MCP_DUAL_READ_PCT=50` in staging; verify dashboards for success rate (≥95%), latency, and content variance.

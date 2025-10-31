@@ -38,3 +38,6 @@ python-dotenv
 PyJWT
 passlib
 apscheduler
+langchain-mcp-adapters
+langgraph 
+"langchain[openai]"
