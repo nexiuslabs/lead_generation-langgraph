@@ -254,8 +254,55 @@ def handle_user_turn(last_agent_question: Optional[str], user_message: str, cont
     return {"reply": answer, "relevant": True, "missing": []}
 
 
+def phrase_system_update(
+    heading: Optional[str] = None,
+    body: Optional[str] = None,
+    block: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return a concise, LLM‑phrased user message for system updates.
+
+    - Produces a short 1–2 sentence summary using the provided heading/body/context.
+    - If `block` is provided (e.g., a table), it is appended verbatim after the sentence.
+    - Falls back to the original text when the LLM is unavailable.
+    """
+    context = context or {}
+    llm = _llm_safely(temperature=0.2)
+    preface: str
+    if llm:
+        try:
+            sys = (
+                "You rephrase internal system updates into a concise, user‑facing sentence (<= 2 sentences). "
+                "Do not invent facts. You may mention counts or next actions from the provided Context. "
+                "Do not include code fences. The UI will append any provided block verbatim."
+            )
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", sys),
+                (
+                    "human",
+                    "Heading: {h}\nBody: {b}\nContext: {c}\n\nRewrite as a concise user update.",
+                ),
+            ])
+            msgs = prompt.format_messages(
+                h=(heading or ""), b=(body or ""), c=json.dumps(context, ensure_ascii=False)
+            )
+            preface = (llm.invoke(msgs).content or "").strip()
+        except Exception as e:
+            log.info("phrase_system_update_llm_fail: %s", e)
+            preface = (heading or (body.splitlines()[0] if body else "Update")).strip()
+    else:
+        preface = (heading or (body.splitlines()[0] if body else "Update")).strip()
+
+    if block:
+        return f"{preface}\n\n{block}"
+    if body:
+        return f"{preface}\n\n{body}"
+    return preface
+
+
 __all__ = [
     "answer_leadgen_question",
+    "phrase_system_update",
     "check_answer_relevance",
     "handle_user_turn",
     "RelevanceJudgment",
