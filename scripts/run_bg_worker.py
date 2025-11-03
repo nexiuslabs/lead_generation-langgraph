@@ -29,17 +29,32 @@ class BGWorker:
             logging.getLogger("bg").info("[bg] LISTEN disabled (DB connect failed); polling only")
             return
         try:
-            # asyncpg.add_listener is a sync API; do not await
-            try:
-                conn.add_listener("bg_jobs", self._on_notify)  # type: ignore[attr-defined]
-            except TypeError:
-                # Some asyncpg variants use a different signature; wrap to ignore extra args
-                def _cb(*_args):
+            # asyncpg.add_listener signature varies across versions; support both sync and async
+            import inspect as _inspect
+            _cb = self._on_notify
+            # Some variants expect (conn, pid, channel, payload); accept and ignore extra args
+            def _wrap(*_args):
+                try:
+                    self._on_notify()
+                except Exception:
+                    pass
+            listener = _wrap
+            addl = getattr(conn, "add_listener", None)
+            if addl is None:
+                # Fallback: raw SQL LISTEN only (no callbacks). We'll rely on sweep polling.
+                await conn.execute("LISTEN bg_jobs")
+            else:
+                if _inspect.iscoroutinefunction(addl):
                     try:
-                        self._on_notify()
-                    except Exception:
-                        pass
-                conn.add_listener("bg_jobs", _cb)  # type: ignore[attr-defined]
+                        await addl("bg_jobs", listener)  # type: ignore[misc]
+                    except TypeError:
+                        # Some builds want the unwrapped callback
+                        await addl("bg_jobs", _cb)  # type: ignore[misc]
+                else:
+                    try:
+                        addl("bg_jobs", listener)  # type: ignore[misc]
+                    except TypeError:
+                        addl("bg_jobs", _cb)  # type: ignore[misc]
         except Exception:
             # Some asyncpg versions use different API; fallback to raw SQL LISTEN loop
             await conn.execute("LISTEN bg_jobs")

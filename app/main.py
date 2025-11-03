@@ -164,6 +164,10 @@ try:
 except Exception as _e:
     logger.warning("Chat SSE routes not mounted: %s", _e)
 
+# Background worker is managed exclusively by scripts/run_bg_worker.py. We do not
+# auto-start any worker in the API process to avoid lifespan conflicts and to
+# keep concerns separated.
+
 # ---------------------------------------------------------------
 # Utilities: SendGrid email smoke test (no enrichment required)
 # ---------------------------------------------------------------
