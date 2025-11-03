@@ -1,0 +1,516 @@
+Feature Dev Plan — Section 6: Multi‑Tenant, SSO & Odoo Integration
+
+Version: v1.1
+Owner: Platform + RevOps
+Scope: Section 6 only (Multi‑Tenant, SSO, Odoo alignment, first‑login auto‑provisioning)
+
+— Overview —
+Goal: Provide secure multi‑tenant access via Nexius SSO (Keycloak OIDC), strict tenant isolation in Postgres, seamless Odoo alignment per tenant, and first‑login auto‑provisioning surfaced in the Agent Chat UI. Use cookie‑based sessions from the backend; the browser never sends Authorization headers in production. FastAPI acts as gateway, verifies sessions, and proxies to LangGraph with server‑side bearer injection.
+
+— Feature‑by‑Feature (By Codebase) —
+lead_generation‑main (FastAPI + LangGraph)
+- E1 Auth & Sessions: Add cookie‑based /auth/* routes; add server dependency to read cookies; wire /whoami; keep DEV_AUTH_BYPASS for local.
+- E2 Tenant Isolation: Ensure set_config('request.tenant_id', ...) per request before DB calls; rely on RLS policies in migrations.
+- E3 First‑Login: Ensure onboarding endpoints are wired; background task seeds Odoo baseline; expose /session/odoo_info.
+- E4 Odoo Alignment: Verify connectivity smoke test; add API key rotation endpoint storing secret in odoo_connections.
+- E5 Graph Proxy/Single Origin: Prefer single‑origin via langgraph.json; fallback proxy /graph/* injects Authorization from server.
+- E7 Hardening & Ops: CORS allowlist, HTTPS only cookies, JWKS caching, structured logs.
+
+agent‑chat‑ui (Next.js)
+- E1 Auth UX: Add simple /login and /register pages posting to backend /auth/*; de‑emphasize direct IdP screens.
+- E6 Requests & Streaming: Use credentials: 'include' everywhere; remove Authorization header in prod; keep dev tenant switcher.
+- E3 First‑Login UX: Continue FirstLoginGate polling onboarding endpoints; add Verify Odoo action.
+
+acra_webhook
+- E2 Isolation: No changes; runs out‑of‑band to populate staging_acra_companies. Ensure it targets the same Postgres cluster.
+
+odoo (external)
+- E4 Alignment: Configure Keycloak OIDC client; map per‑tenant DSN in app DB (odoo_connections); rotate service secret via API.
+
+— Development Plan —
+E1) Auth & Sessions (Gateway)
+- Implement FastAPI /auth endpoints: /auth/register, /auth/login, /auth/refresh, /auth/logout using Keycloak Direct Grant.
+- Verify JWTs via JWKS (RS256) and populate request.state.tenant_id and roles.
+- Set HTTP‑only cookies; never expose tokens to JS. Dev bypass via headers.
+- Implement /whoami and /info.
+Repos: lead_generation-main (app/auth.py, app/auth_routes.py, app/main.py)
+Acceptance: 401 without cookies, 403 when tenant_id missing, /whoami shows correct identity.
+
+E2) Tenant Isolation (DB + App)
+- Enforce RLS on tenant‑owned tables and set Postgres GUC request.tenant_id per request.
+- Ensure queries that bypass RLS include WHERE tenant_id = :tenant_id.
+Repos: lead_generation-main (src/database, app/main.py, migrations)
+Acceptance: Exports show only caller’s tenant rows; no cross‑tenant leakage.
+
+E3) First‑Login Onboarding
+- Ensure tenants, tenant_users, icp_rules defaults; ensure odoo_connections; run connectivity smoke; seed baseline; status transitions captured.
+- Endpoints: POST /onboarding/first_login, GET /onboarding/status, GET /onboarding/verify_odoo, GET /session/odoo_info.
+Repos: lead_generation-main (app/onboarding.py, app/main.py, app/odoo_store.py)
+Acceptance: starting → creating_odoo → configuring_oidc → seeding → ready; UI exits gate.
+
+E3.a) Odoo DB Auto‑Create + Admin User (Provisioning)
+- If the mapped Odoo database does not exist for the tenant, create it automatically, then bootstrap an admin user.
+- Primary method (HTTP DB manager):
+  - Requires ODOO_SERVER_URL and ODOO_MASTER_PASSWORD; DB manager must be reachable from backend.
+  - Detect DB existence via POST {ODOO_SERVER_URL}/web/database/list (JSON‑RPC) and create via POST {ODOO_SERVER_URL}/web/database/create.
+  - Inputs: db name (e.g., template "odoo_t{tenant_id}"), admin login/email (use first user’s email), generated strong admin password.
+- Fallback method (CLI):
+  - If HTTP DB manager is disabled, run odoo‑bin to create DB and install minimal modules (base, contacts, crm) with demo disabled.
+  - Requires ODOO_BIN_PATH and ODOO_CONF (with admin_passwd set) on a host with Odoo installed.
+- After DB creation, use XML‑RPC to create a tenant admin user (or update the default admin) and assign admin group (base.group_system).
+- Store the generated admin credentials server‑side only (e.g., odoo_connections.secret or external secret store); never expose to the browser.
+
+E3.b) Odoo OIDC Auto‑Configuration
+- After DB creation, install `auth_oauth` module and create an OAuth/OIDC provider in Odoo via XML‑RPC.
+- Provider fields: name=Nexius, scope="openid email profile", auth_endpoint/token_endpoint/userinfo based on `NEXIUS_ISSUER` (Keycloak paths).
+- Save client_id/client_secret from env; enable the provider and test with a smoke sign‑in.
+
+E4) Odoo Alignment
+- Configure Odoo as OIDC client of Nexius SSO; per‑tenant service account/API key stored server‑side.
+- Add API key rotation endpoint and smoke test during onboarding.
+Repos: lead_generation-main (app/odoo_store.py, app/main.py), docs (odoo_oidc_setup.md)
+Acceptance: /onboarding/verify_odoo returns exists=true, smoke=true for configured tenant.
+
+E5) Graph Proxy & Single Origin
+- Prefer single origin: mount FastAPI via langgraph.json http.app; configure auth.path for Custom Auth.
+- Split services fallback: proxy /graph/* through gateway and inject server‑side Authorization.
+Repos: lead_generation-main (langgraph.json, app/main.py or proxy), agent-chat-ui (API base)
+Acceptance: Chat works with cookies; SSE preserved; no Authorization header from UI.
+
+E6) Agent Chat UI Updates
+- UI‑first sign‑up/login posting to /auth/*; no direct IdP screens.
+- Ensure fetch/stream uses credentials: 'include'; dev‑only X‑Tenant‑ID.
+- FirstLoginGate polling and “Verify Odoo” action.
+Repos: agent-chat-ui
+Acceptance: Header shows email + tenant; switcher hidden in prod.
+
+E7) Hardening & Ops
+- CORS allowlist, HTTPS, logging redaction, JWKS caching, config flags; acceptance tests.
+
+— Per‑Codebase Task List —
+lead_generation‑main
+- E1: Add app/auth_routes.py (Direct Grant, set cookies). Add app/deps.py with require_session() to read nx_access cookie and set request.state; include router in app/main.py. Keep require_auth() for dev and testing.
+- E2: Before DB access, set SELECT set_config('request.tenant_id', $1, true) from request.state.tenant_id. Confirm RLS migrations (005_tenant_rls.sql, 007_rls_icp.sql) applied via scripts/run_app_migrations.py.
+- E3: Ensure /onboarding/first_login, /onboarding/status, /onboarding/verify_odoo, /session/odoo_info are wired (they are). Keep background task kickoff. Add rotate secret route for odoo_connections.
+- E4: Ensure OdooStore.connectivity_smoke_test() and seed_baseline_entities() used in onboarding; add OdooStore.rotate_service_api_key() or equivalent to update odoo_connections.secret.
+- E5: Update langgraph.json with http.app and auth.path for single‑origin. If split origin, add app/graph_proxy.py and mount /graph/{path}.
+- E7: Enforce secure cookies (Secure, HttpOnly, SameSite=Lax), set EXTRA_CORS_ORIGINS, redact sensitive logs.
+
+- PRD Parity Additions:
+  - Add GET /tenants/{tenant_id} alias for onboarding status (same payload as /onboarding/status).
+  - Expand /info to include capability flags (e.g., checkpoint_enabled) for UI.
+  - Rotate API key route responds 204 No Content as per contract.
+  - Onboarding status phases reflect: starting → creating_odoo → configuring_oidc → seeding → ready.
+  - /auth/register: either call Keycloak Admin API to create user or document SSO self‑registration; plan assumes SSO handles identity while backend provisions tenant.
+
+agent‑chat‑ui
+- E1: Add /login (and optional /register) pages that POST to backend /auth/* and rely on cookies. Preserve NextAuth only for dev if needed, but do not send Authorization in prod.
+- E6: Replace useAuthFetch to include credentials: 'include' and only send X‑Tenant‑ID in dev; update Stream.tsx fetchOptions accordingly.
+- E3: Keep FirstLoginGate; add a “Verify Odoo” button calling GET /onboarding/verify_odoo.
+
+- PRD Parity Additions:
+  - Gate NextAuth to development only (or feature flag). In production do not send Authorization headers; rely exclusively on cookies.
+  - Ensure fetch/stream uses credentials: 'include'; API proxy forwards cookies; dev‑only X‑Tenant‑ID when enabled.
+
+acra_webhook
+- E2: No change required. Validate staging_acra_companies exists and app migrations have been applied. Point DATABASE_URL to the same Postgres cluster as app.
+
+odoo
+- E4: Configure IdP (Keycloak) OIDC client. Per‑tenant DSN mapping stored in app DB table odoo_connections. Rotate per‑tenant secret via backend route and store in odoo_connections.secret; never expose secrets to browser.
+
+— Step‑By‑Step Instructions —
+Backend (lead_generation-main)
+1) Auth and Sessions
+  - Add app/auth_routes.py implementing /auth/login, /auth/register (MVP allowed), /auth/refresh, /auth/logout using Keycloak Direct Grant. Set HTTP‑only cookies.
+  - Keep JWKS verification in app/auth.py; retain DEV_AUTH_BYPASS for local.
+  - Expose /whoami and /info (already present for /info; /whoami present).
+  - Add app/deps.py: require_session(request) reads nx_access cookie, verifies JWT, sets request.state.tenant_id and roles.
+
+2) Tenant Isolation
+  - Use require_auth on protected routes; set GUC via SELECT set_config('request.tenant_id', $1, true) before queries.
+  - Confirm migrations enabling RLS are applied (001_presdr_odoo.sql, 004_multi_tenant_icp.sql, 005_tenant_rls.sql, 007_rls_icp.sql).
+
+3) First‑Login Provisioning
+  - app/onboarding.py already handles ensuring tenant, icp defaults, odoo mapping, seeding, and status table.
+  - Wire endpoints: POST /onboarding/first_login, GET /onboarding/status, GET /onboarding/verify_odoo, GET /session/odoo_info (present).
+  - Add POST /tenants/{tenant_id}/odoo/api-key/rotate to rotate the per‑tenant service key (code below, updates odoo_connections.secret).
+  - Add automatic Odoo DB creation and admin bootstrap in onboarding flow:
+    - Compute db_name (e.g., from ODOO_BASE_DSN_TEMPLATE or "odoo_t{tenant_id}") and test existence.
+    - If missing, create DB via HTTP DB manager or CLI fallback, then create/assign admin user via XML‑RPC.
+    - Persist db_name and secret/admin password server‑side only.
+
+4) Odoo Integration
+  - Ensure OdooStore.connectivity_smoke_test and seed_baseline_entities work and surface errors in onboarding status.
+  - Follow docs/odoo_oidc_setup.md to set up OIDC and store mapping in odoo_connections.
+
+5) Graph & Single Origin
+  - Update langgraph.json to set http.app to app.main:app and auth.path to app.auth:require_auth to share cookies.
+  - If split origin, add /graph/{path:path} proxy injecting Authorization from server cookies.
+
+6) Config & Security
+  - NEXIUS_ISSUER, NEXIUS_AUDIENCE?, NEXIUS_TOKEN_URL, NEXIUS_CLIENT_ID, NEXIUS_CLIENT_SECRET.
+  - DEV_AUTH_BYPASS, DEFAULT_TENANT_ID, DEV_USER_EMAIL (dev only).
+  - ODOO_POSTGRES_DSN or ODOO_BASE_DSN_TEMPLATE; OPENAI_API_KEY; LANGGRAPH_CHECKPOINT_DIR; EXTRA_CORS_ORIGINS.
+  - ODOO_SERVER_URL (e.g., https://odoo.example.com) and ODOO_MASTER_PASSWORD for HTTP DB manager.
+  - ODOO_BIN_PATH and ODOO_CONF for CLI fallback (if HTTP DB manager disabled).
+  - ODOO_DB_NAME_TEMPLATE (default: odoo_t{tenant_id}), ODOO_DEFAULT_MODULES (default: base,contacts,crm).
+  - ODOO_TENANT_ADMIN_EMAIL_TEMPLATE (default: first login user email), ODOO_TENANT_ADMIN_PASSWORD_LENGTH (default: 24).
+
+7) Testing & Rollout
+  - Use lead_generation-main/docs/testing_acceptance_section6.md; verify auth, isolation, onboarding, and Odoo.
+
+Agent Chat UI (agent-chat-ui)
+1) Auth UX
+  - Add simple login/register forms that POST to /auth/*.
+  - Remove sending Authorization header in prod; rely on cookies; dev switcher optional.
+
+2) Requests & Streaming
+  - Ensure credentials: 'include' on fetch and SSE; set X‑Tenant‑ID only in dev.
+
+3) First‑Login UX
+  - Use FirstLoginGate to poll /onboarding/status; show status copy; add “Verify Odoo”.
+
+— Code Snippets —
+1) FastAPI Auth Routes (cookies + Direct Grant)
+File: lead_generation-main/app/auth_routes.py
+from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+import os, httpx, time
+from app.auth import verify_jwt
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+KEYCLOAK_TOKEN_URL = os.getenv("NEXIUS_TOKEN_URL")  # https://sso/realms/realm/protocol/openid-connect/token
+CLIENT_ID = os.getenv("NEXIUS_CLIENT_ID")
+CLIENT_SECRET = os.getenv("NEXIUS_CLIENT_SECRET")
+
+ACCESS_COOKIE = "nx_access"
+REFRESH_COOKIE = "nx_refresh"
+
+def _set_session(resp: Response, access: str, refresh: str | None):
+  max_age = 15*60
+  try:
+    import jwt as pyjwt, time as _t
+    exp = int(pyjwt.decode(access, options={"verify_signature": False}).get("exp", 0))
+    if exp: max_age = max(60, exp - int(_t.time()))
+  except Exception: pass
+  resp.set_cookie(ACCESS_COOKIE, access, httponly=True, secure=True, samesite="lax", max_age=max_age, path="/")
+  if refresh:
+    resp.set_cookie(REFRESH_COOKIE, refresh, httponly=True, secure=True, samesite="lax", max_age=30*24*3600, path="/")
+
+async def _grant(email: str, password: str, otp: str | None = None) -> dict:
+  if not KEYCLOAK_TOKEN_URL or not CLIENT_ID:
+    raise HTTPException(status_code=500, detail="SSO not configured")
+  data = {"grant_type":"password","username":email,"password":password,"client_id":CLIENT_ID}
+  if CLIENT_SECRET: data["client_secret"] = CLIENT_SECRET
+  if otp: data["totp"] = otp
+  async with httpx.AsyncClient(timeout=10) as client:
+    r = await client.post(KEYCLOAK_TOKEN_URL, data=data)
+    if r.status_code != 200: raise HTTPException(status_code=401, detail="Invalid credentials")
+    return r.json()
+
+@router.post("/login")
+async def login(body: dict, response: Response):
+  email = (body.get("email") or "").strip(); password = body.get("password") or ""; otp = body.get("otp")
+  tok = await _grant(email, password, otp)
+  access, refresh = tok.get("access_token"), tok.get("refresh_token")
+  if not access: raise HTTPException(status_code=500, detail="No access token")
+  claims = verify_jwt(access)
+  _set_session(response, access, refresh)
+  return {"tenant_id": claims.get("tenant_id"), "roles": claims.get("roles", []), "tenant_status": "unknown"}
+
+@router.post("/register")
+async def register(body: dict, response: Response):
+  email = (body.get("email") or "").strip(); password = body.get("password") or ""
+  if not email or not password: raise HTTPException(status_code=400, detail="email and password required")
+  tok = await _grant(email, password, None)
+  access, refresh = tok.get("access_token"), tok.get("refresh_token")
+  if not access: raise HTTPException(status_code=500, detail="No access token")
+  claims = verify_jwt(access)
+  _set_session(response, access, refresh)
+  return {"tenant_id": claims.get("tenant_id")}
+
+@router.post("/refresh")
+async def refresh(request: Request, response: Response):
+  rt = request.cookies.get(REFRESH_COOKIE)
+  if not rt: raise HTTPException(status_code=401, detail="No refresh cookie")
+  data = {"grant_type":"refresh_token","refresh_token":rt,"client_id":CLIENT_ID}
+  if CLIENT_SECRET: data["client_secret"] = CLIENT_SECRET
+  async with httpx.AsyncClient(timeout=10) as client:
+    r = await client.post(KEYCLOAK_TOKEN_URL, data=data)
+    if r.status_code != 200: raise HTTPException(status_code=401, detail="Refresh failed")
+    tok = r.json(); _set_session(response, tok.get("access_token"), tok.get("refresh_token"))
+  return {"ok": True}
+
+@router.post("/logout")
+async def logout(response: Response):
+  response.delete_cookie(ACCESS_COOKIE, path="/"); response.delete_cookie(REFRESH_COOKIE, path="/")
+  return Response(status_code=204)
+
+2) Session dependency (server cookie → claims)
+File: lead_generation-main/app/deps.py
+from fastapi import Request, HTTPException
+from app.auth import verify_jwt
+
+async def require_session(request: Request) -> dict:
+  token = request.cookies.get("nx_access")
+  if not token:
+    raise HTTPException(status_code=401, detail="Missing session cookie")
+  claims = verify_jwt(token)
+  request.state.tenant_id = claims.get("tenant_id"); request.state.roles = claims.get("roles", [])
+  if not request.state.tenant_id:
+    raise HTTPException(status_code=403, detail="Missing tenant_id claim")
+  return claims
+
+3) Wire router in app/main.py
+# near imports
+from app.auth_routes import router as auth_router
+# after app init
+app.include_router(auth_router)
+
+4) Optional graph proxy (split origin)
+File: lead_generation-main/app/graph_proxy.py
+from fastapi import APIRouter, Request, Response
+import httpx, os
+
+router = APIRouter()
+
+GRAPH_BASE = os.getenv("LANGGRAPH_BASE_URL", "http://localhost:2024")
+
+@router.api_route("/graph/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE"])
+async def proxy_graph(path: str, request: Request):
+  url = f"{GRAPH_BASE.rstrip('/')}/{path}"
+  token = request.cookies.get("nx_access")
+  headers = {k: v for k, v in request.headers.items() if k.lower() not in {"host","authorization"}}
+  if token:
+    headers["Authorization"] = f"Bearer {token}"
+  async with httpx.AsyncClient(timeout=None) as client:
+    resp = await client.request(request.method, url, headers=headers, content=await request.body())
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
+5) Rotate Odoo API key
+File: lead_generation-main/app/main.py (add)
+from fastapi import Path
+@app.post("/tenants/{tenant_id}/odoo/api-key/rotate")
+async def rotate_odoo_key(tenant_id: int = Path(...), _: dict = Depends(require_auth)):
+  # Update odoo_connections.secret with a new random token; never return it in prod
+  import secrets
+  from src.database import get_conn
+  new_secret = secrets.token_urlsafe(32)
+  with get_conn() as conn, conn.cursor() as cur:
+    cur.execute("UPDATE odoo_connections SET secret=%s WHERE tenant_id=%s", (new_secret, tenant_id))
+  return Response(status_code=204)
+
+6) Odoo DB create via HTTP (JSON‑RPC)
+File: lead_generation-main/app/onboarding.py (pseudo‑code)
+import os, secrets, requests, xmlrpc.client
+
+def _odoo_db_exists(server: str, master_pwd: str, db_name: str) -> bool:
+  payload = {"jsonrpc":"2.0","method":"call","params":{}}
+  r = requests.post(f"{server}/web/database/list", json=payload, timeout=20)
+  r.raise_for_status()
+  names = r.json().get("result", [])
+  return db_name in names
+
+def _odoo_db_create(server: str, master_pwd: str, db_name: str, admin_login: str, admin_password: str):
+  payload = {
+    "jsonrpc":"2.0",
+    "method":"call",
+    "params":{
+      "master_pwd": master_pwd,
+      "name": db_name,
+      "login": admin_login,
+      "password": admin_password,
+      "lang": os.getenv("ODOO_LANG","en_US"),
+      "country_code": os.getenv("ODOO_COUNTRY","SG"),
+      "phone": "",
+      "email": admin_login,
+      "demo": False,
+    }
+  }
+  r = requests.post(f"{server}/web/database/create", json=payload, timeout=120)
+  r.raise_for_status()
+
+def _odoo_admin_user_create(server: str, db_name: str, admin_login: str, admin_password: str, tenant_admin_email: str):
+  common = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/common")
+  uid = common.authenticate(db_name, admin_login, admin_password, {})
+  models = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/object")
+  group_system_id = models.execute_kw(db_name, uid, admin_password,
+    'ir.model.data', 'xmlid_to_res_id', ['base.group_system'])
+  user_id = models.execute_kw(db_name, uid, admin_password, 'res.users', 'create', [{
+    'name': 'Tenant Admin',
+    'login': tenant_admin_email,
+    'email': tenant_admin_email,
+    'groups_id': [(6,0,[group_system_id])],
+  }])
+  return user_id
+
+def ensure_odoo_db_and_admin(tenant_id: int, user_email: str) -> dict:
+  server = os.getenv('ODOO_SERVER_URL'); master = os.getenv('ODOO_MASTER_PASSWORD')
+  if not server or not master:
+    return {"created": False, "reason": "db_manager_not_configured"}
+  db_name_tpl = os.getenv('ODOO_DB_NAME_TEMPLATE','odoo_t{tenant_id}')
+  db_name = db_name_tpl.format(tenant_id=tenant_id)
+  admin_login = user_email
+  admin_password = secrets.token_urlsafe(int(os.getenv('ODOO_TENANT_ADMIN_PASSWORD_LENGTH','24')))
+  if not _odoo_db_exists(server, master, db_name):
+    _odoo_db_create(server, master, db_name, admin_login, admin_password)
+    _odoo_admin_user_create(server, db_name, admin_login, admin_password, user_email)
+  return {"created": True, "db_name": db_name}
+
+7) Configure OIDC provider via XML‑RPC
+File: lead_generation-main/app/onboarding.py (pseudo‑code)
+def _odoo_configure_oidc(server: str, db_name: str, admin_login: str, admin_password: str, issuer: str, cid: str, secret: str):
+  common = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/common")
+  uid = common.authenticate(db_name, admin_login, admin_password, {})
+  models = xmlrpc.client.ServerProxy(f"{server}/xmlrpc/2/object")
+  # Ensure auth_oauth installed
+  ids = models.execute_kw(db_name, uid, admin_password, 'ir.module.module', 'search', [[['name','=','auth_oauth']]])
+  if ids:
+    models.execute_kw(db_name, uid, admin_password, 'ir.module.module', 'button_immediate_install', [ids])
+  # Create or update provider
+  auth_ep = issuer.rstrip('/') + '/protocol/openid-connect/auth'
+  token_ep = issuer.rstrip('/') + '/protocol/openid-connect/token'
+  userinfo_ep = issuer.rstrip('/') + '/protocol/openid-connect/userinfo'
+  prov_ids = models.execute_kw(db_name, uid, admin_password, 'auth.oauth.provider', 'search', [[['name','=','Nexius']]])
+  vals = {
+    'name': 'Nexius',
+    'client_id': cid,
+    'client_secret': secret,
+    'auth_endpoint': auth_ep,
+    'scope': 'openid email profile',
+    'validation_endpoint': userinfo_ep,
+  }
+  if prov_ids:
+    models.execute_kw(db_name, uid, admin_password, 'auth.oauth.provider', 'write', [prov_ids, vals])
+  else:
+    models.execute_kw(db_name, uid, admin_password, 'auth.oauth.provider', 'create', [vals])
+
+6) Single‑origin config
+File: lead_generation-main/langgraph.json
+{
+  "dependencies": ["."],
+  "graphs": { "agent": "./app/lg_entry.py:make_graph" },
+  "auth": { "path": "app.auth:require_auth" },
+  "http": { "app": "app.main:app" }
+}
+
+7) UI cookie‑based fetch helper
+File: agent-chat-ui/src/lib/useAuthFetch.ts (prod variant)
+"use client";
+import { useCallback } from "react";
+export function useAuthFetch() {
+  const enabled = (process.env.NEXT_PUBLIC_ENABLE_TENANT_SWITCHER || "").toLowerCase() === "true";
+  const tenantOverride = useCallback((): string | undefined => {
+    if (!enabled) return undefined;
+    try { return window.localStorage.getItem("lg:chat:tenantId") || undefined; } catch { return undefined; }
+  }, [enabled]);
+  return useCallback(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers || {});
+    const tid = tenantOverride(); if (tid) headers.set("X-Tenant-ID", tid);
+    const res = await fetch(input, { ...init, headers, credentials: "include" });
+    if (res.status === 401 && typeof window !== "undefined") window.location.href = "/login";
+    return res;
+  }, [tenantOverride]);
+}
+
+8) Login page (cookie‑based)
+File: agent-chat-ui/src/app/login/page.tsx
+"use client";
+import { useState } from "react";
+
+export default function LoginPage() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:2024";
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    const res = await fetch(`${apiBase}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ email, password }),
+    });
+    if (res.ok) {
+      window.location.href = "/";
+    } else {
+      const body = await res.json().catch(() => ({}));
+      setError(body?.detail || "Login failed");
+    }
+  }
+
+  return (
+    <div className="min-h-screen w-full flex items-center justify-center p-6">
+      <form onSubmit={onSubmit} className="border rounded-md p-6 w-full max-w-sm space-y-3">
+        <div className="text-lg font-semibold">Sign in</div>
+        {error ? <div className="text-sm text-red-500">{error}</div> : null}
+        <input className="border w-full p-2 rounded" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
+        <input className="border w-full p-2 rounded" placeholder="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} />
+        <button className="bg-black text-white px-3 py-2 rounded w-full" type="submit">Continue</button>
+      </form>
+    </div>
+  );
+}
+
+9) Stream provider updates (no Authorization header; cookies on SSE)
+File: agent-chat-ui/src/providers/Stream.tsx (snippet)
+// inside useTypedStream({ ... }) props
+const streamValue = useTypedStream({
+  apiUrl,
+  apiKey: apiKey ?? undefined,
+  assistantId,
+  threadId: threadId ?? null,
+  fetchOptions: {
+    credentials: "include",
+    headers: {
+      ...(effectiveTenantId ? { "X-Tenant-ID": effectiveTenantId } : {}),
+      // In dev only, Authorization header can be sent via feature flag
+      ...(process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_USE_AUTH_HEADER === 'true' ? (idToken ? { Authorization: `Bearer ${idToken}` } : {}) : {}),
+    },
+  },
+  // ... rest unchanged
+});
+
+10) Odoo service key rotation (app DB)
+File: lead_generation-main/app/odoo_store.py (method to add)
+class OdooStore:
+  # ... existing code ...
+  async def rotate_service_api_key(self) -> str:
+    """Rotate per-tenant secret stored in app DB odoo_connections.secret.
+    Returns the new secret (do not expose to browser in prod)."""
+    import secrets
+    try:
+      tid = getattr(self, "tenant_id", None) if hasattr(self, "tenant_id") else None
+    except Exception:
+      tid = None
+    if tid is None:
+      raise ValueError("tenant_id required to rotate service key")
+    from src.settings import POSTGRES_DSN as APP_DSN
+    import psycopg2
+    new_secret = secrets.token_urlsafe(32)
+    with psycopg2.connect(dsn=APP_DSN) as c, c.cursor() as cur:
+      cur.execute("UPDATE odoo_connections SET secret=%s WHERE tenant_id=%s", (new_secret, int(tid)))
+    return new_secret
+
+— Configuration —
+- UI: NEXT_PUBLIC_API_URL, NEXT_PUBLIC_ASSISTANT_ID, NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=false (prod).
+- API: NEXIUS_ISSUER, NEXIUS_AUDIENCE?, NEXIUS_TOKEN_URL, NEXIUS_CLIENT_ID, NEXIUS_CLIENT_SECRET, DEV_AUTH_BYPASS, DEFAULT_TENANT_ID, DEV_USER_EMAIL, ODOO_POSTGRES_DSN, OPENAI_API_KEY, LANGGRAPH_CHECKPOINT_DIR, EXTRA_CORS_ORIGINS.
+- langgraph.json: set auth.path and http.app for single origin.
+
+— Acceptance Checklist —
+- Auth: Missing/invalid cookies → 401; missing tenant_id → 403; /whoami correct.
+- Isolation: A/B tenants see only their rows in /export/latest_scores.*.
+- Onboarding: first_login → ready; status surfaced; UI exits gate.
+- Odoo: verify_odoo shows exists=true, smoke=true for configured tenant.
+- UI: No Authorization header in prod; cookies + credentials: 'include' everywhere.
+
+— Rollout —
+M3.5: First‑login auto‑provisioning GA
+M5: UI SSO, SSE, role‑based controls
+V1: Standardize on LangGraph Server Custom Auth + single origin
+
+— Notes —
+- This updates prior NextAuth‑centric guidance: in production, the browser does not attach Authorization headers. Sessions are cookie‑based from the FastAPI gateway, which proxies to LangGraph. Dev‑only switcher and bypass headers remain available for local testing.

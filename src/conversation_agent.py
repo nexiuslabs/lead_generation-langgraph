@@ -18,6 +18,7 @@ import json
 import logging
 
 from langchain_openai import ChatOpenAI  # type: ignore
+from src.settings import LANGCHAIN_MODEL, TEMPERATURE
 from langchain_core.prompts import ChatPromptTemplate  # type: ignore
 from pydantic import BaseModel
 
@@ -69,9 +70,12 @@ SYSTEM_REFERENCE = (
 )
 
 
-def _llm_safely(model: str = "gpt-4o-mini", temperature: float = 0.0):
+def _llm_safely(model: str | None = None, temperature: float | None = None):
     try:
-        return ChatOpenAI(model=model, temperature=temperature)
+        _model = model or LANGCHAIN_MODEL
+        # If a specific temperature is not provided, default to configured TEMPERATURE
+        _temp = TEMPERATURE if temperature is None else temperature
+        return ChatOpenAI(model=_model, temperature=_temp)
     except Exception as e:  # no API key or network
         log.info("LLM unavailable: %s", e)
         return None

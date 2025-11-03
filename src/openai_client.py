@@ -18,6 +18,15 @@ def _make_chat_client(model: str, temperature: float | None):
         "callback_manager": None,
         "verbose": False,
     }
+    # Keep retries and timeouts small in dev to avoid long stalls on 429/403
+    try:
+        kwargs["max_retries"] = int(os.getenv("OPENAI_MAX_RETRIES", "0") or 0)
+    except Exception:
+        kwargs["max_retries"] = 0
+    try:
+        kwargs["timeout"] = float(os.getenv("OPENAI_TIMEOUT_S", "15") or 15)
+    except Exception:
+        kwargs["timeout"] = 15.0
     # Some models (e.g., gpt-5) only support default temperature; omit override
     if temperature is not None and not (model or "").lower().startswith("gpt-5"):
         kwargs["temperature"] = temperature
@@ -44,7 +53,7 @@ async def generate_rationale(prompt: str) -> str:
     try:
         result = await chat_client.agenerate([[msg for msg in messages]])
     except Exception as exc:
-        # Rate-limit tracking for OpenAI
+        # Record usage and degrade gracefully to avoid aborting scoring/UI rendering.
         try:
             rid, tid = obs.get_run_context()
             if rid and tid:
@@ -52,7 +61,11 @@ async def generate_rationale(prompt: str) -> str:
                 obs.bump_vendor(int(rid), int(tid), "openai", calls=1, errors=1, rate_limit_hits=rl)
         except Exception:
             pass
-        raise
+        # Return a placeholder rationale on failure instead of raising.
+        msg = str(getattr(exc, "message", None) or exc) or ""
+        if getattr(exc, "status_code", None) == 429 or "rate" in msg.lower():
+            return "Rationale unavailable due to rate limits."
+        return "Rationale unavailable."
     # Vendor usage bump (OpenAI): best-effort tokens/cost extraction
     try:
         rid, tid = obs.get_run_context()

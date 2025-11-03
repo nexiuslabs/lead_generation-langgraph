@@ -32,7 +32,23 @@ APP_POSTGRES_DSN = POSTGRES_DSN
 # OpenAI / LangChain config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ICP_RULE_NAME = os.getenv("ICP_RULE_NAME", "default")
-LANGCHAIN_MODEL = os.getenv("LANGCHAIN_MODEL", "gpt-4o-mini")
+
+# Convenience switch: When MODEL_FAMILY is set and per-model vars are absent,
+# use it for both LANGCHAIN_MODEL and AGENT_MODEL_DISCOVERY.
+_MODEL_FAMILY = (os.getenv("MODEL_FAMILY") or "").strip() or None
+
+# Base chat model selection (order of precedence):
+# 1) explicit LANGCHAIN_MODEL
+# 2) MODEL_FAMILY (if provided)
+# 3) fallback default
+_BASE_MODEL = (os.getenv("LANGCHAIN_MODEL") or (_MODEL_FAMILY or "gpt-4o-mini"))
+LANGCHAIN_MODEL = _BASE_MODEL
+
+# Agent/planner model selection (order of precedence):
+# 1) explicit AGENT_MODEL_DISCOVERY
+# 2) base model from above
+AGENT_MODEL_DISCOVERY = os.getenv("AGENT_MODEL_DISCOVERY", LANGCHAIN_MODEL)
+
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 
 # Agent discovery toggle (use LLM-based planning/extraction in preview flows)
@@ -56,6 +72,30 @@ os.environ.pop("LANGSMITH_API_KEY", None)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # ZeroBounce API Key
 ZEROBOUNCE_API_KEY = os.getenv("ZEROBOUNCE_API_KEY")
+
+# --- Email / SendGrid configuration -------------------------------------------
+# Feature flag to enable emailing enrichment results
+EMAIL_ENABLED = os.getenv("ENABLE_EMAIL_RESULTS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# SendGrid credentials and optional template
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
+SENDGRID_TEMPLATE_ID = os.getenv("SENDGRID_TEMPLATE_ID")
+
+# Optional dev/ops fallback recipient when no JWT email is present (e.g., dev-bypass)
+DEFAULT_NOTIFY_EMAIL = os.getenv("DEFAULT_NOTIFY_EMAIL")
+
+# Dev-only guard: accept tenant_users.user_id as an email if it contains '@'
+# When false, values from tenant_users.user_id will be ignored unless another
+# source provides a valid email (notify_email payload, JWT, or DEFAULT_NOTIFY_EMAIL).
+EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL = (
+    os.getenv("EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL", "true").lower()
+    in ("1", "true", "yes", "on")
+)
 
 # Add new settings below this line if needed
 CRAWLER_USER_AGENT = "ICPFinder-Bot/1.0 (+https://nexiuslabs.com)"
@@ -333,3 +373,60 @@ try:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = int(os.getenv("FIRMO_MIN_COMPLETENESS_FOR_BONUS", "1") or 1)
 except Exception:
     FIRMO_MIN_COMPLETENESS_FOR_BONUS = 1
+
+# --- Jina MCP (read_url + search) --------------------------------------------
+# Feature flag to enable MCP transport for read_url (fallback remains HTTP)
+ENABLE_MCP_READER = os.getenv("ENABLE_MCP_READER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Feature flag to enable MCP search tools in discovery/resolver flows
+ENABLE_MCP_SEARCH = os.getenv("ENABLE_MCP_SEARCH", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# MCP server endpoint and transport selection
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.jina.ai/sse")
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "python")  # 'remote' (mcp-remote) or 'adapters_http'
+
+try:
+    MCP_TIMEOUT_S = float(os.getenv("MCP_TIMEOUT_S", "12.0") or 12.0)
+except Exception:
+    MCP_TIMEOUT_S = 12.0
+
+try:
+    MCP_DUAL_READ_PCT = int(os.getenv("MCP_DUAL_READ_PCT", "0") or 0)
+except Exception:
+    MCP_DUAL_READ_PCT = 0
+
+# Optional: default country hint for MCP search_web
+MCP_SEARCH_COUNTRY = os.getenv("MCP_SEARCH_COUNTRY", "")
+
+# Adapters (Python) tuning
+MCP_ADAPTER_USE_SSE = os.getenv("MCP_ADAPTER_USE_SSE", "false").lower() in ("1", "true", "yes", "on")
+MCP_ADAPTER_USE_STANDARD_BLOCKS = os.getenv("MCP_ADAPTER_USE_STANDARD_BLOCKS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Thread pool size for MCP parallel operations
+try:
+    MCP_POOL_MAX_WORKERS = int(os.getenv("MCP_POOL_MAX_WORKERS", "4") or 4)
+except Exception:
+    MCP_POOL_MAX_WORKERS = 4
+
+# Optional Prometheus exporter toggle (metrics are no-op when disabled)
+PROM_ENABLE = os.getenv("PROM_ENABLE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

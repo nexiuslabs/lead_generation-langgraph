@@ -632,3 +632,50 @@ async def contacts_via_domain_chain(domain: str, titles: List[str] | None = None
                 filtered.append(it)
         items = filtered
     return normalize_contacts(items or [])
+
+
+async def company_summary_by_domain(domain: str, *, timeout_s: int = 600) -> Optional[Dict[str, Any]]:
+    """Resolve LinkedIn company URL by domain, then fetch a company summary via the company actor.
+
+    Returns a dict (first item) if found; else None.
+    """
+    comp_url = await company_url_from_domain(domain, timeout_s=timeout_s)
+    if not comp_url:
+        return None
+    actor = _company_actor_id()
+    if not actor:
+        return None
+    try:
+        items = await _run_actor_items(actor, {"companies": [comp_url]}, timeout_s=timeout_s)
+        if isinstance(items, list) and items:
+            first = items[0]
+            return first if isinstance(first, dict) else None
+        return None
+    except Exception:
+        return None
+
+
+def employees_bucket_to_est(summary: Dict[str, Any]) -> Optional[int]:
+    """Map LinkedIn employees bucket/fields to an approximate employees_est mid-point."""
+    try:
+        rng = summary.get("employeesRange") or summary.get("employeeCountRange") or summary.get("employees_range")
+        if isinstance(rng, dict):
+            lo = rng.get("start") or rng.get("min")
+            hi = rng.get("end") or rng.get("max")
+            if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and int(hi) >= int(lo):
+                return int((int(lo) + int(hi)) / 2)
+        import re as _re
+        text = str(rng or summary.get("employeesRangeText") or summary.get("companySize") or "").lower()
+        m = _re.search(r"(\d[\d,]*)\s*[-–]\s*(\d[\d,]*)", text)
+        if m:
+            a = int(m.group(1).replace(",", ""))
+            b = int(m.group(2).replace(",", ""))
+            if b >= a and a > 0:
+                return int((a + b) / 2)
+        sc = summary.get("staffCount") or summary.get("employees") or summary.get("employeesOnLinkedIn")
+        if isinstance(sc, (int, float)):
+            v = int(sc)
+            return v if v > 0 else None
+    except Exception:
+        return None
+    return None

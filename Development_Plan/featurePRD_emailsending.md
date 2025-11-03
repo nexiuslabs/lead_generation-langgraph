@@ -15,6 +15,7 @@ Revenue operations specialists running enrichment jobs in the pre-SDR assistant 
 - Emails contain an HTML summary table equivalent to the current chat output and include a link to download the existing `/export/latest_scores.csv` file for detailed analysis.
 - Background and next-40 enrichment jobs trigger a single follow-up email on completion that summarises bucket counts and links back to the export, even if the user disconnects from the chat.
 - Chat/SSE responses acknowledge that an email was sent (or that email delivery failed) so users receive immediate status feedback in the conversation history.
+ - Email delivery is independent of UI session state. Once the recipient is captured, the server sends the email on completion whether the user is still logged in, has closed the tab, or has signed out. The CSV link in the email may require re-authentication when opened.
 
 ## Dependencies
 - SendGrid API access (API key, sender identity, optional dynamic template) configured via application settings.

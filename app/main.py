@@ -164,6 +164,68 @@ try:
 except Exception as _e:
     logger.warning("Chat SSE routes not mounted: %s", _e)
 
+# ---------------------------------------------------------------
+# Utilities: SendGrid email smoke test (no enrichment required)
+# ---------------------------------------------------------------
+from typing import Optional
+from fastapi import Body
+
+
+@app.post("/email/test")
+async def email_test(
+    to: Optional[str] = Query(default=None, description="Recipient email"),
+    subject: Optional[str] = Query(default="Test: Lead shortlist delivery", description="Email subject"),
+    simple: bool = Query(default=True, description="Use simple payload (no DB/LLM)"),
+    tenant_id: Optional[int] = Query(default=None, description="Tenant id (only used when simple=false)"),
+    body: Optional[str] = Body(default=None, description="Optional HTML body for simple mode"),
+):
+    """Send a minimal test email via SendGrid to verify configuration.
+
+    - simple=true (default): sends a static HTML payload; no DB or LLM involved.
+    - simple=false: uses the agentic sender with render+LLM; requires tenant_id and DB data.
+    """
+    try:
+        from src.settings import EMAIL_ENABLED, DEFAULT_NOTIFY_EMAIL, SENDGRID_API_KEY, SENDGRID_FROM_EMAIL
+        if not EMAIL_ENABLED:
+            raise HTTPException(status_code=400, detail="email disabled: ENABLE_EMAIL_RESULTS is false")
+        if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
+            raise HTTPException(status_code=400, detail="sendgrid not configured: missing API key or from email")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"email config error: {e}")
+
+    to_final = (to or "").strip() if isinstance(to, str) else None
+    if not to_final:
+        try:
+            from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+            if _DEF_TO and ("@" in str(_DEF_TO)):
+                to_final = str(_DEF_TO)
+        except Exception:
+            pass
+    if not to_final:
+        raise HTTPException(status_code=400, detail="missing 'to' and DEFAULT_NOTIFY_EMAIL not set")
+
+    if not simple:
+        if tenant_id is None:
+            raise HTTPException(status_code=400, detail="tenant_id is required when simple=false")
+        try:
+            from src.notifications.agentic_email import agentic_send_results
+            res = await agentic_send_results(to_final, int(tenant_id))
+            return {"ok": True, **(res or {})}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"agentic send failed: {e}")
+
+    # Simple path: no DB, send minimal HTML
+    html = body or (
+        "<p>This is a SendGrid configuration test from Lead Generation backend.</p>"
+        "<p>If you received this email, your SendGrid credentials are valid.</p>"
+    )
+    try:
+        from src.notifications.sendgrid import send_leads_email
+        res = await send_leads_email(to_final, subject or "Test", html)
+        return {"ok": True, **(res or {})}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"sendgrid send failed: {e}")
+
 def _role_to_type(role: str) -> str:
     r = (role or "").lower()
     if r in ("user", "human"): return "human"
@@ -1777,50 +1839,64 @@ async def shortlist_status(request: Request = None, claims: dict = Depends(requi
         if cached is not None and (time.time() - float(ts)) <= _ttl:
             return cached
 
-    pool = await get_pg_pool()
-    async with pool.acquire() as conn:
-        # Apply RLS tenant context if known
+    # Try to talk to the app DB, but fail fast and return a safe fallback when offline.
+    try:
+        pool = await get_pg_pool()
         try:
-            if tid is not None:
-                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
+            _acq_timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
         except Exception:
-            pass
-        # If we cannot resolve tenant, do not leak global counts
-        if tid is None:
-            total_scored = 0
-            last_ts: datetime | None = None
-            last_run_id = None
-            last_run_status = None
-            last_run_started_at = None
-            last_run_ended_at = None
-        else:
-            # Count only this tenant's scored rows
+            _acq_timeout = 3.0
+        async with pool.acquire(timeout=_acq_timeout) as conn:
+            # Apply RLS tenant context if known
             try:
-                total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = $1", tid))
+                if tid is not None:
+                    await conn.execute("SELECT set_config('request.tenant_id', $1, true)", tid)
             except Exception:
+                pass
+            # If we cannot resolve tenant, do not leak global counts
+            if tid is None:
                 total_scored = 0
+                last_ts: datetime | None = None
+                last_run_id = None
+                last_run_status = None
+                last_run_started_at = None
+                last_run_ended_at = None
+            else:
+                # Count only this tenant's scored rows
+                try:
+                    total_scored = int(await conn.fetchval("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = $1", tid))
+                except Exception:
+                    total_scored = 0
 
-            # Last activity from this tenant's enrichment runs
-            last_ts: datetime | None = None
-            last_run_id = None
-            last_run_status = None
-            last_run_started_at = None
-            last_run_ended_at = None
+                # Last activity from this tenant's enrichment runs
+                last_ts: datetime | None = None
+                last_run_id = None
+                last_run_status = None
+                last_run_started_at = None
+                last_run_ended_at = None
 
-            try:
-                row = await conn.fetchrow(
-                    "SELECT run_id, status, started_at, ended_at FROM enrichment_runs WHERE tenant_id = $1 ORDER BY run_id DESC LIMIT 1",
-                    tid,
-                )
-                if row:
-                    last_run_id = row["run_id"]
-                    last_run_status = row["status"]
-                    last_run_started_at = row["started_at"]
-                    last_run_ended_at = row["ended_at"]
-                    if isinstance(last_run_started_at, datetime):
-                        last_ts = last_run_started_at
-            except Exception:
-                last_ts = last_ts
+                try:
+                    row = await conn.fetchrow(
+                        "SELECT run_id, status, started_at, ended_at FROM enrichment_runs WHERE tenant_id = $1 ORDER BY run_id DESC LIMIT 1",
+                        tid,
+                    )
+                    if row:
+                        last_run_id = row["run_id"]
+                        last_run_status = row["status"]
+                        last_run_started_at = row["started_at"]
+                        last_run_ended_at = row["ended_at"]
+                        if isinstance(last_run_started_at, datetime):
+                            last_ts = last_run_started_at
+                except Exception:
+                    last_ts = last_ts
+    except Exception as _db_exc:
+        # DB offline/unresolvable host. Return a safe, non-failing fallback that the UI can handle.
+        total_scored = 0
+        last_ts = None
+        last_run_id = None
+        last_run_status = "unknown"
+        last_run_started_at = None
+        last_run_ended_at = None
 
     out = {
         "tenant_id": tid,

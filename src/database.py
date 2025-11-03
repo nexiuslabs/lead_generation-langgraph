@@ -12,10 +12,16 @@ async def get_pg_pool():
     global _pool
     if _pool is None:
         # Initialize a very small async pool to avoid exhausting DB connections
+        # Add a short connection timeout to avoid 60s+ stalls on DNS/host issues.
+        try:
+            _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
+        except Exception:
+            _timeout = 3.0
         _pool = await asyncpg.create_pool(
             dsn=POSTGRES_DSN,
             min_size=0,
             max_size=1,
+            timeout=_timeout,
             init=lambda conn: conn.execute("SET search_path TO public;")
         )
     return _pool
@@ -26,7 +32,12 @@ def _get_sync_pool() -> SimpleConnectionPool:
     if _sync_pool is None:
         max_conn = int(os.getenv("DB_MAX_CONN", "4"))
         # Keep the sync pool tiny to prevent connection slot exhaustion
-        _sync_pool = SimpleConnectionPool(1, max_conn, dsn=POSTGRES_DSN)
+        # Add a short connection timeout so DNS/host issues fail fast in dev.
+        try:
+            _timeout = int(float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3))
+        except Exception:
+            _timeout = 3
+        _sync_pool = SimpleConnectionPool(1, max_conn, dsn=POSTGRES_DSN, connect_timeout=_timeout)
     return _sync_pool
 
 

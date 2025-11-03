@@ -16,6 +16,11 @@ from bs4 import BeautifulSoup
 
 from langchain_openai import ChatOpenAI
 from src.settings import ENABLE_DDG_DISCOVERY, DDG_TIMEOUT_S, DDG_KL, DDG_MAX_CALLS
+from src.settings import AGENT_MODEL_DISCOVERY
+try:
+    from src.settings import ENABLE_MCP_SEARCH  # type: ignore
+except Exception:  # pragma: no cover
+    ENABLE_MCP_SEARCH = False  # type: ignore
 try:
     from src.settings import ICP_SG_PROFILES  # type: ignore
 except Exception:  # pragma: no cover
@@ -76,6 +81,7 @@ try:
         is_singapore_page as _is_sg_page,
         is_valid_fqdn as _is_valid_fqdn,
         is_denied_host as _is_denied_host,
+        deny_path_regex as _deny_path_regex,
         score_profile as _score_profile,
         bucket as _bucket,
     )
@@ -253,10 +259,10 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 kl = "uk-en"
     except Exception:
         kl = None
-    def _extract_domains_from_html(raw_html: str) -> List[str]:
+    def _extract_domains_from_html(raw_html: str) -> List[tuple[str, str]]:
         text = raw_html or ""
         text = html_lib.unescape(text)
-        found: List[str] = []
+        found: List[tuple[str, str]] = []
         try:
             # Parse only anchor tags for performance
             soup = BeautifulSoup(text, "html.parser")
@@ -269,6 +275,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     href_abs = urljoin("https://duckduckgo.com", href)
                     u = urlparse(href_abs)
                     host = (u.netloc or "").lower()
+                    path = u.path or ""
                     if not host:
                         continue
                     # Handle DDG redirect pattern
@@ -277,13 +284,15 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                         target = q.get("uddg", [None])[0]
                         if target:
                             target_url = unquote(str(target))
-                            host = (urlparse(target_url).netloc or "").lower()
+                            u2 = urlparse(target_url)
+                            host = (u2.netloc or "").lower()
+                            path = u2.path or ""
                             if not host:
                                 continue
-                            found.append(host)
+                            found.append((host, path))
                             continue
                     # External direct link
-                    found.append(host)
+                    found.append((host, path))
                 except Exception:
                     continue
         except Exception:
@@ -291,9 +300,11 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             for m in re.findall(r"/l/\?[^\s\"']*uddg=([^&\"']+)", text):
                 try:
                     target_url = unquote(m)
-                    host = (urlparse(target_url).netloc or "").lower()
+                    u2 = urlparse(target_url)
+                    host = (u2.netloc or "").lower()
+                    path = u2.path or ""
                     if host:
-                        found.append(host)
+                        found.append((host, path))
                 except Exception:
                     continue
             for href in re.findall(r'href=[\"\']([^\"\']+)[\"\']', text):
@@ -301,36 +312,44 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     href_abs = urljoin("https://duckduckgo.com", href.strip())
                     u = urlparse(href_abs)
                     host = (u.netloc or "").lower()
+                    path = u.path or ""
                     if not host:
                         continue
-                    found.append(host)
+                    found.append((host, path))
                 except Exception:
                     continue
         # Normalize and filter noisy/search/CDN/wiki hosts
-        out: List[str] = []
-        for h in _uniq(found):
+        out: List[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for host, path in found:
+            h = host
             if any(x in h for x in (
                 "duckduckgo.", "google.", "bing.", "brave.", "yahoo.", "yandex.", "mojeek.",
                 "cloudflare.", "wikipedia.", "wikimedia.", "github.", "stackexchange.",
             )):
                 continue
             if _is_probable_domain(h):
-                out.append(h)
-            if len(out) >= max_results:
-                break
+                tup = (h, path or "")
+                if tup not in seen:
+                    seen.add(tup)
+                    out.append(tup)
+                if len(out) >= max_results:
+                    break
         # If no domains extracted via hrefs/redirects, fall back to text-based domain scanning
         if not out:
             try:
                 text_domains = _extract_domains_from_text(text)
                 # Preserve order and cap
-                tmp: List[str] = []
+                tmp: List[tuple[str, str]] = []
                 for d in text_domains:
                     if any(x in d for x in (
                         "duckduckgo.", "cloudflare.", "wikipedia.", "wikimedia.",
                     )):
                         continue
-                    if _is_probable_domain(d) and d not in tmp:
-                        tmp.append(d)
+                    if _is_probable_domain(d):
+                        tup = (d, "")
+                        if tup not in tmp:
+                            tmp.append(tup)
                     if len(tmp) >= max_results:
                         break
                 if tmp:
@@ -428,6 +447,7 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
         DDG_HTML_ENDPOINT,  # html.duckduckgo.com/html/
         DDG_LITE_GET,       # lite.duckduckgo.com/lite/
     ]
+    drop_path_count = 0
     for page in range(MAX_PAGES):
         if len(collected) >= max_results:
             break
@@ -444,10 +464,20 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                 page_hosts = _extract_domains_from_html(r.text)
                 # Enforce site: filter and apex normalization
                 page_domains: List[str] = []
-                for h in page_hosts:
-                    d = _apex_domain(_clean_possible_percent_encoded(h))
-                    if d and _is_probable_domain(d) and _site_filter(d):
-                        page_domains.append(d)
+                cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+                deny_pat = _deny_path_regex(cfg) if _deny_path_regex else None
+                for (host, path) in page_hosts:
+                    d = _apex_domain(_clean_possible_percent_encoded(host))
+                    if not (d and _is_probable_domain(d) and _site_filter(d)):
+                        continue
+                    # Drop directory/portal paths early
+                    try:
+                        if deny_pat is not None and path and deny_pat.search(path):
+                            drop_path_count += 1
+                            continue
+                    except Exception:
+                        pass
+                    page_domains.append(d)
                 # Log and merge
                 try:
                     log.info(
@@ -475,10 +505,19 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
             if snapshot:
                 snap_hosts = _extract_domains_from_html(snapshot)
                 page_domains: List[str] = []
-                for h in snap_hosts:
-                    d = _apex_domain(_clean_possible_percent_encoded(h))
-                    if d and _is_probable_domain(d) and _site_filter(d):
-                        page_domains.append(d)
+                cfg = (_load_sg_cfg() if _load_sg_cfg else {})
+                deny_pat = _deny_path_regex(cfg) if _deny_path_regex else None
+                for (host, path) in snap_hosts:
+                    d = _apex_domain(_clean_possible_percent_encoded(host))
+                    if not (d and _is_probable_domain(d) and _site_filter(d)):
+                        continue
+                    try:
+                        if deny_pat is not None and path and deny_pat.search(path):
+                            drop_path_count += 1
+                            continue
+                    except Exception:
+                        pass
+                    page_domains.append(d)
                 try:
                     log.info(
                         "[ddg] page %d domains: %s",
@@ -498,6 +537,49 @@ def _ddg_search_domains(query: str, max_results: int = 25, country: str | None =
                     return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
                 break
     return [d for d in _uniq(collected) if _is_probable_domain(str(d))][:max_results]
+
+
+def _mcp_search_domains(query: str, max_results: int = 25, country: str | None = None) -> List[str]:
+    """Use MCP search_web to get URLs and convert to domains.
+
+    Falls back to DDG on error.
+    """
+    try:
+        from urllib.parse import urlparse as _up
+        from src.services import mcp_reader as _mcp  # type: ignore
+        urls = _mcp.search_web(query, country=country, max_results=max_results) or []
+        doms: List[str] = []
+        for u in urls:
+            try:
+                s = str(u or "").strip()
+                if not s:
+                    continue
+                if not s.startswith("http"):
+                    s = "https://" + s
+                host = (_up(s).netloc or s).lower()
+                host = _normalize_host(host)
+                if host and _is_probable_domain(host):
+                    doms.append(host)
+            except Exception:
+                continue
+        doms = _uniq(doms)
+        try:
+            log.info("[mcp] search domains=%d", len(doms))
+        except Exception:
+            pass
+        return doms[:max_results]
+    except Exception as e:
+        try:
+            log.info("[mcp] search fallback to DDG due to: %s", (str(e) or type(e).__name__))
+        except Exception:
+            pass
+        return _search_domains(query, max_results=max_results, country=country)
+
+
+def _search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
+    if ENABLE_MCP_SEARCH:
+        return _mcp_search_domains(query, max_results=max_results, country=country)
+    return _search_domains(query, max_results=max_results, country=country, lang=lang)
 
 
 log = logging.getLogger("agents.icp")
@@ -564,7 +646,7 @@ def ensure_icp_enriched_with_jina(state: Dict[str, Any]) -> Dict[str, Any]:
         evidence = "\n\n".join(parts)
         if not evidence.strip():
             return state
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
         structured = llm.with_structured_output(MicroICP)
         msgs = ChatPromptTemplate.from_messages([
             ("system", "Extract micro-ICP lists from web page snippets. Return arrays for industries, integrations, buyer_titles, size_bands, triggers. Keep items concise but meaningful; dedupe and lowercase."),
@@ -638,7 +720,7 @@ def icp_synthesizer(state: Dict[str, Any]) -> Dict[str, Any]:
     Outputs:
       state['icp_profile'] = { 'industries': [...], 'integrations': [...], 'buyer_titles': [...], 'size_bands': [...], 'triggers': [...] }
     """
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
     seeds_text = "\n\n".join([f"URL: {s.get('url','')}\n{(s.get('snippet') or '')[:1000]}" for s in (state.get("seeds") or [])])
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You extract micro-ICP from short evidence. Return JSON with keys: industries[], integrations[], buyer_titles[], size_bands[], triggers[]. Keep values short, lowercase, and deduplicated."),
@@ -695,7 +777,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     # Compose one concise DDG query from ICP + website via LLM (fallback to heuristic)
     def _llm_compose_ddg_query(website_text: Optional[str]) -> Optional[str]:
         try:
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+            llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
             inds = ", ".join([s for s in (icp.get("industries") or []) if isinstance(s, str) and s.strip()])
             site = "site:.sg" if (country_hint == 'sg') else ""
             sys = (
@@ -791,17 +873,17 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 query = fallback or "b2b distributors"
 
     # Single-query discovery: paginate up to 8 pages, stop at 50
-    log.info("[plan] ddg-only query: %s", query)
+    log.info("[plan] query: %s (search=%s)", query, ("mcp" if ENABLE_MCP_SEARCH else "ddg"))
     domains: List[str] = []
     ddg_count = 0
     try:
-        for dom in _ddg_search_domains(query, max_results=50, country=country_hint):
+        for dom in _search_domains(query, max_results=50, country=country_hint):
             domains.append(dom)
             ddg_count += 1
     except Exception as e:
-        log.info("[plan] ddg fail: %s", e)
+        log.info("[plan] search fail: %s", e)
     try:
-        log.info("[planner] tools.ddg=%d", ddg_count)
+        log.info("[planner] tools.search.count=%d", ddg_count)
     except Exception:
         pass
     uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
@@ -833,6 +915,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 continue
         uniq = _f
         try:
+            counts["DENY_PATH"] = int(counts.get("DENY_PATH") or 0) + int(drop_path_count)
             log.info(
                 "[plan] host_filter kept=%s drop_hygiene=%s drop_deny=%s drop_path=%s",
                 counts.get("kept"), counts.get("DOMAIN_HYGIENE"), counts.get("DENY_HOST"), counts.get("DENY_PATH")
@@ -843,9 +926,9 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     if not uniq and (country_hint == 'sg'):
         try:
             _q2 = "b2b distributors site:.sg"
-            log.info("[plan] ddg retry with default query: %s", _q2)
+            log.info("[plan] retry with default query: %s", _q2)
             more2: List[str] = []
-            for dom in _ddg_search_domains(_q2, max_results=50, country=country_hint):
+            for dom in _search_domains(_q2, max_results=50, country=country_hint):
                 more2.append(dom)
             muniq = [d for d in _uniq(more2) if _is_probable_domain(str(d))]
             if muniq:
@@ -859,7 +942,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             q_relaxed2 = re.sub(r"\bsite:[^\s]+", "", query).strip()
             if q_relaxed2 and q_relaxed2 != query:
                 more2: List[str] = []
-                for dom in _ddg_search_domains(q_relaxed2, max_results=50, country=country_hint):
+                for dom in _search_domains(q_relaxed2, max_results=50, country=country_hint):
                     more2.append(dom)
                 if more2:
                     merged = [d for d in _uniq(uniq + more2) if _is_probable_domain(str(d))]
@@ -885,7 +968,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 if q_relaxed and q_relaxed != query:
                     more: List[str] = []
                     try:
-                        for dom in _ddg_search_domains(q_relaxed, max_results=50, country=country_hint):
+                        for dom in _search_domains(q_relaxed, max_results=50, country=country_hint):
                             more.append(dom)
                     except Exception:
                         more = []
@@ -929,18 +1012,9 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     for d in uniq[:5]:
         try:
             url = f"https://{d}"
-            reader = f"https://r.jina.ai/http://{d}"
-            log.info("[jina] GET %s", reader)
-            # Shorter timeout to avoid long stalls during planning
-            r = requests.get(reader, timeout=6)
-            txt = (r.text or "")[:8000]
-            # Clean noisy prefixes often present in r.jina output
-            lines = [ln.strip() for ln in (txt or "").splitlines() if ln.strip()]
-            filtered = [
-                ln for ln in lines
-                if not re.match(r"^(Title:|URL Source:|Published Time:|Markdown Content:|Warning:)", ln, flags=re.I)
-            ]
-            clean = " ".join(filtered) if filtered else " ".join((txt or "").split())
+            # Use unified reader (MCP read_url when enabled; falls back to HTTP)
+            from src.jina_reader import read_url as _jina_read  # local import to avoid cycles
+            clean = _jina_read(url, timeout=6) or ""
             snip = clean[:400]
             low = clean.lower()
             if ind_toks:
@@ -948,9 +1022,9 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                     # Skip off-industry candidates early
                     continue
             jina_snips[d] = snip
-            log.info("[jina] ok len=%d domain=%s", len(txt), d)
+            log.info("[jina/mcp] ok len=%d domain=%s", len(clean), d)
         except Exception as e:
-            log.info("[jina] fail domain=%s err=%s", d, e)
+            log.info("[jina/mcp] fail domain=%s err=%s", d, e)
             continue
     # Final list of discovery candidates (cap at 50)
     state["discovery_candidates"] = uniq[:50]
@@ -1023,7 +1097,7 @@ def compliance_guard(state: Dict[str, Any]) -> Dict[str, Any]:
         llm_tiebreak = 0
         try:
             if ambiguous:
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+                llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
                 for dn in ambiguous[:3]:
                     snip = jina_snips.get(dn) or ""
                     if not snip:
@@ -1091,7 +1165,7 @@ def evidence_extractor(state: Dict[str, Any]) -> Dict[str, Any]:
     Inputs: state['evidence']
     Outputs: state['evidence'] augmented with 'signals' and normalized fields.
     """
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
 
     class EvidenceOut(BaseModel):
         evidence_types: Optional[int] = None
@@ -1472,7 +1546,7 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         # Discover domains strictly via DDG
         domains: List[str] = []
         for q in queries[:3]:
-            for dom in _ddg_search_domains(q, max_results=25):
+            for dom in _search_domains(q, max_results=25):
                 domains.append(dom)
         uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))][:20]
         if not uniq:
@@ -1482,11 +1556,8 @@ def plan_top10_with_reasons_fallback(icp_profile: Dict[str, Any]) -> List[Dict[s
         out: List[Dict[str, Any]] = []
         for d in uniq[:10]:
             try:
-                reader = f"https://r.jina.ai/http://{d}"
-                r = requests.get(reader, timeout=10)
-                txt = (r.text or "")[:8000]
-                from src.jina_reader import clean_jina_text as _clean
-                clean = _clean(txt)
+                from src.jina_reader import read_url as _jina_read
+                clean = _jina_read(f"https://{d}", timeout=10) or ""
                 snip = clean[:180]
                 # Heuristic scoring
                 low = clean.lower()
@@ -1573,10 +1644,10 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
         use_sg = any(s.endswith(".sg") for s in seeds)
         if use_sg:
             qset = [q + " site:.sg" for q in qset]
-        # Run DDG for each query (cap)
+        # Run search for each query (cap)
         cand: List[str] = []
         for q in qset[:6]:
-            for dom in _ddg_search_domains(q, max_results=25):
+            for dom in _search_domains(q, max_results=25):
                 cand.append(dom)
         uniq = [h for h in _uniq(cand) if _is_probable_domain(h) and h not in seed_set][:60]
         if not uniq:
@@ -1599,13 +1670,10 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
         ind_toks3 = _ind_terms3(icp_profile)
         for d in uniq[:30]:
             try:
-                # Prefer Jina but fall back to direct homepage title/description on 429/network errors
+                # Prefer Jina MCP via unified reader; fallback to simple snippet on error
                 try:
-                    reader = f"https://r.jina.ai/http://{d}"
-                    r = requests.get(reader, timeout=10)
-                    raw = (r.text or "")[:8000]
-                    from src.jina_reader import clean_jina_text as _clean
-                    clean = _clean(raw)
+                    from src.jina_reader import read_url as _jina_read
+                    clean = _jina_read(f"https://{d}", timeout=10) or ""
                 except Exception:
                     clean = _fallback_home_snippet(d) or d
                 snip = (clean or "")[:180]
@@ -1666,16 +1734,13 @@ def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[
         cand: List[str] = []
         for s in seeds[:6]:
             try:
-                reader = f"https://r.jina.ai/http://{_normalize_host(s)}"
-                log.info("[jina] GET %s", reader)
-                r = requests.get(reader, timeout=10)
-                raw = (r.text or "")[:10000]
-                from src.jina_reader import clean_jina_text as _clean
-                clean = _clean(raw)
+                from src.jina_reader import read_url as _jina_read
+                url = f"https://{_normalize_host(s)}"
+                clean = _jina_read(url, timeout=10) or ""
                 for h in _extract_domains_from_text(clean):
                     cand.append(h)
             except Exception as e:
-                log.info("[jina] seed read fail %s err=%s", s, e)
+                log.info("[jina/mcp] seed read fail %s err=%s", s, e)
                 continue
         uniq: List[str] = []
         seen = set()
@@ -1717,10 +1782,8 @@ def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[
         for d in uniq[:20]:
             try:
                 try:
-                    reader = f"https://r.jina.ai/http://{d}"
-                    r = requests.get(reader, timeout=10)
-                    from src.jina_reader import clean_jina_text as _clean
-                    clean = _clean((r.text or "")[:8000])
+                    from src.jina_reader import read_url as _jina_read
+                    clean = _jina_read(f"https://{d}", timeout=10) or ""
                 except Exception:
                     clean = _fallback_home_snippet(d) or d
                 low = (clean or "").lower()

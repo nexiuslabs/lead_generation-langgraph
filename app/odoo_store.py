@@ -179,7 +179,16 @@ class OdooStore:
             pool = OdooStore._pools.get(self.dsn)
             if pool is None:
                 # Small pool to keep a warm connection across requests
-                pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=2)
+                try:
+                    _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
+                except Exception:
+                    _timeout = 3.0
+                pool = await asyncpg.create_pool(
+                    dsn=self.dsn,
+                    min_size=1,
+                    max_size=2,
+                    timeout=_timeout,
+                )
                 OdooStore._pools[self.dsn] = pool
             return pool
 
@@ -212,10 +221,18 @@ class OdooStore:
         except Exception:
             pool = None
         if pool is not None:
-            conn = await pool.acquire()
+            try:
+                _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
+            except Exception:
+                _timeout = 3.0
+            conn = await pool.acquire(timeout=_timeout)
             return conn, True
         # Fallback to direct connection (no pooling configured)
-        return await asyncpg.connect(self.dsn), False
+        try:
+            _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
+        except Exception:
+            _timeout = 3.0
+        return await asyncpg.connect(self.dsn, timeout=_timeout), False
 
     async def _release_conn(self, conn: asyncpg.Connection, pooled: bool) -> None:
         if pooled:

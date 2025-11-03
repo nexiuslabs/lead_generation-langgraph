@@ -35,6 +35,8 @@ from src.vendors.apify_linkedin import (
     contacts_via_company_chain as apify_contacts_via_chain,
     contacts_via_domain_chain as apify_contacts_via_domain_chain,
     company_url_from_domain as apify_company_url_from_domain,
+    company_summary_by_domain as apify_company_summary_by_domain,
+    employees_bucket_to_est as apify_employees_bucket_to_est,
 )
 from src.openai_client import get_embedding
 from src.settings import (
@@ -2445,6 +2447,33 @@ async def node_llm_extract(state: EnrichmentState) -> EnrichmentState:
                     data["industry_confidence"] = guess.get("industry_confidence") or 0.5
         except Exception:
             pass
+        # Targeted retry: If both industry and employees are missing, attempt quick LinkedIn company summary
+        try:
+            if not data.get("industry_norm") and data.get("employees_est") in (None, 0):
+                # derive domain from home URL
+                home_url = state.get("home") or ""
+                dom = None
+                try:
+                    from urllib.parse import urlparse
+                    dom = (urlparse(home_url).netloc or "").lower()
+                except Exception:
+                    pass
+                if dom:
+                    summary = await apify_company_summary_by_domain(dom, timeout_s=180)
+                    if isinstance(summary, dict):
+                        est = apify_employees_bucket_to_est(summary)
+                        if est and not data.get("employees_est"):
+                            data["employees_est"] = est
+                            data["employees_source"] = "linkedin_bucket"
+                        # industry/category hints
+                        for k in ("industry", "category", "companyType"):
+                            v = summary.get(k)
+                            if isinstance(v, str) and not data.get("industry_norm"):
+                                data["industry_norm"] = v.strip().lower()
+                                data["industry_confidence"] = data.get("industry_confidence") or 0.4
+                        (state.setdefault("degraded_reasons", [])).append("FIRMO_RETRY_LINKEDIN")
+        except Exception:
+            pass
     except Exception:
         pass
     state["data"] = data
@@ -2987,7 +3016,7 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
                     )
         except Exception:
             pass
-        # Best-effort projection of degradation reasons for this company
+        # Best-effort projection of degradation reasons and firmographics provenance for this company
         try:
             reasons = ",".join(state.get("degraded_reasons") or []) or None
             if reasons:
@@ -2996,6 +3025,11 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
                 conn = get_db_connection()
                 with conn:
                     fields = {"company_id": company_id, "degraded_reasons": reasons}
+                    # Persist soft confidence/source when available (columns optional)
+                    if data.get("industry_confidence") is not None:
+                        fields["industry_confidence"] = float(data.get("industry_confidence"))
+                    if data.get("employees_source"):
+                        fields["employees_source"] = str(data.get("employees_source"))
                     tid = _default_tenant_id()
                     if tid is not None:
                         fields["tenant_id"] = tid

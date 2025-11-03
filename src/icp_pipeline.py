@@ -8,6 +8,7 @@ from psycopg2.extras import Json
 
 from src.jina_reader import read_url as jina_read
 from langchain_openai import ChatOpenAI
+from src.settings import AGENT_MODEL_DISCOVERY
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 from src.database import get_conn
@@ -121,7 +122,7 @@ async def build_resolver_cards(seeds: List[Dict[str, Any]]) -> List[ResolverCard
     - Confidence derived from text richness combined with search confidence
     """
     cards: List[ResolverCard] = []
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatOpenAI(model=AGENT_MODEL_DISCOVERY, temperature=0)
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Extract quick company fast-facts from homepage text. Return JSON with keys: industry_guess, size_band_guess, geo_guess, buyer_titles (array), integrations_mentions (array). Keep values concise."),
         ("human", "Seed: {name}\nDomain: {domain}\n\n{body}"),

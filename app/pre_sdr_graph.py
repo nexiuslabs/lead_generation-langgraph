@@ -437,6 +437,18 @@ async def _resolve_tenant_id_for_write(state: dict) -> Optional[int]:
             return int(v)
     except Exception:
         pass
+    # Next: explicit DEFAULT_TENANT_ID from current session env (set by /session/odoo_info)
+    try:
+        _tid_env = os.getenv("DEFAULT_TENANT_ID")
+        if _tid_env and _tid_env.isdigit():
+            tid_env = int(_tid_env)
+            # Validate it's an active odoo mapping
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute("SELECT 1 FROM odoo_connections WHERE tenant_id=%s AND active=TRUE", (tid_env,))
+                if _cur.fetchone():
+                    return tid_env
+    except Exception:
+        pass
     # Infer from ODOO_POSTGRES_DSN via odoo_connections
     try:
         inferred_db = None
@@ -709,6 +721,17 @@ def _resolve_tenant_id_for_write_sync(state: dict) -> Optional[int]:
         v = state.get("tenant_id") if isinstance(state, dict) else None
         if v is not None:
             return int(v)
+    except Exception:
+        pass
+    # Next: explicit DEFAULT_TENANT_ID from current session env (set by /session/odoo_info)
+    try:
+        _tid_env = os.getenv("DEFAULT_TENANT_ID")
+        if _tid_env and _tid_env.isdigit():
+            tid_env = int(_tid_env)
+            with get_conn() as _c, _c.cursor() as _cur:
+                _cur.execute("SELECT 1 FROM odoo_connections WHERE tenant_id=%s AND active=TRUE", (tid_env,))
+                if _cur.fetchone():
+                    return tid_env
     except Exception:
         pass
     try:
@@ -1428,6 +1451,17 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                     acand = [str(d).strip().lower() for d in gcand if isinstance(d, str) and d.strip()]
                 except Exception:
                     pass
+            # Bounded one-shot re-plan when guard prunes all and relaxation is allowed
+            try:
+                if not acand and (os.getenv("ENABLE_DDG_RELAX", "").lower() in {"1","true","yes"}):
+                    logger.info("[guard] replan requested: relaxing site filter once")
+                    # Re-run planner once with same icp_profile
+                    planned2 = _agent_plan_discovery({"icp_profile": state.get("icp_profile") or {}})
+                    guarded2 = _agent_compliance_guard(planned2) if _agent_compliance_guard else planned2
+                    ac2 = (guarded2 or {}).get("discovery_candidates") or []
+                    acand = [str(d).strip().lower() for d in ac2 if isinstance(d, str) and d.strip()]
+            except Exception:
+                pass
             if acand:
                 state["agent_candidates"] = acand
                 # Persist all discovered (guarded) domains into staging for audit/queueing
@@ -2319,8 +2353,9 @@ class GraphState(TypedDict):
 # LLMs
 # ------------------------------
 
-QUESTION_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-EXTRACT_LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+from src.settings import LANGCHAIN_MODEL
+QUESTION_LLM = ChatOpenAI(model=LANGCHAIN_MODEL, temperature=0.2)
+EXTRACT_LLM = ChatOpenAI(model=LANGCHAIN_MODEL, temperature=0)
 
 # ------------------------------
 # Helpers
