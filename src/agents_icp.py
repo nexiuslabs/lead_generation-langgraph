@@ -579,7 +579,8 @@ def _mcp_search_domains(query: str, max_results: int = 25, country: str | None =
 def _search_domains(query: str, max_results: int = 25, country: str | None = None, lang: str | None = None) -> List[str]:
     if ENABLE_MCP_SEARCH:
         return _mcp_search_domains(query, max_results=max_results, country=country)
-    return _search_domains(query, max_results=max_results, country=country, lang=lang)
+    # Fallback to DDG-based search when MCP search is disabled
+    return _ddg_search_domains(query, max_results=max_results, country=country, lang=lang)
 
 
 log = logging.getLogger("agents.icp")
@@ -759,15 +760,15 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
     sig_list = (icp.get("integrations") or []) + (icp.get("triggers") or [])
     sigs = ", ".join(sig_list)
     titles = ", ".join(icp.get("buyer_titles") or [])
-    # Derive a coarse country hint for DDG (e.g., 'sg') from seed domains
-    country_hint: Optional[str] = None
+    # Derive a coarse country hint. Priority is Singapore for discovery.
+    country_hint: Optional[str] = 'sg'
     try:
         seeds = list(SEED_HINTS)
         if any(str(s).endswith('.sg') for s in seeds):
             country_hint = 'sg'
     except Exception:
-        country_hint = None
-    # If SG profiles feature is enabled, force SG region bias
+        country_hint = 'sg'
+    # If SG profiles feature is enabled, also force SG region bias (no-op when already 'sg')
     try:
         if ICP_SG_PROFILES:
             country_hint = 'sg'
@@ -841,36 +842,23 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
             website_text = jina_read(u, timeout=6) or _fallback_home_snippet(u)
         except Exception:
             website_text = None
-    # Prefer LLM-composed, single strict query; fallback to heuristic join
+    # Build query strictly from original industry values (no LLM); prioritize Singapore (.sg)
     query = None
-    try:
-        q_llm = _llm_compose_ddg_query(website_text)
-        if q_llm and len(q_llm) >= 4:
-            query = q_llm
-            try:
-                log.info("[planner] llm=1 website_used=%s", bool(website_text))
-            except Exception:
-                pass
-    except Exception:
-        query = None
-    if not query:
-        terms: List[str] = []
-        for v in (icp.get("industries") or []):
-            if isinstance(v, str) and v.strip():
-                terms.append(v.strip())
-        inline_site = "site:.sg" if (country_hint == 'sg') else ""
-        base_query = (
-            (", ".join(_uniq(terms)) + (" " + inline_site if inline_site else "")).strip()
-            if terms else ""
-        )
-        if base_query:
-            query = base_query
-        else:
-            fallback = ", ".join([s for s in [inds, titles, sigs] if s]).strip(", ")
-            if country_hint == 'sg':
-                query = (f"{fallback} site:.sg" if fallback else "b2b distributors site:.sg").strip()
-            else:
-                query = fallback or "b2b distributors"
+    terms: List[str] = []
+    for v in (icp.get("industries") or []):
+        if isinstance(v, str) and v.strip():
+            terms.append(v.strip())
+    inline_site = "site:.sg"  # Priority is Singapore
+    base_query = (
+        (", ".join(_uniq(terms)) + (" " + inline_site if inline_site else "")).strip()
+        if terms else ""
+    )
+    if base_query:
+        query = base_query
+    else:
+        # If industries are absent, fall back to a safe default with SG focus
+        fallback = ", ".join([s for s in [inds] if s]).strip(", ")
+        query = (f"{fallback} site:.sg" if fallback else "b2b distributors site:.sg").strip()
 
     # Single-query discovery: paginate up to 8 pages, stop at 50
     log.info("[plan] query: %s (search=%s)", query, ("mcp" if ENABLE_MCP_SEARCH else "ddg"))
@@ -923,7 +911,7 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
     # If nothing found, retry once with a safe default query focused on SG
-    if not uniq and (country_hint == 'sg'):
+    if not uniq:
         try:
             _q2 = "b2b distributors site:.sg"
             log.info("[plan] retry with default query: %s", _q2)
@@ -936,20 +924,19 @@ def discovery_planner(state: Dict[str, Any]) -> Dict[str, Any]:
                 uniq = [d for d in _uniq(domains) if _is_probable_domain(str(d))]
         except Exception as _e2:
             log.info("[plan] ddg default retry failed: %s", _e2)
-    # If SG-biased discovery is active, also include a relaxed pass without site:.sg to collect non-SG
+    # Relax SG filter in a second pass to include non-.sg results, but keep .sg first
     try:
-        if country_hint == 'sg':
-            q_relaxed2 = re.sub(r"\bsite:[^\s]+", "", query).strip()
-            if q_relaxed2 and q_relaxed2 != query:
-                more2: List[str] = []
-                for dom in _search_domains(q_relaxed2, max_results=50, country=country_hint):
-                    more2.append(dom)
-                if more2:
-                    merged = [d for d in _uniq(uniq + more2) if _is_probable_domain(str(d))]
-                    # Prioritize .sg domains first, then the rest
-                    sg = [d for d in merged if str(d).endswith('.sg')]
-                    non = [d for d in merged if not str(d).endswith('.sg')]
-                    uniq = sg + non
+        q_relaxed2 = re.sub(r"\bsite:[^\s]+", "", query).strip()
+        if q_relaxed2 and q_relaxed2 != query:
+            more2: List[str] = []
+            for dom in _search_domains(q_relaxed2, max_results=50, country=country_hint):
+                more2.append(dom)
+            if more2:
+                merged = [d for d in _uniq(uniq + more2) if _is_probable_domain(str(d))]
+                # Prioritize .sg domains first, then the rest
+                sg = [d for d in merged if str(d).endswith('.sg')]
+                non = [d for d in merged if not str(d).endswith('.sg')]
+                uniq = (sg + non)[:50]
     except Exception as _e_relax:
         pass
 
@@ -1641,7 +1628,8 @@ def fallback_top10_from_seeds(seed_domains: List[str], icp_profile: Dict[str, An
                 qset.append(f"{label} competitors")
                 qset.append(f"similar to {label} distributor")
         # Region hint: prefer .sg if any seed endswith .sg
-        use_sg = any(s.endswith(".sg") for s in seeds)
+        # Priority is Singapore: always bias queries to .sg
+        use_sg = True
         if use_sg:
             qset = [q + " site:.sg" for q in qset]
         # Run search for each query (cap)
@@ -1729,7 +1717,8 @@ def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[
         if not seeds:
             return []
         seed_apex = {_apex_domain(s) for s in seeds}
-        prefer_sg = any(s.endswith(".sg") for s in seeds)
+        # Priority is Singapore when selecting outlinks
+        prefer_sg = True
         # Collect outlink domains from seed pages
         cand: List[str] = []
         for s in seeds[:6]:
