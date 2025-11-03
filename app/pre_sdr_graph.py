@@ -58,6 +58,12 @@ except Exception:  # pragma: no cover
 from src.lead_scoring import lead_scoring_agent
 from src.settings import ODOO_POSTGRES_DSN
 try:
+    # For LLM-backed greeting generation
+    from src.settings import LANGCHAIN_MODEL, TEMPERATURE  # type: ignore
+except Exception:  # pragma: no cover
+    LANGCHAIN_MODEL = None  # type: ignore
+    TEMPERATURE = 0.3  # type: ignore
+try:
     from src.settings import ENABLE_AGENT_DISCOVERY  # type: ignore
 except Exception:  # pragma: no cover
     ENABLE_AGENT_DISCOVERY = False  # type: ignore
@@ -86,9 +92,13 @@ except Exception:  # pragma: no cover
     STRICT_DDG_ONLY = True  # type: ignore
 try:
     # Lead‑gen conversational Q&A helpers
-    from src.conversation_agent import answer_leadgen_question as _qa_answer  # type: ignore
+    from src.conversation_agent import (
+        answer_leadgen_question as _qa_answer,  # type: ignore
+        phrase_system_update as _phrase_update,  # type: ignore
+    )
 except Exception:  # pragma: no cover
     _qa_answer = None  # type: ignore
+    _phrase_update = None  # type: ignore
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -143,6 +153,7 @@ def _announce_completed_bg_jobs(state) -> None:
                             b, c = (br[0] or "C"), int(br[1] or 0)
                             counts[str(b)] = c
                     err_txt = f" error={error}" if error else ""
+                    # Phrase background completion with LLM preface later; keep raw detail now
                     msgs.append(
                         f"Background enrichment finished (job {jid}). Processed {int(processed or 0)}/{int(total or 0)}. "
                         f"Buckets: A={counts.get('A',0)}, B={counts.get('B',0)}, C={counts.get('C',0)}.{err_txt}"
@@ -152,7 +163,15 @@ def _announce_completed_bg_jobs(state) -> None:
                     continue
         if msgs:
             for m in msgs:
-                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=m)])
+                try:
+                    content = (
+                        _phrase_update("Background job update", block=m)
+                        if _phrase_update is not None
+                        else m
+                    )
+                except Exception:
+                    content = m
+                state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=content)])
         if done_ids:
             try:
                 state["pending_bg_jobs"] = [j for j in pend if int(j) not in set(done_ids)]
@@ -1662,7 +1681,24 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
     text = "\n\n".join([ln for ln in msg_lines if ln])
     state["icp_match_total"] = icp_total
     state["enrich_now_planned"] = do_now
-    state["messages"].append(AIMessage(text))
+    # Wrap operational update with a concise LLM‑phrased preface, preserving details below
+    try:
+        content = (
+            _phrase_update(
+                "Status update",
+                block=text,
+                context={
+                    "icp_match_total": icp_total,
+                    "enrich_now_planned": do_now,
+                    "discovered_total": display_total,
+                },
+            )
+            if _phrase_update is not None
+            else text
+        )
+    except Exception:
+        content = text
+    state["messages"].append(AIMessage(content))
     return state
 
 
@@ -1856,9 +1892,25 @@ async def run_enrichment(state: PreSDRState) -> PreSDRState:
                                 state["pending_bg_jobs"] = pend
                             except Exception:
                                 pass
+                            # Phrase background enqueue note
+                            try:
+                                raw = (
+                                    f"Enriching the next {min(len(bg_ids), bg_limit)} in the background (job {_jid}). "
+                                    f"I will reply here when it finishes. You can also check status via /jobs/{_jid}."
+                                )
+                                content = (
+                                    _phrase_update("Background enrichment queued", block=raw)
+                                    if _phrase_update is not None
+                                    else raw
+                                )
+                            except Exception:
+                                content = (
+                                    f"Enriching the next {min(len(bg_ids), bg_limit)} in the background (job {_jid}). "
+                                    f"I will reply here when it finishes. You can also check status via /jobs/{_jid}."
+                                )
                             state["messages"] = add_messages(
                                 state.get("messages") or [],
-                                [AIMessage(content=f"Enriching the next {min(len(bg_ids), bg_limit)} in the background (job {_jid}). I will reply here when it finishes. You can also check status via /jobs/{_jid}.")],
+                                [AIMessage(content=content)],
                             )
                     except Exception:
                         pass
@@ -3725,8 +3777,19 @@ async def candidates_node(state: GraphState) -> GraphState:
     else:
         lines.append("No candidates yet. I’ll keep collecting ICP details.")
     msg = "\n".join([ln for ln in lines if ln])
-
-    state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=msg)])
+    try:
+        content = (
+            _phrase_update(
+                "Status update",
+                block=msg,
+                context={"icp_match_total": icp_total, "enrich_now_planned": do_now},
+            )
+            if _phrase_update is not None
+            else msg
+        )
+    except Exception:
+        content = msg
+    state["messages"] = add_messages(state.get("messages") or [], [AIMessage(content=content)])
     return state
 
 
@@ -5377,9 +5440,18 @@ async def score_node(state: GraphState) -> GraphState:
 
     if not ids:
         table = _fmt_table([])
+        # LLM‑phrased preface + table block
+        try:
+            content = (
+                _phrase_update("Here are your leads.", block=table, context={"count": 0})
+                if _phrase_update is not None
+                else f"Here are your leads:\n\n{table}"
+            )
+        except Exception:
+            content = f"Here are your leads:\n\n{table}"
         state["messages"] = add_messages(
             state.get("messages") or [],
-            [AIMessage(content=f"Here are your leads:\n\n{table}")],
+            [AIMessage(content=content)],
         )
         return state
 
@@ -5451,9 +5523,17 @@ async def score_node(state: GraphState) -> GraphState:
 
     state["scored"] = scored
     table = _fmt_table(scored)
+    try:
+        content = (
+            _phrase_update("Here are your leads.", block=table, context={"count": len(scored)})
+            if _phrase_update is not None
+            else f"Here are your leads:\n\n{table}"
+        )
+    except Exception:
+        content = f"Here are your leads:\n\n{table}"
     state["messages"] = add_messages(
         state.get("messages") or [],
-        [AIMessage(content=f"Here are your leads:\n\n{table}")],
+        [AIMessage(content=content)],
     )
     return state
 
@@ -5469,9 +5549,8 @@ def router(state: GraphState) -> str:
 
     text = _last_user_text(state).lower()
 
-    # Boot-session initialization: record current message count and STOP
-    # any resumed run immediately after server restart. We only honor commands
-    # after a NEW human message arrives post-boot.
+    # Boot-session initialization: record current message count.
+    # Do not halt routing on first turn; allow fresh human input to proceed.
     try:
         def _is_human(m) -> bool:
             try:
@@ -5487,18 +5566,15 @@ def router(state: GraphState) -> str:
         if state.get("boot_init_token") != BOOT_TOKEN:
             state["boot_init_token"] = BOOT_TOKEN
             state["boot_seen_messages_len"] = len(msgs)
+            # If last is human, proceed normally; otherwise just initialize without halting.
             last = msgs[-1] if msgs else None
-            # Halt only if there isn't a fresh human message
-            if not (last and _is_human(last)):
-                logger.info("router -> end (boot resume guard: waiting for new user input)")
-                return "end"
-            # Fresh human: clear duplicate guard to allow routing
-            state["last_user_boot_token"] = BOOT_TOKEN
-            try:
-                if "last_routed_text" in state:
-                    del state["last_routed_text"]
-            except Exception:
-                pass
+            if last and _is_human(last):
+                state["last_user_boot_token"] = BOOT_TOKEN
+                try:
+                    if "last_routed_text" in state:
+                        del state["last_routed_text"]
+                except Exception:
+                    pass
         else:
             # On subsequent router cycles, if new messages appended and last is Human → mark as fresh user action
             if len(msgs) > int(state.get("boot_seen_messages_len") or 0):
@@ -5558,7 +5634,7 @@ def router(state: GraphState) -> str:
         return "icp"
 
     # Greetings: acknowledge and explain how to start lead-gen, without auto-starting
-    if re.search(r"\b(hello|hi|hey|howdy)\b", text) and not bool(state.get("welcomed")):
+    if re.search(r"\b(hello|hi|hey|howdy|greetings|good\s*(morning|afternoon|evening)|hi\s*there|hello\s*there|nice\s*(to\s*meet\s*you|meeting\s*you)|yo|sup)\b", text) and not bool(state.get("welcomed")):
         logger.info("router -> welcome (greeting)")
         try:
             state["last_routed_text"] = text
@@ -5660,7 +5736,14 @@ def router(state: GraphState) -> str:
             _qa_answer is not None
             and not any(k in text for k in ("run enrichment", "accept micro", "accept micro-icp"))
             # Detect question intent: question mark OR question verbs anywhere in text
-            and ("?" in text or re.search(r"\b(how|what|why|when|where|which|tips|best|increase|improve|explain|define|definition|meaning)\b", text, flags=re.I))
+            and (
+                "?" in text
+                or re.search(r"\b(how|what|why|when|where|which|tips|best|increase|improve|explain|define|definition|meaning)\b", text, flags=re.I)
+                # Additionally, allow topical statements about ICP/enrichment without a question mark
+                or re.search(r"\b(icp|enrichment|enrich|lead\s*gen|lead\s*generation|pipeline|process)\b", text, flags=re.I)
+                # Or explicit ask for help/guidance
+                or re.search(r"\b(help|assist|support|guide|how\s*to)\b", text, flags=re.I)
+            )
             and (state.get("last_answered_text") != text)
         ):
             logger.info("router -> leadgen_qa (free‑form question detected)")
@@ -5725,7 +5808,15 @@ def router(state: GraphState) -> str:
     except Exception:
         pass
 
-    # 7) Default: do nothing until explicit intent
+    # 7) Default: route to lead‑gen Q&A as a fallback; the Q&A will refuse out‑of‑scope topics politely.
+    if text.strip() and _qa_answer is not None and (state.get("last_answered_text") != text):
+        logger.info("router -> leadgen_qa (fallback)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        return "leadgen_qa"
+
     logger.info("router -> end (no explicit lead‑gen intent)")
     return "end"
 
@@ -5787,13 +5878,49 @@ def build_graph():
     g.add_node("confirm", confirm_node)
     g.add_node("enrich", enrich_node)
     g.add_node("score", score_node)
-    # Welcome node for greetings without kicking off lead-gen automatically
+    # Welcome node for greetings without kicking off lead-gen automatically.
+    # Generates an LLM-based greeting so replies are not hard-coded.
     def welcome(state: GraphState) -> GraphState:
         try:
-            msg = (
-                "Hi! I can answer questions about lead generation. "
-                "When you’re ready to begin, say ‘start lead gen’, ‘find leads’, or ‘run enrichment’."
+            # Prefer configured model; degrade gracefully if unavailable
+            llm = None
+            try:
+                llm = ChatOpenAI(model=LANGCHAIN_MODEL or "gpt-4o-mini", temperature=TEMPERATURE if TEMPERATURE is not None else 0.3)
+            except Exception:
+                llm = None
+
+            # Compact context for greeting (optional)
+            icp = state.get("icp") or {}
+            has_icp = bool(icp)
+            enable_finder = bool(ENABLE_ICP_INTAKE)
+            sys = (
+                "You are a helpful SDR assistant for a lead‑gen system. Greet briefly and explain how to start.\n"
+                "Do NOT start flows automatically. Mention the allowed commands succinctly: 'start lead gen', 'confirm', 'accept micro-icp N', 'run enrichment'.\n"
+                "Clarify you only answer questions about this system (ICP, candidates, enrichment, scoring). Politely refuse unrelated topics."
             )
+            human = (
+                "The user greeted you. Current state: has_icp={has_icp}, finder_enabled={finder}.\n"
+                "Return ONE short paragraph (<= 2 sentences)."
+            )
+            if llm is not None:
+                try:
+                    from langchain_core.prompts import ChatPromptTemplate  # type: ignore
+                    prompt = ChatPromptTemplate.from_messages([
+                        ("system", sys),
+                        ("human", human),
+                    ])
+                    msg = (llm.invoke(prompt.format_messages(has_icp=str(has_icp).lower(), finder=str(enable_finder).lower())).content or "").strip()
+                except Exception:
+                    msg = (
+                        "Hi! I can answer questions about this lead‑gen system. "
+                        "When you’re ready, say 'start lead gen', or ask about ICP or enrichment."
+                    )
+            else:
+                # Fallback if LLM not configured
+                msg = (
+                    "Hi! I can answer questions about this lead‑gen system. "
+                    "When you’re ready, say 'start lead gen', or ask about ICP or enrichment."
+                )
             state["messages"] = add_messages(state.get("messages") or [], [AIMessage(msg)])
             state["welcomed"] = True
         except Exception:
