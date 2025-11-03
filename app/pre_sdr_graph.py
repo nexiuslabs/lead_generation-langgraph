@@ -588,6 +588,43 @@ def _clean_snippet(s: str) -> str:
         return (s or "")[:180]
 
 
+def _llm_snippet_blurb(raw: str, *, domain: str | None = None) -> str | None:
+    """Return a single, clear sentence summarizing the company from a raw snippet.
+
+    Falls back to None when the LLM is unavailable or fails, so callers can
+    display a cleaned snippet instead. Keeps latency low with a concise prompt.
+    """
+    try:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        try:
+            from src.settings import LANGCHAIN_MODEL as _MODEL, TEMPERATURE as _TEMP  # type: ignore
+        except Exception:
+            _MODEL, _TEMP = None, 0.2
+        try:
+            llm = ChatOpenAI(model=_MODEL or "gpt-4o-mini", temperature=_TEMP if _TEMP is not None else 0.2)
+        except Exception:
+            return None
+        sys = (
+            "You write exactly ONE clear sentence (<= 22 words) summarizing what the company does, "
+            "based only on the provided snippet. Ignore navigation/UI boilerplate. Do not invent details."
+        )
+        dom = (domain or "").strip()
+        human = f"domain: {dom}\nsnippet:\n{text[:800]}"
+        from langchain_core.prompts import ChatPromptTemplate  # type: ignore
+        prompt = ChatPromptTemplate.from_messages([("system", sys), ("human", human)])
+        out = llm.invoke(prompt.format_messages())
+        sent = (getattr(out, "content", None) or "").strip()
+        if not sent:
+            return None
+        # Normalize whitespace and cap length defensively
+        sent = " ".join(sent.split())
+        return sent[:200]
+    except Exception:
+        return None
+
+
 def _fmt_top10_md(rows: list[dict]) -> str:
     if not rows:
         return "No lookalikes found."
@@ -600,7 +637,11 @@ def _fmt_top10_md(rows: list[dict]) -> str:
         dom = str(r.get("domain") or "")
         score = str(int(r.get("score") or 0))
         why = str(r.get("why") or "")
-        snip = _clean_snippet(str(r.get("snippet") or ""))
+        raw_snip = str(r.get("snippet") or "")
+        # Prefer an LLM-phrased, one-sentence blurb; when snippet is empty,
+        # try summarizing the "why" rationale. Always fall back to a cleaned snippet.
+        source_text = raw_snip if raw_snip.strip() else (why or "")
+        snip = _llm_snippet_blurb(source_text, domain=dom) or _clean_snippet(raw_snip or why)
         out.append(f"| {idx} | {dom} | {score} | {why} | {snip} |")
     return "\n".join(out)
 
@@ -1588,7 +1629,9 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                             dom = row.get("domain")
                             why = row.get("why") or "signal match"
                             score = int(row.get("score") or 0)
-                            snip = _clean_snippet(row.get("snippet") or "")
+                            raw_snip = (row.get("snippet") or "").strip()
+                            blurb = _llm_snippet_blurb(raw_snip or why, domain=str(dom or ""))
+                            snip = blurb or _clean_snippet(raw_snip or why)
                             if snip:
                                 msg_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
                             else:
@@ -4172,7 +4215,9 @@ async def confirm_node(state: GraphState) -> GraphState:
                                             dom = row.get("domain")
                                             why = row.get("why") or "signal match"
                                             score = int(row.get("score") or 0)
-                                            snip = _clean_snippet(row.get("snippet") or "")
+                                            raw_snip = (row.get("snippet") or "").strip()
+                                            blurb = _llm_snippet_blurb(raw_snip or why, domain=str(dom or ""))
+                                            snip = blurb or _clean_snippet(raw_snip or why)
                                             if snip:
                                                 top_lines.append(f"{i}) {dom} — {why} (score {score}) — {snip}")
                                             else:
