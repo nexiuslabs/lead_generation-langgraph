@@ -134,6 +134,13 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
             ready = True
         except Exception as e:
             error = str(e)
+
+    if not ready:
+        env = (os.getenv("ENVIRONMENT") or os.getenv("PY_ENV") or os.getenv("NODE_ENV") or "dev").lower()
+        if env in {"dev", "development", "local", "localhost"}:
+            ready = True
+            if not error:
+                error = "odoo connectivity bypassed in dev"
     # Build a login URL that works with subdomain dbfilter or db param fallback
     try:
         if base_url:

@@ -1,6 +1,8 @@
 import os
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 # Ensure project root on path
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -8,8 +10,44 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
+def _configure_logging() -> None:
+    env = (
+        os.getenv("ENVIRONMENT")
+        or os.getenv("PY_ENV")
+        or os.getenv("NODE_ENV")
+        or "dev"
+    ).strip().lower()
+    log_dir = os.getenv("TROUBLESHOOT_API_LOG_DIR")
+    if not log_dir and env in {"dev", "development", "local", "localhost"}:
+        log_dir = ".log_api"
+    if not log_dir:
+        logging.basicConfig(level=logging.INFO)
+        return
+    try:
+        path = Path(log_dir).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(path / "api.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root = logging.getLogger()
+        if not root.handlers:
+            root.addHandler(handler)
+        else:
+            existing = [h for h in root.handlers if isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", None) == str(path / "api.log")]
+            if not existing:
+                root.addHandler(handler)
+        stream_present = any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers)
+        if not stream_present:
+            sh = logging.StreamHandler()
+            sh.setFormatter(logging.Formatter("%(message)s"))
+            root.addHandler(sh)
+        if root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+
+
 def main():
-    logging.basicConfig(level=logging.INFO)
+    _configure_logging()
     try:
         from src.acra_direct import run_once
     except Exception as e:
@@ -26,4 +64,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -5,6 +5,7 @@ import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langgraph.graph import StateGraph, END
 from app.pre_sdr_graph import build_graph, GraphState  # new dynamic builder
+from app.langgraph_logging import LangGraphTroubleshootHandler
 from src.database import get_conn
 from src.icp import _find_ssic_codes_by_terms
 import logging
@@ -633,6 +634,27 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def _extract_log_context(config: Dict[str, Any] | None) -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {}
+    if not isinstance(config, dict):
+        return ctx
+    for key in ("tenant_id", "session_id", "thread_id", "job_id", "graph_id", "request_id"):
+        val = config.get(key)
+        if isinstance(val, (str, int)):
+            ctx[key] = val
+    configurable = config.get("configurable")
+    if isinstance(configurable, dict):
+        for key, value in configurable.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                ctx[f"config_{key}"] = value
+    metadata = config.get("metadata")
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                ctx[f"meta_{key}"] = value
+    return ctx
+
+
 def make_graph(config: Dict[str, Any] | None = None):
     """Called by `langgraph dev` to get a valid compiled Graph.
 
@@ -654,4 +676,6 @@ def make_graph(config: Dict[str, Any] | None = None):
     outer.set_entry_point("normalize")
     outer.add_edge("normalize", "presdr")
     outer.add_edge("presdr", END)
-    return outer.compile()
+    compiled = outer.compile()
+    handler = LangGraphTroubleshootHandler(context=_extract_log_context(config))
+    return compiled.with_config(callbacks=[handler])

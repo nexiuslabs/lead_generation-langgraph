@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import signal
-import logging
 from typing import Optional
 
 import asyncpg
@@ -10,6 +9,11 @@ import re
 
 from src.settings import POSTGRES_DSN
 from src.jobs import run_web_discovery_bg_enrich
+from src.troubleshoot_log import log_json
+
+
+def bg_event(event: str, level: str = "info", **data) -> None:
+    log_json("background_next40", level, event, data or None)
 
 
 class BGWorker:
@@ -26,7 +30,7 @@ class BGWorker:
             conn = await asyncpg.connect(dsn=self._dsn)
         except Exception:
             # Fallback to polling only
-            logging.getLogger("bg").info("[bg] LISTEN disabled (DB connect failed); polling only")
+            bg_event("listen_disabled", reason="db_connect_failed")
             return
         try:
             # asyncpg.add_listener signature varies across versions; support both sync and async
@@ -58,7 +62,7 @@ class BGWorker:
         except Exception:
             # Some asyncpg versions use different API; fallback to raw SQL LISTEN loop
             await conn.execute("LISTEN bg_jobs")
-        logging.getLogger("bg").info("[bg] LISTEN bg_jobs active")
+        bg_event("listen_active")
         try:
             while not self._stop.is_set():
                 # Wait for notifications or timeout to keep connection alive
@@ -165,7 +169,7 @@ class BGWorker:
                     "SELECT COUNT(*) FROM background_jobs WHERE status='queued' AND job_type='web_discovery_bg_enrich'"
                 )
                 if q and int(q) > 0:
-                    print(f"[bg] queued web_discovery_bg_enrich jobs: {int(q)}")
+                    bg_event("queue_depth", queued=int(q))
             except Exception:
                 pass
             while len(self._tasks) < self._max and not self._stop.is_set():
@@ -178,9 +182,9 @@ class BGWorker:
 
     async def _run_job(self, job_id: int) -> None:
         try:
-            logging.getLogger("bg").info(f"[bg] start job id={int(job_id)} type=web_discovery_bg_enrich")
+            bg_event("job_start", job_id=int(job_id), job_type="web_discovery_bg_enrich")
             await run_web_discovery_bg_enrich(int(job_id))
-            logging.getLogger("bg").info(f"[bg] done job id={int(job_id)}")
+            bg_event("job_complete", job_id=int(job_id))
         except Exception:
             # Errors are handled inside the job call; ensure task finishes cleanly
             pass
@@ -190,8 +194,10 @@ class BGWorker:
         try:
             import urllib.parse as _up
             pr = _up.urlparse(self._dsn)
-            logging.getLogger("bg").info(
-                "[bg] connected dsn host=%s db=%s", pr.hostname or "", (pr.path or "/").lstrip("/")
+            bg_event(
+                "connected",
+                host=pr.hostname or "",
+                database=(pr.path or "/").lstrip("/"),
             )
         except Exception:
             pass
@@ -235,7 +241,6 @@ class BGWorker:
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     def _parse_int(env: str, default: int) -> int:
         val = os.getenv(env)
         if val is None:
@@ -276,9 +281,9 @@ async def main() -> None:
     interval = _parse_interval("BG_WORKER_SWEEP_INTERVAL", 15.0)
     dsn = POSTGRES_DSN or os.getenv("POSTGRES_DSN")
     if not dsn:
-        print("[bg] ERROR: POSTGRES_DSN not configured. Set it in environment or .env.")
+        bg_event("fatal", level="error", message="POSTGRES_DSN not configured")
         return
-    print(f"[bg] starting; sweep_interval={interval}s max_concurrency={max_c}")
+    bg_event("startup", sweep_interval=interval, max_concurrency=max_c)
     worker = BGWorker(dsn, max_concurrency=max_c, sweep_interval=interval)
 
     loop = asyncio.get_running_loop()
@@ -287,7 +292,7 @@ async def main() -> None:
     try:
         await worker.run()
     except Exception as e:
-        print(f"[bg] fatal: {e}")
+        bg_event("fatal", level="error", error=str(e))
 
 
 if __name__ == "__main__":

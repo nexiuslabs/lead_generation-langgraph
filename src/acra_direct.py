@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import logging
 import asyncio
 from typing import Dict, Any, Iterable, Optional, Tuple
@@ -435,7 +436,20 @@ def run_once() -> Dict[str, int]:
         count += 1
         try:
             cid, info = upsert_company_from_staging(row)
-            log.info("[direct] upsert company_id=%s uen=%s name=%s industry_code=%s title=%s", cid, info.get("uen"), info.get("name"), info.get("industry_code"), info.get("industry_title"))
+            log.info(
+                json.dumps(
+                    {
+                        "service": "acra_direct",
+                        "event": "upsert",
+                        "company_id": cid,
+                        "uen": info.get("uen"),
+                        "name": info.get("name"),
+                        "industry_code": info.get("industry_code"),
+                        "industry_title": info.get("industry_title"),
+                    },
+                    ensure_ascii=False,
+                )
+            )
             # Advance checkpoint early to avoid repeating the same row on interruption.
             try:
                 _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
@@ -443,7 +457,16 @@ def run_once() -> Dict[str, int]:
                 pass
             if _recent_enrichment_exists(cid):
                 skipped += 1
-                log.info("[direct] skip company_id=%s due to prior enrichment", cid)
+                log.info(
+                    json.dumps(
+                        {
+                            "service": "acra_direct",
+                            "event": "skip_existing_enrichment",
+                            "company_id": cid,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
                 try:
                     _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
                 except Exception:
@@ -461,7 +484,18 @@ def run_once() -> Dict[str, int]:
             try:
                 pages = len((state or {}).get("extracted_pages") or []) if isinstance(state, dict) else None
                 emails = len(((state or {}).get("data") or {}).get("email", [])) if isinstance(state, dict) else None
-                log.info("[direct] enriched company_id=%s pages=%s emails=%s", cid, pages, emails)
+                log.info(
+                    json.dumps(
+                        {
+                            "service": "acra_direct",
+                            "event": "enriched",
+                            "company_id": cid,
+                            "pages": pages,
+                            "emails": emails,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
             except Exception:
                 pass
             processed += 1
@@ -471,12 +505,31 @@ def run_once() -> Dict[str, int]:
                 _set_progress("acra_direct", row.get("staging_id"), row.get("uen"))
             except Exception:
                 pass
-            log.info("[direct] interrupted; checkpoint saved; exiting early")
+            log.info(
+                json.dumps(
+                    {
+                        "service": "acra_direct",
+                        "event": "interrupted",
+                        "message": "checkpoint saved, exiting early",
+                    },
+                    ensure_ascii=False,
+                )
+            )
             break
         except Exception as e:
             failures += 1
             sid = row.get("staging_id") or row.get("uen") or row.get("entity_name")
-            log.warning("[direct] failure staging_ref=%s err=%s", sid, e)
+            log.warning(
+                json.dumps(
+                    {
+                        "service": "acra_direct",
+                        "event": "failure",
+                        "staging_ref": sid,
+                        "error": str(e),
+                    },
+                    ensure_ascii=False,
+                )
+            )
             continue
         finally:
             try:
@@ -484,5 +537,17 @@ def run_once() -> Dict[str, int]:
             except Exception:
                 pass
     dur_ms = int((time.perf_counter() - t0) * 1000)
-    log.info("[direct] finished processed=%s skipped=%s failures=%s duration_ms=%s", processed, skipped, failures, dur_ms)
+    log.info(
+        json.dumps(
+            {
+                "service": "acra_direct",
+                "event": "summary",
+                "processed": processed,
+                "skipped": skipped,
+                "failures": failures,
+                "duration_ms": dur_ms,
+            },
+            ensure_ascii=False,
+        )
+    )
     return {"processed": processed, "skipped": skipped, "failures": failures}

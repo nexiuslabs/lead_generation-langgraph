@@ -40,4 +40,4 @@ passlib
 apscheduler
 langchain-mcp-adapters
 langgraph 
-"langchain[openai]"
+langgraph-sdk>=0.1.36
