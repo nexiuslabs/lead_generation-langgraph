@@ -28,7 +28,7 @@ def _configure_logging() -> None:
         path = Path(log_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
         handler = TimedRotatingFileHandler(
-            path / "api.log",
+            path / "acra_direct.log",
             when="midnight",
             interval=1,
             backupCount=14,
@@ -42,7 +42,7 @@ def _configure_logging() -> None:
         if not root.handlers:
             root.addHandler(handler)
         else:
-            existing = [h for h in root.handlers if isinstance(h, TimedRotatingFileHandler) and getattr(h, "baseFilename", None) == str(path / "api.log")]
+            existing = [h for h in root.handlers if isinstance(h, TimedRotatingFileHandler) and getattr(h, "baseFilename", None) == str(path / "acra_direct.log")]
             if not existing:
                 root.addHandler(handler)
         stream_present = any(isinstance(h, logging.StreamHandler) and not isinstance(h, TimedRotatingFileHandler) for h in root.handlers)

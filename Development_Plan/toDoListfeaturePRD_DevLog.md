@@ -8,9 +8,9 @@ Scope: Frontend (Next.js) + Backend (LangGraph/optional FastAPI) + Minimal inges
 - Frontend client logger + global handlers: Completed
 - Network/SSE failure hooks: Completed (minimal)
 - Backend (FastAPI) correlation + `/v1/logs`: Completed (optional if not used)
-- Frontend local file sink (`TROUBLESHOOT_FE_LOG_DIR`): Not Implemented
+- Frontend local file sink (`TROUBLESHOOT_FE_LOG_DIR`): In Progress (env wiring present; file sink pending)
 - Diagnostic Mode (info/debug in prod): Not Implemented
-- JSON formatting for global server exceptions: Not Implemented
+- JSON formatting for global server exceptions: In Progress (partial coverage for LangGraph errors; FastAPI handler missing)
 - Unit tests for redaction/rate limits: Not Implemented
 - `/v1/logs/health` endpoint + monitoring checks: Not Implemented
 - DigitalOcean deployment logging (systemd, logrotate, shipping): Not Implemented

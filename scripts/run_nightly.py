@@ -22,7 +22,7 @@ def _configure_logging() -> None:
     try:
         path = Path(log_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
-        file_path = path / "api.log"
+        file_path = path / "nightly.log"
         root = logging.getLogger()
         if not any(isinstance(h, TimedRotatingFileHandler) and getattr(h, "baseFilename", None) == str(file_path) for h in root.handlers):
             fh = TimedRotatingFileHandler(
