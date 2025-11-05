@@ -13,6 +13,29 @@ logger = logging.getLogger("onboarding")
 # Cache for /session/odoo_info to avoid spamming connectivity checks and logs
 _INFO_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 _LAST_LOG: Dict[int, Tuple[float, Optional[bool]]] = {}
+_LOCAL_ENV_VALUES = {"dev", "development", "local", "localhost"}
+
+
+def _app_env() -> str:
+    return (
+        os.getenv("ENVIRONMENT")
+        or os.getenv("PY_ENV")
+        or os.getenv("NODE_ENV")
+        or "dev"
+    ).strip().lower()
+
+
+def _env_flag(name: str) -> str:
+    return (os.getenv(name) or "").strip().lower()
+
+
+def _should_bypass_connectivity() -> bool:
+    override = _env_flag("ODOO_BYPASS_CONNECTIVITY_CHECK")
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    return _app_env() in _LOCAL_ENV_VALUES
 
 def _ttl_seconds() -> float:
     try:
@@ -111,6 +134,7 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
     cached = _cache_get(tid)
     if cached is not None:
         return cached
+    bypass_connectivity = _should_bypass_connectivity()
     db_name = None
     base_url = None
     if tid is not None:
@@ -127,7 +151,7 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
     ready = False
     error = None
     login_url = None
-    if tid is not None:
+    if tid is not None and not bypass_connectivity:
         try:
             store = OdooStore(tenant_id=int(tid))
             await store.connectivity_smoke_test()
@@ -135,12 +159,10 @@ async def get_odoo_connection_info(email: str, claim_tid: Optional[int]) -> Dict
         except Exception as e:
             error = str(e)
 
-    if not ready:
-        env = (os.getenv("ENVIRONMENT") or os.getenv("PY_ENV") or os.getenv("NODE_ENV") or "dev").lower()
-        if env in {"dev", "development", "local", "localhost"}:
-            ready = True
-            if not error:
-                error = "odoo connectivity bypassed in dev"
+    if not ready and bypass_connectivity:
+        ready = True
+        if not error:
+            error = "odoo connectivity bypassed in dev"
     # Build a login URL that works with subdomain dbfilter or db param fallback
     try:
         if base_url:

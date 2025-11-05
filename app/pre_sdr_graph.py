@@ -19,7 +19,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-from app.odoo_store import OdooStore
+from app.odoo_store import OdooStore, OdooUnavailable
 from psycopg2.extras import Json
 from src.database import get_pg_pool, get_conn
 from src.icp import _find_ssic_codes_by_terms, _select_acra_by_ssic_codes
@@ -5085,30 +5085,20 @@ async def enrich_node(state: GraphState) -> GraphState:
                 try:
                     def _odoo_export_enabled() -> bool:
                         # Policy: if ODOO_EXPORT_ENABLED is explicitly set, honor it.
-                        # Otherwise, auto-enable when a mapping/DSN is present.
                         try:
                             raw = os.getenv("ODOO_EXPORT_ENABLED")
                             if raw is not None:
                                 v = raw.strip().lower()
-                                return v in ("1", "true", "yes", "on")
+                                if v in ("1", "true", "yes", "on"):
+                                    return True
+                                if v in ("0", "false", "no", "off"):
+                                    return False
                         except Exception:
                             pass
-                        # Auto-enable if we can resolve any active mapping or DSN
-                        try:
-                            from src.settings import ODOO_POSTGRES_DSN as _ODSN
-                            if _ODSN:
-                                return True
-                        except Exception:
-                            pass
-                        try:
-                            with get_conn() as _c, _c.cursor() as _cur:
-                                _cur.execute("SELECT 1 FROM odoo_connections WHERE active=TRUE LIMIT 1")
-                                return bool(_cur.fetchone())
-                        except Exception:
-                            return False
+                        return True
 
                     if not _odoo_export_enabled():
-                        logger.info("odoo export skipped: disabled by policy (no mapping/flag)")
+                        logger.info("odoo export skipped: disabled via ODOO_EXPORT_ENABLED")
                         # Soft-skip export without raising; proceed with rest of flow
                         raise StopIteration
                     pool = await get_pg_pool()
@@ -5137,8 +5127,6 @@ async def enrich_node(state: GraphState) -> GraphState:
                             ids_export,
                         )
                         scores = {r["company_id"]: dict(r) for r in score_rows}
-
-                    from app.odoo_store import OdooStore
 
                     try:
                         try:
@@ -5271,6 +5259,12 @@ async def enrich_node(state: GraphState) -> GraphState:
                                             email,
                                             odoo_id,
                                         )
+                                    except OdooUnavailable as _c_unavail:
+                                        logger.info(
+                                            "odoo export: contact skipped partner_id=%s reason=%s",
+                                            odoo_id,
+                                            _c_unavail,
+                                        )
                                     except Exception as _c_exc:
                                         logger.warning(
                                             "odoo export: add_contact failed email=%s err=%s",
@@ -5291,12 +5285,22 @@ async def enrich_node(state: GraphState) -> GraphState:
                                             str(score.get("rationale") or ""),
                                             email,
                                         )
+                                    except OdooUnavailable as _lead_unavail:
+                                        logger.info(
+                                            "odoo export: lead create skipped partner_id=%s reason=%s",
+                                            odoo_id,
+                                            _lead_unavail,
+                                        )
                                     except Exception as _lead_exc:
                                         logger.warning(
                                             "odoo export: create_lead failed partner_id=%s err=%s",
                                             odoo_id,
                                             _lead_exc,
                                         )
+                            except OdooUnavailable as exc:
+                                logger.info(
+                                    "odoo sync skipped for company_id=%s: %s", cid, exc
+                                )
                             except Exception as exc:
                                 logger.exception(
                                     "odoo sync failed for company_id=%s", cid
@@ -5347,7 +5351,6 @@ async def enrich_node(state: GraphState) -> GraphState:
         # Attempt Odoo export for completed subset (best-effort)
         try:
             if done_ids:
-                from app.odoo_store import OdooStore
                 # Resolve tenant id, mirroring the all_done path
                 _tid_val = state.get("tenant_id") if isinstance(state, dict) else None
                 try:
@@ -5363,8 +5366,8 @@ async def enrich_node(state: GraphState) -> GraphState:
                 store = None
                 try:
                     store = OdooStore(tenant_id=_tid)
-                except Exception:
-                    store = None
+                except Exception as _partial_store_exc:
+                    logger.info("odoo export skipped in partial path: %s", _partial_store_exc)
                 if store is not None:
                     async with pool.acquire() as conn:
                         comp_rows = await conn.fetch(
@@ -5404,6 +5407,12 @@ async def enrich_node(state: GraphState) -> GraphState:
                             if email:
                                 try:
                                     await store.add_contact(odoo_id, email)
+                                except OdooUnavailable as _c_unavail:
+                                    logger.info(
+                                        "odoo export: contact skipped partner_id=%s reason=%s",
+                                        odoo_id,
+                                        _c_unavail,
+                                    )
                                 except Exception:
                                     pass
                             sc = scores.get(cid)
@@ -5417,8 +5426,16 @@ async def enrich_node(state: GraphState) -> GraphState:
                                         str(sc.get("rationale") or ""),
                                         email,
                                     )
+                                except OdooUnavailable as _lead_unavail:
+                                    logger.info(
+                                        "odoo export: lead create skipped partner_id=%s reason=%s",
+                                        odoo_id,
+                                        _lead_unavail,
+                                    )
                                 except Exception:
                                     pass
+                        except OdooUnavailable as exc:
+                            logger.info("odoo sync skipped for company_id=%s: %s", cid, exc)
                         except Exception:
                             logger.exception("odoo sync failed for company_id=%s", cid)
         except Exception:

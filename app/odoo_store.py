@@ -16,6 +16,47 @@ from src.database import get_conn
 
 logger = logging.getLogger(__name__)
 
+_LOCAL_ENV_VALUES = {"dev", "development", "local", "localhost"}
+
+
+def _app_env() -> str:
+    return (
+        os.getenv("ENVIRONMENT")
+        or os.getenv("PY_ENV")
+        or os.getenv("NODE_ENV")
+        or "dev"
+    ).strip().lower()
+
+
+def _env_flag(name: str) -> str:
+    return (os.getenv(name) or "").strip().lower()
+
+
+TRUTHY = {"1", "true", "yes", "on"}
+FALSY = {"0", "false", "no", "off"}
+
+
+def should_attempt_tunnel() -> bool:
+    """Return True if we should attempt to open/connect to the Odoo Postgres target."""
+    override = _env_flag("ODOO_REQUIRE_TUNNEL")
+    if override in TRUTHY:
+        return True
+    if override in FALSY:
+        return False
+    export_flag = _env_flag("ODOO_EXPORT_ENABLED")
+    if export_flag in TRUTHY:
+        return True
+    if export_flag in FALSY:
+        return False
+    return _app_env() not in _LOCAL_ENV_VALUES
+
+
+class OdooUnavailable(RuntimeError):
+    """Raised when Odoo connectivity is intentionally disabled or unavailable."""
+
+    def __init__(self, message: str = "Odoo connectivity unavailable"):
+        super().__init__(message)
+
 
 class OdooStore:
     def __init__(self, tenant_id: int | None = None, dsn: str | None = None):
@@ -93,6 +134,10 @@ class OdooStore:
         # If local port is already open, record status and return
         if self._port_open("127.0.0.1", local_port) or self._port_open("::1", local_port):
             OdooStore._tunnel_opened = True
+            return
+
+        if not should_attempt_tunnel():
+            OdooStore._tunnel_opened = False
             return
 
         if not (ssh_host and ssh_user and db_host_in_droplet):
@@ -183,12 +228,15 @@ class OdooStore:
                     _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
                 except Exception:
                     _timeout = 3.0
-                pool = await asyncpg.create_pool(
-                    dsn=self.dsn,
-                    min_size=1,
-                    max_size=2,
-                    timeout=_timeout,
-                )
+                try:
+                    pool = await asyncpg.create_pool(
+                        dsn=self.dsn,
+                        min_size=1,
+                        max_size=2,
+                        timeout=_timeout,
+                    )
+                except (OSError, asyncpg.PostgresError) as exc:
+                    raise OdooUnavailable("Odoo pool creation failed") from exc
                 OdooStore._pools[self.dsn] = pool
             return pool
 
@@ -206,18 +254,21 @@ class OdooStore:
         # Re-check/ensure tunnel in case previous attempt failed or was terminated
         self._ensure_tunnel_once()
         # Best-effort visibility if local port is not open
-        try:
-            from urllib.parse import urlparse
-            u = urlparse(self.dsn)
-            host = u.hostname or "127.0.0.1"
-            port = u.port or 5432
-            if not self._port_open(host, port):
-                logger.warning("Odoo DSN target %s:%s not reachable before connect()", host, port)
-        except Exception:
-            pass
+        if should_attempt_tunnel():
+            try:
+                from urllib.parse import urlparse
+                u = urlparse(self.dsn)
+                host = u.hostname or "127.0.0.1"
+                port = u.port or 5432
+                if not self._port_open(host, port):
+                    logger.warning("Odoo DSN target %s:%s not reachable before connect()", host, port)
+            except Exception:
+                pass
         # Try pool first
         try:
             pool = await self._get_pool()
+        except OdooUnavailable:
+            raise
         except Exception:
             pool = None
         if pool is not None:
@@ -225,14 +276,20 @@ class OdooStore:
                 _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
             except Exception:
                 _timeout = 3.0
-            conn = await pool.acquire(timeout=_timeout)
+            try:
+                conn = await pool.acquire(timeout=_timeout)
+            except (OSError, asyncpg.PostgresError) as exc:
+                raise OdooUnavailable("Odoo connection failed (pool acquire)") from exc
             return conn, True
         # Fallback to direct connection (no pooling configured)
         try:
             _timeout = float(os.getenv("PG_CONNECT_TIMEOUT_S", "3") or 3)
         except Exception:
             _timeout = 3.0
-        return await asyncpg.connect(self.dsn, timeout=_timeout), False
+        try:
+            return await asyncpg.connect(self.dsn, timeout=_timeout), False
+        except (OSError, asyncpg.PostgresError) as exc:
+            raise OdooUnavailable("Odoo connection failed (direct)") from exc
 
     async def _release_conn(self, conn: asyncpg.Connection, pooled: bool) -> None:
         if pooled:
