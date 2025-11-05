@@ -10,7 +10,7 @@ from app.auth import require_auth, require_identity, require_optional_identity
 from app.middleware_request_id import CorrelationMiddleware
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path as PathlibPath
 import os
 import shutil
@@ -50,13 +50,22 @@ def _configure_troubleshoot_file_logging() -> None:
         root = logging.getLogger()
         # Avoid duplicate handlers when module re-imports (uvicorn reload)
         for handler in root.handlers:
-            if isinstance(handler, RotatingFileHandler) and getattr(handler, "baseFilename", None) == str(file_path):
+            if isinstance(handler, TimedRotatingFileHandler) and getattr(handler, "baseFilename", None) == str(file_path):
                 return
-        handler = RotatingFileHandler(file_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler = TimedRotatingFileHandler(
+            file_path,
+            when="midnight",
+            interval=1,
+            backupCount=14,
+            encoding="utf-8",
+            utc=True,
+        )
+        handler.suffix = "%Y-%m-%d"
+        handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # type: ignore[attr-defined]
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
         handler.setLevel(logging.INFO)
         root.addHandler(handler)
-        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers):
+        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
             stream = logging.StreamHandler()
             stream.setFormatter(fmt)
             root.addHandler(stream)

@@ -2,8 +2,9 @@ import asyncio
 import logging
 import os
 from typing import Optional, List
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+import re
 
 from src.database import get_conn
 from src.jobs import run_staging_upsert, run_enrich_candidates, enqueue_staging_upsert
@@ -16,25 +17,34 @@ def _configure_logging() -> None:
     if not log_dir and env in {"dev", "development", "local", "localhost"}:
         log_dir = ".log_api"
     if not log_dir:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         return
     try:
         path = Path(log_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / "api.log"
         root = logging.getLogger()
-        if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", None) == str(file_path) for h in root.handlers):
-            fh = RotatingFileHandler(file_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
-            fh.setFormatter(logging.Formatter("%(message)s"))
+        if not any(isinstance(h, TimedRotatingFileHandler) and getattr(h, "baseFilename", None) == str(file_path) for h in root.handlers):
+            fh = TimedRotatingFileHandler(
+                file_path,
+                when="midnight",
+                interval=1,
+                backupCount=14,
+                encoding="utf-8",
+                utc=True,
+            )
+            fh.suffix = "%Y-%m-%d"
+            fh.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # type: ignore[attr-defined]
+            fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
             root.addHandler(fh)
-        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers):
+        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
             sh = logging.StreamHandler()
-            sh.setFormatter(logging.Formatter("%(message)s"))
+            sh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
             root.addHandler(sh)
         if root.level == logging.NOTSET:
             root.setLevel(logging.INFO)
     except Exception:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 async def run_queued_jobs(limit: Optional[int] = None) -> int:

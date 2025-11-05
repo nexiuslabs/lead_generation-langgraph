@@ -1,8 +1,9 @@
 import os
 import sys
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+import re
 
 # Ensure project root on path
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -26,24 +27,33 @@ def _configure_logging() -> None:
     try:
         path = Path(log_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(path / "api.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler = TimedRotatingFileHandler(
+            path / "api.log",
+            when="midnight",
+            interval=1,
+            backupCount=14,
+            encoding="utf-8",
+            utc=True,
+        )
+        handler.suffix = "%Y-%m-%d"
+        handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # type: ignore[attr-defined]
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
         root = logging.getLogger()
         if not root.handlers:
             root.addHandler(handler)
         else:
-            existing = [h for h in root.handlers if isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", None) == str(path / "api.log")]
+            existing = [h for h in root.handlers if isinstance(h, TimedRotatingFileHandler) and getattr(h, "baseFilename", None) == str(path / "api.log")]
             if not existing:
                 root.addHandler(handler)
-        stream_present = any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers)
+        stream_present = any(isinstance(h, logging.StreamHandler) and not isinstance(h, TimedRotatingFileHandler) for h in root.handlers)
         if not stream_present:
             sh = logging.StreamHandler()
-            sh.setFormatter(logging.Formatter("%(message)s"))
+            sh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
             root.addHandler(sh)
         if root.level == logging.NOTSET:
             root.setLevel(logging.INFO)
     except Exception:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 def main():
