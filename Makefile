@@ -16,3 +16,9 @@ app-migrations:
 .PHONY: nightly
 nightly:
 	$(PY) -m scripts.run_nightly
+
+.PHONY: logs-tail
+logs-tail:
+	@LOG_DIR=$${TROUBLESHOOT_API_LOG_DIR:-.log_api}; \
+	echo "Tailing $$LOG_DIR/api.log"; \
+	tail -F "$$LOG_DIR"/api.log

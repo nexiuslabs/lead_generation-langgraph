@@ -7,6 +7,9 @@ import json
 import logging
 import os
 from pathlib import Path
+from datetime import datetime, timezone
+import jwt
+from jwt import PyJWTError
 
 
 router = APIRouter(prefix="/v1/logs", tags=["logs"]) 
@@ -14,6 +17,7 @@ router = APIRouter(prefix="/v1/logs", tags=["logs"])
 ALLOWED_LEVELS = {"error", "warn", "info", "debug"}
 ENV = (os.getenv("ENVIRONMENT") or os.getenv("PY_ENV") or os.getenv("NODE_ENV") or "dev").lower()
 HMAC_SECRET = os.getenv("LOG_INGEST_HMAC_SECRET")
+DIAGNOSTIC_SECRET = os.getenv("LOG_DIAGNOSTIC_SECRET")
 
 LOG_DIR = os.getenv("TROUBLESHOOT_API_LOG_DIR")
 if not LOG_DIR and ENV in {"dev", "development", "local", "localhost"}:
@@ -101,6 +105,31 @@ def _sanitize_data(d: Optional[dict]) -> Optional[dict]:
     return out or None
 
 
+def _decode_diagnostic_cookie(request: Request) -> Optional[Dict[str, Any]]:
+    if not DIAGNOSTIC_SECRET:
+        return None
+    token = request.cookies.get("diag")
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, DIAGNOSTIC_SECRET, algorithms=["HS256"])
+        exp = payload.get("exp")
+        if exp is not None:
+            try:
+                if datetime.now(timezone.utc).timestamp() > float(exp):
+                    return None
+            except Exception:
+                return None
+        return payload
+    except PyJWTError:
+        return None
+
+
+@router.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
 @router.post("")
 async def ingest(request: Request):
     # Rate limit per IP
@@ -109,6 +138,19 @@ async def ingest(request: Request):
         raise HTTPException(status_code=429, detail="rate_limited")
 
     raw = await request.body()
+
+    diag_payload = _decode_diagnostic_cookie(request)
+    diag_session = ""
+    diag_allow_all = False
+    if diag_payload:
+        diag_session = str(
+            diag_payload.get("session_id")
+            or diag_payload.get("sid")
+            or diag_payload.get("session")
+            or ""
+        ).strip()
+        diag_allow_all = bool(diag_payload.get("allow_all") or diag_payload.get("allow"))
+        setattr(request.state, "diagnostic_mode", True)
 
     # Optional HMAC verification (best-effort)
     if HMAC_SECRET:
@@ -146,7 +188,7 @@ async def ingest(request: Request):
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid_payload")
+            raise HTTPException(status_code=400, detail="invalid_payload")
 
     # Enforce prod policy: only warn/error unless langgraph service explicitly emits info
     if ENV == "prod":
@@ -155,6 +197,11 @@ async def ingest(request: Request):
             svc = (e.service or "").lower()
             if lvl in {"warn", "error"}:
                 continue
+            if diag_payload:
+                if diag_allow_all:
+                    continue
+                if diag_session and diag_session == (e.session_id or ""):
+                    continue
             if svc == "langgraph" and lvl in {"info", "warn", "error"}:
                 continue
             raise HTTPException(status_code=400, detail="level_not_allowed")
