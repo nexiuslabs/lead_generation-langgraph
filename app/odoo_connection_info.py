@@ -102,7 +102,10 @@ def _resolve_tenant_id(email: str, claim_tid: Optional[int]) -> Optional[int]:
 
     # Priority 2: tenant_id from claim (if present)
     if claim_tid is not None:
-        return int(claim_tid)
+        try:
+            return int(claim_tid)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring non-numeric claim_tid=%r", claim_tid)
 
     # Priority 3: Existing user mapping by email
     try:
