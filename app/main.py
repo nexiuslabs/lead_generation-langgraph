@@ -1,20 +1,24 @@
 # app/main.py
 from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
 from app.odoo_connection_info import get_odoo_connection_info
 from src.database import get_pg_pool, get_conn
 from app.auth import require_auth, require_identity, require_optional_identity
+from app.middleware_request_id import CorrelationMiddleware
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path as PathlibPath
 import os
 import shutil
 import csv
 from io import StringIO
 import logging
+import json
 import re
-import os
 from datetime import datetime
 import time
 import threading
@@ -22,6 +26,58 @@ import asyncio
 import math
 
 fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
+
+APP_ENV = (
+    os.getenv("ENVIRONMENT")
+    or os.getenv("PY_ENV")
+    or os.getenv("NODE_ENV")
+    or "dev"
+).strip().lower()
+
+
+def _configure_troubleshoot_file_logging() -> None:
+    """Attach a rotating file handler for API/background troubleshooting logs."""
+
+    log_dir = os.getenv("TROUBLESHOOT_API_LOG_DIR")
+    if not log_dir and APP_ENV in {"dev", "development", "local", "localhost"}:
+        log_dir = ".log_api"
+    if not log_dir:
+        return
+    try:
+        path = PathlibPath(log_dir).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        file_path = path / "api.log"
+        root = logging.getLogger()
+        # Avoid duplicate handlers when module re-imports (uvicorn reload)
+        for handler in root.handlers:
+            if isinstance(handler, TimedRotatingFileHandler) and getattr(handler, "baseFilename", None) == str(file_path):
+                return
+        handler = TimedRotatingFileHandler(
+            file_path,
+            when="midnight",
+            interval=1,
+            backupCount=14,
+            encoding="utf-8",
+            utc=True,
+        )
+        handler.suffix = "%Y-%m-%d"
+        handler.extMatch = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # type: ignore[attr-defined]
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        handler.setLevel(logging.INFO)
+        root.addHandler(handler)
+        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
+            stream = logging.StreamHandler()
+            stream.setFormatter(fmt)
+            root.addHandler(stream)
+        if root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
+        # Surface path for other modules/helpers
+        os.environ.setdefault("TROUBLESHOOT_API_LOG_DIR", str(path))
+    except Exception as exc:  # pragma: no cover - best effort
+        logging.getLogger("startup").warning("Failed to configure troubleshoot file logging: %s", exc)
+
+
+_configure_troubleshoot_file_logging()
 
 def _ensure_logger(name: str, level: str = "INFO"):
     lg = logging.getLogger(name)
@@ -103,6 +159,9 @@ except Exception as _e:
 
 app = FastAPI(title="Pre-SDR LangGraph Server")
 
+# Attach correlation middleware so request_id/trace_id propagate across logs
+app.add_middleware(CorrelationMiddleware)
+
 # CORS allowlist (env-extensible)
 extra_origins = []
 try:
@@ -143,6 +202,39 @@ try:
         logger.info("/graph proxy routes enabled")
 except Exception as _e:
     logger.warning("Graph proxy not mounted: %s", _e)
+
+# Troubleshooting logs ingestion router
+try:
+    from app.logs_routes import router as logs_router
+    app.include_router(logs_router)
+    logging.getLogger("startup").info("/v1/logs endpoint enabled")
+except Exception as _e:
+    logging.getLogger("startup").warning("Logs router not mounted: %s", _e)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """Capture unhandled exceptions and emit structured troubleshoot logs."""
+
+    payload = {
+        "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        "level": "error",
+        "service": "api",
+        "environment": APP_ENV,
+        "release": os.getenv("RELEASE", ""),
+        "message": f"Unhandled exception on {getattr(request, 'method', '?')} {getattr(getattr(request, 'url', None), 'path', '')}",
+        "trace_id": getattr(request.state, "trace_id", None),
+        "request_id": getattr(request.state, "request_id", None),
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        },
+    }
+    try:
+        logging.getLogger("troubleshoot").error(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        logging.getLogger("api").error("Failed to emit troubleshoot error log", exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": "internal_error"})
 
 # Mount ICP Finder endpoints when enabled
 try:

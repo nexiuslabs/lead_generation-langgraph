@@ -76,6 +76,7 @@ env.bak/
 # Logs
 *.log
 logs/
+.log_api/
 
 # Caches
 __pypackages__/
