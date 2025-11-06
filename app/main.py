@@ -2,6 +2,7 @@
 from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
 from app.odoo_connection_info import get_odoo_connection_info
@@ -10,6 +11,7 @@ from app.auth import require_auth, require_identity, require_optional_identity
 from app.middleware_request_id import CorrelationMiddleware
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
+from src.troubleshoot_log import log_json
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path as PathlibPath
 import os
@@ -1887,6 +1889,42 @@ async def auth_guard(request: Request, call_next):
         return await call_next(request)
     # In production, do not double-enforce here; route dependencies perform auth
     return await call_next(request)
+
+# --- Global error handler to emit structured troubleshoot logs ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, ClientDisconnect):
+        return JSONResponse(status_code=499, content={"detail": "client_disconnect"})
+    if isinstance(exc, HTTPException):
+        if exc.status_code >= 500:
+            log_json(
+                "api",
+                "error",
+                "HTTPException",
+                {
+                    "status": exc.status_code,
+                    "detail": exc.detail,
+                    "path": request.url.path,
+                    "method": request.method,
+                    "request_id": getattr(request.state, "request_id", None),
+                    "trace_id": getattr(request.state, "trace_id", None),
+                },
+            )
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    log_json(
+        "api",
+        "error",
+        "Unhandled exception",
+        {
+            "error_type": type(exc).__name__,
+            "detail": str(exc),
+            "path": request.url.path,
+            "method": request.method,
+            "request_id": getattr(request.state, "request_id", None),
+            "trace_id": getattr(request.state, "trace_id", None),
+        },
+    )
+    return JSONResponse(status_code=500, content={"detail": "internal_server_error"})
 
 # --- Admin/ops: rotate per-tenant Odoo API key ---
 @app.post("/tenants/{tenant_id}/odoo/api-key/rotate")
