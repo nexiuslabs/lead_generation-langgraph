@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import random
 import threading
 import logging
 from typing import Optional, Any, Dict, Tuple, List
@@ -62,6 +63,126 @@ def _metrics_record(tool: str, status: str, duration_s: Optional[float]) -> None
 
 class MCPClientNotImplemented(RuntimeError):
     pass
+
+
+def _load_int_setting(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        from src import settings as _settings  # type: ignore
+        raw = getattr(_settings, name, None)
+    except Exception:
+        raw = None
+    if raw is None:
+        raw = os.getenv(name)
+    try:
+        val = int(raw if raw not in (None, "") else default)
+    except Exception:
+        val = default
+    if val < min_value:
+        return min_value
+    if val > max_value:
+        return max_value
+    return val
+
+
+def _load_float_setting(name: str, default: float, *, min_value: float, max_value: Optional[float] = None) -> float:
+    try:
+        from src import settings as _settings  # type: ignore
+        raw = getattr(_settings, name, None)
+    except Exception:
+        raw = None
+    if raw is None:
+        raw = os.getenv(name)
+    try:
+        val = float(raw if raw not in (None, "") else default)
+    except Exception:
+        val = default
+    if val < min_value:
+        val = min_value
+    if max_value is not None and val > max_value:
+        val = max_value
+    return val
+
+
+_MCP_RATE_MAX_CONCURRENCY = _load_int_setting("MCP_READ_MAX_CONCURRENCY", 2, min_value=1, max_value=16)
+_MCP_RATE_MIN_INTERVAL_S = _load_float_setting("MCP_READ_MIN_INTERVAL_S", 0.35, min_value=0.0)
+_MCP_RATE_JITTER_S = _load_float_setting("MCP_READ_JITTER_S", 0.15, min_value=0.0)
+_MCP_READ_MAX_ATTEMPTS = _load_int_setting("MCP_READ_MAX_ATTEMPTS", 3, min_value=1, max_value=6)
+_MCP_READ_BACKOFF_BASE_S = _load_float_setting("MCP_READ_BACKOFF_BASE_S", 0.6, min_value=0.0)
+_MCP_READ_BACKOFF_CAP_S = _load_float_setting("MCP_READ_BACKOFF_CAP_S", 4.0, min_value=0.1)
+_MCP_READ_RATELIMIT_BACKOFF_S = _load_float_setting("MCP_READ_RATELIMIT_BACKOFF_S", 2.0, min_value=0.0)
+
+
+def _looks_like_rate_limit(exc: Exception) -> bool:
+    try:
+        msg = str(exc or "")
+    except Exception:
+        msg = ""
+    msg = msg.lower()
+    if not msg:
+        return False
+    return ("429" in msg) or ("rate" in msg and "limit" in msg)
+
+
+def _compute_backoff_delay(attempt: int, rate_limited: bool) -> float:
+    base = _MCP_READ_BACKOFF_BASE_S
+    if base <= 0:
+        base = 0.0
+    delay = base * (2 ** max(0, attempt - 1))
+    delay = min(delay if delay > 0 else base, _MCP_READ_BACKOFF_CAP_S)
+    if rate_limited:
+        delay = max(delay, _MCP_READ_RATELIMIT_BACKOFF_S)
+    jitter_cap = min(max(delay * 0.25, 0.05), 0.5) if delay > 0 else 0.05
+    jitter = random.uniform(0.0, jitter_cap) if jitter_cap > 0 else 0.0
+    return max(0.0, delay + jitter)
+
+
+class _RateLimiterToken:
+    def __init__(self, limiter: "_ReadRateLimiter") -> None:
+        self._limiter = limiter
+
+    def __enter__(self) -> None:
+        self._limiter._acquire()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._limiter._release()
+
+
+class _ReadRateLimiter:
+    def __init__(self, max_concurrency: int, min_interval_s: float, jitter_s: float) -> None:
+        self._sem = threading.BoundedSemaphore(max(1, max_concurrency))
+        self._min_interval = max(0.0, min_interval_s)
+        self._jitter = max(0.0, jitter_s)
+        self._lock = threading.Lock()
+        self._next_ready = 0.0
+
+    def token(self) -> _RateLimiterToken:
+        return _RateLimiterToken(self)
+
+    def _acquire(self) -> None:
+        self._sem.acquire()
+        self._throttle()
+
+    def _release(self) -> None:
+        try:
+            self._sem.release()
+        except Exception:
+            pass
+
+    def _throttle(self) -> None:
+        if self._min_interval <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.perf_counter()
+                wait = self._next_ready - now
+                if wait <= 0:
+                    jitter = random.uniform(0.0, self._jitter) if self._jitter > 0 else 0.0
+                    self._next_ready = now + self._min_interval + jitter
+                    return
+            time.sleep(min(wait, 0.05) if wait > 0 else 0.0)
+
+
+_READ_RATE_LIMITER = _ReadRateLimiter(_MCP_RATE_MAX_CONCURRENCY, _MCP_RATE_MIN_INTERVAL_S, _MCP_RATE_JITTER_S)
 
 
 def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -650,6 +771,11 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
     is set to `python`, callers may inject an alternate implementation via tests;
     the default production path uses `mcp-remote`.
     """
+    with _READ_RATE_LIMITER.token():
+        return _read_url_inner(url, timeout_s=timeout_s)
+
+
+def _read_url_inner(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
     # Allow resetting adapter singletons on retry
     global _ADAPTORS_CLIENT, _ADAPTORS_READ_TOOL
     tenant: Optional[int] = None
@@ -680,7 +806,6 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
         # Adapters transport (Python): use langchain_mcp_adapters client
         if transport_cfg == "adapters_http":
             tcall0 = time.perf_counter()
-            # Wrap with stage_timer when run context is available
             _use_timer = obs is not None and run_id is not None and tenant is not None
             if _use_timer:
                 try:
@@ -689,34 +814,44 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                     ctx = None
             else:
                 ctx = None
-            try:
-                if ctx is None:
-                    # Attempt call; allow one retry on failure after re-init
+            text: Optional[str] = None
+            attempts = max(1, _MCP_READ_MAX_ATTEMPTS)
+            ctx_used = False
+            for attempt in range(1, attempts + 1):
+                try:
+                    call_timeout = _effective_timeout(timeout_s, 12.0)
+                    if ctx is not None and not ctx_used:
+                        with ctx:
+                            text = _adapters_call_read_url(url, timeout_s=call_timeout)
+                            ctx_used = True
+                    else:
+                        text = _adapters_call_read_url(url, timeout_s=call_timeout)
+                    break
+                except Exception as _e1:
+                    rate_limited = _looks_like_rate_limit(_e1)
                     try:
-                        text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
-                    except Exception as _e1:
-                        # Reset cached tool and client then retry once
-                        try:
-                            _ADAPTORS_READ_TOOL = None
-                            _ADAPTORS_CLIENT = None
-                        except Exception:
-                            pass
-                        _ensure_adapters_client()
-                        text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
-                else:
-                    with ctx:
-                        try:
-                            text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
-                        except Exception as _e1:
-                            try:
-                                _ADAPTORS_READ_TOOL = None
-                                _ADAPTORS_CLIENT = None
-                            except Exception:
-                                pass
-                            _ensure_adapters_client()
-                            text = _adapters_call_read_url(url, timeout_s=_effective_timeout(timeout_s, 12.0))
-            finally:
-                pass
+                        log.info(
+                            "[mcp] adapters attempt=%s/%s err=%s url=%s",
+                            attempt,
+                            attempts,
+                            type(_e1).__name__,
+                            url,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        _ADAPTORS_READ_TOOL = None
+                        _ADAPTORS_CLIENT = None
+                    except Exception:
+                        pass
+                    _ensure_adapters_client()
+                    if attempt >= attempts:
+                        raise
+                    delay = _compute_backoff_delay(attempt, rate_limited)
+                    if delay > 0:
+                        time.sleep(delay)
+                    ctx_used = True  # avoid reusing ctx after first failure
+                    continue
             tcall1 = time.perf_counter()
             _metrics_record(tool, "ok", (tcall1 - tcall0))
             # Telemetry: success
@@ -740,11 +875,11 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
         log.info("[mcp] starting read_url transport=remote (cfg=%s) server=%s", transport_cfg, server_url)
         if transport_cfg not in ("remote", "python"):
             transport_cfg = "remote"
-        # For now, implement remote only (effective transport='remote'). Python client can be added later.
-        client = _POOL.get(server_url, api_key)
-        # Use cached tool name if available to avoid listing tools every call
         tool_name = _POOL.get_cached_tool(server_url, api_key, purpose="read_url")
-        try:
+        text: Optional[str] = None
+        attempts = max(1, _MCP_READ_MAX_ATTEMPTS)
+        for attempt in range(1, attempts + 1):
+            client = _POOL.get(server_url, api_key)
             if not tool_name:
                 log.info("[mcp] session initialized; listing tools…")
                 tools = client.list_tools(timeout_s=_effective_timeout(timeout_s, 15.0)) or []
@@ -758,39 +893,41 @@ def read_url(url: str, timeout_s: Optional[float] = None) -> Optional[str]:
                         f"No compatible read tool found. Available: {[t.get('name') for t in tools if isinstance(t, dict)]}"
                     )
                 _POOL.set_cached_tool(server_url, api_key, purpose="read_url", name=tool_name)
-            log.info("[mcp] calling tool=%s url=%s", tool_name, url)
-            tcall0 = time.perf_counter()
-            result = client.call_tool(tool_name, {"url": url}, timeout_s=_effective_timeout(timeout_s, 30.0))
-            tcall1 = time.perf_counter()
-            text = _extract_text_from_result(result)
-            log.info("[mcp] call done tool=%s url=%s text_len=%s", tool_name, url, len(text) if isinstance(text, str) else None)
-            _metrics_record(tool, "ok", (tcall1 - tcall0))
-        except Exception as _e1:
-            # Auto-recover on SSE disconnects/remote timeouts: restart session once and retry
             try:
-                log.info("[mcp] call failed (%s); restarting session and retrying once", type(_e1).__name__)
-            except Exception:
-                pass
-            # Only invalidate the session on non-timeout errors to avoid overhead
-            if not isinstance(_e1, TimeoutError):
-                _POOL.invalidate(server_url, api_key)
-            client = _POOL.get(server_url, api_key)
-            # Reacquire tool name if not cached
-            tool_name = _POOL.get_cached_tool(server_url, api_key, purpose="read_url")
-            if not tool_name:
-                tools = client.list_tools(timeout_s=_effective_timeout(timeout_s, 15.0)) or []
-                for candidate in ("jina_read_url", "read_url", "read"):
-                    if any(isinstance(t, dict) and t.get("name") == candidate for t in tools):
-                        tool_name = candidate
-                        break
-                if not tool_name:
+                log.info("[mcp] calling tool=%s url=%s attempt=%s", tool_name, url, attempt)
+                tcall0 = time.perf_counter()
+                result = client.call_tool(tool_name, {"url": url}, timeout_s=_effective_timeout(timeout_s, 30.0))
+                tcall1 = time.perf_counter()
+                text = _extract_text_from_result(result)
+                log.info(
+                    "[mcp] call done tool=%s url=%s text_len=%s",
+                    tool_name,
+                    url,
+                    len(text) if isinstance(text, str) else None,
+                )
+                _metrics_record(tool, "ok", (tcall1 - tcall0))
+                break
+            except Exception as _e1:
+                rate_limited = _looks_like_rate_limit(_e1)
+                try:
+                    log.info(
+                        "[mcp] call failed attempt=%s/%s err=%s url=%s",
+                        attempt,
+                        attempts,
+                        type(_e1).__name__,
+                        url,
+                    )
+                except Exception:
+                    pass
+                if not isinstance(_e1, TimeoutError) and not rate_limited:
+                    _POOL.invalidate(server_url, api_key)
+                    tool_name = None
+                if attempt >= attempts:
                     raise
-                _POOL.set_cached_tool(server_url, api_key, purpose="read_url", name=tool_name)
-            tcall0 = time.perf_counter()
-            result = client.call_tool(tool_name, {"url": url}, timeout_s=_effective_timeout(timeout_s, 30.0))
-            tcall1 = time.perf_counter()
-            text = _extract_text_from_result(result)
-            _metrics_record(tool, "ok", (tcall1 - tcall0))
+                delay = _compute_backoff_delay(attempt, rate_limited)
+                if delay > 0:
+                    time.sleep(delay)
+                continue
         # Telemetry: success
         try:
             if obs is not None and run_id is not None and tenant is not None:
