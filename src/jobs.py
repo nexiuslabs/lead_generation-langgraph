@@ -356,6 +356,7 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                         continue
         except Exception:
             comp_map = {}
+        scored_ids: list[int] = []
         for cid in ids:
             try:
                 name, uen = comp_map.get(int(cid), (str(cid), None))
@@ -400,6 +401,7 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                 except Exception:
                     pass
                 processed += 1
+                scored_ids.append(int(cid))
             except Exception:
                 # continue best-effort
                 pass
@@ -416,6 +418,22 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                 if attempt == 2:
                     raise
                 await _asyncio.sleep(0.5 * (attempt + 1))
+        # Run lead scoring for enriched companies best-effort
+        try:
+            if scored_ids:
+                from src.lead_scoring import lead_scoring_agent
+                scoring_state = {
+                    "candidate_ids": scored_ids,
+                    "lead_features": [],
+                    "lead_scores": [],
+                    "icp_payload": {},
+                }
+                await lead_scoring_agent.ainvoke(scoring_state)
+        except Exception as e:
+            try:
+                log.warning("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"scoring_error\",\"job_id\":%s,\"error\":\"%s\"}", job_id, str(e)[:200])
+            except Exception:
+                pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:  # pragma: no cover
@@ -666,6 +684,7 @@ async def run_enrich_candidates(job_id: int) -> None:
         except Exception:
             pass
         processed = 0
+        scored_ids: list[int] = []
         if enrich_company_with_tavily and rows:
             import asyncio as _asyncio
 
@@ -679,12 +698,30 @@ async def run_enrich_candidates(job_id: int) -> None:
 
             await _run()
             processed = len(rows)
+            scored_ids = [int(r[0]) for r in rows if r and r[0] is not None]
             # Best-effort Odoo export for enriched companies
             try:
                 await _odoo_export_for_ids(tenant_id, rows)
             except Exception:
                 pass
+            # Run lead scoring on the enriched batch so nightly runs update lead_scores immediately
+            try:
+                if scored_ids:
+                    from src.lead_scoring import lead_scoring_agent
+                    scoring_state = {
+                        "candidate_ids": scored_ids,
+                        "lead_features": [],
+                        "lead_scores": [],
+                        "icp_payload": {},
+                    }
+                    await lead_scoring_agent.ainvoke(scoring_state)
+            except Exception as e:
+                try:
+                    log.warning("{\"job\":\"enrich_candidates\",\"phase\":\"scoring_error\",\"job_id\":%s,\"error\":\"%s\"}", job_id, str(e)[:200])
+                except Exception:
+                    pass
         # If we fully utilized today's quota, keep the job queued for the next night; else mark done
+        job_completed = True
         if processed >= effective_limit and effective_limit > 0:
             # Re-queue for next window
             with get_conn() as conn, conn.cursor() as cur:
@@ -702,6 +739,7 @@ async def run_enrich_candidates(job_id: int) -> None:
                 )
             except Exception:
                 pass
+            job_completed = False
         else:
             with get_conn() as conn, conn.cursor() as cur:
                 cur.execute(
@@ -723,6 +761,88 @@ async def run_enrich_candidates(job_id: int) -> None:
             processed,
             dur_ms,
         )
+        # If the nightly batch fully completed, send the shortlist email once scoring is done
+        if job_completed and tenant_id is not None and processed > 0:
+            try:
+                current_params = params
+                try:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT params FROM background_jobs WHERE job_id=%s", (job_id,))
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            current_params = row[0] or {}
+                except Exception:
+                    pass
+                to_email = (current_params or {}).get("notify_email") if isinstance(current_params, dict) else None
+                sent_at = (current_params or {}).get("email_sent_at") if isinstance(current_params, dict) else None
+                # Resolve tenant_users fallback
+                if not to_email:
+                    try:
+                        with get_conn() as conn, conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
+                                (int(tenant_id),),
+                            )
+                            row = cur.fetchone()
+                            if row and row[0]:
+                                candidate = str(row[0])
+                                try:
+                                    from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL
+                                except Exception:
+                                    _ACCEPT_TU_EMAIL = True
+                                if _ACCEPT_TU_EMAIL and ("@" in candidate):
+                                    to_email = candidate
+                                    with get_conn() as conn, conn.cursor() as cur2:
+                                        cur2.execute(
+                                            "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source', 'tenant_users') WHERE job_id=%s",
+                                            (to_email, job_id),
+                                        )
+                    except Exception:
+                        pass
+                if not to_email:
+                    try:
+                        from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
+                        if _DEF_TO and ("@" in str(_DEF_TO)):
+                            to_email = str(_DEF_TO)
+                            with get_conn() as conn, conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source', 'default_env') WHERE job_id=%s",
+                                    (to_email, job_id),
+                                )
+                    except Exception:
+                        pass
+                if to_email and not sent_at:
+                    from src.notifications.agentic_email import agentic_send_results
+                    res = await agentic_send_results(str(to_email), int(tenant_id))
+                    try:
+                        log.info(
+                            "{\"job\":\"enrich_candidates\",\"phase\":\"email\",\"job_id\":%s,\"tenant_id\":%s,\"to\":\"%s\",\"status\":%s}",
+                            job_id,
+                            tenant_id,
+                            (to_email or "").replace("\"", "'")[:200],
+                            (res or {}).get("status"),
+                        )
+                    except Exception:
+                        pass
+                    if (res or {}).get("status") == "sent":
+                        with get_conn() as conn, conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('email_sent_at', now(), 'email_to', %s) WHERE job_id=%s",
+                                (to_email, job_id),
+                            )
+                else:
+                    try:
+                        reason = "already_sent" if sent_at else "missing_to"
+                        log.info(
+                            "{\"job\":\"enrich_candidates\",\"phase\":\"email_skip\",\"job_id\":%s,\"tenant_id\":%s,\"reason\":\"%s\"}",
+                            job_id,
+                            tenant_id,
+                            reason,
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     except Exception as e:  # pragma: no cover
         try:
             with get_conn() as conn, conn.cursor() as cur:

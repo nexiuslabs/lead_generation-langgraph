@@ -8,7 +8,7 @@
 
 ## Frontend Overview (Technical)
 - `AppShell` provides navigation, signed-in identity, export buttons, optional tenant override, Odoo check, and sign-out. It’s rendered on Chat/Candidates/Metrics pages (`agent-chat-ui/src/components/ui/app-shell.tsx:213`).
-- `CandidatesPanel` calls `/candidates/latest`, stores cursor state, supports an industry filter, and renders rows through `VirtualList` for smooth scrolling (`agent-chat-ui/src/components/CandidatesPanel.tsx:8`).
+- `CandidatesPanel` calls `/candidates/latest`, stores cursor state, supports an industry filter, and renders a compact table with sticky headers and overflow scrolling for quick scanning (`agent-chat-ui/src/components/CandidatesPanel.tsx:8`).
 - `JobsProgress` polls `/jobs/{job_id}` every 1.5 s to show processed/total counts (`agent-chat-ui/src/components/JobsProgress.tsx:1`).
 - The Metrics page polls `/metrics` every 15 s and renders the six dashboard cards (`agent-chat-ui/src/app/metrics/page.tsx:15`).
 - All data-fetching hooks go through `useAuthFetch`, which attaches bearer tokens, optional tenant overrides, retries once after `/auth/refresh`, and supports API proxying (`agent-chat-ui/src/lib/useAuthFetch.ts:5`).
@@ -21,8 +21,7 @@
 ### Candidates Page UI Pieces
 - **Header (`AppShell`)** – shared top strip with navigation, who’s logged in, export buttons, Odoo check, optional tenant override, and sign-out.
 - **Industry Launcher** – text box where you paste industry names; it queues a background refresh job and shows its progress.
-- **Candidates List** – searchable, scrollable list of companies showing ID, name, industry, website, and last-seen time. You can filter by industry and manually refresh or load more.
-- **Virtual Scroll** – keeps the list snappy by rendering only visible rows, so large result sets don’t slow the browser.
+- **Candidates Table** – searchable, scrollable table of companies with columns for ID, name, industry, website, and last-seen time. You can filter by industry and manually refresh or load more.
 
 ### Metrics Page UI Pieces
 - **Header (`AppShell`)** – same shared navigation and controls.
