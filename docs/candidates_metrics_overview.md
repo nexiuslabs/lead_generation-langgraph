@@ -4,13 +4,11 @@
 - Visiting `/candidates/latest` fetches recent companies for the signed-in tenant. It filters on `industry_norm`, orders by `last_seen`/`company_id`, and returns a keyset `nextCursor` so the UI can paginate (`app/main.py:927`). The query joins `icp_evidence` (tenant-scoped) to resolve the company ids and calls `set_config('request.tenant_id', ...)` before hitting Postgres so RLS policies remain effective.
 - `/metrics` aggregates operational stats from Postgres: job queue depth and processed totals from `background_jobs`, lead-score counts from `lead_scores`, and latency metrics from `run_event_logs` (`app/main.py:1081`). The handler now sets the tenant GUC and adds explicit `tenant_id` predicates before executing each query, so callers only see their own data. 
 - Tests keep pagination honest: `tests/test_pagination_candidates.py:59` ensures no `OFFSET` use, and metric p95 logic matches test expectations (`app/main.py:1056`).
-- `IndustryJobLauncher` queues work through `/jobs/staging_upsert`, inserting a queued row in `background_jobs` (`app/main.py:1099`, `src/jobs.py:32`). The worker later maps SSIC codes in `ssic_ref`, streams rows from `staging_acra_companies`, and upserts or updates `companies` (including `last_seen`) (`app/lg_entry.py:211`). Job polling hits `/jobs/{id}` and reads `background_jobs` (`app/main.py:1113`).
 - `/metrics/ttfb` allows the UI to persist chat-first-token timing by inserting into `run_event_logs` (`app/main.py:1085`).
 
 ## Frontend Overview (Technical)
 - `AppShell` provides navigation, signed-in identity, export buttons, optional tenant override, Odoo check, and sign-out. It’s rendered on Chat/Candidates/Metrics pages (`agent-chat-ui/src/components/ui/app-shell.tsx:213`).
 - `CandidatesPanel` calls `/candidates/latest`, stores cursor state, supports an industry filter, and renders rows through `VirtualList` for smooth scrolling (`agent-chat-ui/src/components/CandidatesPanel.tsx:8`).
-- `IndustryJobLauncher` collects industries, POSTs to `/jobs/staging_upsert`, and hands the job id to `JobsProgress` (`agent-chat-ui/src/components/IndustryJobLauncher.tsx:7`).
 - `JobsProgress` polls `/jobs/{job_id}` every 1.5 s to show processed/total counts (`agent-chat-ui/src/components/JobsProgress.tsx:1`).
 - The Metrics page polls `/metrics` every 15 s and renders the six dashboard cards (`agent-chat-ui/src/app/metrics/page.tsx:15`).
 - All data-fetching hooks go through `useAuthFetch`, which attaches bearer tokens, optional tenant overrides, retries once after `/auth/refresh`, and supports API proxying (`agent-chat-ui/src/lib/useAuthFetch.ts:5`).
@@ -32,7 +30,6 @@
 
 ## Database Touchpoints by Action
 - **Browse Candidates** (load page, filter, load more): reads `companies` via `/candidates/latest`, scoped through `icp_evidence` for the signed-in tenant.
-- **Queue Industry Refresh** (submit industries): inserts into `background_jobs` via `/jobs/staging_upsert`; the downstream worker reads `ssic_ref` and `staging_acra_companies` and upserts/updates `companies` (updates `last_seen`).
 - **Monitor Job Progress** (auto polling): reads `background_jobs` via `/jobs/{id}`.
 - **View Metrics Dashboard** (poll every 15 s): reads `background_jobs`, `lead_scores`, and `run_event_logs` via `/metrics`.
 - **Record Chat TTFB** (optional UI metric submission): inserts into `run_event_logs` via `/metrics/ttfb`.
@@ -48,7 +45,6 @@
 
 **Callouts**
 - `AppShell` has no direct DB effect; it frames the experience while the other widgets drive API traffic.
-- `IndustryJobLauncher` writes to `background_jobs` immediately; later the worker reads `ssic_ref` and `staging_acra_companies` and updates `companies`.
 - `CandidatesPanel` is a pure read against `companies` for the tenant.
 - `JobsProgress` polls `background_jobs` to keep its bar current.
 - `Metrics Dashboard` reads `background_jobs`, `lead_scores`, and `run_event_logs`, while optional TTFB submissions add rows to `run_event_logs`.
@@ -65,7 +61,6 @@
 - Frontend shell/navigation: `agent-chat-ui/src/components/ui/app-shell.tsx` (component: `AppShell`)
 - Candidates page: `agent-chat-ui/src/app/candidates/page.tsx` (component: `CandidatesPage`)
 - Candidates list component: `agent-chat-ui/src/components/CandidatesPanel.tsx` (component: `CandidatesPanel`)
-- Industry job launcher: `agent-chat-ui/src/components/IndustryJobLauncher.tsx` (component: `IndustryJobLauncher`)
 - Job progress widget: `agent-chat-ui/src/components/JobsProgress.tsx` (component: `JobsProgress`)
 - Metrics page: `agent-chat-ui/src/app/metrics/page.tsx` (component: `MetricsPage`)
 - Authenticated fetch hook: `agent-chat-ui/src/lib/useAuthFetch.ts` (hook: `useAuthFetch`)
