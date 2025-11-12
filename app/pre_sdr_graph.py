@@ -2513,49 +2513,18 @@ def _top10_preview_was_sent(state: GraphState) -> bool:
 
 
 def synthesize_welcome_message(state: Dict[str, Any]) -> str:
-    has_icp = bool((state or {}).get("icp"))
-    enable_finder = bool(ENABLE_ICP_INTAKE)
-    sys = (
-        "You are a helpful SDR assistant for a lead‑gen system. Greet briefly and explain how to start.\n"
-        "Do NOT start flows automatically. Mention allowed commands succinctly: "
-        "'start lead gen', 'confirm profile', 'confirm', 'confirm micro-icp', 'accept micro-icp N', 'run enrichment'.\n"
-        "Define jargon inline the first time (e.g., 'ICP (ideal customer profile)'). "
-        "Clarify you only answer questions about this system (ICP, candidates, enrichment, scoring). "
-        "Politely refuse unrelated topics."
-    )
-    human = (
-        "The user opened a new session. Current state: has_icp={has_icp}, finder_enabled={finder}.\n"
-        "Return ONE short paragraph (<= 2 sentences)."
-    )
-    try:
-        llm = ChatOpenAI(
-            model=LANGCHAIN_MODEL or "gpt-4o-mini",
-            temperature=TEMPERATURE if TEMPERATURE is not None else 0.3,
-        )
-        from langchain_core.prompts import ChatPromptTemplate  # type: ignore
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", sys),
-                ("human", human),
-            ]
-        )
-        msg = (
-            llm.invoke(
-                prompt.format_messages(
-                    has_icp=str(has_icp).lower(), finder=str(enable_finder).lower()
-                )
-            ).content
-            or ""
-        ).strip()
-        if msg:
-            return msg
-    except Exception:
-        pass
     return (
-        "Hi! I can walk you through this lead‑gen system. Start with **start lead gen** and I’ll capture your ICP "
-        "(ideal customer profile), confirm the profile, propose micro‑ICPs, gather any anti‑ICP notes, and then you can "
-        "run enrichment. Ask anytime if you need help."
+        "Hey! I can help you find and generate qualified leads using a quick ICP intake.\n\n"
+        "Here’s how it works:\n"
+        "1) Tell me your ICP: website URL, best customers, industries, employee range, and target geographies.\n"
+        "2) I’ll suggest micro-ICPs and show candidate counts.\n"
+        "3) Pick a segment and I’ll enrich the leads with contact details and scoring.\n\n"
+        "You’re in control with simple commands:\n"
+        "- start lead gen — begin the ICP intake\n"
+        "- confirm — lock in your ICP\n"
+        "- accept micro-icp N — choose a suggested segment\n"
+        "- run enrichment — fetch contacts and scores\n\n"
+        "Ready to go? Type start lead gen."
     )
 
 
