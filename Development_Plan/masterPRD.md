@@ -66,6 +66,7 @@ Our lead generation platform currently depends on Jina's r.jina.ai proxy for det
 - **Official `jina-mcp` Client Adoption:** Using the upstream client accelerates delivery and reduces protocol maintenance overhead while permitting targeted patches.
 - **Synchronous Wrapper Strategy:** Thread-pool backed wrappers allow legacy synchronous code to adopt MCP without broad async rewrites.
 - **Full Tool Suite at Launch:** Activating `read_url`, `parallel_search_web`, and `search_web` together validates MCP’s broader value proposition despite higher QA demands.
+- **Onboarding Flow Alignment:** The pre-SDR welcome and intake experience now includes the greeting, profile verification, and micro-ICP confirmation checkpoints defined in `featurePRD_007_onboarding_refinements.md`, ensuring the MCP rollout narrative reflects the current user guidance expectations.
 
 ## Open Questions
 None at this time. Future uncertainties will be documented here with inline TODO annotations naming owners and due dates.
