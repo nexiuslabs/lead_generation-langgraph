@@ -423,6 +423,60 @@ try:
 except Exception:
     MCP_POOL_MAX_WORKERS = 4
 
+# MCP read throttling + retry tuning
+try:
+    MCP_READ_MAX_CONCURRENCY = int(os.getenv("MCP_READ_MAX_CONCURRENCY", "2") or 2)
+    if MCP_READ_MAX_CONCURRENCY < 1:
+        MCP_READ_MAX_CONCURRENCY = 1
+    elif MCP_READ_MAX_CONCURRENCY > 16:
+        MCP_READ_MAX_CONCURRENCY = 16
+except Exception:
+    MCP_READ_MAX_CONCURRENCY = 2
+
+try:
+    MCP_READ_MIN_INTERVAL_S = float(os.getenv("MCP_READ_MIN_INTERVAL_S", "0.35") or 0.35)
+    if MCP_READ_MIN_INTERVAL_S < 0:
+        MCP_READ_MIN_INTERVAL_S = 0.0
+except Exception:
+    MCP_READ_MIN_INTERVAL_S = 0.35
+
+try:
+    MCP_READ_JITTER_S = float(os.getenv("MCP_READ_JITTER_S", "0.15") or 0.15)
+    if MCP_READ_JITTER_S < 0:
+        MCP_READ_JITTER_S = 0.0
+except Exception:
+    MCP_READ_JITTER_S = 0.15
+
+try:
+    MCP_READ_MAX_ATTEMPTS = int(os.getenv("MCP_READ_MAX_ATTEMPTS", "3") or 3)
+    if MCP_READ_MAX_ATTEMPTS < 1:
+        MCP_READ_MAX_ATTEMPTS = 1
+    elif MCP_READ_MAX_ATTEMPTS > 6:
+        MCP_READ_MAX_ATTEMPTS = 6
+except Exception:
+    MCP_READ_MAX_ATTEMPTS = 3
+
+try:
+    MCP_READ_BACKOFF_BASE_S = float(os.getenv("MCP_READ_BACKOFF_BASE_S", "0.6") or 0.6)
+    if MCP_READ_BACKOFF_BASE_S < 0:
+        MCP_READ_BACKOFF_BASE_S = 0.0
+except Exception:
+    MCP_READ_BACKOFF_BASE_S = 0.6
+
+try:
+    MCP_READ_BACKOFF_CAP_S = float(os.getenv("MCP_READ_BACKOFF_CAP_S", "4.0") or 4.0)
+    if MCP_READ_BACKOFF_CAP_S < 0.1:
+        MCP_READ_BACKOFF_CAP_S = 0.1
+except Exception:
+    MCP_READ_BACKOFF_CAP_S = 4.0
+
+try:
+    MCP_READ_RATELIMIT_BACKOFF_S = float(os.getenv("MCP_READ_RATELIMIT_BACKOFF_S", "2.0") or 2.0)
+    if MCP_READ_RATELIMIT_BACKOFF_S < 0:
+        MCP_READ_RATELIMIT_BACKOFF_S = 0.0
+except Exception:
+    MCP_READ_RATELIMIT_BACKOFF_S = 2.0
+
 # Optional Prometheus exporter toggle (metrics are no-op when disabled)
 PROM_ENABLE = os.getenv("PROM_ENABLE", "false").lower() in (
     "1",

@@ -76,6 +76,11 @@ MCP Reader (Jina) — Read URL
 - MCP_NPX_PATH: override `npx` executable path if needed (default `npx`)
 - MCP_PROTOCOL_VERSION: override protocol version sent in `initialize` (default `2024-10-07`)
 - MCP_EXEC: optional path/name of a globally installed `mcp-remote` binary. If set (e.g., `mcp-remote`), the backend skips `npx` and executes it directly to reduce spawn overhead.
+- MCP_READ_MAX_CONCURRENCY: max concurrent MCP `read_url` calls (default `2`; hard-clamped `1..16`)
+- MCP_READ_MIN_INTERVAL_S / MCP_READ_JITTER_S: enforce a minimum spacing (plus jitter) between MCP calls to avoid bursting; defaults `0.35s`/`0.15s`
+- MCP_READ_MAX_ATTEMPTS: capped retry attempts per URL before falling back (default `3`)
+- MCP_READ_BACKOFF_BASE_S / MCP_READ_BACKOFF_CAP_S: exponential backoff base and ceiling used between attempts (defaults `0.6s` / `4s`)
+- MCP_READ_RATELIMIT_BACKOFF_S: floor delay applied when a 429/rate-limit is detected (default `2s`)
 Adapters (Python) — Optional
 - MCP_ADAPTER_USE_SSE: when `true`, use SSE transport; otherwise use streamable HTTP (default `false`)
 - MCP_ADAPTER_USE_STANDARD_BLOCKS: when `true`, standardize tool outputs for robust text extraction (default `true`)

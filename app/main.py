@@ -21,7 +21,7 @@ from io import StringIO
 import logging
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import threading
 import asyncio
@@ -1018,8 +1018,19 @@ async def scores_latest(limit: int = Query(50, ge=1, le=200), afterScore: float 
     return {"items": items, "nextCursor": next_cursor}
 
 
+def _require_tenant_id(request: Request) -> int:
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if tenant_id is None:
+        raise HTTPException(status_code=403, detail="tenant_id required")
+    try:
+        return int(tenant_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=400, detail="Invalid tenant_id") from exc
+
+
 @app.get("/candidates/latest")
 async def candidates_latest(
+    request: Request,
     limit: int = Query(50, ge=1, le=200),
     afterUpdatedAt: datetime | None = None,
     afterId: int | None = None,
@@ -1031,35 +1042,41 @@ async def candidates_latest(
     Returns { items: [...], nextCursor: { afterUpdatedAt, afterId } | null }
     """
     items: list[dict] = []
-    where = []
-    params: list = []
+    tenant_id = _require_tenant_id(request)
+    filters: list[str] = []
+    filter_params: list = []
     if industry and industry.strip():
-        where.append("LOWER(industry_norm) = LOWER(%s)")
-        params.append(industry.strip())
-    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        filters.append("LOWER(c.industry_norm) = LOWER(%s)")
+        filter_params.append(industry.strip())
+    where_sql = ""
+    if filters:
+        where_sql = " AND " + " AND ".join(filters)
+    order_expr = "COALESCE(c.last_seen, '1970-01-01'::timestamptz)"
     with get_conn() as conn, conn.cursor() as cur:
-        if afterUpdatedAt is None or afterId is None:
-            cur.execute(
-                f"""
-                SELECT company_id, name, industry_norm, website_domain, last_seen
-                FROM companies
-                {where_sql}
-                ORDER BY last_seen DESC NULLS LAST, company_id DESC
-                LIMIT %s
-                """,
-                (*params, limit),
-            )
-        else:
-            cur.execute(
-                f"""
-                SELECT company_id, name, industry_norm, website_domain, last_seen
-                FROM companies
-                {where_sql} {' AND ' if where_sql else ' WHERE '} (last_seen, company_id) < (%s, %s)
-                ORDER BY last_seen DESC NULLS LAST, company_id DESC
-                LIMIT %s
-                """,
-                (*params, afterUpdatedAt, afterId, limit),
-            )
+        try:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tenant_id),))
+        except Exception:
+            pass
+        cursor_clause = ""
+        cursor_params: list = []
+        if afterUpdatedAt is not None and afterId is not None:
+            cursor_clause = f" AND ({order_expr}, c.company_id) < (%s, %s)"
+            cursor_params = [afterUpdatedAt, afterId]
+        sql = f"""
+            SELECT c.company_id, c.name, c.industry_norm, c.website_domain, c.last_seen
+            FROM companies c
+            JOIN (
+                SELECT DISTINCT company_id
+                FROM icp_evidence
+                WHERE tenant_id = %s
+            ) ie ON ie.company_id = c.company_id
+            WHERE 1=1{where_sql}
+            {cursor_clause}
+            ORDER BY {order_expr} DESC, c.company_id DESC
+            LIMIT %s
+        """
+        params = [tenant_id, *filter_params, *cursor_params, limit]
+        cur.execute(sql, params)
         rows = cur.fetchall() or []
         for r in rows:
             items.append(
@@ -1074,12 +1091,15 @@ async def candidates_latest(
     next_cursor = None
     if items and len(items) == limit:
         last = items[-1]
-        next_cursor = {"afterUpdatedAt": last["last_seen"], "afterId": last["company_id"]}
+        cursor_last_seen = last["last_seen"]
+        if cursor_last_seen is None:
+            cursor_last_seen = datetime.fromtimestamp(0, timezone.utc).isoformat()
+        next_cursor = {"afterUpdatedAt": cursor_last_seen, "afterId": last["company_id"]}
     return {"items": items, "nextCursor": next_cursor}
 
 
 @app.get("/metrics")
-async def metrics(_: dict = Depends(require_auth)):
+async def metrics(request: Request, _: dict = Depends(require_auth)):
     """Light metrics for ops and dashboards with richer stats."""
     out = {
         "job_queue_depth": 0,
@@ -1089,19 +1109,27 @@ async def metrics(_: dict = Depends(require_auth)):
         "p95_job_ms": None,
         "chat_ttfb_p95_ms": None,
     }
+    tenant_id = _require_tenant_id(request)
     with get_conn() as conn, conn.cursor() as cur:
         try:
-            cur.execute("SELECT COUNT(*) FROM background_jobs WHERE status='queued'")
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(tenant_id),))
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT COUNT(*) FROM background_jobs WHERE tenant_id = %s AND status='queued'", (tenant_id,))
             out["job_queue_depth"] = int((cur.fetchone() or [0])[0] or 0)
         except Exception:
             pass
         try:
-            cur.execute("SELECT COALESCE(SUM(processed),0) FROM background_jobs WHERE job_type='staging_upsert' AND status='done'")
+            cur.execute(
+                "SELECT COALESCE(SUM(processed),0) FROM background_jobs WHERE tenant_id = %s AND job_type='staging_upsert' AND status='done'",
+                (tenant_id,),
+            )
             out["jobs_processed_total"] = int((cur.fetchone() or [0])[0] or 0)
         except Exception:
             pass
         try:
-            cur.execute("SELECT COUNT(*) FROM lead_scores")
+            cur.execute("SELECT COUNT(*) FROM lead_scores WHERE tenant_id = %s", (tenant_id,))
             out["lead_scores_total"] = int((cur.fetchone() or [0])[0] or 0)
         except Exception:
             pass
@@ -1111,10 +1139,11 @@ async def metrics(_: dict = Depends(require_auth)):
                 """
                 SELECT processed, EXTRACT(EPOCH FROM (ended_at - started_at)) AS secs
                 FROM background_jobs
-                WHERE job_type='staging_upsert' AND status='done' AND started_at IS NOT NULL AND ended_at IS NOT NULL
+                WHERE tenant_id = %s AND job_type='staging_upsert' AND status='done' AND started_at IS NOT NULL AND ended_at IS NOT NULL
                 ORDER BY job_id DESC
                 LIMIT 20
-                """
+                """,
+                (tenant_id,),
             )
             rows = cur.fetchall() or []
             rates = []
@@ -1140,10 +1169,11 @@ async def metrics(_: dict = Depends(require_auth)):
             cur.execute(
                 """
                 SELECT duration_ms FROM run_event_logs
-                WHERE stage='chat' AND event='ttfb' AND ts > NOW() - INTERVAL '7 days' AND duration_ms IS NOT NULL
+                WHERE tenant_id = %s AND stage='chat' AND event='ttfb' AND ts > NOW() - INTERVAL '7 days' AND duration_ms IS NOT NULL
                 ORDER BY duration_ms
                 LIMIT 1000
-                """
+                """,
+                (tenant_id,),
             )
             vals = sorted(int(r[0]) for r in (cur.fetchall() or []) if r and r[0] is not None)
             if vals:
