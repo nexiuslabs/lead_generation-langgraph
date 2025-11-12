@@ -2,7 +2,8 @@
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set, TypedDict
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 import os
 
 from langgraph.graph import END, StateGraph
@@ -165,12 +166,13 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
         return s or None
 
     name = r.get("name") or r.get("entity_name")
-    ind_norm = r.get("industry_norm") or r.get("primary_ssic_description")
-    ind_code = r.get("industry_code")
-    if ind_code is None:
-        ind_code = r.get("primary_ssic_code")
+    ind_norm_raw = r.get("industry_norm") or r.get("primary_ssic_description")
+    ind_code_raw = r.get("industry_code")
+    if ind_code_raw is None:
+        ind_code_raw = r.get("primary_ssic_code")
     # Normalize to text
-    ind_code = str(ind_code) if ind_code is not None else None
+    ind_code_str = str(ind_code_raw) if ind_code_raw is not None else None
+    industry_code, industry_norm = resolve_industry_fields(ind_code_str, ind_norm_raw)
     raw_year = r.get("incorporation_year")
     if raw_year is None:
         raw_year = (
@@ -233,8 +235,8 @@ def _normalize_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "company_id": r.get("company_id"),
         "uen": _norm_str(r.get("uen")),
         "name": _norm_str(name),
-        "industry_norm": _norm_str(ind_norm).lower() if ind_norm else None,
-        "industry_code": _norm_str(ind_code),
+        "industry_norm": _norm_str(industry_norm).lower() if industry_norm else None,
+        "industry_code": _norm_str(industry_code),
         "website_domain": _norm_str(r.get("website_domain") or r.get("website")),
         "incorporation_year": year,
         "founded_year": founded,
@@ -253,6 +255,71 @@ def _table_columns(conn, table: str) -> set[str]:
             (table,),
         )
         return {r[0] for r in cur.fetchall()}
+
+
+def _norm_industry_text(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    try:
+        text = " ".join(str(val).split())
+        text = text.strip()
+        return text or None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=512)
+def _ssic_title_from_code(code: str) -> Optional[str]:
+    """Return the canonical SSIC title for a normalized code."""
+    if not code:
+        return None
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT title FROM ssic_ref WHERE regexp_replace(code::text,'\\D','','g') = %s LIMIT 1",
+                (code,),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception as exc:
+        log.info("ssic lookup failed for code=%s: %s", code, exc)
+        return None
+
+
+@lru_cache(maxsize=512)
+def _ssic_guess_from_hint(hint: str) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort SSIC resolution from a free-text industry hint."""
+    if not hint:
+        return (None, None)
+    try:
+        matches = _find_ssic_codes_by_terms([hint])
+    except Exception as exc:
+        log.info("ssic lookup by hint failed: %s", exc)
+        return (None, None)
+    if matches:
+        code, title, _score = matches[0]
+        return _norm_ssic(code), title
+    return (None, None)
+
+
+def resolve_industry_fields(
+    industry_code: Optional[str], industry_hint: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """Ensure both industry_code and industry_norm are populated using ssic_ref when possible."""
+    hint_norm = _norm_industry_text(industry_hint)
+    code_norm = _norm_ssic(industry_code)
+
+    if code_norm:
+        title = _ssic_title_from_code(code_norm)
+        return code_norm, title or hint_norm
+
+    if hint_norm:
+        # Attempt to find a code directly from the hint text
+        code_from_hint, title_from_hint = _ssic_guess_from_hint(hint_norm.lower())
+        if code_from_hint:
+            return code_from_hint, title_from_hint or hint_norm
+
+    return None, hint_norm
 
 
 def _norm_ssic(s: str | None) -> str | None:
@@ -613,4 +680,4 @@ _icp_ssic_graph.add_edge("icp_match_ssic", "icp_fetch_acra_by_ssic")
 _icp_ssic_graph.add_edge("icp_fetch_acra_by_ssic", END)
 icp_by_ssic_agent = _icp_ssic_graph.compile()
 
-__all__ = ["normalize_agent", "icp_refresh_agent", "icp_by_ssic_agent"]
+__all__ = ["normalize_agent", "icp_refresh_agent", "icp_by_ssic_agent", "resolve_industry_fields"]

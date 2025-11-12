@@ -13,6 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 from src.database import get_conn
 from src.icp_intake import fuzzy_map_seed_to_acra
+from src.icp import resolve_industry_fields
 from src.database import get_conn
 from src.ddg_simple import search_domains as _ddg_simple
 
@@ -317,16 +318,21 @@ def acra_anchor_seed(
                 nm = (acra.get("entity_name") or seed_name or "").strip()
                 code = acra.get("primary_ssic_code")
                 ind_code = str(code) if code is not None else None
+                resolved_code, resolved_norm = resolve_industry_fields(ind_code, None)
                 if uen:
                     # Upsert by UEN
                     cur.execute(
                         """
-                        INSERT INTO companies(uen, name, industry_code, last_seen)
-                        VALUES (%s, %s, %s, NOW())
-                        ON CONFLICT (uen) DO UPDATE SET name=EXCLUDED.name, industry_code=COALESCE(EXCLUDED.industry_code, companies.industry_code), last_seen=NOW()
+                        INSERT INTO companies(uen, name, industry_code, industry_norm, last_seen)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (uen) DO UPDATE SET
+                            name=EXCLUDED.name,
+                            industry_code=COALESCE(EXCLUDED.industry_code, companies.industry_code),
+                            industry_norm=COALESCE(EXCLUDED.industry_norm, companies.industry_norm),
+                            last_seen=NOW()
                         RETURNING company_id
                         """,
-                        (uen, nm, ind_code),
+                        (uen, nm, resolved_code, resolved_norm),
                     )
                     row = cur.fetchone()
                     if row and row[0] is not None:
@@ -340,11 +346,11 @@ def acra_anchor_seed(
                     else:
                         cur.execute(
                             """
-                            INSERT INTO companies(name, industry_code, last_seen)
-                            VALUES (%s, %s, NOW())
+                            INSERT INTO companies(name, industry_code, industry_norm, last_seen)
+                            VALUES (%s, %s, %s, NOW())
                             RETURNING company_id
                             """,
-                            (nm, ind_code),
+                            (nm, resolved_code, resolved_norm),
                         )
                         rr = cur.fetchone()
                         if rr and rr[0] is not None:

@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from psycopg2.extras import Json
 from src.database import get_conn
+from src.icp import resolve_industry_fields
 from src.obs import log_event
 
 log = logging.getLogger("icp_intake")
@@ -117,17 +118,24 @@ def map_seeds_to_evidence(tenant_id: int) -> int:
             acra = fuzzy_map_seed_to_acra(cur, name)
             if company_id is None and acra and acra.get("uen"):
                 try:
+                    ssic_code = str(acra.get("primary_ssic_code")) if acra.get("primary_ssic_code") is not None else None
+                    resolved_code, resolved_norm = resolve_industry_fields(ssic_code, None)
                     cur.execute(
                         """
-                        INSERT INTO companies(uen, name, industry_code, last_seen)
-                        VALUES (%s, %s, %s, NOW())
-                        ON CONFLICT (uen) DO UPDATE SET name=EXCLUDED.name, industry_code=COALESCE(EXCLUDED.industry_code, companies.industry_code), last_seen=NOW()
+                        INSERT INTO companies(uen, name, industry_code, industry_norm, last_seen)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (uen) DO UPDATE SET
+                            name=EXCLUDED.name,
+                            industry_code=COALESCE(EXCLUDED.industry_code, companies.industry_code),
+                            industry_norm=COALESCE(EXCLUDED.industry_norm, companies.industry_norm),
+                            last_seen=NOW()
                         RETURNING company_id
                         """,
                         (
                             (acra.get("uen") or "").strip(),
                             (acra.get("entity_name") or name)[:255],
-                            str(acra.get("primary_ssic_code")) if acra.get("primary_ssic_code") is not None else None,
+                            resolved_code,
+                            resolved_norm,
                         ),
                     )
                     r = cur.fetchone()
