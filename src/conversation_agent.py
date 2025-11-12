@@ -42,10 +42,13 @@ class RelevanceJudgment(BaseModel):
 SYSTEM_REFERENCE = (
     "Agent: Pre‑SDR lead‑gen assistant under LangGraph Server. Router-controlled chat graph.\n"
     "Entry: app/lg_entry.py:make_graph → app/pre_sdr_graph.build_graph.\n"
-    "Safety: No auto‑start or auto‑enrichment; explicit user commands required. Greetings and Q&A are terminal.\n\n"
+    "Safety: No auto‑start or auto‑enrichment; explicit user commands required. Greetings and Q&A are terminal.\n"
+    "Tone: Explain jargon inline (e.g., 'ICP (ideal customer profile)').\n\n"
     "User Commands:\n"
     "- start lead gen | find leads | discover leads | prospect leads: begin ICP flow.\n"
+    "- confirm profile: acknowledge the captured company profile before progressing.\n"
     "- confirm: persist current ICP/intake and advance to candidates.\n"
+    "- confirm micro-icp: approve the suggested micro‑ICP (focused ICP) list after providing anti-ICP notes.\n"
     "- accept micro-icp N: select a suggested micro‑ICP (often SSIC‑based) to unlock enrichment.\n"
     "- run enrichment: enrich current candidates now (small batch), schedule remainder nightly.\n\n"
     "ICP Intake (Finder on):\n"
@@ -53,7 +56,9 @@ SYSTEM_REFERENCE = (
     "2) Ask 5–15 best customers as 'Company — website' (seeds).\n"
     "3) Ask industries, employee range, geographies, buying signals (skip allowed).\n"
     "4) Optionals: ACV, cycle length, price floor, champion titles, triggers.\n"
-    "After confirm, system may propose micro‑ICPs and show counts.\n\n"
+    "5) After synthesizing the company profile, show the summary back and wait for **confirm profile** or corrections.\n"
+    "After confirm, system proposes micro‑ICPs with evidence, captures anti‑ICP (companies to avoid), "
+    "and requires **confirm micro-icp** before selection.\n\n"
     "Candidates: From (a) recent upserts (sync head), (b) DB by ICP filters, and may preview counts.\n"
     "Micro‑ICPs: Suggested segments with evidence; user accepts with 'accept micro-icp N'.\n\n"
     "Enrichment (run enrichment):\n"
@@ -123,7 +128,8 @@ def answer_leadgen_question(question: str, context: Optional[Dict[str, Any]] = N
     sys = (
         "You answer ONLY from the provided Reference and Context. Do not use external/web knowledge.\n"
         "If asked beyond what the Reference/Context covers, say what’s available in this system and what isn’t.\n"
-        "Be specific, concise, and recommend the next command the user can run (e.g., 'start lead gen', 'confirm', 'accept micro-icp N', 'run enrichment').\n\n"
+        "Be specific, concise, and recommend the next command the user can run (e.g., 'start lead gen', 'confirm profile', "
+        "'confirm micro-icp', 'accept micro-icp N', 'run enrichment').\n\n"
         f"Reference:\n{SYSTEM_REFERENCE}"
     )
     prompt = ChatPromptTemplate.from_messages([
@@ -158,7 +164,14 @@ def answer_leadgen_question(question: str, context: Optional[Dict[str, Any]] = N
             "enrich_now_planned": (context or {}).get("enrich_now_planned"),
             "RUN_NOW_LIMIT": (context or {}).get("RUN_NOW_LIMIT"),
         },
-        "commands": ["start lead gen", "confirm", "accept micro-icp N", "run enrichment"],
+        "commands": [
+            "start lead gen",
+            "confirm profile",
+            "confirm",
+            "confirm micro-icp",
+            "accept micro-icp N",
+            "run enrichment",
+        ],
     }
     msgs = prompt.format_messages(q=question, ctx=json.dumps(ctx, ensure_ascii=False))
     try:

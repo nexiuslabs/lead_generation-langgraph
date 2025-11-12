@@ -6,7 +6,7 @@ import inspect
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
 try:  # Python 3.9/3.10 fallback
     from typing import Annotated  # type: ignore
 except Exception:  # pragma: no cover
@@ -74,6 +74,10 @@ try:
 except Exception:  # pragma: no cover
     _agent_icp_synth = None  # type: ignore
     _agent_plan_discovery = None  # type: ignore
+try:
+    from src.chat_events import emitter as chat_events  # type: ignore
+except Exception:  # pragma: no cover
+    chat_events = None  # type: ignore
 try:
     from src.settings import ENABLE_ICP_INTAKE  # type: ignore
 except Exception:  # pragma: no cover
@@ -1416,7 +1420,7 @@ def icp_confirm(state: PreSDRState) -> PreSDRState:
                                     ev = it.get("evidence_count") or 0
                                     lines.append(f"{i}) {title} (evidence: {ev})")
                                 state["messages"].append(AIMessage("\n".join(lines)))
-                                state["micro_icp_suggestions"] = items
+                                _set_micro_icp_suggestions(state, items, prompt_user=True)
                                 state["finder_suggestions_done"] = True
                     except Exception:
                         pass
@@ -2442,6 +2446,12 @@ class GraphState(TypedDict):
     icp_confirmed: bool
     ask_counts: Dict[str, int]  # how many times we asked each slot
     scored: List[Dict[str, Any]]
+    greeting_sent: NotRequired[bool]
+    company_profile_confirmed: NotRequired[bool]
+    awaiting_profile_confirmation: NotRequired[bool]
+    micro_icp_confirmed: NotRequired[bool]
+    awaiting_micro_icp_confirmation: NotRequired[bool]
+    anti_icp_notes: NotRequired[List[str]]
 
 
 # ------------------------------
@@ -2500,6 +2510,307 @@ def _top10_preview_was_sent(state: GraphState) -> bool:
     except Exception:
         pass
     return False
+
+
+def synthesize_welcome_message(state: Dict[str, Any]) -> str:
+    has_icp = bool((state or {}).get("icp"))
+    enable_finder = bool(ENABLE_ICP_INTAKE)
+    sys = (
+        "You are a helpful SDR assistant for a lead‑gen system. Greet briefly and explain how to start.\n"
+        "Do NOT start flows automatically. Mention allowed commands succinctly: "
+        "'start lead gen', 'confirm profile', 'confirm', 'confirm micro-icp', 'accept micro-icp N', 'run enrichment'.\n"
+        "Define jargon inline the first time (e.g., 'ICP (ideal customer profile)'). "
+        "Clarify you only answer questions about this system (ICP, candidates, enrichment, scoring). "
+        "Politely refuse unrelated topics."
+    )
+    human = (
+        "The user opened a new session. Current state: has_icp={has_icp}, finder_enabled={finder}.\n"
+        "Return ONE short paragraph (<= 2 sentences)."
+    )
+    try:
+        llm = ChatOpenAI(
+            model=LANGCHAIN_MODEL or "gpt-4o-mini",
+            temperature=TEMPERATURE if TEMPERATURE is not None else 0.3,
+        )
+        from langchain_core.prompts import ChatPromptTemplate  # type: ignore
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", sys),
+                ("human", human),
+            ]
+        )
+        msg = (
+            llm.invoke(
+                prompt.format_messages(
+                    has_icp=str(has_icp).lower(), finder=str(enable_finder).lower()
+                )
+            ).content
+            or ""
+        ).strip()
+        if msg:
+            return msg
+    except Exception:
+        pass
+    return (
+        "Hi! I can walk you through this lead‑gen system. Start with **start lead gen** and I’ll capture your ICP "
+        "(ideal customer profile), confirm the profile, propose micro‑ICPs, gather any anti‑ICP notes, and then you can "
+        "run enrichment. Ask anytime if you need help."
+    )
+
+
+PROFILE_CONFIRM_RE = re.compile(
+    r"\b(confirm(ed)?|looks good|sounds good|accurate|yes|yep|ok(ay)?|lgtm|proceed)\b",
+    flags=re.IGNORECASE,
+)
+MICRO_CONFIRM_RE = re.compile(
+    r"\b(confirm(\s+micro)?-?icp|looks good|sounds good|ready|locked in)\b",
+    flags=re.IGNORECASE,
+)
+ANTI_ICP_HINTS = ("avoid", "exclude", "not a fit", "bad fit", "no longer", "skip", "without", "except")
+
+
+def _emit_onboarding_event(
+    state: GraphState, event: str, message: str, extra: Optional[Dict[str, Any]] = None
+) -> None:
+    try:
+        if chat_events is None:
+            logger.info("[onboarding:%s] %s | extra=%s", event, message, extra)
+            return
+        session_id = state.get("session_id")
+        tenant_id = state.get("tenant_id")
+        ctx = extra.copy() if isinstance(extra, dict) else {}
+        chat_events.emit(session_id, tenant_id, event, message, ctx)
+    except Exception:
+        logger.debug("onboarding event emit failed: event=%s", event, exc_info=True)
+
+
+def _icp_profile_summary_lines(icp_prof: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    industries = [s for s in (icp_prof.get("industries") or []) if isinstance(s, str)]
+    buyers = [s for s in (icp_prof.get("buyer_titles") or []) if isinstance(s, str)]
+    sizes = [s for s in (icp_prof.get("company_sizes") or []) if isinstance(s, str)]
+    geos = [s for s in (icp_prof.get("geos") or []) if isinstance(s, str)]
+    signals = [s for s in (icp_prof.get("signals") or []) if isinstance(s, str)]
+    if industries:
+        lines.append(f"- Industries: {', '.join(industries[:6])}")
+    if buyers:
+        lines.append(f"- Buyer titles: {', '.join(buyers[:6])}")
+    if sizes:
+        lines.append(f"- Company sizes: {', '.join(sizes[:6])}")
+    if geos:
+        lines.append(f"- Key geographies: {', '.join(geos[:6])}")
+    if signals:
+        lines.append(f"- Buying signals: {', '.join(signals[:6])}")
+    if not lines:
+        lines.append("- Profile details are still populating.")
+    return lines
+
+
+def _should_prompt_profile_confirmation(state: GraphState) -> bool:
+    if state.get("company_profile_confirmed"):
+        return False
+    if state.get("awaiting_profile_confirmation"):
+        return False
+    prof = state.get("icp_profile") or {}
+    if not isinstance(prof, dict) or not prof:
+        return False
+    has_signal = any(
+        bool(prof.get(key))
+        for key in ("industries", "buyer_titles", "company_sizes", "geos", "signals")
+    )
+    return has_signal
+
+
+def _prompt_profile_confirmation(state: GraphState) -> None:
+    prof = dict(state.get("icp_profile") or {})
+    summary = _icp_profile_summary_lines(prof)
+    lines = [
+        "Here’s the company profile I’ve captured so far (ICP = ideal customer profile):",
+        *summary,
+        "",
+        "Does this look right? Reply **confirm profile** (or just say it looks good), or tell me what to change.",
+    ]
+    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+    state["awaiting_profile_confirmation"] = True
+    _emit_onboarding_event(
+        state,
+        "company_profile_prompted",
+        "Requested confirmation of the synthesized company profile.",
+        {"summary": summary},
+    )
+
+
+def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
+    if state.get("awaiting_profile_confirmation"):
+        reply = (user_text or "").strip()
+        if not reply:
+            return "await"
+        if PROFILE_CONFIRM_RE.search(reply):
+            state["company_profile_confirmed"] = True
+            state["awaiting_profile_confirmation"] = False
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [
+                    AIMessage(
+                        "Great! I’ll keep that profile locked. Next up: I’ll propose micro‑ICP segments."
+                    )
+                ],
+            )
+            _emit_onboarding_event(
+                state,
+                "company_profile_verified",
+                "User confirmed the synthesized company profile.",
+                {"icp_profile": dict(state.get("icp_profile") or {})},
+            )
+            return "continue"
+        # Treat everything else as feedback
+        feedback = reply
+        icp = dict(state.get("icp") or {})
+        fb_list = list(icp.get("profile_corrections") or [])
+        fb_list.append(feedback)
+        icp["profile_corrections"] = fb_list[-10:]
+        state["icp"] = icp
+        prof = dict(state.get("icp_profile") or {})
+        manual_notes = list(prof.get("manual_notes") or [])
+        manual_notes.append(feedback)
+        prof["manual_notes"] = manual_notes[-10:]
+        state["icp_profile"] = prof
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [
+                AIMessage(
+                    "Thanks for the correction — I’ve noted it. "
+                    "Share more adjustments or say **confirm profile** when it’s accurate."
+                )
+            ],
+        )
+        _emit_onboarding_event(
+            state,
+            "company_profile_adjusted",
+            "User provided adjustments to the company profile.",
+            {"feedback": feedback},
+        )
+        _prompt_profile_confirmation(state)
+        return "await"
+    if _should_prompt_profile_confirmation(state):
+        _prompt_profile_confirmation(state)
+        return "prompted"
+    return "continue"
+
+
+def _set_micro_icp_suggestions(
+    state: GraphState, items: List[Dict[str, Any]], *, prompt_user: bool = True
+) -> None:
+    state["micro_icp_suggestions"] = items
+    state["micro_icp_confirmed"] = False
+    state["awaiting_micro_icp_confirmation"] = False
+    if items and prompt_user:
+        _prompt_micro_icp_confirmation(state)
+
+
+def _should_prompt_micro_icp_confirmation(state: GraphState) -> bool:
+    if not state.get("micro_icp_suggestions"):
+        return False
+    if state.get("micro_icp_confirmed"):
+        return False
+    if state.get("awaiting_micro_icp_confirmation"):
+        return False
+    return True
+
+
+def _prompt_micro_icp_confirmation(state: GraphState) -> None:
+    suggestions = state.get("micro_icp_suggestions") or []
+    if not suggestions:
+        return
+    lines = ["Here are the draft micro‑ICP segments (micro‑ICP = focused ICP slice):"]
+    for idx, it in enumerate(suggestions, 1):
+        title = it.get("title") or it.get("id") or f"Segment {idx}"
+        rationale = it.get("rationale") or ""
+        ev = it.get("evidence_count") or 0
+        detail = f"{title} — evidence:{ev}"
+        if rationale:
+            detail += f" | why: {rationale}"
+        lines.append(f"{idx}) {detail}")
+    lines.append("")
+    lines.append(
+        "Do these look correct? Reply **confirm micro-icp** (or 'looks good') if they fit, "
+        "or tell me what to adjust. Also call out any anti-ICP traits (companies to avoid)."
+    )
+    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+    state["awaiting_micro_icp_confirmation"] = True
+    state["micro_icp_confirmed"] = False
+    _emit_onboarding_event(
+        state,
+        "micro_icp_prompted",
+        "Requested confirmation of micro-ICP suggestions.",
+        {"suggestion_count": len(suggestions)},
+    )
+
+
+def _handle_micro_icp_confirmation_response(state: GraphState, user_text: str) -> str:
+    if not state.get("awaiting_micro_icp_confirmation"):
+        if _should_prompt_micro_icp_confirmation(state):
+            _prompt_micro_icp_confirmation(state)
+            return "prompted"
+        return "continue"
+    reply = (user_text or "").strip()
+    if not reply:
+        return "await"
+    lower = reply.lower()
+    has_adjustment = any(hint in lower for hint in ANTI_ICP_HINTS)
+    if has_adjustment:
+        notes = list(state.get("anti_icp_notes") or [])
+        notes.append(reply)
+        state["anti_icp_notes"] = notes[-10:]
+        icp = dict(state.get("icp") or {})
+        anti = list(icp.get("anti_icp") or [])
+        anti.append(reply)
+        icp["anti_icp"] = anti[-10:]
+        state["icp"] = icp
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [
+                AIMessage(
+                    "Noted that as anti‑ICP guidance. Share more if needed, then say **confirm micro-icp** when it’s right."
+                )
+            ],
+        )
+        _emit_onboarding_event(
+            state,
+            "anti_icp_logged",
+            "Captured anti-ICP guidance from the user.",
+            {"note": reply},
+        )
+        return "await"
+    if MICRO_CONFIRM_RE.search(reply):
+        state["micro_icp_confirmed"] = True
+        state["awaiting_micro_icp_confirmation"] = False
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [
+                AIMessage(
+                    "Awesome — you can now pick one (e.g., **accept micro-icp 1**) or tweak further."
+                )
+            ],
+        )
+        _emit_onboarding_event(
+            state,
+            "micro_icp_confirmed",
+            "User confirmed the micro-ICP suggestions.",
+            {"suggestion_count": len(state.get("micro_icp_suggestions") or [])},
+        )
+        return "continue"
+    # Treat everything else as clarification but keep waiting for explicit confirm
+    state["messages"] = add_messages(
+        state.get("messages") or [],
+        [
+            AIMessage(
+                "Thanks — I captured that. If everything looks good, reply **confirm micro-icp** so we can continue."
+            )
+        ],
+    )
+    return "await"
 
 
 async def _regenerate_top10_if_missing(
@@ -3196,9 +3507,17 @@ async def icp_node(state: GraphState) -> GraphState:
 
     text = _last_user_text(state)
 
+    profile_gate = _handle_profile_confirmation_gate(state, text)
+    if profile_gate in ("await", "prompted"):
+        return state
+
     # Reset flow when user types 'start' explicitly
     if re.search(r"\bstart\b", text.strip(), flags=re.IGNORECASE):
         state["icp"] = {}
+        state["company_profile_confirmed"] = False
+        state["awaiting_profile_confirmation"] = False
+        state["micro_icp_confirmed"] = False
+        state["awaiting_micro_icp_confirmation"] = False
         # Clear transient outputs so we ask fresh ICP questions
         for k in ("candidates", "results", "scored", "ask_counts", "enrichment_completed"):
             try:
@@ -3839,6 +4158,9 @@ async def candidates_node(state: GraphState) -> GraphState:
 async def confirm_node(state: GraphState) -> GraphState:
     state["confirmed"] = True
     logger.info("[confirm] Entered confirm_node")
+    micro_gate = _handle_micro_icp_confirmation_response(state, _last_user_text(state))
+    if micro_gate in ("await", "prompted"):
+        return state
     # Emit a quick progress note so the user sees immediate feedback
     try:
         state["messages"] = add_messages(
@@ -4354,7 +4676,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     pass
                                 state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
                                 chips.append("Suggestions ✓")
-                                state["micro_icp_suggestions"] = items2
+                                _set_micro_icp_suggestions(state, items2, prompt_user=True)
                             state["finder_suggestions_done"] = True
                     except Exception:
                         pass
@@ -5610,6 +5932,17 @@ def router(state: GraphState) -> str:
     icp = state.get("icp") or {}
 
     text = _last_user_text(state).lower()
+    # Auto-greet brand-new sessions once (skip if this conversation already has assistant replies)
+    if not state.get("greeting_sent"):
+        if any(isinstance(m, AIMessage) for m in msgs):
+            state["greeting_sent"] = True
+        else:
+            logger.info("router -> welcome (auto bootstrap greeting)")
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "welcome"
 
     # Boot-session initialization: record current message count.
     # Do not halt routing on first turn; allow fresh human input to proceed.
@@ -5660,6 +5993,24 @@ def router(state: GraphState) -> str:
             return "end"
     except Exception:
         pass
+
+    # While we are waiting on a profile confirmation, keep routing through the ICP node
+    if state.get("awaiting_profile_confirmation"):
+        logger.info("router -> icp (awaiting profile confirmation)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        return "icp"
+
+    # Hold in confirm node while waiting on micro-ICP approval/anti-ICP notes
+    if state.get("awaiting_micro_icp_confirmation"):
+        logger.info("router -> confirm (awaiting micro-ICP confirmation)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        return "confirm"
 
     # Note: Do not route to enrichment here. We intentionally handle
     # explicit 'run enrichment' after the assistant-last guard below to
@@ -5896,6 +6247,17 @@ def router_entry(state: GraphState) -> GraphState:
 @log_node("accept")
 def accept_micro_icp(state: GraphState) -> GraphState:
     """Persist selected micro‑ICP (basic SSIC-based payload) and unlock enrichment."""
+    if not state.get("micro_icp_confirmed"):
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [
+                AIMessage(
+                    "Please confirm the micro‑ICP suggestions first (reply **confirm micro-icp**) "
+                    "or share adjustments before selecting one."
+                )
+            ],
+        )
+        return state
     text = _last_user_text(state)
     # Parse selection number
     m = re.search(r"accept\s+micro[- ]icp\s*(\d+)", text, flags=re.IGNORECASE)
@@ -5944,47 +6306,10 @@ def build_graph():
     # Generates an LLM-based greeting so replies are not hard-coded.
     def welcome(state: GraphState) -> GraphState:
         try:
-            # Prefer configured model; degrade gracefully if unavailable
-            llm = None
-            try:
-                llm = ChatOpenAI(model=LANGCHAIN_MODEL or "gpt-4o-mini", temperature=TEMPERATURE if TEMPERATURE is not None else 0.3)
-            except Exception:
-                llm = None
-
-            # Compact context for greeting (optional)
-            icp = state.get("icp") or {}
-            has_icp = bool(icp)
-            enable_finder = bool(ENABLE_ICP_INTAKE)
-            sys = (
-                "You are a helpful SDR assistant for a lead‑gen system. Greet briefly and explain how to start.\n"
-                "Do NOT start flows automatically. Mention the allowed commands succinctly: 'start lead gen', 'confirm', 'accept micro-icp N', 'run enrichment'.\n"
-                "Clarify you only answer questions about this system (ICP, candidates, enrichment, scoring). Politely refuse unrelated topics."
-            )
-            human = (
-                "The user greeted you. Current state: has_icp={has_icp}, finder_enabled={finder}.\n"
-                "Return ONE short paragraph (<= 2 sentences)."
-            )
-            if llm is not None:
-                try:
-                    from langchain_core.prompts import ChatPromptTemplate  # type: ignore
-                    prompt = ChatPromptTemplate.from_messages([
-                        ("system", sys),
-                        ("human", human),
-                    ])
-                    msg = (llm.invoke(prompt.format_messages(has_icp=str(has_icp).lower(), finder=str(enable_finder).lower())).content or "").strip()
-                except Exception:
-                    msg = (
-                        "Hi! I can answer questions about this lead‑gen system. "
-                        "When you’re ready, say 'start lead gen', or ask about ICP or enrichment."
-                    )
-            else:
-                # Fallback if LLM not configured
-                msg = (
-                    "Hi! I can answer questions about this lead‑gen system. "
-                    "When you’re ready, say 'start lead gen', or ask about ICP or enrichment."
-                )
+            msg = synthesize_welcome_message(state)
             state["messages"] = add_messages(state.get("messages") or [], [AIMessage(msg)])
             state["welcomed"] = True
+            state["greeting_sent"] = True
         except Exception:
             pass
         return state
@@ -6043,9 +6368,8 @@ def build_graph():
     # Start in the router so we always decide the right first step
     g.set_entry_point("router")
     g.add_conditional_edges("router", router, mapping)
-    # Every worker node loops back to the router
-    # Route all worker nodes back to router EXCEPT welcome, which should end the run
-    for node in ("icp", "candidates", "confirm", "accept", "enrich", "score"):
+    # Every worker node loops back to the router (welcome now flows back so the same run can process the user input)
+    for node in ("welcome", "icp", "candidates", "confirm", "accept", "enrich", "score"):
         g.add_edge(node, "router")
     return g.compile()
 
