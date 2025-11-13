@@ -3288,7 +3288,7 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
     state["icp_profile"] = prof_updates
     state["icp_profile_confirmed"] = False
     state["icp_profile_seed_fingerprint"] = fingerprint
-    _persist_icp_profile_sync(state, prof_updates, confirmed=False, seed_urls=_current_seed_urls(state))
+    # Keep ICP draft in memory until user confirms
     _remember_icp_profile(state, prof_updates)
     _prompt_icp_profile_confirmation(state)
 
@@ -3472,6 +3472,45 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
     manual_text_trigger = awaiting and incoming_text and incoming_text != last_feedback_text
     has_new_input = has_new_human or manual_text_trigger
 
+    # If the user explicitly confirms even when we are not currently awaiting,
+    # treat it as a confirmation as long as we have profile context. This
+    # avoids silent no-ops when the awaiting flag was cleared (e.g., after
+    # restarts or interleaved messages).
+    try:
+        # Only auto-confirm here on explicit company profile confirms
+        # (e.g., "confirm profile" or "confirm company profile").
+        _company_confirm_cmd = False
+        if incoming_text:
+            try:
+                _company_confirm_cmd = bool(re.search(r"\bconfirm\s+(company\s+)?profile\b", incoming_text, flags=re.IGNORECASE))
+            except Exception:
+                _company_confirm_cmd = False
+        if (not awaiting) and _company_confirm_cmd:
+            if _has_company_profile_context(state):
+                state["company_profile_confirmed"] = True
+                state["awaiting_profile_confirmation"] = False
+                prof_snapshot = dict(state.get("company_profile") or {})
+                _remember_company_profile(state, prof_snapshot)
+                _persist_company_profile_sync(state, prof_snapshot, confirmed=True)
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [
+                        AIMessage(
+                            "Great! I’ll keep that profile locked. Next up: I’ll propose micro‑ICP segments."
+                        )
+                    ],
+                )
+                _emit_onboarding_event(
+                    state,
+                    "company_profile_verified",
+                    "User confirmed the synthesized company profile.",
+                    {"company_profile": prof_snapshot},
+                )
+                return "continue"
+    except Exception:
+        # fall through to normal prompting logic
+        pass
+
     if not awaiting and not needs_prompt:
         return "continue"
 
@@ -3616,6 +3655,40 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     manual_text_trigger = awaiting and incoming_text and incoming_text != last_feedback_text
     has_new_input = has_new_human or manual_text_trigger
 
+    # Resilient: if user explicitly says "confirm icp profile" but we're not awaiting,
+    # honor it as long as there is ICP profile context.
+    try:
+        _icp_confirm_cmd = False
+        if incoming_text:
+            try:
+                _icp_confirm_cmd = bool(re.search(r"\bconfirm\s+(icp\s+)?profile\b", incoming_text, flags=re.IGNORECASE))
+            except Exception:
+                _icp_confirm_cmd = False
+        if (not awaiting) and _icp_confirm_cmd and _has_icp_profile_context(state):
+            state["icp_profile_confirmed"] = True
+            state["awaiting_icp_profile_confirmation"] = False
+            prof_snapshot = dict(state.get("icp_profile") or {})
+            _remember_icp_profile(state, prof_snapshot)
+            _persist_icp_profile_sync(state, prof_snapshot, confirmed=True, seed_urls=_current_seed_urls(state))
+            _merge_icp_profile_into_state(state, prof_snapshot)
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [
+                    AIMessage(
+                        "Great! I’ll keep that ICP profile locked. Next I’ll use it to plan discovery and micro‑ICPs."
+                    )
+                ],
+            )
+            _emit_onboarding_event(
+                state,
+                "icp_profile_verified",
+                "User confirmed the customer-derived ICP profile.",
+                {"icp_profile": prof_snapshot},
+            )
+            return "continue"
+    except Exception:
+        pass
+
     if not awaiting and not needs_prompt:
         return "continue"
 
@@ -3661,10 +3734,21 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
         return "await"
 
     if _is_profile_update_request(reply):
+        # LLM-driven ICP update inside the confirmation loop
+        try:
+            icp_upd = extract_icp_profile_update_sync(reply)
+        except Exception:
+            icp_upd = None
+        if icp_upd is not None:
+            _apply_icp_profile_llm_update(state, icp_upd)
         state["awaiting_icp_profile_confirmation"] = False
         state["icp_profile_feedback_last_text"] = reply
         _prompt_icp_profile_confirmation(
-            state, header="Sure — here’s the latest ICP profile snapshot:"
+            state,
+            header=(
+                "Updated. Here’s the latest ICP profile snapshot:" if icp_upd else
+                "Sure — here’s the latest ICP profile snapshot:"
+            ),
         )
         return "prompted"
 
@@ -3678,18 +3762,18 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     prof["manual_notes"] = manual_notes[-10:]
     state["icp_profile"] = prof
     state["icp_profile_confirmed"] = False
-    _persist_icp_profile_sync(state, prof, confirmed=False)
-    state["messages"] = add_messages(
-        state.get("messages") or [],
-        [
-            AIMessage(
-                "Thanks for the correction — I’ve noted it. "
-                "Share more adjustments or say **confirm icp profile** when it’s accurate."
-            )
-        ],
-    )
-    updates = _extract_profile_feedback_updates(feedback)
-    applied = _apply_icp_profile_feedback_updates(state, updates)
+    # Keep drafts in memory only; do not persist until confirm
+    # Try LLM-driven merge for additional structure
+    applied: dict[str, list[str]] = {}
+    try:
+        icp_upd = extract_icp_profile_update_sync(feedback)
+        if icp_upd is not None:
+            applied = _apply_icp_profile_llm_update(state, icp_upd)
+    except Exception:
+        pass
+    if not applied:
+        updates = _extract_profile_feedback_updates(feedback)
+        applied = _apply_icp_profile_feedback_updates(state, updates)
     if applied:
         _emit_onboarding_event(
             state,
@@ -4127,6 +4211,83 @@ def _apply_company_profile_llm_update(state: GraphState, upd: CompanyProfileUpda
         state["company_profile"] = prof
         state["company_profile_confirmed"] = False
         _remember_company_profile(state, prof)
+    return applied
+
+
+# ------------------------------
+# LLM-driven ICP Profile update extraction
+# ------------------------------
+
+
+class ICPProfileUpdate(BaseModel):
+    industries: list[str] = Field(default_factory=list)
+    buyer_titles: list[str] = Field(default_factory=list)
+    size_bands: list[str] = Field(default_factory=list)
+    geos: list[str] = Field(default_factory=list)
+    integrations: list[str] = Field(default_factory=list)
+    triggers: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+
+ICP_PROFILE_UPDATE_SYS = SystemMessage(
+    content=(
+        "You interpret a user's natural-language request to UPDATE an ICP Profile.\n"
+        "Return JSON ONLY with fields to add/adjust: industries (list[str]), buyer_titles (list[str]), size_bands (list[str]), geos (list[str]), integrations (list[str]), triggers (list[str]), exclusions (list[str]).\n"
+        "- Extract only the NEW items the user asked to add or emphasize.\n"
+        "- Example: 'add healthcare and fintech to ICP industries' → industries:[\"healthcare\",\"fintech\"].\n"
+        "- Do not invent information; leave arrays empty if unspecified."
+    )
+)
+
+
+async def extract_icp_profile_update(text: str) -> ICPProfileUpdate:
+    structured = EXTRACT_LLM.with_structured_output(ICPProfileUpdate)
+    return await structured.ainvoke([ICP_PROFILE_UPDATE_SYS, HumanMessage(text)])
+
+def extract_icp_profile_update_sync(text: str) -> ICPProfileUpdate:
+    """Synchronous helper for contexts where awaiting is not possible.
+
+    Uses the same structured LLM but via .invoke(). Safe to call from
+    non-async gates that run inside the graph without their own event loop.
+    """
+    structured = EXTRACT_LLM.with_structured_output(ICPProfileUpdate)
+    return structured.invoke([ICP_PROFILE_UPDATE_SYS, HumanMessage(text)])
+
+
+def _apply_icp_profile_llm_update(state: GraphState, upd: ICPProfileUpdate) -> dict[str, list[str]]:
+    prof = dict(state.get("icp_profile") or {})
+    applied: dict[str, list[str]] = {}
+    def _merge(field: str, values: list[str]):
+        nonlocal prof, applied
+        if not values:
+            return
+        cur = [v for v in prof.get(field) or [] if isinstance(v, str)]
+        changed: list[str] = []
+        for val in values:
+            low = (val or "").strip().lower()
+            if not low:
+                continue
+            if any((v or "").strip().lower() == low for v in cur):
+                continue
+            cur.append(val)
+            changed.append(val)
+        if changed:
+            prof[field] = cur
+            applied[field] = changed
+    _merge("industries", upd.industries or [])
+    _merge("buyer_titles", upd.buyer_titles or [])
+    # Prefer size_bands field; many callers also alias as company_sizes downstream
+    if upd.size_bands:
+        _merge("size_bands", upd.size_bands)
+    _merge("geos", upd.geos or [])
+    # Integrations/signals
+    _merge("integrations", upd.integrations or [])
+    _merge("triggers", upd.triggers or [])
+    _merge("exclusions", upd.exclusions or [])
+    if applied:
+        state["icp_profile"] = prof
+        state["icp_profile_confirmed"] = False
+        _remember_icp_profile(state, prof)
     return applied
 
 
@@ -4669,11 +4830,24 @@ async def icp_node(state: GraphState) -> GraphState:
         has_company_profile = _has_company_profile_context(state)
         handled = False
         if wants_icp and seeds_ready and icp_profile_ready:
-            if not state.get("awaiting_icp_profile_confirmation"):
-                state["icp_profile_feedback_last_text"] = text
-                _prompt_icp_profile_confirmation(
-                    state, header="Sure — here’s the latest ICP profile snapshot:"
-                )
+            # LLM-driven update of ICP profile
+            feedback = text
+            try:
+                icp_upd = await extract_icp_profile_update(feedback)
+            except Exception:
+                icp_upd = None
+            applied_updates: dict[str, list[str]] = {}
+            if icp_upd is not None:
+                applied_updates = _apply_icp_profile_llm_update(state, icp_upd)
+            state["icp_profile_feedback_last_text"] = feedback
+            state["awaiting_icp_profile_confirmation"] = False
+            _prompt_icp_profile_confirmation(
+                state,
+                header=(
+                    "Updated. Here’s the latest ICP profile snapshot:" if applied_updates else
+                    "Sure — here’s the latest ICP profile snapshot:"
+                ),
+            )
             handled = True
         elif has_company_profile:
             # Apply the user's natural-language update directly to the in-memory

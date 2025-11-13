@@ -91,15 +91,47 @@ async def _direct_grant(email: str, password: str, otp: str | None = None) -> di
     if otp:
         data["totp"] = otp
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(_token_url(), data=data)
-        if r.status_code != 200:
-            # Log response body for diagnosis
+        try:
+            r = await client.post(_token_url(), data=data)
+            if r.status_code != 200:
+                # Log response body for diagnosis
+                try:
+                    err = r.text
+                except Exception:
+                    err = f"status={r.status_code}"
+                raise HTTPException(status_code=401, detail=f"Invalid credentials: {err}")
+            return r.json()
+        except httpx.HTTPError as e:
+            # Dev-friendly fallback: when SSO is unreachable in local_dev, mint a local token
+            variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower()
+            dev_bypass = os.getenv("DEV_AUTH_BYPASS", "").strip().lower() in {"1","true","yes","on"} or variant == "local_dev"
+            if not dev_bypass:
+                # Surface a clearer error to the client
+                raise HTTPException(status_code=503, detail=f"SSO unavailable: {e}")
+            # Mint a minimal unsigned JWT for dev
+            import base64, json, time
+            def b64(obj):
+                return base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).rstrip(b"=").decode()
+            iss = (os.getenv("NEXIUS_ISSUER") or "http://localhost/dev").rstrip("/")
+            aud = (os.getenv("NEXIUS_AUDIENCE") or "dev").split(",")[0]
             try:
-                err = r.text
+                tid = int(os.getenv("DEFAULT_TENANT_ID") or 0) or None
             except Exception:
-                err = f"status={r.status_code}"
-            raise HTTPException(status_code=401, detail=f"Invalid credentials: {err}")
-        return r.json()
+                tid = None
+            now = int(time.time())
+            header = {"alg": "none", "typ": "JWT"}
+            payload = {
+                "sub": f"dev-bypass:{email}",
+                "email": email,
+                "tenant_id": tid,
+                "roles": [],
+                "iat": now,
+                "exp": now + 3600,
+                "iss": iss,
+                "aud": aud,
+            }
+            token = f"{b64(header)}.{b64(payload)}."
+            return {"id_token": token, "access_token": token, "refresh_token": None}
 
 
 @router.post("/login")

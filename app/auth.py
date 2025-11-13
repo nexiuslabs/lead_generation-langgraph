@@ -73,12 +73,27 @@ def _public_key_for_token(token: str):
     raise HTTPException(status_code=401, detail="No matching JWK for kid")
 
 
+def _dev_mode_enabled() -> bool:
+    variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT", "") or "").strip().lower()
+    return variant == "local_dev" or _is_truthy(os.getenv("DEV_AUTH_BYPASS"))
+
+
 def verify_jwt(token: str) -> dict:
     """Verify a JWT against issuer and (optionally) audience.
 
     - Supports comma-separated audiences in NEXIUS_AUDIENCE.
     - In local_dev variant, if audience verification fails, fallback to no-aud verification to ease dev.
     """
+    # In local dev or when DEV_AUTH_BYPASS is true, avoid network calls and
+    # decode without verifying signature or audience. This prevents crashes
+    # when OIDC endpoints are unreachable during development.
+    if _dev_mode_enabled():
+        try:
+            return jwt.decode(token, options={"verify_signature": False})
+        except jwt.PyJWTError as e:
+            # Fall through to normal path if decoding fails for some reason
+            pass
+
     key = _public_key_for_token(token)
     audiences = _audiences()
     opts = {"verify_aud": bool(audiences)}
