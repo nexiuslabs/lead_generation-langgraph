@@ -3492,14 +3492,33 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                 prof_snapshot = dict(state.get("company_profile") or {})
                 _remember_company_profile(state, prof_snapshot)
                 _persist_company_profile_sync(state, prof_snapshot, confirmed=True)
-                state["messages"] = add_messages(
-                    state.get("messages") or [],
-                    [
+                # Acknowledge confirmation and immediately ask for seeds if missing
+                followups: list[AIMessage] = [
+                    AIMessage(
+                        "Great! I’ll keep that profile locked. Next we’ll capture your best customers so I can infer signals and propose micro‑ICP segments."
+                    )
+                ]
+                try:
+                    icp_f = dict(state.get("icp") or {})
+                except Exception:
+                    icp_f = {}
+                need_seeds = True
+                try:
+                    seeds = icp_f.get("seeds_list") or []
+                    need_seeds = not (isinstance(seeds, list) and len(seeds) >= 5)
+                except Exception:
+                    need_seeds = True
+                if need_seeds:
+                    asks = dict(state.get("ask_counts") or {})
+                    asks["seeds"] = asks.get("seeds", 0) + 1
+                    state["ask_counts"] = asks
+                    state["icp_last_focus"] = "seeds"
+                    followups.append(
                         AIMessage(
-                            "Great! I’ll keep that profile locked. Next up: I’ll propose micro‑ICP segments."
+                            "Please list 5–15 of your best customers (Company — website). Optionally add 2–3 lost/churned with a short reason."
                         )
-                    ],
-                )
+                    )
+                state["messages"] = add_messages(state.get("messages") or [], followups)
                 _emit_onboarding_event(
                     state,
                     "company_profile_verified",
@@ -3558,14 +3577,33 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
             prof_snapshot = dict(state.get("company_profile") or {})
             _remember_company_profile(state, prof_snapshot)
             _persist_company_profile_sync(state, prof_snapshot, confirmed=True)
-            state["messages"] = add_messages(
-                state.get("messages") or [],
-                [
+            followups: list[AIMessage] = [
+                AIMessage(
+                    "Great! I’ll keep that profile locked. Next we’ll capture your best customers so I can infer signals and propose micro‑ICP segments."
+                )
+            ]
+            # Ask for seeds immediately if missing
+            try:
+                icp_f = dict(state.get("icp") or {})
+            except Exception:
+                icp_f = {}
+            need_seeds = True
+            try:
+                seeds = icp_f.get("seeds_list") or []
+                need_seeds = not (isinstance(seeds, list) and len(seeds) >= 5)
+            except Exception:
+                need_seeds = True
+            if need_seeds:
+                asks = dict(state.get("ask_counts") or {})
+                asks["seeds"] = asks.get("seeds", 0) + 1
+                state["ask_counts"] = asks
+                state["icp_last_focus"] = "seeds"
+                followups.append(
                     AIMessage(
-                        "Great! I’ll keep that profile locked. Next up: I’ll propose micro‑ICP segments."
+                        "Please list 5–15 of your best customers (Company — website). Optionally add 2–3 lost/churned with a short reason."
                     )
-                ],
-            )
+                )
+            state["messages"] = add_messages(state.get("messages") or [], followups)
             _emit_onboarding_event(
                 state,
                 "company_profile_verified",
