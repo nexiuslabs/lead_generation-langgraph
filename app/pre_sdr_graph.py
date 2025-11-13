@@ -8,7 +8,7 @@ import os
 import re
 import textwrap
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, NotRequired, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Mapping, NotRequired, Optional, Tuple, TypedDict, Literal
 try:  # Python 3.9/3.10 fallback
     from typing import Annotated  # type: ignore
 except Exception:  # pragma: no cover
@@ -3347,7 +3347,7 @@ def _extract_profile_feedback_updates(feedback: str) -> Dict[str, List[str]]:
         verb_match = None
         try:
             verb_match = re.search(
-                rf"(?:add|include|plus|focus|target|expand|prioritize|emphasize)\s+(.+?)\s+(?:in|to|for)\s+{pattern}",
+                rf"(?:add|include|plus|focus|target|expand|prioritize|emphasize)\s+(.+?)\s+(?:in|to|for)\s+(?:the\s+)?{pattern}",
                 feedback,
                 flags=re.IGNORECASE,
             )
@@ -4064,6 +4064,117 @@ async def extract_update_from_text(text: str) -> ICPUpdate:
 
 
 # ------------------------------
+# LLM-driven Company Profile update extraction
+# ------------------------------
+
+
+class CompanyProfileUpdate(BaseModel):
+    industries: list[str] = Field(default_factory=list)
+    buyer_titles: list[str] = Field(default_factory=list)
+    geos: list[str] = Field(default_factory=list)
+    signals: list[str] = Field(default_factory=list)
+    summary_override: str | None = Field(
+        default=None, description="If user provided a replacement summary, set it here"
+    )
+
+
+COMPANY_PROFILE_UPDATE_SYS = SystemMessage(
+    content=(
+        "You interpret a user's natural-language request to UPDATE a Company Profile.\n"
+        "Return JSON ONLY with fields to add/adjust: industries (list[str]), buyer_titles (list[str]), geos (list[str]), signals (list[str]), summary_override (str|nullable).\n"
+        "- Extract only the NEW items the user asked to add or replace.\n"
+        "- If the user asked to 'add automation to industries', return industries:[\"automation\"].\n"
+        "- If the user provided a new summary text, put it entirely in summary_override; otherwise leave summary_override null.\n"
+        "- Do not invent information; if uncertain, return empty arrays and null."
+    )
+)
+
+
+async def extract_company_profile_update(text: str) -> CompanyProfileUpdate:
+    structured = EXTRACT_LLM.with_structured_output(CompanyProfileUpdate)
+    return await structured.ainvoke([COMPANY_PROFILE_UPDATE_SYS, HumanMessage(text)])
+
+
+def _apply_company_profile_llm_update(state: GraphState, upd: CompanyProfileUpdate) -> dict[str, list[str]]:
+    prof = dict(state.get("company_profile") or {})
+    applied: dict[str, list[str]] = {}
+    def _merge_list(field: str, values: list[str]):
+        nonlocal prof, applied
+        if not values:
+            return
+        cur = [v for v in prof.get(field) or [] if isinstance(v, str)]
+        changed: list[str] = []
+        for val in values:
+            low = (val or "").strip().lower()
+            if not low:
+                continue
+            if any((v or "").strip().lower() == low for v in cur):
+                continue
+            cur.append(val)
+            changed.append(val)
+        if changed:
+            prof[field] = cur
+            applied[field] = changed
+    _merge_list("industries", upd.industries or [])
+    _merge_list("buyer_titles", upd.buyer_titles or [])
+    _merge_list("geos", upd.geos or [])
+    _merge_list("signals", upd.signals or [])
+    if (upd.summary_override or "").strip():
+        prof["summary"] = (upd.summary_override or "").strip()
+        applied.setdefault("summary", [])
+    if applied:
+        prof["website_url"] = prof.get("website_url") or state.get("site_profile_bootstrap_url")
+        state["company_profile"] = prof
+        state["company_profile_confirmed"] = False
+        _remember_company_profile(state, prof)
+    return applied
+
+
+# ------------------------------
+# LLM-driven intent classification for profile actions
+# ------------------------------
+
+
+class ProfileIntent(BaseModel):
+    action: Literal[
+        "none",
+        "show_company",
+        "update_company",
+        "confirm_company",
+        "show_icp",
+        "update_icp",
+        "confirm_icp",
+    ] = "none"
+
+
+PROFILE_INTENT_SYS = SystemMessage(
+    content=(
+        "Classify the user's message into ONE action related to profiles.\n"
+        "Return JSON ONLY with {action}. Allowed values:\n"
+        "- show_company (e.g., 'show company profile', 'show me updated company profile')\n"
+        "- update_company (e.g., 'add automation to industries', 'change summary to ...')\n"
+        "- confirm_company (e.g., 'confirm profile', 'looks good' referring to Company Profile)\n"
+        "- show_icp (e.g., 'show ICP profile')\n"
+        "- update_icp (e.g., 'add healthcare to ICP industries', 'ICPs should include fintech')\n"
+        "- confirm_icp (e.g., 'confirm icp profile', 'icp looks good')\n"
+        "- none (if unrelated).\n"
+        "Use surrounding words to infer company vs icp; if unspecified, prefer company for 'profile'."
+    )
+)
+
+
+async def classify_profile_intent(text: str) -> str:
+    if not (text or "").strip():
+        return "none"
+    structured = EXTRACT_LLM.with_structured_output(ProfileIntent)
+    out = await structured.ainvoke([PROFILE_INTENT_SYS, HumanMessage(text)])
+    try:
+        return out.action
+    except Exception:
+        return "none"
+
+
+# ------------------------------
 # Dynamic question generation
 # ------------------------------
 
@@ -4479,6 +4590,7 @@ async def icp_node(state: GraphState) -> GraphState:
                 if rec.get("confirmed") is not None:
                     state["company_profile_confirmed"] = bool(rec.get("confirmed"))
 
+    llm_act: Optional[str] = None
     if _is_profile_show_request(text):
         wants_icp = _mentions_icp(text)
         if wants_icp and _has_icp_profile_context(state):
@@ -4509,10 +4621,48 @@ async def icp_node(state: GraphState) -> GraphState:
         )
         state["messages"] = add_messages(state.get("messages") or [], [AIMessage(target_msg)])
         return state
+    else:
+        # LLM-driven show intent fallback
+        try:
+            llm_act = await classify_profile_intent(text)
+        except Exception:
+            llm_act = None
+        if llm_act == "show_company":
+            if _has_company_profile_context(state):
+                _prompt_profile_confirmation(
+                    state,
+                    header="Here’s the latest company profile snapshot:",
+                    require_confirmation=not bool(state.get("company_profile_confirmed")),
+                )
+            else:
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [AIMessage("I haven’t captured a company profile yet — share your website URL so I can summarize it.")],
+                )
+            return state
+        if llm_act == "show_icp":
+            if _has_icp_profile_context(state):
+                _prompt_icp_profile_confirmation(
+                    state,
+                    header="Here’s the latest ICP profile snapshot:",
+                    require_confirmation=not bool(state.get("icp_profile_confirmed")),
+                )
+            else:
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [AIMessage("I haven’t synthesized an ICP profile yet — list 5–15 best customers so I can analyze them.")],
+                )
+            return state
 
-    if _is_profile_update_request(text):
+    # Update intent: pattern or LLM-driven
+    if _is_profile_update_request(text) or (llm_act in {"update_company", "update_icp"}):
         lowered = text.lower()
         wants_icp = ("icp" in lowered) or ("ideal customer" in lowered)
+        # If LLM classified explicitly, honor it
+        if llm_act == "update_company":
+            wants_icp = False
+        elif llm_act == "update_icp":
+            wants_icp = True
         icp = state.get("icp") or {}
         seeds_ready = len(icp.get("seeds_list") or []) >= 5
         icp_profile_ready = _has_icp_profile_context(state)
@@ -4526,13 +4676,39 @@ async def icp_node(state: GraphState) -> GraphState:
                 )
             handled = True
         elif has_company_profile:
-            # Always treat explicit update intent as fresh feedback on the company profile,
-            # even if we're already awaiting confirmation. This ensures we emit an
-            # AI snapshot message and break router re-entry loops.
-            state["profile_feedback_last_text"] = text
+            # Apply the user's natural-language update directly to the in-memory
+            # company profile, then show an updated snapshot and re-open the
+            # confirmation loop (memory-only until confirm).
+            feedback = text
+            # Keep a note of the raw feedback
+            prof0 = dict(state.get("company_profile") or {})
+            notes = list(prof0.get("manual_notes") or [])
+            notes.append(feedback)
+            prof0["manual_notes"] = notes[-10:]
+            state["company_profile"] = prof0
+            # LLM-driven: extract and apply structured updates (industries, buyers, geos, signals, summary)
+            updates: dict[str, list[str]] = {}
+            try:
+                llm_upd = await extract_company_profile_update(feedback)
+            except Exception:
+                llm_upd = None  # fallback to pattern-based if LLM fails
+            if llm_upd is not None:
+                applied_llm = _apply_company_profile_llm_update(state, llm_upd)
+                updates.update(applied_llm)
+            if not updates:
+                # Fallback: light pattern-based extraction as a safety net
+                fb_updates = _extract_profile_feedback_updates(feedback)
+                _ = _apply_profile_feedback_updates(state, fb_updates)
+                updates.update(fb_updates)
+            # Re-prompt with the updated snapshot; mark as awaiting confirmation again
+            state["profile_feedback_last_text"] = feedback
             state["awaiting_profile_confirmation"] = False
             _prompt_profile_confirmation(
-                state, header="Sure — here’s the latest company profile snapshot:"
+                state,
+                header=(
+                    "Updated. Here’s the latest company profile snapshot:" if updates else
+                    "Sure — here’s the latest company profile snapshot:"
+                ),
             )
             handled = True
         elif seeds_ready and icp_profile_ready:
