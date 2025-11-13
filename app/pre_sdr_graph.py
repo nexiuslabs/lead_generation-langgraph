@@ -1562,44 +1562,10 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
                             )
                     )
                     return state
-            # Optionally run LLM ICP synthesizer to augment inferred profile
-            try:
-                if ENABLE_AGENT_DISCOVERY and _agent_icp_synth is not None:
-                    s = {
-                        "icp_profile": dict(state.get("icp") or {}),
-                        "seeds": [{"url": u, "snippet": ""} for u in (icp.get("seeds_list") or [])],
-                    }
-                    icp_prof = _agent_icp_synth(s).get("icp_profile")
-                    if icp_prof:
-                        state["icp_profile"] = icp_prof
-                        # Inform the user in chat once the AI agents have synthesized the ICP
-                        try:
-                            ind = ", ".join((icp_prof.get("industries") or [])[:3]) or "n/a"
-                            titles = ", ".join((icp_prof.get("buyer_titles") or [])[:3]) or "n/a"
-                            sizes = ", ".join((icp_prof.get("size_bands") or [])[:3]) or "n/a"
-                            sigs = ", ".join((icp_prof.get("integrations") or [])[:3]) or "n/a"
-                            trig = ", ".join((icp_prof.get("triggers") or [])[:3]) or "n/a"
-                            lines = [
-                                "ICP profile ready.",
-                                f"- Industries: {ind}",
-                                f"- Buyer titles: {titles}",
-                                f"- Size bands: {sizes}",
-                                f"- Integrations/signals: {sigs}",
-                                f"- Triggers: {trig}",
-                                "Reply confirm to proceed or edit any field.",
-                            ]
-                            state["messages"].append(AIMessage("\n".join(lines)))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            # Ready to confirm
-            state["messages"].append(
-                AIMessage(
-                    "Thanks! I’ll crawl your site + seed sites, plan web discovery, and propose a Top‑10 with evidence. ACRA is only used later in the nightly SG pass. Reply confirm to proceed, or add more seeds."
-                )
-            )
-            return state
+            state["icp"] = icp_f
+            # Do not advance until ICP profile is confirmed
+            if not icp_f.get("icp_profile_confirmed"):
+                return state
     except Exception:
         pass
 
@@ -3267,11 +3233,15 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
             if domain:
                 url = domain if domain.startswith("http") else f"https://{domain}"
                 seeds_payload.append({"url": url, "snippet": ""})
+                logger.info("[icp intake] seed queued for crawl: %s", url)
         elif isinstance(seed, str):
             url = seed if seed.startswith("http") else f"https://{seed}"
             seeds_payload.append({"url": url, "snippet": ""})
+            logger.info("[icp intake] seed queued for crawl: %s", url)
     if not seeds_payload:
         return
+    seed_urls = [item.get("url") for item in seeds_payload if item.get("url")]
+    logger.info("[icp intake] synthesizing ICP profile from %d seed URLs", len(seed_urls))
     prof_updates: Dict[str, Any] = {}
     try:
         synth_state = _agent_icp_synth(
@@ -3288,8 +3258,8 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
     state["icp_profile"] = prof_updates
     state["icp_profile_confirmed"] = False
     state["icp_profile_seed_fingerprint"] = fingerprint
-    # Keep ICP draft in memory until user confirms
     _remember_icp_profile(state, prof_updates)
+    logger.info("[icp intake] ICP profile synthesized with keys=%s", sorted(prof_updates.keys()))
     _prompt_icp_profile_confirmation(state)
 
 
@@ -3732,6 +3702,9 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
 
     if not awaiting:
         _prompt_icp_profile_confirmation(state)
+        if incoming_text:
+            state["icp_profile_feedback_last_text"] = incoming_text
+        state["icp_profile_feedback_handled_len"] = msg_len
         return "prompted"
 
     if awaiting and not has_new_input:
@@ -5049,8 +5022,13 @@ async def icp_node(state: GraphState) -> GraphState:
     try:
         if ENABLE_ICP_INTAKE:
             icp_f = dict(state.get("icp") or {})
-            # Ask for website URL first
             if not icp_f.get("website_url"):
+                fallback_site = (state.get("site_profile_bootstrap_url") or "").strip()
+                if fallback_site:
+                    icp_f["website_url"] = fallback_site
+            # Ask for website URL first
+            awaiting_seeds = (state.get("icp_last_focus") == "seeds") or bool((state.get("ask_counts") or {}).get("seeds"))
+            if (not icp_f.get("website_url")) and not awaiting_seeds:
                 url = _parse_website(text)
                 if url:
                     logger.info(
@@ -5080,6 +5058,8 @@ async def icp_node(state: GraphState) -> GraphState:
                         [AIMessage("\n".join(ack_lines))],
                     )
                     await _maybe_bootstrap_profile_from_site(state, url)
+                    state["icp_last_focus"] = "profile"
+                    state["icp"] = icp_f
                 else:
                     logger.info("[icp intake] no website detected in latest reply; prompting again")
                     state["messages"] = add_messages(
@@ -5106,9 +5086,9 @@ async def icp_node(state: GraphState) -> GraphState:
                         except Exception:
                             _reset_icp_profile_loop(state)
                         asks = dict(state.get("ask_counts") or {})
-                        if asks.get("seeds", 0) == 0:
-                            asks["seeds"] = 1
-                            state["ask_counts"] = asks
+                        asks["seeds"] = 0
+                        state["ask_counts"] = asks
+                        state["icp_last_focus"] = "icp_profile"
                         logger.info(
                             "[icp intake] stored %d seeds (previous=%d); gating satisfied",
                             len(seeds),
@@ -5130,41 +5110,45 @@ async def icp_node(state: GraphState) -> GraphState:
                         )
                         state["icp"] = icp_f
                         return state
-                if not icp_f.get("seeds_list"):
-                    asks = dict(state.get("ask_counts") or {})
-                    state["icp_last_focus"] = "seeds"
-                    if asks.get("seeds", 0) == 0:
-                        asks["seeds"] = 1
-                        state["ask_counts"] = asks
-                        logger.info("[icp intake] prompting for best customers (first ask)")
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [
-                                AIMessage(
-                                    "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
-                                )
-                            ],
-                        )
-                    else:
-                        logger.info(
-                            "[icp intake] re-prompting for best customers (ask_count=%d)",
-                            asks.get("seeds", 0),
-                        )
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [
-                                AIMessage(
-                                    "That doesn’t seem to answer my question about best customers. Please list seeds as 'Company — domain' per line, one per line. Thanks!"
-                                )
-                            ],
-                        )
+            if not icp_f.get("seeds_list"):
+                asks = dict(state.get("ask_counts") or {})
+                state["icp_last_focus"] = "seeds"
+                if asks.get("seeds", 0) == 0:
+                    asks["seeds"] = 1
+                    state["ask_counts"] = asks
+                    logger.info("[icp intake] prompting for best customers (first ask)")
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [
+                            AIMessage(
+                                "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                            )
+                        ],
+                    )
+                else:
+                    logger.info(
+                        "[icp intake] re-prompting for best customers (ask_count=%d)",
+                        asks.get("seeds", 0),
+                    )
+                    state["messages"] = add_messages(
+                        state.get("messages") or [],
+                        [
+                            AIMessage(
+                                "That doesn’t seem to answer my question about best customers. Please list seeds as 'Company — domain' per line, one per line. Thanks!"
+                            )
+                        ],
+                    )
                     state["icp"] = icp_f
                     return state
 
             seeds_ready = len(icp_f.get("seeds_list") or []) >= 5
             icp_profile_loop_active = seeds_ready
             if icp_profile_loop_active:
+                awaiting_before = bool(state.get("awaiting_icp_profile_confirmation"))
                 await _maybe_bootstrap_icp_profile_from_seeds(state)
+                if state.get("awaiting_icp_profile_confirmation") and not awaiting_before:
+                    state["icp_profile_feedback_last_text"] = text or ""
+                    state["icp_profile_feedback_handled_len"] = len(state.get("messages") or [])
                 icp_profile_gate = _handle_icp_profile_confirmation_gate(state, text)
                 if icp_profile_gate in ("await", "prompted"):
                     state["icp"] = icp_f
@@ -5172,10 +5156,10 @@ async def icp_node(state: GraphState) -> GraphState:
                 if state.get("awaiting_icp_profile_confirmation"):
                     state["icp"] = icp_f
                     return state
-                if state.get("icp_profile_confirmed"):
-                    icp_f["icp_profile_confirmed"] = True
+                if not state.get("icp_profile_confirmed"):
                     state["icp"] = icp_f
                     return state
+                icp_f["icp_profile_confirmed"] = True
             # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation immediately
             if ICP_WIZARD_FAST_START_ONLY:
                 if not icp_f.get("fast_start_explained"):
@@ -5189,16 +5173,9 @@ async def icp_node(state: GraphState) -> GraphState:
                     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
                     icp_f["fast_start_explained"] = True
                 # Go straight to confirmation prompt
-                state["messages"] = add_messages(
-                    state.get("messages") or [],
-                    [
-                        AIMessage(
-                            "Thanks! I’ll crawl your site + seed sites, run web discovery, extract evidence, and propose a Top‑10 with why‑us fit. ACRA is used later during the SG nightly pass. Reply confirm to proceed, or adjust any detail."
-                        )
-                    ],
-                )
-                state["icp"] = icp_f
-                return state
+                if not state.get("icp_profile_confirmed"):
+                    state["icp"] = icp_f
+                    return state
 
             # Collect core ICP points before confirmation: industries -> employees -> geos -> (optional) signals
             # 1) Industries (skip when fast-start is enabled; we infer from evidence)
