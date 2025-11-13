@@ -531,6 +531,11 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 row = _cur.fetchone()
                 payload_rule = row[0] if row and row[0] is not None else None
+                _cur.execute(
+                    "SELECT profile, confirmed, source_url FROM tenant_company_profiles WHERE tenant_id=%s",
+                    (int(tenant_id),),
+                )
+                company_row = _cur.fetchone()
             if isinstance(payload_rule, dict) and payload_rule:
                 # Map rule payload into chat state icp fields and an icp_profile for agent discovery
                 icp_ic = {}
@@ -565,6 +570,15 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                     state["icp"] = icp_ic
                 if prof:
                     state["icp_profile"] = prof
+            if company_row:
+                comp_profile = company_row[0] if isinstance(company_row[0], dict) else {}
+                if comp_profile:
+                    state["company_profile"] = comp_profile
+                confirmed = bool(company_row[1]) if company_row[1] is not None else False
+                if confirmed:
+                    state["company_profile_confirmed"] = True
+                if company_row[2]:
+                    state["site_profile_bootstrap_url"] = company_row[2]
     except Exception:
         # Non-fatal; proceed without priming
         pass
