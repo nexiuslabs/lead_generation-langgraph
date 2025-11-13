@@ -5053,6 +5053,11 @@ async def icp_node(state: GraphState) -> GraphState:
             if not icp_f.get("website_url"):
                 url = _parse_website(text)
                 if url:
+                    logger.info(
+                        "[icp intake] captured website_url=%s (previous=%s)",
+                        url,
+                        (state.get("site_profile_bootstrap_url") or "").strip() or "-",
+                    )
                     icp_f["website_url"] = url
                     previous_url = (state.get("site_profile_bootstrap_url") or "").strip()
                     if previous_url != url.strip():
@@ -5075,9 +5080,8 @@ async def icp_node(state: GraphState) -> GraphState:
                         [AIMessage("\n".join(ack_lines))],
                     )
                     await _maybe_bootstrap_profile_from_site(state, url)
-                    state["icp"] = icp_f
-                    return state
                 else:
+                    logger.info("[icp intake] no website detected in latest reply; prompting again")
                     state["messages"] = add_messages(
                         state.get("messages") or [],
                         [AIMessage("Let's infer your ICP from evidence. What's your website URL?")],
@@ -5085,53 +5089,77 @@ async def icp_node(state: GraphState) -> GraphState:
                     state["icp"] = icp_f
                     return state
             if not icp_f.get("seeds_list"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("seeds", 0) == 0:
-                    asks["seeds"] = 1
-                    state["ask_counts"] = asks
-                    state["icp_last_focus"] = "seeds"
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [
-                            AIMessage(
-                                "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
-                            )
-                        ],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    seeds = _parse_seeds(text)
-                    if seeds:
-                        if len(seeds) >= 5:
-                            prev = list(icp_f.get("seeds_list") or [])
-                            icp_f["seeds_list"] = seeds
-                            try:
-                                if prev:
-                                    prev_keys = {(p.get("seed_name"), p.get("domain")) for p in prev if isinstance(p, dict)}
-                                else:
-                                    prev_keys = set()
-                                new_keys = {(p.get("seed_name"), p.get("domain")) for p in seeds if isinstance(p, dict)}
-                                if prev_keys != new_keys:
-                                    _reset_icp_profile_loop(state)
-                            except Exception:
+                seeds = _parse_seeds(text)
+                if seeds:
+                    logger.info("[icp intake] parsed %d potential seeds from latest reply", len(seeds))
+                    if len(seeds) >= 5:
+                        prev = list(icp_f.get("seeds_list") or [])
+                        icp_f["seeds_list"] = seeds
+                        try:
+                            if prev:
+                                prev_keys = {(p.get("seed_name"), p.get("domain")) for p in prev if isinstance(p, dict)}
+                            else:
+                                prev_keys = set()
+                            new_keys = {(p.get("seed_name"), p.get("domain")) for p in seeds if isinstance(p, dict)}
+                            if prev_keys != new_keys:
                                 _reset_icp_profile_loop(state)
-                        else:
-                            state["icp_last_focus"] = "seeds"
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage(f"That doesn’t quite answer my question yet — I need at least 5 best customers. You shared {len(seeds)}; please add a few more (format: Company — website).")],
-                            )
-                            state["icp"] = icp_f
-                            return state
+                        except Exception:
+                            _reset_icp_profile_loop(state)
+                        asks = dict(state.get("ask_counts") or {})
+                        if asks.get("seeds", 0) == 0:
+                            asks["seeds"] = 1
+                            state["ask_counts"] = asks
+                        logger.info(
+                            "[icp intake] stored %d seeds (previous=%d); gating satisfied",
+                            len(seeds),
+                            len(prev),
+                        )
                     else:
+                        logger.info(
+                            "[icp intake] insufficient seeds (%d provided); requesting more",
+                            len(seeds),
+                        )
                         state["icp_last_focus"] = "seeds"
                         state["messages"] = add_messages(
                             state.get("messages") or [],
-                            [AIMessage("That doesn’t seem to answer my question about best customers. Please list seeds as 'Company — domain' per line, one per line. Thanks!")],
+                            [
+                                AIMessage(
+                                    f"That doesn’t quite answer my question yet — I need at least 5 best customers. You shared {len(seeds)}; please add a few more (format: Company — website)."
+                                )
+                            ],
                         )
                         state["icp"] = icp_f
                         return state
+                if not icp_f.get("seeds_list"):
+                    asks = dict(state.get("ask_counts") or {})
+                    state["icp_last_focus"] = "seeds"
+                    if asks.get("seeds", 0) == 0:
+                        asks["seeds"] = 1
+                        state["ask_counts"] = asks
+                        logger.info("[icp intake] prompting for best customers (first ask)")
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [
+                                AIMessage(
+                                    "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                                )
+                            ],
+                        )
+                    else:
+                        logger.info(
+                            "[icp intake] re-prompting for best customers (ask_count=%d)",
+                            asks.get("seeds", 0),
+                        )
+                        state["messages"] = add_messages(
+                            state.get("messages") or [],
+                            [
+                                AIMessage(
+                                    "That doesn’t seem to answer my question about best customers. Please list seeds as 'Company — domain' per line, one per line. Thanks!"
+                                )
+                            ],
+                        )
+                    state["icp"] = icp_f
+                    return state
 
             seeds_ready = len(icp_f.get("seeds_list") or []) >= 5
             icp_profile_loop_active = seeds_ready
