@@ -46,3 +46,20 @@ def test_router_routes_profile_show_requests_back_to_icp():
     state["site_profile_summary_sent"] = True
 
     assert presdr.router(state) == "icp"
+
+
+def test_router_blocks_run_discovery_until_icp_confirmed():
+    state = _router_state("please run discovery")
+    state["icp_profile_confirmed"] = False
+
+    assert presdr.router(state) == "end"
+    last_ai = next((msg for msg in reversed(state["messages"]) if isinstance(msg, AIMessage)), None)
+    assert last_ai is not None
+    assert "confirm your icp profile" in (last_ai.content or "").lower()
+
+
+def test_router_allows_run_discovery_once_icp_confirmed():
+    state = _router_state("run discovery now")
+    state["icp_profile_confirmed"] = True
+
+    assert presdr.router(state) == "confirm"

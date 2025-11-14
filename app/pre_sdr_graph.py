@@ -2789,6 +2789,28 @@ def _remember_procedural_step(state: GraphState, step: str) -> None:
     state["short_term_memory"] = mem
 
 
+def _nonempty_profile_keys(profile: Mapping[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for key, value in (profile or {}).items():
+        if isinstance(value, (list, tuple, dict)):
+            if value:
+                keys.append(key)
+        else:
+            if value not in (None, "", False):
+                keys.append(key)
+    return sorted(set(keys))
+
+
+def _remind_icp_confirmation_required(state: GraphState) -> None:
+    try:
+        state["messages"] = add_messages(
+            state.get("messages") or [],
+            [AIMessage(DISCOVERY_CONFIRMATION_REQUIRED)],
+        )
+    except Exception:
+        pass
+
+
 def _log_new_messages_to_memory(state: GraphState, messages: List[BaseMessage]) -> None:
     last_logged = int(state.get("short_term_memory_logged_len") or 0)
     total = len(messages)
@@ -2957,13 +2979,23 @@ def synthesize_welcome_message(state: Dict[str, Any]) -> str:
 
 
 PROFILE_CONFIRM_RE = re.compile(
-    r"\b(confirm(ed)?|looks good|sounds good|accurate|yes|yep|ok(ay)?|lgtm|proceed)\b",
+    r"\b(confirm(ed)?|confimr|confrim|cofirm|cnofirm|confrm|looks good|sounds good|accurate|yes|yep|ok(ay)?|lgtm|proceed)\b",
     flags=re.IGNORECASE,
 )
 MICRO_CONFIRM_RE = re.compile(
     r"\b(confirm(\s+micro)?-?icp|looks good|sounds good|ready|locked in)\b",
     flags=re.IGNORECASE,
 )
+ICP_KEYWORD_RE = re.compile(r"\b(icp|icps|ideal\s+customer|ideal\s+client)\b", flags=re.IGNORECASE)
+COMPANY_PROFILE_KEYWORD_RE = re.compile(
+    r"\b(company|business|organisation|organization|org|startup|firm|hq)\b",
+    flags=re.IGNORECASE,
+)
+ICP_CONFIRM_CLARIFICATION = (
+    "The company profile is already locked. If you're happy with the ICP profile shown above, "
+    "reply **confirm icp profile** (or tell me what to change)."
+)
+DISCOVERY_CONFIRMATION_REQUIRED = "Please confirm your ICP profile first so I can use it for discovery."
 ANTI_ICP_HINTS = ("avoid", "exclude", "not a fit", "bad fit", "no longer", "skip", "without", "except")
 PROFILE_FEEDBACK_HINTS = (
     ("industries", r"industr(?:y|ies)"),
@@ -2975,6 +3007,35 @@ PROFILE_UPDATE_VERB_RE = re.compile(
     r"^(?:to\s+)?(?:add|include|plus|focus|target|expand|prioritize|emphasize)\s+",
     flags=re.IGNORECASE,
 )
+_CONFIRM_TOKENS = ("confirm", "confimr", "confrim", "cofirm", "cnofirm", "confrm", "confirmed")
+
+
+def _matches_profile_confirm_command(text: Optional[str], *, icp: bool = False) -> bool:
+    if not text:
+        return False
+    try:
+        lowered = text.lower()
+    except Exception:
+        lowered = str(text or "").lower()
+    confirm_hit = bool(PROFILE_CONFIRM_RE.search(text or ""))
+    if not confirm_hit:
+        tokens_pattern = "|".join({tok for tok in _CONFIRM_TOKENS if tok})
+        try:
+            confirm_hit = bool(re.search(rf"\b({tokens_pattern})\b", lowered, flags=re.IGNORECASE))
+        except re.error:
+            confirm_hit = any(tok in lowered for tok in _CONFIRM_TOKENS)
+    if not confirm_hit:
+        return False
+    mentions_icp = _mentions_icp(text)
+    mentions_company = _mentions_company_profile(text)
+    has_profile_keyword = "profile" in lowered
+    if icp:
+        return mentions_icp
+    if mentions_icp and not mentions_company:
+        return False
+    if not (has_profile_keyword or mentions_company):
+        return False
+    return True
 
 
 def _emit_onboarding_event(
@@ -3600,12 +3661,7 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
     try:
         # Only auto-confirm here on explicit company profile confirms
         # (e.g., "confirm profile" or "confirm company profile").
-        _company_confirm_cmd = False
-        if incoming_text:
-            try:
-                _company_confirm_cmd = bool(re.search(r"\bconfirm\s+(company\s+)?profile\b", incoming_text, flags=re.IGNORECASE))
-            except Exception:
-                _company_confirm_cmd = False
+        _company_confirm_cmd = _matches_profile_confirm_command(incoming_text, icp=False)
         if (not awaiting) and _company_confirm_cmd:
             if _has_company_profile_context(state):
                 state["company_profile_confirmed"] = True
@@ -3641,11 +3697,20 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                         )
                     )
                 state["messages"] = add_messages(state.get("messages") or [], followups)
+                telemetry = {
+                    "company_profile": prof_snapshot,
+                    "company_profile_keys": _nonempty_profile_keys(prof_snapshot),
+                }
+                tenant_id = state.get("tenant_id")
+                if tenant_id:
+                    telemetry["tenant_id"] = tenant_id
+                if incoming_text:
+                    telemetry["confirmation_text"] = incoming_text
                 _emit_onboarding_event(
                     state,
                     "company_profile_verified",
                     "User confirmed the synthesized company profile.",
-                    {"company_profile": prof_snapshot},
+                    telemetry,
                 )
                 return "continue"
     except Exception:
@@ -3681,12 +3746,12 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
             except Exception:
                 pass
             return "continue"
-        if _is_profile_show_request(reply):
+        if _is_profile_show_request(reply, icp=False):
             _prompt_profile_confirmation(
                 state, header="Here’s the latest company profile snapshot:", require_confirmation=True
             )
             return "await"
-        if _is_profile_update_request(reply):
+        if _is_profile_update_request(reply, icp=False):
             state["awaiting_profile_confirmation"] = False
             state["profile_feedback_last_text"] = reply
             _prompt_profile_confirmation(state)
@@ -3694,6 +3759,16 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
         if not reply:
             return "await"
         if PROFILE_CONFIRM_RE.search(reply):
+            if _mentions_icp(reply) and not _mentions_company_profile(reply):
+                state["messages"] = add_messages(
+                    state.get("messages") or [],
+                    [
+                        AIMessage(
+                            "Sounds like you’re referring to the ICP profile. Let’s finish confirming your company profile first — reply with any edits or say **confirm profile** when it looks good."
+                        )
+                    ],
+                )
+                return "await"
             state["company_profile_confirmed"] = True
             state["awaiting_profile_confirmation"] = False
             state["company_profile_pending"] = False
@@ -3727,11 +3802,20 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                     )
                 )
             state["messages"] = add_messages(state.get("messages") or [], followups)
+            telemetry = {
+                "company_profile": prof_snapshot,
+                "company_profile_keys": _nonempty_profile_keys(prof_snapshot),
+            }
+            tenant_id = state.get("tenant_id")
+            if tenant_id:
+                telemetry["tenant_id"] = tenant_id
+            if reply:
+                telemetry["confirmation_text"] = reply
             _emit_onboarding_event(
                 state,
                 "company_profile_verified",
                 "User confirmed the synthesized company profile.",
-                {"company_profile": prof_snapshot},
+                telemetry,
             )
             return "continue"
         # Treat everything else as feedback
@@ -3741,6 +3825,7 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
         manual_notes.append(feedback)
         prof["manual_notes"] = manual_notes[-10:]
         state["company_profile"] = prof
+        _remember_company_profile(state, prof)
         state["company_profile_confirmed"] = False
         updates = _extract_profile_feedback_updates(feedback)
         applied = _apply_profile_feedback_updates(state, updates)
@@ -3821,10 +3906,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     try:
         _icp_confirm_cmd = False
         if incoming_text:
-            try:
-                _icp_confirm_cmd = bool(re.search(r"\bconfirm\s+(icp\s+)?profile\b", incoming_text, flags=re.IGNORECASE))
-            except Exception:
-                _icp_confirm_cmd = False
+            _icp_confirm_cmd = _matches_profile_confirm_command(incoming_text, icp=True)
         if (not awaiting) and _icp_confirm_cmd and _has_icp_profile_context(state):
             state["icp_profile_confirmed"] = True
             state["awaiting_icp_profile_confirmation"] = False
@@ -3841,11 +3923,20 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
                     )
                 ],
             )
+            telemetry = {
+                "icp_profile": prof_snapshot,
+                "icp_profile_keys": _nonempty_profile_keys(prof_snapshot),
+            }
+            tenant_id = state.get("tenant_id")
+            if tenant_id:
+                telemetry["tenant_id"] = tenant_id
+            if incoming_text:
+                telemetry["confirmation_text"] = incoming_text
             _emit_onboarding_event(
                 state,
                 "icp_profile_verified",
                 "User confirmed the customer-derived ICP profile.",
-                {"icp_profile": prof_snapshot},
+                telemetry,
             )
             return "continue"
     except Exception:
@@ -3870,6 +3961,17 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
         state["icp_profile_feedback_last_text"] = reply
 
     if PROFILE_CONFIRM_RE.search(reply):
+        mentions_icp = _mentions_icp(reply)
+        mentions_company = _mentions_company_profile(reply)
+        if not mentions_icp:
+            clarification = ICP_CONFIRM_CLARIFICATION
+            if mentions_company:
+                clarification = (
+                    "Looks like you’re confirming the company profile. I’m showing the ICP snapshot here — say **confirm icp profile** "
+                    "(or let me know what to change) when this view looks correct."
+                )
+            state["messages"] = add_messages(state.get("messages") or [], [AIMessage(clarification)])
+            return "await"
         state["icp_profile_confirmed"] = True
         state["awaiting_icp_profile_confirmation"] = False
         state["icp_profile_pending"] = False
@@ -3885,21 +3987,30 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
                 )
             ],
         )
+        telemetry = {
+            "icp_profile": prof_snapshot,
+            "icp_profile_keys": _nonempty_profile_keys(prof_snapshot),
+        }
+        tenant_id = state.get("tenant_id")
+        if tenant_id:
+            telemetry["tenant_id"] = tenant_id
+        if reply:
+            telemetry["confirmation_text"] = reply
         _emit_onboarding_event(
             state,
             "icp_profile_verified",
             "User confirmed the customer-derived ICP profile.",
-            {"icp_profile": prof_snapshot},
+            telemetry,
         )
         return "continue"
 
-    if _is_profile_show_request(reply):
+    if _is_profile_show_request(reply, icp=True):
         _prompt_icp_profile_confirmation(
             state, header="Here’s the latest ICP profile snapshot:", require_confirmation=True
         )
         return "await"
 
-    if _is_profile_update_request(reply):
+    if _is_profile_update_request(reply, icp=True):
         # LLM-driven ICP update inside the confirmation loop
         try:
             icp_upd = extract_icp_profile_update_sync(reply)
@@ -3927,6 +4038,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     manual_notes.append(feedback)
     prof["manual_notes"] = manual_notes[-10:]
     state["icp_profile"] = prof
+    _remember_icp_profile(state, prof)
     state["icp_profile_confirmed"] = False
     # Keep drafts in memory only; do not persist until confirm
     # Try LLM-driven merge for additional structure
@@ -4134,11 +4246,14 @@ def _user_just_confirmed(state: dict) -> bool:
     msgs = state.get("messages") or []
     for m in reversed(msgs):
         if isinstance(m, HumanMessage):
-            raw = (getattr(m, "content", "") or "").strip().lower()
-            # normalize punctuation
+            raw = _to_text(getattr(m, "content", "") or "")
+            if not raw:
+                continue
+            text = raw.strip()
+            lowered = text.lower()
+            # normalize trailing punctuation
             import re as _re
-            txt = _re.sub(r"[\s.!?]+$", "", raw)
-            # accept common confirmations
+            normalized = _re.sub(r"[\s.!?]+$", "", lowered)
             confirmed_set = {
                 "confirm",
                 "confirmed",
@@ -4153,8 +4268,16 @@ def _user_just_confirmed(state: dict) -> bool:
                 "continue",
                 "sounds good",
                 "done",
+                "confirm profile",
+                "confirm icp profile",
             }
-            return txt in confirmed_set
+            if normalized in confirmed_set:
+                return True
+            if PROFILE_CONFIRM_RE.search(text):
+                return True
+            if _matches_profile_confirm_command(text, icp=False) or _matches_profile_confirm_command(text, icp=True):
+                return True
+            return False
     return False
 
 
@@ -7937,8 +8060,34 @@ def router(state: GraphState) -> str:
 
     # 2) If assistant spoke last and no pending work, wait for user input (covered by early guard)
 
+    # Discovery guard: require confirmed ICP before planner/enrichment
+    if "run discovery" in text:
+        if not state.get("icp_profile_confirmed"):
+            logger.info("router -> end (run discovery blocked until ICP confirmed)")
+            _remind_icp_confirmation_required(state)
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "end"
+        logger.info("router -> confirm (user requested discovery run)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        _remember_procedural_step(state, "run_discovery")
+        return "confirm"
+
     # 3) Fast-path: user requested enrichment (only when last turn was human)
     if "run enrichment" in text:
+        if not state.get("icp_profile_confirmed"):
+            logger.info("router -> end (run enrichment blocked until ICP confirmed)")
+            _remind_icp_confirmation_required(state)
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "end"
         logger.info("router -> enrich (user requested enrichment)")
         try:
             state["last_routed_text"] = text
@@ -7996,7 +8145,16 @@ def router(state: GraphState) -> str:
         pass
 
     # 6) User said confirm: proceed forward once (avoid loops)
-    if _user_just_confirmed(state):
+    just_confirmed = _user_just_confirmed(state)
+    if just_confirmed:
+        if not state.get("icp_profile_confirmed"):
+            logger.info("router -> icp (confirmation gated until ICP profile locked)")
+            _remind_icp_confirmation_required(state)
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "icp"
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
         if ENABLE_ICP_INTAKE:
             has_minimal = bool(icp.get("website_url")) and bool(icp.get("seeds_list"))
@@ -8225,24 +8383,45 @@ PROFILE_UPDATE_VERBS = r"\b(update|edit|change|fix|tweak|adjust|revise|add|inclu
 PROFILE_SHOW_VERBS = r"\b(show|display|see|review|recap|repeat|resend|reshare|share|remind)\b"
 
 
-def _is_profile_update_request(text: str) -> bool:
+def _is_profile_update_request(text: str, *, icp: Optional[bool] = None) -> bool:
     if not text:
         return False
     lowered = text.lower()
     if not re.search(PROFILE_UPDATE_VERBS, lowered):
         return False
+    mentions_icp = _mentions_icp(text)
+    mentions_company = _mentions_company_profile(text)
+    wants_icp = icp if icp is not None else (mentions_icp and not mentions_company)
+    if wants_icp:
+        if not mentions_icp:
+            return False
+    else:
+        if mentions_icp and not mentions_company:
+            return False
     return any(hint in lowered for hint in PROFILE_FIELD_HINTS)
 
 
-def _is_profile_show_request(text: str) -> bool:
+def _is_profile_show_request(text: str, *, icp: Optional[bool] = None) -> bool:
     if not text:
         return False
     lowered = text.lower()
     if not re.search(PROFILE_SHOW_VERBS, lowered):
         return False
+    mentions_icp = _mentions_icp(text)
+    mentions_company = _mentions_company_profile(text)
+    wants_icp = icp if icp is not None else (mentions_icp and not mentions_company)
+    if wants_icp:
+        if not mentions_icp:
+            return False
+    else:
+        if mentions_icp and not mentions_company:
+            return False
     return any(hint in lowered for hint in PROFILE_FIELD_HINTS)
 
 
 def _mentions_icp(text: str) -> bool:
-    lowered = (text or "").lower()
-    return ("icp" in lowered) or ("ideal customer" in lowered)
+    return bool(ICP_KEYWORD_RE.search(text or ""))
+
+
+def _mentions_company_profile(text: str) -> bool:
+    return bool(COMPANY_PROFILE_KEYWORD_RE.search(text or ""))
