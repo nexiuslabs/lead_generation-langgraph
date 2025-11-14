@@ -958,6 +958,7 @@ def _reset_icp_profile_loop(state: dict) -> None:
     state["icp_profile_confirmed"] = False
     state["awaiting_icp_profile_confirmation"] = False
     state["icp_profile_feedback_handled_len"] = 0
+    state["icp_profile_pending"] = False
     # Keep previously synthesized profile in case we need to re-display without re-running agents.
 
 
@@ -1394,6 +1395,35 @@ def _seed_fingerprint(seeds: List[str]) -> str:
             cleaned.append(str(s))
     cleaned = sorted(set([c for c in cleaned if c]))
     return "|".join(cleaned)
+
+
+def _seed_name_list(seeds: List[Any]) -> List[str]:
+    names: List[str] = []
+    for seed in seeds:
+        name: Optional[str] = None
+        if isinstance(seed, dict):
+            name = (seed.get("seed_name") or "").strip()
+        elif isinstance(seed, str):
+            name = seed.strip()
+        if not name:
+            continue
+        if name not in names:
+            names.append(name)
+    return names[:20]
+
+
+def _seed_fallback_summary(seed_names: List[str], *, needs_domains: bool = True) -> Optional[str]:
+    if not seed_names:
+        return None
+    primary = ", ".join(seed_names[:6])
+    extra = len(seed_names) - len(seed_names[:6])
+    extra_note = f" (+{extra} more)" if extra > 0 else ""
+    base = f"Seed list noted: {primary}{extra_note}."
+    if needs_domains:
+        return (
+            f"{base} Provide the website domains for each so I can crawl them and finish the ICP profile."
+        )
+    return f"{base} I’ll use these seeds to infer the ICP once discovery is enabled."
 
 
 def _parse_lost_churned(text: str) -> list[dict]:
@@ -3138,6 +3168,9 @@ def _prompt_icp_profile_confirmation(
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
     if require_confirmation:
         state["awaiting_icp_profile_confirmation"] = True
+        state["icp_profile_pending"] = True
+    else:
+        state["icp_profile_pending"] = False
     state["icp_profile_summary_sent"] = True
     if require_confirmation:
         try:
@@ -3299,13 +3332,39 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
     seeds = icp.get("seeds_list") or []
     if not isinstance(seeds, list) or len(seeds) < 5:
         return
+    seed_names = _seed_name_list(seeds)
+    fingerprint = _seed_fingerprint(_current_seed_urls(state))
     if state.get("icp_profile_confirmed"):
-        return
+        if fingerprint and state.get("icp_profile_seed_fingerprint") == fingerprint and state.get("icp_profile_summary_sent"):
+            return
+        state["icp_profile_confirmed"] = False
     if state.get("awaiting_icp_profile_confirmation") and state.get("icp_profile_summary_sent"):
         return
-    if not (ENABLE_AGENT_DISCOVERY and _agent_icp_synth is not None):
+
+    def _prompt_seed_fallback(reason: str, *, needs_domains: bool = True) -> bool:
+        summary = _seed_fallback_summary(seed_names, needs_domains=needs_domains)
+        if not summary:
+            return False
+        stub = {"summary": summary}
+        state["icp_profile"] = stub
+        state["icp_profile_confirmed"] = False
+        state["icp_profile_seed_fingerprint"] = fingerprint
+        _remember_icp_profile(state, stub)
+        _prompt_icp_profile_confirmation(state, header=reason)
+        return True
+
+    agent_enabled = ENABLE_AGENT_DISCOVERY and _agent_icp_synth is not None
+    seed_urls_present = bool(_current_seed_urls(state))
+    if not agent_enabled:
+        needs_domains = not seed_urls_present
+        reason = (
+            "I captured your seed list — share their website domains so I can infer the ICP profile."
+            if needs_domains
+            else "I captured your seed list. Here’s the snapshot while discovery is disabled."
+        )
+        if _prompt_seed_fallback(reason, needs_domains=needs_domains):
+            return
         return
-    fingerprint = _seed_fingerprint(_current_seed_urls(state))
     if fingerprint and state.get("icp_profile_seed_fingerprint") == fingerprint and state.get("icp_profile_summary_sent"):
         return
     seeds_payload = []
@@ -3317,10 +3376,15 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
                 seeds_payload.append({"url": url, "snippet": ""})
                 logger.info("[icp intake] seed queued for crawl: %s", url)
         elif isinstance(seed, str):
-            url = seed if seed.startswith("http") else f"https://{seed}"
-            seeds_payload.append({"url": url, "snippet": ""})
-            logger.info("[icp intake] seed queued for crawl: %s", url)
+                url = seed if seed.startswith("http") else f"https://{seed}"
+                seeds_payload.append({"url": url, "snippet": ""})
+                logger.info("[icp intake] seed queued for crawl: %s", url)
     if not seeds_payload:
+        if _prompt_seed_fallback(
+            "I noted the seeds you shared, but I still need the website domains for each before I can crawl them.",
+            needs_domains=True,
+        ):
+            return
         return
     seed_urls = [item.get("url") for item in seeds_payload if item.get("url")]
     logger.info("[icp intake] synthesizing ICP profile from %d seed URLs", len(seed_urls))
@@ -3336,6 +3400,11 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
     except Exception:
         logger.debug("icp profile synthesis failed", exc_info=True)
     if not prof_updates:
+        if _prompt_seed_fallback(
+            "I logged your seed companies — send their website domains or more detail so I can finalize the ICP profile.",
+            needs_domains=not seed_urls_present,
+        ):
+            return
         return
     state["icp_profile"] = prof_updates
     state["icp_profile_confirmed"] = False
@@ -3759,6 +3828,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
         if (not awaiting) and _icp_confirm_cmd and _has_icp_profile_context(state):
             state["icp_profile_confirmed"] = True
             state["awaiting_icp_profile_confirmation"] = False
+            state["icp_profile_pending"] = False
             prof_snapshot = dict(state.get("icp_profile") or {})
             _remember_icp_profile(state, prof_snapshot)
             _persist_icp_profile_sync(state, prof_snapshot, confirmed=True, seed_urls=_current_seed_urls(state))
@@ -3802,6 +3872,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     if PROFILE_CONFIRM_RE.search(reply):
         state["icp_profile_confirmed"] = True
         state["awaiting_icp_profile_confirmation"] = False
+        state["icp_profile_pending"] = False
         prof_snapshot = dict(state.get("icp_profile") or {})
         _remember_icp_profile(state, prof_snapshot)
         _persist_icp_profile_sync(state, prof_snapshot, confirmed=True, seed_urls=_current_seed_urls(state))
@@ -4913,7 +4984,9 @@ async def icp_node(state: GraphState) -> GraphState:
     # Update intent: pattern or LLM-driven
     if _is_profile_update_request(text) or (llm_act in {"update_company", "update_icp"}):
         lowered = text.lower()
-        wants_icp = ("icp" in lowered) or ("ideal customer" in lowered)
+        explicit_icp_request = ("icp" in lowered) or ("ideal customer" in lowered) or (llm_act == "update_icp")
+        explicit_company_request = ("company profile" in lowered) or (llm_act == "update_company")
+        wants_icp = explicit_icp_request
         # If LLM classified explicitly, honor it
         if llm_act == "update_company":
             wants_icp = False
@@ -4930,8 +5003,14 @@ async def icp_node(state: GraphState) -> GraphState:
         icp_summary_sent = bool(state.get("icp_profile_summary_sent"))
         company_pending = bool(state.get("company_profile_pending"))
         if company_pending:
-            wants_icp = False
-        elif not wants_icp and icp_profile_ready:
+            if explicit_icp_request:
+                # Honor explicit ICP updates even if the company snapshot is still pending.
+                state["company_profile_pending"] = False
+                state["awaiting_profile_confirmation"] = False
+                company_pending = False
+            else:
+                wants_icp = False
+        elif not wants_icp and icp_profile_ready and not explicit_company_request:
             if last_prompt == "icp":
                 wants_icp = True
             elif awaiting_icp and not awaiting_company:
@@ -5014,7 +5093,9 @@ async def icp_node(state: GraphState) -> GraphState:
             )
             return state
 
-    profile_gate = _handle_profile_confirmation_gate(state, text)
+    profile_gate = "continue"
+    if not (state.get("awaiting_icp_profile_confirmation") or state.get("icp_profile_pending")):
+        profile_gate = _handle_profile_confirmation_gate(state, text)
     if profile_gate in ("await", "prompted"):
         return state
 
@@ -5121,14 +5202,29 @@ async def icp_node(state: GraphState) -> GraphState:
     try:
         if ENABLE_ICP_INTAKE:
             icp_f = dict(state.get("icp") or {})
+            state["icp"] = icp_f
             if not icp_f.get("website_url"):
                 fallback_site = (state.get("site_profile_bootstrap_url") or "").strip()
                 if fallback_site:
                     icp_f["website_url"] = fallback_site
             incoming_url = _parse_website(text)
             bare_site_input = _is_bare_site_message(text, incoming_url)
+            parsed_seeds: List[dict] = []
+            if not icp_f.get("seeds_list"):
+                parsed_seeds = _parse_seeds(text)
+                if parsed_seeds:
+                    logger.info("[icp intake] parsed %d potential seeds from latest reply", len(parsed_seeds))
             # Ask for website URL (or refresh profile) when user provides a bare URL/domain
-            if bare_site_input or not icp_f.get("website_url"):
+            awaiting_icp_loop = bool(state.get("awaiting_icp_profile_confirmation") or state.get("icp_profile_pending"))
+            allow_seed_first = bool(state.get("company_profile_confirmed") or state.get("site_profile_summary_sent"))
+            looks_like_seed_drop = len(parsed_seeds) >= 5
+            if (not awaiting_icp_loop) and (
+                bare_site_input
+                or (
+                    not icp_f.get("website_url")
+                    and not (looks_like_seed_drop and allow_seed_first)
+                )
+            ):
                 if incoming_url:
                     url = incoming_url
                     logger.info(
@@ -5182,21 +5278,19 @@ async def icp_node(state: GraphState) -> GraphState:
                 state["icp"] = icp_f
                 return state
             if not icp_f.get("seeds_list"):
-                seeds = _parse_seeds(text)
-                if seeds:
-                    logger.info("[icp intake] parsed %d potential seeds from latest reply", len(seeds))
-                    if len(seeds) >= 5:
+                if parsed_seeds:
+                    if len(parsed_seeds) >= 5:
                         prev = list(icp_f.get("seeds_list") or [])
-                        icp_f["seeds_list"] = seeds
-                        try:
-                            if prev:
+                        icp_f["seeds_list"] = parsed_seeds
+                        need_reset = not bool(prev)
+                        if prev:
+                            try:
                                 prev_keys = {(p.get("seed_name"), p.get("domain")) for p in prev if isinstance(p, dict)}
-                            else:
-                                prev_keys = set()
-                            new_keys = {(p.get("seed_name"), p.get("domain")) for p in seeds if isinstance(p, dict)}
-                            if prev_keys != new_keys:
-                                _reset_icp_profile_loop(state)
-                        except Exception:
+                                new_keys = {(p.get("seed_name"), p.get("domain")) for p in parsed_seeds if isinstance(p, dict)}
+                                need_reset = need_reset or (prev_keys != new_keys)
+                            except Exception:
+                                need_reset = True
+                        if need_reset:
                             _reset_icp_profile_loop(state)
                         asks = dict(state.get("ask_counts") or {})
                         asks["seeds"] = 0
@@ -5204,13 +5298,17 @@ async def icp_node(state: GraphState) -> GraphState:
                         state["icp_last_focus"] = "icp_profile"
                         logger.info(
                             "[icp intake] stored %d seeds (previous=%d); gating satisfied",
-                            len(seeds),
+                            len(parsed_seeds),
                             len(prev),
                         )
+                        state["icp"] = icp_f
+                        if not (ENABLE_AGENT_DISCOVERY and _agent_icp_synth is not None):
+                            await _maybe_bootstrap_icp_profile_from_seeds(state)
+                            return state
                     else:
                         logger.info(
                             "[icp intake] insufficient seeds (%d provided); requesting more",
-                            len(seeds),
+                            len(parsed_seeds),
                         )
                         state["icp_last_focus"] = "seeds"
                         state["messages"] = add_messages(
@@ -5269,10 +5367,12 @@ async def icp_node(state: GraphState) -> GraphState:
                 if state.get("awaiting_icp_profile_confirmation"):
                     state["icp"] = icp_f
                     return state
-                if not state.get("icp_profile_confirmed"):
+                # Only pause when we've already shown an ICP snapshot to confirm.
+                if state.get("icp_profile_summary_sent") and not state.get("icp_profile_confirmed"):
                     state["icp"] = icp_f
                     return state
-                icp_f["icp_profile_confirmed"] = True
+                if state.get("icp_profile_confirmed"):
+                    icp_f["icp_profile_confirmed"] = True
             # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation immediately
             if ICP_WIZARD_FAST_START_ONLY:
                 if not icp_f.get("fast_start_explained"):
