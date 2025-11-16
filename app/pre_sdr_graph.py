@@ -449,9 +449,13 @@ def _maybe_backfill_icp_basics_from_context(state: GraphState) -> None:
                 seeds = mem_prof.get("seed_urls") or mem_prof.get("seeds_list")
                 if isinstance(seeds, list) and seeds:
                     seeds_source = list(seeds)
+        if not seeds_source:
+            seeds_source = _load_customer_seeds_from_db(state)
         normalized_source = _normalize_seed_entries(seeds_source)
         if normalized_source:
             icp["seeds_list"] = normalized_source
+            if not icp.get("fast_start_explained"):
+                icp["fast_start_explained"] = True
             changed = True
             asks = dict(state.get("ask_counts") or {})
             if asks.get("seeds"):
@@ -1698,6 +1702,30 @@ def _persist_customer_seeds(state: GraphState, seeds: List[Dict[str, Any]]) -> N
         state["icp_seeds_persisted_fingerprint"] = fingerprint
     except Exception:
         logger.debug("seed intake persist failed", exc_info=True)
+
+
+def _load_customer_seeds_from_db(state: GraphState, limit: int = 30) -> List[Dict[str, Any]]:
+    tid = _resolve_tenant_id_for_write_sync(state)
+    if not isinstance(tid, int):
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT seed_name, domain FROM customer_seeds WHERE tenant_id=%s ORDER BY id ASC LIMIT %s",
+                (tid, limit),
+            )
+            for name, domain in cur.fetchall() or []:
+                entry = {}
+                if name:
+                    entry["seed_name"] = str(name).strip()
+                if domain:
+                    entry["domain"] = str(domain).strip()
+                if entry:
+                    rows.append(entry)
+    except Exception:
+        return []
+    return rows
 
 
 def _seed_name_list(seeds: List[Any]) -> List[str]:
@@ -5310,6 +5338,10 @@ async def icp_node(state: GraphState) -> GraphState:
         pass
 
     text = _last_user_text(state)
+    if state.get("icp_skip_recap_for_text") and state.get("icp_skip_recap_for_text") != text:
+        state["icp_skip_next_recap"] = False
+        state.pop("icp_skip_recap_for_text", None)
+    original_text = text
     if _is_progress_recap_request(text):
         recap = _build_icp_progress_recap(state)
         if recap:
@@ -5582,8 +5614,11 @@ async def icp_node(state: GraphState) -> GraphState:
                 [AIMessage("Progress recap\n\n" + recap_text)],
             )
             recap_rendered = True
+            state["icp_skip_next_recap"] = True
+            state["icp_skip_recap_for_text"] = original_text
         icp_ready = _has_icp_profile_context(state)
         icp_confirmed = bool(state.get("icp_profile_confirmed"))
+        icp_basics_ready = _icp_required_fields_done(state.get("icp") or {}, state.get("ask_counts"))
         if icp_ready and icp_confirmed:
             _prompt_icp_profile_confirmation(
                 state,
@@ -5591,6 +5626,11 @@ async def icp_node(state: GraphState) -> GraphState:
                 require_confirmation=False,
             )
             state["icp_last_focus"] = "icp_profile"
+            state["skip_icp_snapshot_blip"] = True
+            if not recap_rendered:
+                _maybe_emit_progress_recap(state, header="Progress recap")
+            text = ""
+        elif icp_basics_ready:
             state["skip_icp_snapshot_blip"] = True
             if not recap_rendered:
                 _maybe_emit_progress_recap(state, header="Progress recap")
@@ -8495,6 +8535,9 @@ def _maybe_emit_progress_recap(
     state: GraphState, *, header: Optional[str] = None, require_completed: bool = True
 ) -> None:
     try:
+        if state.get("icp_skip_next_recap"):
+            state["icp_skip_next_recap"] = False
+            return
         recap = _build_icp_progress_recap(state, require_completed=require_completed)
         if not recap:
             return

@@ -500,13 +500,29 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     state: Dict[str, Any] = {"messages": norm_msgs}
 
     # Propagate tenant_id from context or input for multi-user runs
+    tenant_candidates: List[Any] = []
     try:
         ctx = payload.get("context") or data.get("context") or {}
-        tid = ctx.get("tenant_id") or data.get("tenant_id")
-        if tid is not None:
-            state["tenant_id"] = tid
+        if isinstance(ctx, dict):
+            tenant_candidates.append(ctx.get("tenant_id"))
+        tenant_candidates.append(data.get("tenant_id"))
+        meta = payload.get("metadata")
+        if isinstance(meta, dict):
+            tenant_candidates.append(meta.get("tenant_id"))
     except Exception:
         pass
+    env_tid = os.getenv("DEFAULT_TENANT_ID")
+    if env_tid:
+        tenant_candidates.append(env_tid)
+    for cand in tenant_candidates:
+        if cand is None:
+            continue
+        try:
+            tid_val = int(str(cand).strip())
+        except Exception:
+            continue
+        state["tenant_id"] = tid_val
+        break
 
     # Best-effort: if we have a tenant_id (or can infer one), pre-load the last saved ICP rule
     # and reuse it to prime the chat state so users don't need to re-enter ICP each session.
