@@ -3468,7 +3468,7 @@ def _prompt_icp_profile_confirmation(
         lines.extend(
             [
                 "",
-                "Want me to refresh micro‑ICP suggestions? Just reply **confirm**. You can also run **run enrichment** to reuse this ICP as-is.",
+                "Looks right? Reply **confirm icp profile** (or share edits) and I'll refresh the micro‑ICP suggestions. You can also run **run enrichment** to reuse this ICP as-is.",
             ]
         )
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
@@ -8008,6 +8008,17 @@ def router(state: GraphState) -> str:
             state["last_routed_text"] = text
             return "icp"
         if re.search(r"\bconfirm\s+(icp\s+)?profile\b", text) and not state.get("icp_profile_confirmed"):
+            gate_status = _handle_icp_profile_confirmation_gate(state, text_raw)
+            if state.get("icp_profile_confirmed"):
+                logger.info("router -> confirm (ICP profile locked via command)")
+                _remember_procedural_step(state, "confirm_icp_profile")
+                state["last_routed_text"] = text
+                return "confirm"
+            if gate_status in ("prompted", "await"):
+                logger.info("router -> icp (confirm ICP profile command - awaiting user ack)")
+                _remember_procedural_step(state, "confirm_icp_profile")
+                state["last_routed_text"] = text
+                return "icp"
             logger.info("router -> icp (confirm ICP profile command)")
             _remember_procedural_step(state, "confirm_icp_profile")
             state["last_routed_text"] = text
