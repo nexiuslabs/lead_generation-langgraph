@@ -323,6 +323,37 @@ async def test_confirm_icp_profile_keyword_unlocks_discovery(monkeypatch):
     assert not out.get("icp_profile_pending")
 
 
+@pytest.mark.asyncio
+async def test_confirm_profile_skips_duplicate_website_prompt(monkeypatch):
+    import app.pre_sdr_graph as presdr
+
+    monkeypatch.setattr(presdr, "_persist_company_profile_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(presdr, "ENABLE_ICP_INTAKE", True, raising=False)
+
+    state = {
+        "messages": [
+            AIMessage(content="Here’s the latest company profile snapshot."),
+            HumanMessage(content="confirm profile"),
+        ],
+        "company_profile": {
+            "industries": ["logistics"],
+            "website_url": "https://example.com",
+        },
+        "icp": {},
+        "site_profile_summary_sent": True,
+        "awaiting_profile_confirmation": True,
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    msgs = out.get("messages") or []
+    last_ai = next((msg for msg in reversed(msgs) if isinstance(msg, AIMessage)), None)
+    assert last_ai is not None
+    content = (last_ai.content or "").lower()
+    assert "list 5" in content
+    assert "website url" not in content
+
+
 def test_icp_manual_edit_updates_memory_snapshot(monkeypatch):
     import app.pre_sdr_graph as presdr
 
@@ -346,3 +377,197 @@ def test_icp_manual_edit_updates_memory_snapshot(monkeypatch):
     semantic = (state.get("short_term_memory") or {}).get("semantic") or {}
     snapshot = semantic.get("icp_profile") or {}
     assert "automation" in snapshot.get("industries", [])
+
+
+@pytest.mark.asyncio
+async def test_icp_recap_progress_lists_completed_steps():
+    import app.pre_sdr_graph as presdr
+
+    seeds = [{"seed_name": f"Seed {i}", "domain": f"seed{i}.com"} for i in range(5)]
+    state = {
+        "messages": [HumanMessage(content="recap")],
+        "icp": {
+            "website_url": "https://example.com",
+            "seeds_list": seeds,
+            "lost_churned": [],
+            "industries": ["SaaS"],
+            "employees_min": 10,
+            "employees_max": 200,
+            "geos": ["SG", "SEA"],
+            "integrations_required": ["HubSpot"],
+            "acv_usd": 18000,
+            "cycle_weeks_min": 4,
+            "cycle_weeks_max": 8,
+            "price_floor_usd": 8000,
+            "champion_titles": ["RevOps Lead"],
+            "triggers": ["Hiring RevOps"],
+        },
+        "company_profile_confirmed": True,
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    last_ai = next((msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage)), None)
+    assert last_ai is not None
+    content = (last_ai.content or "").lower()
+    assert "captured so far" in content
+    assert "company profile" in content
+    assert "best customers" in content
+
+
+@pytest.mark.asyncio
+async def test_icp_recap_handles_missing_inputs():
+    import app.pre_sdr_graph as presdr
+
+    state = {
+        "messages": [HumanMessage(content="recap please")],
+        "icp": {},
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    last_ai = next((msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage)), None)
+    assert last_ai is not None
+    content = (last_ai.content or "").lower()
+    assert "website" in content
+    assert "best customers" in content
+
+
+@pytest.mark.asyncio
+async def test_progress_recap_emitted_after_website_capture(monkeypatch):
+    import app.pre_sdr_graph as presdr
+
+    async def fake_bootstrap(state, url, *, force_refresh=False):
+        return None
+
+    monkeypatch.setattr(presdr, "_maybe_bootstrap_profile_from_site", fake_bootstrap)
+
+    state = {
+        "messages": [HumanMessage(content="https://example.com")],
+        "icp": {},
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    recap_msg = next(
+        (msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage) and "progress recap" in (msg.content or "").lower()),
+        None,
+    )
+    assert recap_msg is not None
+    assert "company profile" in (recap_msg.content or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_progress_recap_emitted_after_seed_collection(monkeypatch):
+    import app.pre_sdr_graph as presdr
+
+    async def fake_bootstrap_icp(state):
+        return None
+
+    monkeypatch.setattr(presdr, "_maybe_bootstrap_icp_profile_from_seeds", fake_bootstrap_icp)
+
+    seeds_text = "\n".join([f"Seed {i} — https://seed{i}.com" for i in range(5)])
+    state = {
+        "messages": [HumanMessage(content=seeds_text)],
+        "icp": {"website_url": "https://example.com"},
+        "company_profile_confirmed": True,
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    recap_msg = next(
+        (msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage) and "progress recap" in (msg.content or "").lower()),
+        None,
+    )
+    assert recap_msg is not None
+    content = (recap_msg.content or "").lower()
+    assert "best customers" in content
+    assert "company profile" in content
+
+
+@pytest.mark.asyncio
+async def test_progress_recap_sent_on_initial_seed_prompt():
+    import app.pre_sdr_graph as presdr
+
+    state = {
+        "messages": [HumanMessage(content="start lead gen")],
+        "icp": {},
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    recap_msg = next(
+        (msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage) and "progress recap" in (msg.content or "").lower()),
+        None,
+    )
+    assert recap_msg is not None
+    content = (recap_msg.content or "").lower()
+    assert "progress recap" in content
+    assert "company profile" in content or "haven’t captured enough" in content or "haven't captured enough" in content
+
+
+def test_seed_submission_persists_intake_once(monkeypatch):
+    import app.pre_sdr_graph as presdr
+
+    monkeypatch.setattr(presdr, "ENABLE_ICP_INTAKE", True, raising=False)
+
+    saved: list[dict] = []
+
+    def fake_save(tid: int, submitted_by: str, payload: dict):
+        saved.append({"tid": tid, "payload": payload})
+
+    monkeypatch.setattr(presdr, "_icp_save_intake", fake_save)
+
+    state = {"tenant_id": 77, "icp": {"website_url": "https://example.com"}}
+    seeds = [
+        {"seed_name": "Acme", "domain": "acme.com"},
+        {"seed_name": "Beta", "domain": "beta.com"},
+    ]
+
+    presdr._persist_customer_seeds(state, seeds)
+    presdr._persist_customer_seeds(state, seeds)
+
+    assert len(saved) == 1
+    assert saved[0]["tid"] == 77
+    stored = saved[0]["payload"].get("seeds") or []
+    assert any(s.get("seed_name") == "Acme" for s in stored)
+
+
+@pytest.mark.asyncio
+async def test_icp_bootstrap_persists_unconfirmed_profile(monkeypatch):
+    import app.pre_sdr_graph as presdr
+
+    monkeypatch.setattr(presdr, "ENABLE_AGENT_DISCOVERY", True, raising=False)
+
+    def fake_agent(payload):
+        return {"icp_profile": {"industries": ["SaaS"]}}
+
+    monkeypatch.setattr(presdr, "_agent_icp_synth", fake_agent)
+
+    captured: dict = {}
+
+    def fake_persist(state, profile, confirmed=None, seed_urls=None):
+        captured["profile"] = dict(profile or {})
+        captured["confirmed"] = confirmed
+        captured["seed_urls"] = seed_urls
+
+    monkeypatch.setattr(presdr, "_persist_icp_profile_sync", fake_persist)
+
+    state = {
+        "tenant_id": 55,
+        "icp": {
+            "seeds_list": [
+                {"seed_name": "Acme", "domain": "acme.com"},
+                {"seed_name": "Beta", "domain": "beta.com"},
+                {"seed_name": "Gamma", "domain": "gamma.com"},
+                {"seed_name": "Delta", "domain": "delta.com"},
+                {"seed_name": "Epsilon", "domain": "epsilon.com"},
+            ]
+        },
+    }
+
+    await presdr._maybe_bootstrap_icp_profile_from_seeds(state)
+
+    assert captured.get("profile", {}).get("industries") == ["SaaS"]
+    assert captured.get("confirmed") is False
+    assert len(captured.get("seed_urls") or []) >= 5
