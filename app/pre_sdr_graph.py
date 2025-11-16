@@ -5631,7 +5631,7 @@ async def icp_node(state: GraphState) -> GraphState:
                 _maybe_emit_progress_recap(state, header="Progress recap")
             text = ""
         elif icp_basics_ready:
-            state["skip_icp_snapshot_blip"] = True
+            state.pop("skip_icp_snapshot_blip", None)
             if not recap_rendered:
                 _maybe_emit_progress_recap(state, header="Progress recap")
             text = ""
