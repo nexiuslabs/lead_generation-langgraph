@@ -400,45 +400,66 @@ def _is_non_sg_active_profile(state: Dict[str, Any]) -> bool:
 
 # --- Helper: ensure required Fast-Start fields are present (asked and captured) ---
 def _icp_required_fields_done(icp: dict, ask_counts: dict | None = None) -> bool:
-    """Return True when all required Fast-Start fields have been captured.
-
-    Required keys (no industry):
-      - website_url
-      - seeds_list (>=5)
-      - lost_churned (present; can be empty if user skipped)
-      - employees_min or employees_max
-      - geos (list)
-      - integrations_required (present; can be empty)
-      - acv_usd (present; can be None)
-      - cycle_weeks_min or cycle_weeks_max (present; can be None)
-      - price_floor_usd (present; can be None)
-      - champion_titles (present; can be empty)
-      - triggers (present; can be empty)
-    """
+    """Return True when the only required Fast-Start fields are captured."""
     icp = icp or {}
-    def present(k: str) -> bool:
-        return k in icp
     if not icp.get("website_url"):
         return False
     seeds = icp.get("seeds_list") or []
-    if not isinstance(seeds, list) or len(seeds) < 5:
-        return False
-    if not present("lost_churned"):
-        return False
-    if not (present("employees_min") or present("employees_max")):
-        return False
-    if not (isinstance(icp.get("geos"), list)):
-        return False
-    for k in ("integrations_required", "acv_usd", "price_floor_usd"):
-        if not present(k):
-            return False
-    if not (present("cycle_weeks_min") or present("cycle_weeks_max")):
-        return False
-    if not present("champion_titles"):
-        return False
-    if not present("triggers"):
-        return False
-    return True
+    return isinstance(seeds, list) and len(seeds) >= 5
+
+
+def _maybe_backfill_icp_basics_from_context(state: GraphState) -> None:
+    """Ensure the ICP intake dict knows about persisted website + seeds."""
+    try:
+        icp = dict(state.get("icp") or {})
+    except Exception:
+        icp = {}
+    changed = False
+
+    site = (icp.get("website_url") or "").strip() if isinstance(icp.get("website_url"), str) else ""
+    if not site:
+        fallback_site = ""
+        for candidate in (
+            state.get("site_profile_bootstrap_url"),
+            (state.get("company_profile") or {}).get("website_url") if isinstance(state.get("company_profile"), dict) else None,
+            (state.get("icp_profile") or {}).get("website_url") if isinstance(state.get("icp_profile"), dict) else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                fallback_site = candidate.strip()
+                break
+        if fallback_site:
+            icp["website_url"] = fallback_site
+            changed = True
+
+    seeds_list = icp.get("seeds_list") or []
+    normalized_existing = _normalize_seed_entries(seeds_list)
+    if normalized_existing and normalized_existing != seeds_list:
+        icp["seeds_list"] = normalized_existing
+        changed = True
+    if not normalized_existing:
+        seeds_source: List[Any] = []
+        prof = state.get("icp_profile")
+        if isinstance(prof, dict):
+            seeds = prof.get("seed_urls") or prof.get("seeds_list")
+            if isinstance(seeds, list) and seeds:
+                seeds_source = list(seeds)
+        if not seeds_source:
+            mem_prof = _get_semantic_memory(state, "icp_profile")
+            if isinstance(mem_prof, dict):
+                seeds = mem_prof.get("seed_urls") or mem_prof.get("seeds_list")
+                if isinstance(seeds, list) and seeds:
+                    seeds_source = list(seeds)
+        normalized_source = _normalize_seed_entries(seeds_source)
+        if normalized_source:
+            icp["seeds_list"] = normalized_source
+            changed = True
+            asks = dict(state.get("ask_counts") or {})
+            if asks.get("seeds"):
+                asks["seeds"] = 0
+                state["ask_counts"] = asks
+
+    if changed:
+        state["icp"] = icp
 
 
 def _format_short_currency(value: Optional[float]) -> str:
@@ -530,74 +551,6 @@ def _collect_icp_progress_steps(state: GraphState) -> List[Dict[str, Any]]:
         _add("Best customers", False, pending=f"{seed_count}/5 captured")
     else:
         _add("Best customers", False, pending="Need 5–15 best customers (Company — website).")
-
-    if "lost_churned" in icp:
-        lost = icp.get("lost_churned") or []
-        if lost:
-            names = _seed_name_list(lost)
-            detail = f"{len(lost)} logged"
-            if names:
-                preview = ", ".join(names[:3])
-                detail += f" ({preview})"
-        else:
-            detail = "Skip noted"
-        _add("Lost/churned references", True, detail)
-    elif seed_count >= 5:
-        _add("Lost/churned references", False, pending="Share 2–3 lost/churned (or type skip).")
-
-    if icp.get("industries"):
-        _add("Industries", True, _format_list_preview(icp.get("industries") or []))
-    elif icp.get("industries") == []:
-        _add("Industries", True, "Skip noted")
-    else:
-        _add("Industries", False)
-
-    has_emp = ("employees_min" in icp) or ("employees_max" in icp)
-    if has_emp:
-        detail = _format_range(icp.get("employees_min"), icp.get("employees_max"), " employees")
-        _add("Employee range", True, detail or "Skip noted")
-    else:
-        _add("Employee range", False)
-
-    geos = icp.get("geos")
-    if isinstance(geos, list):
-        _add("Geographies", True, _format_list_preview(geos, empty_note="Skip noted"))
-    else:
-        _add("Geographies", False)
-
-    if "integrations_required" in icp:
-        integrations = icp.get("integrations_required") or []
-        _add("Integrations", True, _format_list_preview(integrations, empty_note="None"))
-    else:
-        _add("Integrations", False)
-
-    if "acv_usd" in icp:
-        _add("Average deal size", True, _format_short_currency(icp.get("acv_usd")))
-    else:
-        _add("Average deal size", False)
-
-    if ("cycle_weeks_min" in icp) or ("cycle_weeks_max" in icp):
-        cycle_detail = _format_range(icp.get("cycle_weeks_min"), icp.get("cycle_weeks_max"), " weeks") or "Skip noted"
-        _add("Deal cycle", True, cycle_detail)
-    else:
-        _add("Deal cycle", False)
-
-    if "price_floor_usd" in icp:
-        _add("Price floor", True, _format_short_currency(icp.get("price_floor_usd")))
-    else:
-        _add("Price floor", False)
-
-    if "champion_titles" in icp:
-        titles = icp.get("champion_titles") or []
-        _add("Champion titles", True, _format_list_preview(titles, empty_note="Skip noted"))
-    else:
-        _add("Champion titles", False)
-
-    if "triggers" in icp:
-        triggers = icp.get("triggers") or []
-        _add("Predictive events", True, _format_list_preview(triggers, empty_note="Skip noted"))
-    else:
-        _add("Predictive events", False)
 
     return steps
 
@@ -1609,19 +1562,86 @@ def _parse_seeds(text: str) -> list[dict]:
     except Exception:
         return out
 
+def _normalize_domain(value: str) -> str:
+    txt = (value or "").strip()
+    if not txt:
+        return ""
+    txt = re.sub(r"^https?://", "", txt, flags=re.IGNORECASE)
+    if txt.startswith("www."):
+        txt = txt[4:]
+    for sep in ("/", "?", "#"):
+        if sep in txt:
+            txt = txt.split(sep, 1)[0]
+    return txt.strip().lower()
+
+
+def _normalize_seed_entries(seeds: List[Any]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for seed in seeds or []:
+        entry: Dict[str, Any]
+        domain = ""
+        name = ""
+        if isinstance(seed, dict):
+            entry = dict(seed)
+            domain_fields = [
+                entry.get("domain"),
+                entry.get("url"),
+                entry.get("website"),
+                entry.get("seed_domain"),
+            ]
+            for candidate in domain_fields:
+                if isinstance(candidate, str) and candidate.strip():
+                    domain = candidate
+                    break
+            if not domain:
+                fallback = entry.get("seed_name") or entry.get("name") or entry.get("company")
+                if isinstance(fallback, str):
+                    domain = fallback
+            domain = _normalize_domain(domain)
+            name_fields = [
+                entry.get("seed_name"),
+                entry.get("name"),
+                entry.get("company"),
+                entry.get("label"),
+            ]
+            for candidate in name_fields:
+                if isinstance(candidate, str) and candidate.strip():
+                    name = candidate.strip()
+                    break
+            if not name and domain:
+                name = domain
+            if name:
+                entry["seed_name"] = name[:120]
+            if domain:
+                entry["domain"] = domain
+        elif isinstance(seed, str):
+            domain = _normalize_domain(seed)
+            if not domain:
+                continue
+            entry = {"seed_name": seed.strip()[:120] or domain, "domain": domain}
+        else:
+            continue
+        domain_key = entry.get("domain")
+        if not domain_key:
+            continue
+        key = (entry.get("seed_name") or "", domain_key.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(entry)
+    return normalized
+
 
 def _current_seed_urls(state: dict) -> List[str]:
     icp = state.get("icp") or {}
     seeds = icp.get("seeds_list") or []
     urls: List[str] = []
     try:
-        for item in seeds:
-            if isinstance(item, dict):
-                dom = (item.get("domain") or "").strip()
-                if dom:
-                    urls.append(dom)
-            elif isinstance(item, str):
-                urls.append(item.strip())
+        for item in _normalize_seed_entries(seeds):
+            dom = (item.get("domain") or "").strip()
+            if dom:
+                urls.append(dom)
     except Exception:
         pass
     return urls[:20]
@@ -1707,101 +1727,6 @@ def _seed_fallback_summary(seed_names: List[str], *, needs_domains: bool = True)
             f"{base} Provide the website domains for each so I can crawl them and finish the ICP profile."
         )
     return f"{base} I’ll use these seeds to infer the ICP once discovery is enabled."
-
-
-def _parse_lost_churned(text: str) -> list[dict]:
-    """Parse entries like 'Company — domain — reason' per line."""
-    out: list[dict] = []
-    try:
-        s = (text or "").strip()
-        if not s:
-            return out
-        lines = re.split(r"[\n;]+", s)
-        for ln in lines:
-            ln = ln.strip().strip(",")
-            if not ln:
-                continue
-            parts = [p.strip() for p in re.split(r"\s+—\s+|\s+-\s+|\s+--\s+", ln)]
-            # Expect 2 or 3 parts: name, domain[, reason]
-            if len(parts) >= 2:
-                name, dom = parts[0], parts[1]
-                reason = parts[2] if len(parts) >= 3 else None
-                # basic filters
-                if not re.search(r"[a-z]", name.lower()):
-                    continue
-                m = re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", dom, re.IGNORECASE)
-                domain = m.group(0).lower() if m else None
-                if name and domain:
-                    rec = {"seed_name": name[:120], "domain": domain}
-                    if reason and isinstance(reason, str) and reason.strip():
-                        rec["reason"] = reason.strip()[:240]
-                    out.append(rec)
-        # dedupe by (name, domain)
-        seen = set()
-        dedup = []
-        for it in out:
-            key = (it.get("seed_name"), it.get("domain"))
-            if key in seen:
-                continue
-            seen.add(key)
-            dedup.append(it)
-        return dedup[:20]
-    except Exception:
-        return out
-
-
-def _parse_titles_list(text: str) -> list[str]:
-    parts = [p.strip() for p in re.split(r"[,/\n;]+", text or "") if p and p.strip()]
-    out: list[str] = []
-    for p in parts:
-        if len(p) < 2:
-            continue
-        if p.lower() in {"skip", "none", "any"}:
-            continue
-        out.append(p[:60])
-    # dedupe preserving order
-    seen = set()
-    ded = []
-    for t in out:
-        if t.lower() in seen:
-            continue
-        seen.add(t.lower())
-        ded.append(t)
-    return ded[:10]
-
-
-def _parse_currency_usd(text: str) -> float | None:
-    try:
-        s = (text or "").lower()
-        # extract like $18k, 18k, $18000, 18,000
-        m = re.search(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)(\s*[km])?", s)
-        if not m:
-            return None
-        num = float(m.group(1).replace(",", ""))
-        suffix = (m.group(2) or "").strip().lower()
-        if suffix == "k":
-            num *= 1_000
-        elif suffix == "m":
-            num *= 1_000_000
-        return float(num)
-    except Exception:
-        return None
-
-
-def _parse_weeks_range(text: str) -> tuple[float | None, float | None]:
-    try:
-        s = (text or "").lower()
-        # strip non-digit separators, read patterns like 4–8 weeks, 4-8w, 6 weeks
-        m = re.search(r"(\d{1,3})(?:\s*(?:[-–]|to)\s*(\d{1,3}))?\s*(w|wk|wks|week|weeks)?", s)
-        if not m:
-            return (None, None)
-        lo = float(m.group(1))
-        hi = float(m.group(2)) if m.group(2) else None
-        return (lo, hi)
-    except Exception:
-        return (None, None)
-    except Exception:
-        return out
 
 
 def _log_state(prefix: str, state: Dict[str, Any]):
@@ -1897,9 +1822,7 @@ def icp_discovery(state: PreSDRState) -> PreSDRState:
                         return state
                 else:
                     state["messages"].append(
-                            AIMessage(
-                                "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
-                            )
+                            AIMessage("List 5–15 best customers (Company — website).")
                     )
                     return state
             state["icp"] = icp_f
@@ -2901,7 +2824,7 @@ def route(state: PreSDRState) -> str:
     if re.search(r"\b(start\s+lead\s*gen|start\s+leadgen|start\s+lead\s+generation|find\s+leads)\b", text):
         logger.info("router -> icp (explicit start intent)")
         try:
-            state["last_routed_text"] = text
+            state["last_routed_text"] = text_raw
             state["icp_in_progress"] = True
         except Exception:
             pass
@@ -3249,8 +3172,8 @@ def synthesize_welcome_message(state: Dict[str, Any]) -> str:
     return (
         "Hey! I can help you find and generate qualified leads using a quick ICP intake.\n\n"
         "Here’s how it works:\n"
-        "1) Tell me your ICP: website URL, best customers, industries, employee range, and target geographies.\n"
-        "2) I’ll suggest micro-ICPs and show candidate counts.\n"
+        "1) Share your website URL plus 5–15 of your best customer websites.\n"
+        "2) I’ll crawl them to infer industries, size bands, geos, signals, and more, then suggest micro‑ICPs.\n"
         "3) Pick a segment and I’ll enrich the leads with contact details and scoring.\n\n"
         "You’re in control with simple commands:\n"
         "- start lead gen — begin the ICP intake\n"
@@ -3513,6 +3436,13 @@ def _prompt_icp_profile_confirmation(
                 "Does this look right? Reply **confirm icp profile** (or just say it looks good), or tell me what to change.",
             ]
         )
+    else:
+        lines.extend(
+            [
+                "",
+                "Want me to refresh micro‑ICP suggestions? Just reply **confirm**. You can also run **run enrichment** to reuse this ICP as-is.",
+            ]
+        )
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
     if require_confirmation:
         state["awaiting_icp_profile_confirmation"] = True
@@ -3657,6 +3587,8 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
     if not isinstance(seeds, list) or len(seeds) < 5:
         return
     seed_names = _seed_name_list(seeds)
+    if state.pop("skip_icp_snapshot_blip", False):
+        return
     fingerprint = _seed_fingerprint(_current_seed_urls(state))
     if state.get("icp_profile_confirmed"):
         if fingerprint and state.get("icp_profile_seed_fingerprint") == fingerprint and state.get("icp_profile_summary_sent"):
@@ -3746,7 +3678,6 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
             prof_updates,
             confirmed=False,
             seed_urls=seed_urls,
-            user_confirmed=False,
         )
     except Exception:
         logger.debug("icp profile persistence failed", exc_info=True)
@@ -3926,20 +3857,21 @@ def _has_icp_profile_context(state: Mapping[str, Any]) -> bool:
                         state["icp_profile_user_confirmed"] = bool(user_conf)  # type: ignore[index]
                     except Exception:
                         pass
-                    seed_urls = rec.get("seed_urls") or []
-                    if seed_urls:
-                        try:
-                            icp_state = dict(state.get("icp") or {})  # type: ignore[arg-type]
-                            if not icp_state.get("seeds_list"):
-                                icp_state["seeds_list"] = seed_urls
-                            state["icp"] = icp_state  # type: ignore[index]
-                        except Exception:
-                            pass
+                seed_urls = rec.get("seed_urls") or []
+                if seed_urls:
                     try:
-                        state["icp_profile_summary_sent"] = True  # type: ignore[index]
+                        icp_state = dict(state.get("icp") or {})  # type: ignore[arg-type]
+                        normalized_seeds = _normalize_seed_entries(seed_urls)
+                        if normalized_seeds and not icp_state.get("seeds_list"):
+                            icp_state["seeds_list"] = normalized_seeds
+                        state["icp"] = icp_state  # type: ignore[index]
                     except Exception:
                         pass
-                    prof = snapshot
+                try:
+                    state["icp_profile_summary_sent"] = True  # type: ignore[index]
+                except Exception:
+                    pass
+                prof = snapshot
     if isinstance(prof, dict) and prof:
         return True
     return bool(state.get("icp_profile_summary_sent") or state.get("awaiting_icp_profile_confirmation"))
@@ -4026,9 +3958,7 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                     state["ask_counts"] = asks
                     state["icp_last_focus"] = "seeds"
                     followups.append(
-                        AIMessage(
-                            "Please list 5–15 of your best customers (Company — website). Optionally add 2–3 lost/churned with a short reason."
-                        )
+                        AIMessage("Please list 5–15 of your best customers (Company — website).")
                     )
                 state["messages"] = add_messages(state.get("messages") or [], followups)
                 telemetry = {
@@ -4132,9 +4062,7 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                 state["ask_counts"] = asks
                 state["icp_last_focus"] = "seeds"
                 followups.append(
-                    AIMessage(
-                        "Please list 5–15 of your best customers (Company — website). Optionally add 2–3 lost/churned with a short reason."
-                    )
+                    AIMessage("Please list 5–15 of your best customers (Company — website).")
                 )
             state["messages"] = add_messages(state.get("messages") or [], followups)
             telemetry = {
@@ -4678,12 +4606,10 @@ def _icp_website_from_state(state: Mapping[str, Any]) -> str:
 def _icp_complete(icp: Dict[str, Any]) -> bool:
     if icp.get("icp_profile_confirmed"):
         return True
-    has_industries = bool(icp.get("industries"))
-    has_employees = bool(icp.get("employees_min") or icp.get("employees_max"))
-    has_geos = bool(icp.get("geos"))
-    signals_done = bool(icp.get("signals")) or bool(icp.get("signals_done"))
-    # Require industries + employees + geos, and either explicit signals or explicit skip (signals_done)
-    return has_industries and has_employees and has_geos and signals_done
+    has_site = bool(icp.get("website_url"))
+    seeds = icp.get("seeds_list") or []
+    has_seeds = isinstance(seeds, list) and len(seeds) >= 5
+    return has_site and has_seeds
 
 
 def _is_company_like(token: str) -> bool:
@@ -5074,40 +5000,6 @@ def _fmt_icp(icp: Dict[str, Any]) -> str:
     )
 
 
-def next_icp_question(icp: Dict[str, Any]) -> tuple[str, str]:
-    order: List[str] = []
-    if not icp.get("industries"):
-        order.append("industries")
-    if not (icp.get("employees_min") or icp.get("employees_max")):
-        order.append("employees")
-    if not icp.get("revenue_bucket"):
-        order.append("revenue")
-    if not (icp.get("year_min") or icp.get("year_max")):
-        order.append("inc_year")
-    if not icp.get("geos"):
-        order.append("geos")
-    if not icp.get("signals") and not icp.get("signals_done", False):
-        order.append("signals")
-
-    if not order:
-        summary = _fmt_icp(icp)
-        return (
-            f"Does ICPs look right? Type **confirm** to enrichment.\n\n{summary}",
-            "confirm",
-        )
-
-    focus = order[0]
-    prompts = {
-        "industries": "Which industries or problem spaces should we target? (e.g., SaaS, logistics, fintech)",
-        "employees": "What's the typical employee range? (e.g., 10–200)",
-        "revenue": "Preferred revenue bucket? (small / medium / large)",
-        "inc_year": "Incorporation year range? (e.g., 2015–2024)",
-        "geos": "Which geographies or markets? (e.g., SG, SEA, global)",
-        "signals": "What specific buying signals are you looking for (e.g., hiring for data roles, ISO 27001, AWS partner)?",
-    }
-    return (prompts[focus], focus)
-
-
 # ------------------------------
 # Persistence helpers
 # ------------------------------
@@ -5442,6 +5334,13 @@ async def icp_node(state: GraphState) -> GraphState:
                 if rec.get("confirmed") is not None:
                     state["company_profile_confirmed"] = bool(rec.get("confirmed"))
 
+    # Ensure previously-captured ICP profile context (and seeds) are hydrated for Finder gating.
+    try:
+        _has_icp_profile_context(state)
+    except Exception:
+        pass
+    _maybe_backfill_icp_basics_from_context(state)
+
     llm_act: Optional[str] = None
     if _is_profile_show_request(text):
         wants_icp = _mentions_icp(text)
@@ -5657,82 +5556,68 @@ async def icp_node(state: GraphState) -> GraphState:
                         state.get("messages") or [],
                         [
                             AIMessage(
-                                "Perfect — now list 5–15 of your best customers (Company — website). "
-                                "Optional: add 2–3 lost/churned with a short reason."
+                                "Perfect — now list 5–15 of your best customers (Company — website)."
                             )
                         ],
                     )
                     state["icp"] = icp_f
                     return state
-                # If website + seeds exist but core ICP not complete, ask the next missing item
+                # With website + seeds captured, there are no additional manual questions.
                 if not _icp_complete(icp_f):
-                    asks = dict(state.get("ask_counts") or {})
-                    # Industries → Employees → Geos → Signals
-                    if not icp_f.get("industries"):
-                        asks["industries"] = asks.get("industries", 0) + 1
-                        state["ask_counts"] = asks
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Which industries or problem spaces? (e.g., SaaS, professional services, logistics)")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-                    if not (icp_f.get("employees_min") or icp_f.get("employees_max")):
-                        asks["employees"] = asks.get("employees", 0) + 1
-                        state["ask_counts"] = asks
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Typical company size? (e.g., 10–200 employees)")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-                    if not icp_f.get("geos"):
-                        asks["geos"] = asks.get("geos", 0) + 1
-                        state["ask_counts"] = asks
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Primary geographies? (e.g., SG, SEA, global)")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-                    if not icp_f.get("signals") and not icp_f.get("signals_done"):
-                        asks["signals"] = asks.get("signals", 0) + 1
-                        state["ask_counts"] = asks
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Buying signals? (e.g., hiring, specific tech stack, certifications). Reply 'skip' to continue.")],
-                        )
-                        state["icp"] = icp_f
-                        return state
+                    state["icp"] = icp_f
+                    return state
         except Exception:
             pass
         # If Finder is off or core ICP is already complete, allow router to branch.
         return state
 
-    # Reset flow when user types 'start' explicitly
-    if re.search(r"\bstart\b", text.strip(), flags=re.IGNORECASE):
-        state["icp"] = {}
-        _reset_company_profile_loop(state)
-        _reset_icp_profile_loop(state)
-        state["company_profile_confirmed"] = False
-        state["awaiting_profile_confirmation"] = False
-        state["site_profile_summary_sent"] = False
-        state["icp_profile_confirmed"] = False
-        state["awaiting_icp_profile_confirmation"] = False
-        state["icp_profile_summary_sent"] = False
-        state["icp_profile_user_confirmed"] = False
-        state["icp_profile_soft_confirmation_open"] = False
-        state["micro_icp_confirmed"] = False
-        state["awaiting_micro_icp_confirmation"] = False
-        # Clear transient outputs so we ask fresh ICP questions
-        for k in ("candidates", "results", "scored", "ask_counts", "enrichment_completed"):
-            try:
-                if k in state:
-                    del state[k]  # type: ignore[index]
-            except Exception:
-                pass
-        # Proceed to question generation with an empty ICP
-        text = ""  # ensure extractor doesn't pollute with previous context
+    # Reset flow when user types 'start' explicitly (unless a confirmed ICP already exists)
+    start_cmd = bool(re.search(r"\bstart\b", text.strip(), flags=re.IGNORECASE))
+    if start_cmd:
+        recap_rendered = False
+        recap_text = _build_icp_progress_recap(state, require_completed=False)
+        if recap_text:
+            state["messages"] = add_messages(
+                state.get("messages") or [],
+                [AIMessage("Progress recap\n\n" + recap_text)],
+            )
+            recap_rendered = True
+        icp_ready = _has_icp_profile_context(state)
+        icp_confirmed = bool(state.get("icp_profile_confirmed"))
+        if icp_ready and icp_confirmed:
+            _prompt_icp_profile_confirmation(
+                state,
+                header="Here’s the latest ICP profile snapshot:",
+                require_confirmation=False,
+            )
+            state["icp_last_focus"] = "icp_profile"
+            state["skip_icp_snapshot_blip"] = True
+            if not recap_rendered:
+                _maybe_emit_progress_recap(state, header="Progress recap")
+            text = ""
+        else:
+            state["icp"] = {}
+            _reset_company_profile_loop(state)
+            _reset_icp_profile_loop(state)
+            state["company_profile_confirmed"] = False
+            state["awaiting_profile_confirmation"] = False
+            state["site_profile_summary_sent"] = False
+            state["icp_profile_confirmed"] = False
+            state["awaiting_icp_profile_confirmation"] = False
+            state["icp_profile_summary_sent"] = False
+            state["icp_profile_user_confirmed"] = False
+            state["icp_profile_soft_confirmation_open"] = False
+            state["micro_icp_confirmed"] = False
+            state["awaiting_micro_icp_confirmation"] = False
+            # Clear transient outputs so we ask fresh ICP questions
+            for k in ("candidates", "results", "scored", "ask_counts", "enrichment_completed"):
+                try:
+                    if k in state:
+                        del state[k]  # type: ignore[index]
+                except Exception:
+                    pass
+            # Proceed to question generation with an empty ICP
+            text = ""
 
     # Feature 17: ICP Finder intake (website + seeds + core key points) when enabled
     try:
@@ -5872,7 +5757,7 @@ async def icp_node(state: GraphState) -> GraphState:
                         state.get("messages") or [],
                         [
                             AIMessage(
-                                "List 5–15 best customers (Company — website). Optionally 2–3 lost/churned with a short reason."
+                                "List 5–15 best customers (Company — website)."
                             )
                         ],
                     )
@@ -5916,7 +5801,10 @@ async def icp_node(state: GraphState) -> GraphState:
                     icp_f["icp_profile_confirmed"] = True
             # If Fast-Start is enabled, skip detailed prompts and proceed to confirmation immediately
             if ICP_WIZARD_FAST_START_ONLY:
-                if not icp_f.get("fast_start_explained"):
+                ask_counts = dict(state.get("ask_counts") or {})
+                basics_ready = _icp_required_fields_done(icp_f, ask_counts)
+                needs_fast_start_hint = (not basics_ready) or bool(state.get("icp_profile_pending"))
+                if needs_fast_start_hint and not icp_f.get("fast_start_explained"):
                     expl = [
                         "I will infer industries from evidence instead of asking.",
                         "What I will crawl:",
@@ -5926,302 +5814,11 @@ async def icp_node(state: GraphState) -> GraphState:
                     ]
                     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(expl))])
                     icp_f["fast_start_explained"] = True
-                # Go straight to confirmation prompt
-                if not state.get("icp_profile_confirmed"):
+                if (not basics_ready) or state.get("icp_profile_pending"):
                     state["icp"] = icp_f
                     return state
 
-            # Collect core ICP points before confirmation: industries -> employees -> geos -> (optional) signals
-            # 1) Industries (skip when fast-start is enabled; we infer from evidence)
-            if not ICP_WIZARD_FAST_START_ONLY and not icp_f.get("industries"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("industries", 0) == 0:
-                    asks["industries"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Which industries or problem spaces? (e.g., SaaS, professional services, logistics)")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    try:
-                        from typing import List as _List
-                        from_lang = _extract_icp_industries_from_text(text)
-                        inds: _List[str] = [s.strip() for s in from_lang if s and s.strip()]
-                    except Exception:
-                        inds = []  # type: ignore
-                    if inds:
-                        icp_f["industries"] = inds
-                    else:
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("A few examples help (e.g., SaaS, logistics). You can also type 'skip' if not sure.")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-            # 2) Employees
-            if not (icp_f.get("employees_min") or icp_f.get("employees_max")):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("employees", 0) == 0:
-                    asks["employees"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Typical company size? (e.g., 10–200 employees)")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    m = re.search(r"(\d{1,6})\s*(?:[-–]|to)\s*(\d{1,6})", text)
-                    if m:
-                        try:
-                            lo = int(m.group(1))
-                            hi = int(m.group(2))
-                            if lo > 0 and hi >= lo:
-                                icp_f["employees_min"], icp_f["employees_max"] = lo, hi
-                        except Exception:
-                            pass
-                    if not (icp_f.get("employees_min") or icp_f.get("employees_max")):
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Please provide a range like 10–200, 50-500, or 10 to 200.")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-            # 3) Geos
-            if not icp_f.get("geos"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("geos", 0) == 0:
-                    asks["geos"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Primary geographies? (e.g., SG, SEA, global)")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    parts = [p.strip() for p in re.split(r"[,\n]+", text) if p and p.strip()]
-                    geos = [p for p in parts if 1 <= len(p) <= 40 and p.lower() not in {"confirm", "start"}]
-                    geo_words = {"sg", "singapore", "sea", "apac", "global", "worldwide", "us", "usa", "uk", "eu", "emea", "asia"}
-                    geos = [g for g in geos if g.lower() in geo_words or len(g) <= 20]
-                    if geos:
-                        icp_f["geos"] = sorted(set(geos))
-                    else:
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Examples: SG, SEA, APAC, Global. You can list multiple separated by commas.")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-            # Optional: signals (skip if none)
-            if not icp_f.get("signals") and not icp_f.get("signals_done"):
-                if re.search(r"\b(none|skip|any)\b", text.strip(), flags=re.IGNORECASE):
-                    icp_f["signals_done"] = True
-                else:
-                    # Ask once; subsequent turn can proceed with confirm if skipped
-                    asks = dict(state.get("ask_counts") or {})
-                    if asks.get("signals", 0) < 1:
-                        asks["signals"] = 1
-                        state["ask_counts"] = asks
-                        state["messages"] = add_messages(
-                            state.get("messages") or [],
-                            [AIMessage("Buying signals? (e.g., hiring, specific tech stack, certifications). Reply 'skip' to continue.")],
-                        )
-                        state["icp"] = icp_f
-                        return state
-            # --- Fast‑Start additions ---
-            # 4) Lost/Churned (name — website — 1-line reason)
-            if not icp_f.get("lost_churned") and icp_f.get("seeds_list"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("lost_churned", 0) == 0:
-                    asks["lost_churned"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("List 3 lost/churned (Company — website — 1‑line reason). Type 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["lost_churned"] = []
-                    else:
-                        lc = _parse_lost_churned(text)
-                        if lc:
-                            icp_f["lost_churned"] = lc
-                        else:
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("Please format as 'Company — domain — reason'. Or type 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # 5) Must‑have integrations
-            if not icp_f.get("integrations_required"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("integrations", 0) == 0:
-                    asks["integrations"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Must‑have integrations? (e.g., HubSpot, Salesforce, Shopify). Comma‑separated; 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["integrations_required"] = []
-                    else:
-                        icp_f["integrations_required"] = _parse_titles_list(text)
-                        if not icp_f["integrations_required"]:
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("List integrations separated by commas (e.g., HubSpot, Salesforce). Or type 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # 6) Average deal size (ACV)
-            if not icp_f.get("acv_usd"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("acv", 0) == 0:
-                    asks["acv"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Average deal size (ACV)? e.g., $18k. Type 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["acv_usd"] = None
-                    else:
-                        v = _parse_currency_usd(text)
-                        if v and v > 0:
-                            icp_f["acv_usd"] = v
-                        else:
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("Please provide a number like $18k, 18,000, or type 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # 7) Deal cycle length
-            if not (icp_f.get("cycle_weeks_min") or icp_f.get("cycle_weeks_max")):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("cycle", 0) == 0:
-                    asks["cycle"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Typical deal cycle length? e.g., 4–8 weeks. Type 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["cycle_weeks_min"] = None
-                        icp_f["cycle_weeks_max"] = None
-                    else:
-                        lo, hi = _parse_weeks_range(text)
-                        if lo:
-                            icp_f["cycle_weeks_min"] = lo
-                        if hi:
-                            icp_f["cycle_weeks_max"] = hi
-                        if not (lo or hi):
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("Please provide a value like 4–8 weeks or 6 weeks, or 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # 8) Price floor
-            if not icp_f.get("price_floor_usd"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("price_floor", 0) == 0:
-                    asks["price_floor"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Price floor? Deals usually fail when budget < … e.g., <$8k ACV. Type 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["price_floor_usd"] = None
-                    else:
-                        v = _parse_currency_usd(text)
-                        if v and v > 0:
-                            icp_f["price_floor_usd"] = v
-                        else:
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("Provide a number like $8k, 8000, or type 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # 9) Champion titles
-            if not icp_f.get("champion_titles"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("champions", 0) == 0:
-                    asks["champions"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("Champion title(s)? e.g., RevOps Lead, Head of Sales. Comma‑separated; 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["champion_titles"] = []
-                    else:
-                        t = _parse_titles_list(text)
-                        if t:
-                            icp_f["champion_titles"] = t
-                        else:
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("List titles separated by commas (e.g., RevOps Lead, Head of Sales), or 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # 10) Predictive events
-            if not icp_f.get("triggers"):
-                asks = dict(state.get("ask_counts") or {})
-                if asks.get("triggers", 0) == 0:
-                    asks["triggers"] = 1
-                    state["ask_counts"] = asks
-                    state["messages"] = add_messages(
-                        state.get("messages") or [],
-                        [AIMessage("3 events that predict a good fit? e.g., Hiring RevOps, migrating to HubSpot. Comma‑separated; 'skip' to continue.")],
-                    )
-                    state["icp"] = icp_f
-                    return state
-                else:
-                    if re.search(r"\b(skip|none|n/a)\b", text.strip(), flags=re.IGNORECASE):
-                        icp_f["triggers"] = []
-                    else:
-                        icp_f["triggers"] = _parse_titles_list(text)
-                        if not icp_f["triggers"]:
-                            state["messages"] = add_messages(
-                                state.get("messages") or [],
-                                [AIMessage("List events separated by commas (e.g., Hiring RevOps, HubSpot migration), or 'skip'.")],
-                            )
-                            state["icp"] = icp_f
-                            return state
-            # Ready to confirm
-            state["messages"] = add_messages(
-                state.get("messages") or [],
-                [
-                    AIMessage(
-                        "Thanks! I’ll crawl your site + seed sites, run web discovery, extract evidence, and propose a Top‑10 with why‑us fit. ACRA is used later during the SG nightly pass. Reply confirm to proceed, or adjust any detail."
-                    )
-                ],
-            )
+            # With website + seeds captured, rely on automated evidence to finalize the ICP profile.
             state["icp"] = icp_f
             return state
     except Exception:
@@ -6499,42 +6096,36 @@ async def confirm_node(state: GraphState) -> GraphState:
         logger.info("[confirm] ENABLE_AGENT_DISCOVERY=%s", _ead)
     except Exception:
         logger.info("[confirm] ENABLE_AGENT_DISCOVERY unavailable (default False)")
+    normalized_seeds: List[Dict[str, Any]] = []
     # Persist ICP captured in the dynamic graph flow
+    _maybe_backfill_icp_basics_from_context(state)
     try:
         icp = dict(state.get("icp") or {})
+        normalized_seeds = _normalize_seed_entries(icp.get("seeds_list") or [])
+        if normalized_seeds:
+            icp["seeds_list"] = normalized_seeds
+            state["icp"] = icp
         try:
             logger.info("[confirm] ICP keys present: %s", sorted(list(icp.keys())))
         except Exception:
             pass
         # Feature 17: if Finder inputs present, save intake and generate suggestions immediately
         try:
-            if ENABLE_ICP_INTAKE and icp.get("website_url") and icp.get("seeds_list"):
+            if ENABLE_ICP_INTAKE and icp.get("website_url") and normalized_seeds:
                 tid = await _resolve_tenant_id_for_write(state)
                 if isinstance(tid, int):
                     chips: list[str] = []
-                    # Collect Fast‑Start answers for persistence
+                    # Collect Fast-Start answers for persistence
                     answers = {
                         "website": icp.get("website_url"),
-                        "industries": icp.get("industries"),
-                        "employees_min": icp.get("employees_min"),
-                        "employees_max": icp.get("employees_max"),
-                        "geos": icp.get("geos"),
-                        "signals": icp.get("signals") if icp.get("signals") else [],
-                        "lost_churned": icp.get("lost_churned") if icp.get("lost_churned") else [],
-                        "integrations_required": icp.get("integrations_required") if icp.get("integrations_required") else [],
-                        "acv_usd": icp.get("acv_usd"),
-                        "cycle_weeks_min": icp.get("cycle_weeks_min"),
-                        "cycle_weeks_max": icp.get("cycle_weeks_max"),
-                        "price_floor_usd": icp.get("price_floor_usd"),
-                        "champion_titles": icp.get("champion_titles") if icp.get("champion_titles") else [],
-                        "triggers": icp.get("triggers") if icp.get("triggers") else [],
+                        "seeds": normalized_seeds,
                     }
                     try:
                         logger.info("[confirm] Intake Answers JSON: %s", json.dumps(answers, ensure_ascii=False))
-                        logger.info("[confirm] Seeds JSON: %s", json.dumps(icp.get("seeds_list") or [], ensure_ascii=False))
+                        logger.info("[confirm] Seeds JSON: %s", json.dumps(normalized_seeds, ensure_ascii=False))
                     except Exception:
                         pass
-                    payload_in = {"answers": answers, "seeds": icp.get("seeds_list")}
+                    payload_in = {"answers": answers, "seeds": normalized_seeds}
                     # Persist intake if storage function is available; otherwise continue Finder pipeline
                     if _icp_save_intake:
                         logger.info("[confirm] Saving intake (tenant_id=%s)", tid)
@@ -6552,7 +6143,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                         pass
                     # Seed Normalization + Resolver (Step 2–3): propose domains and show fast facts
                     try:
-                        seeds_in = list(icp.get("seeds_list") or [])
+                        seeds_in = list(normalized_seeds or [])
                         if _icp_build_resolver_cards and isinstance(seeds_in, list) and seeds_in:
                             logger.info("[confirm] Building resolver cards for %d seeds", len(seeds_in))
                             cards = await _icp_build_resolver_cards(seeds_in)
@@ -6687,7 +6278,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 except Exception:
                                     pass
                             return (ev_added, acra_added)
-                        seeds_list = list(icp.get("seeds_list") or [])
+                        seeds_list = list(normalized_seeds or [])
                         for n, a in await asyncio.gather(*[_collect_for_seed(s) for s in seeds_list]):
                             ev_count += int(n)
                             acra_count += int(a)
@@ -6756,7 +6347,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 # If empty, synthesize from seeds quickly
                                 if not icp_prof and _agent_synth is not None:
                                     try:
-                                        seeds_ev = [{"url": s.get("domain"), "snippet": s.get("seed_name")} for s in (icp.get("seeds_list") or [])]
+                                        seeds_ev = [{"url": s.get("domain"), "snippet": s.get("seed_name")} for s in normalized_seeds]
                                         sstate = {"icp_profile": {}, "seeds": seeds_ev}
                                         logger.info("[confirm] invoking icp_synthesizer on %d seeds", len(seeds_ev))
                                         out = await asyncio.to_thread(_agent_synth, sstate)
@@ -6774,7 +6365,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                                 # Pass seed domains as discovery hints for DDG
                                 try:
                                     seed_domains = []
-                                    for s in (icp.get("seeds_list") or []):
+                                    for s in normalized_seeds:
                                         dom = (s.get("domain") or "").strip().lower() if isinstance(s, dict) else ""
                                         if dom:
                                             seed_domains.append(dom)
@@ -6801,7 +6392,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                                         try:
                                             from src.agents_icp import fallback_top10_from_seeds as _fb_seeds  # type: ignore
                                             seed_domains = []
-                                            for s in (icp.get("seeds_list") or []):
+                                            for s in normalized_seeds:
                                                 dom = (s.get("domain") or "").strip().lower()
                                                 if dom:
                                                     seed_domains.append(dom)
@@ -6815,7 +6406,7 @@ async def confirm_node(state: GraphState) -> GraphState:
                                     try:
                                         from src.agents_icp import fallback_top10_via_seed_outlinks as _fb_outlinks  # type: ignore
                                         seed_domains = []
-                                        for s in (icp.get("seeds_list") or []):
+                                        for s in normalized_seeds:
                                             dom = (s.get("domain") or "").strip().lower()
                                             if dom:
                                                 seed_domains.append(dom)
@@ -8435,10 +8026,10 @@ def router(state: GraphState) -> str:
 
     # If user pasted a website/domain and Finder is enabled, treat it as starting/continuing ICP
     try:
-        url = _parse_website(text)
+        url = _parse_website(text_raw)
     except Exception:
         url = None
-    if url:
+    if url and _is_bare_site_message(text_raw, url):
         logger.info("router -> icp (website/domain provided)")
         try:
             state["last_routed_text"] = text
@@ -8591,7 +8182,18 @@ def router(state: GraphState) -> str:
             return "icp"
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
         if ENABLE_ICP_INTAKE:
-            has_minimal = bool(icp.get("website_url")) and bool(icp.get("seeds_list"))
+            _maybe_backfill_icp_basics_from_context(state)
+            icp = state.get("icp") or {}
+            site_url = str(icp.get("website_url") or "").strip()
+            if not site_url:
+                fallback_site = _icp_website_from_state(state)
+                if fallback_site:
+                    site_url = fallback_site
+                    icp["website_url"] = fallback_site
+                    state["icp"] = icp
+            seeds_list = icp.get("seeds_list") or []
+            has_enough_seeds = isinstance(seeds_list, list) and len(seeds_list) >= 5
+            has_minimal = bool(site_url) and has_enough_seeds
             if has_minimal:
                 logger.info("router -> confirm (Finder minimal intake present; proceeding to confirm pipeline)")
                 try:
