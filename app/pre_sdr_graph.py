@@ -7,8 +7,9 @@ import logging
 import os
 import re
 import textwrap
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, NotRequired, Optional, Tuple, TypedDict, Literal
+from typing import Any, Dict, Iterable, List, Mapping, NotRequired, Optional, Tuple, TypedDict, Literal
 try:  # Python 3.9/3.10 fallback
     from typing import Annotated  # type: ignore
 except Exception:  # pragma: no cover
@@ -995,9 +996,17 @@ def _persist_company_profile_sync(
                 """,
                 (tid, Json(profile or {}), src, confirmed_flag, confirmed_flag),
             )
+            try:
+                logger.info(
+                    "[company_profile] persisted tenant_id=%s keys=%s confirmed=%s",
+                    tid,
+                    sorted(list((profile or {}).keys()))[:8],
+                    confirmed_flag,
+                )
+            except Exception:
+                pass
     except Exception:
-        # Persistence best-effort
-        pass
+        logger.warning("[company_profile] persist failed tenant_id=%s", tid, exc_info=True)
 
 
 def _reset_company_profile_loop(state: dict) -> None:
@@ -2951,6 +2960,74 @@ class GraphState(TypedDict):
     icp_profile_seed_fingerprint: NotRequired[str]
     awaiting_icp_discovery_confirmation: NotRequired[bool]
     icp_discovery_confirmed: NotRequired[bool]
+    profile_workflow_focus: NotRequired[str]
+    icp_customer_profiles: NotRequired[Dict[str, Any]]
+    prompt_best_customers_header: NotRequired[str]
+    confirm_handled_human_idx: NotRequired[int]
+    tenant_id: NotRequired[int]
+    session_id: NotRequired[str]
+
+
+@dataclass
+class ProfileWorkflowStatus:
+    company_ready: bool
+    icp_ready: bool
+    discovery_ready: bool
+
+    @property
+    def next_step(self) -> str:
+        if not self.company_ready:
+            return "company_profile"
+        if not self.icp_ready:
+            return "icp_profile"
+        if not self.discovery_ready:
+            return "icp_discovery"
+        return "ready"
+
+
+def _profile_workflow_status(state: GraphState) -> ProfileWorkflowStatus:
+    return ProfileWorkflowStatus(
+        company_ready=bool(state.get("company_profile_confirmed")),
+        icp_ready=bool(state.get("icp_profile_confirmed")),
+        discovery_ready=bool(state.get("icp_discovery_confirmed")),
+    )
+
+
+def _set_profile_focus(state: GraphState, focus: str) -> None:
+    try:
+        state["profile_workflow_focus"] = focus
+    except Exception:
+        pass
+
+
+def _sync_icp_seed_profiles(state: GraphState) -> None:
+    """Persist per-customer ICP placeholders so downstream nodes can reference them explicitly."""
+    try:
+        icp = state.get("icp") or {}
+    except Exception:
+        icp = {}
+    seeds = icp.get("seeds_list") or []
+    if not isinstance(seeds, list):
+        return
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    for idx, seed in enumerate(seeds, 1):
+        seed_dict = seed if isinstance(seed, dict) else {}
+        snapshots[f"icp_profile_{idx}"] = {
+            "seed_name": seed_dict.get("seed_name") or seed_dict.get("name"),
+            "domain": seed_dict.get("domain"),
+            "confirmed": bool(state.get("icp_profile_confirmed")),
+        }
+    if snapshots:
+        state["icp_customer_profiles"] = snapshots
+
+
+def _human_turn_count(state: GraphState) -> int:
+    msgs = state.get("messages") or []
+    count = 0
+    for msg in msgs:
+        if isinstance(msg, HumanMessage):
+            count += 1
+    return count
 
 
 def _ensure_memory_dict(state: GraphState) -> Dict[str, Any]:
@@ -3065,11 +3142,22 @@ def _prompt_icp_discovery_confirmation(state: GraphState) -> None:
     )
     state["awaiting_icp_discovery_confirmation"] = True
     state["icp_discovery_confirmed"] = False
+    _set_profile_focus(state, "icp_discovery")
+    logger.info(
+        "icp_flow: prompt_icp_discovery_confirmation awaiting_now=%s icp_confirmed=%s",
+        bool(state.get("awaiting_icp_discovery_confirmation")),
+        bool(state.get("icp_profile_confirmed")),
+    )
 
 
 def _ack_icp_discovery_confirmation(state: GraphState, *, silent: bool = False) -> None:
     state["awaiting_icp_discovery_confirmation"] = False
     state["icp_discovery_confirmed"] = True
+    _set_profile_focus(state, "icp_discovery")
+    logger.info(
+        "icp_flow: ack_icp_discovery_confirmation silent=%s",
+        silent,
+    )
     if silent:
         return
     state["messages"] = add_messages(
@@ -3271,16 +3359,6 @@ ICP_DISCOVERY_CONFIRMATION_PROMPT = (
     "Ready for me to start ICP discovery and refresh the micro-ICP suggestions? Reply **start discovery** (or tell me what to adjust)."
 )
 ANTI_ICP_HINTS = ("avoid", "exclude", "not a fit", "bad fit", "no longer", "skip", "without", "except")
-PROFILE_FEEDBACK_HINTS = (
-    ("industries", r"industr(?:y|ies)"),
-    ("buyer_titles", r"(?:buyer|title|persona|role)"),
-    ("geos", r"(?:geo|region|country|market)"),
-    ("signals", r"(?:signal|trigger|integration|stack|tech)"),
-)
-PROFILE_UPDATE_VERB_RE = re.compile(
-    r"^(?:to\s+)?(?:add|include|plus|focus|target|expand|prioritize|emphasize)\s+",
-    flags=re.IGNORECASE,
-)
 _CONFIRM_TOKENS = ("confirm", "confimr", "confrim", "cofirm", "cnofirm", "confrm", "confirmed")
 
 
@@ -3462,6 +3540,13 @@ def _prompt_profile_confirmation(
     else:
         state["company_profile_pending"] = False
     state["last_profile_prompt_type"] = "company"
+    _set_profile_focus(state, "company")
+    logger.info(
+        "icp_flow: prompt_company_profile_confirmation require=%s summary_keys=%s awaiting_now=%s",
+        require_confirmation,
+        _nonempty_profile_keys(prof),
+        bool(state.get("awaiting_profile_confirmation")),
+    )
     _emit_onboarding_event(
         state,
         "company_profile_prompted" if require_confirmation else "company_profile_snapshot_shared",
@@ -3524,6 +3609,14 @@ def _prompt_icp_profile_confirmation(
         except Exception:
             pass
     state["last_profile_prompt_type"] = "icp"
+    _set_profile_focus(state, "icp")
+    logger.info(
+        "icp_flow: prompt_icp_profile_confirmation require=%s summary_keys=%s seed_count=%s awaiting_now=%s",
+        require_confirmation,
+        _nonempty_profile_keys(prof),
+        len(_current_seed_urls(state)),
+        bool(state.get("awaiting_icp_profile_confirmation")),
+    )
     _emit_onboarding_event(
         state,
         "icp_profile_prompted" if require_confirmation else "icp_profile_snapshot_shared",
@@ -3545,12 +3638,24 @@ def _prompt_best_customer_seeds(state: GraphState, header: Optional[str] = None)
     asks["seeds"] = count
     state["ask_counts"] = asks
     state["icp_last_focus"] = "seeds"
+    try:
+        icp = state.get("icp") or {}
+    except Exception:
+        icp = {}
+    seeds_list = icp.get("seeds_list") or []
     lines = [
         header
         or "Great! To produce your ICP profile I still need 5–15 of your best customers (Company — website).",
         "Share them one per line, e.g., `Acme — https://acme.com`.",
     ]
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+    logger.info(
+        "icp_flow: prompt_best_customers ask_count=%s current_seed_count=%s header_overridden=%s",
+        count,
+        len(seeds_list) if isinstance(seeds_list, list) else 0,
+        bool(header),
+    )
+    _set_profile_focus(state, "icp_seeds")
     _maybe_emit_progress_recap(state, header="Progress recap", require_completed=False)
 
 
@@ -3568,6 +3673,70 @@ def _icp_seeds_ready(state: GraphState) -> bool:
         if isinstance(prof_seeds, list) and len(prof_seeds) >= 5:
             return True
     return False
+
+
+def _rehydrate_icp_seeds_from_context(state: GraphState) -> None:
+    """Ensure icp['seeds_list'] stays populated even if other nodes temporarily clear it."""
+    try:
+        icp = state.get("icp") or {}
+    except Exception:
+        icp = {}
+    seeds_raw = icp.get("seeds_list")
+    normalized_current: List[Dict[str, Any]] = []
+    if isinstance(seeds_raw, list) and seeds_raw:
+        try:
+            normalized_current = _normalize_seed_entries(seeds_raw)
+        except Exception:
+            normalized_current = []
+        else:
+            if normalized_current and seeds_raw != normalized_current:
+                icp["seeds_list"] = normalized_current
+                state["icp"] = icp
+    if len(normalized_current) >= 5:
+        return
+    fallback_candidates: List[Any] = []
+    snapshots = state.get("icp_customer_profiles")
+    if isinstance(snapshots, dict):
+        for entry in snapshots.values():
+            if not isinstance(entry, dict):
+                continue
+            domain = (entry.get("domain") or "").strip()
+            if not domain:
+                continue
+            fallback_candidates.append(
+                {"seed_name": entry.get("seed_name") or entry.get("name") or domain, "domain": domain}
+            )
+    if not fallback_candidates:
+        prof = state.get("icp_profile")
+        if not isinstance(prof, dict) or not prof:
+            prof = _get_semantic_memory(state, "icp_profile")
+        if isinstance(prof, dict):
+            fallback_candidates = prof.get("seeds_list") or prof.get("seed_urls") or []
+    try:
+        fallback_normalized = _normalize_seed_entries(fallback_candidates)
+    except Exception:
+        fallback_normalized = []
+    if not fallback_normalized:
+        return
+    combined = list(normalized_current)
+    seen_domains = {
+        (entry.get("domain") or "").strip().lower()
+        for entry in combined
+        if isinstance(entry, dict) and entry.get("domain")
+    }
+    updated = False
+    for entry in fallback_normalized:
+        if not isinstance(entry, dict):
+            continue
+        domain = (entry.get("domain") or "").strip().lower()
+        if not domain or domain in seen_domains:
+            continue
+        combined.append(entry)
+        seen_domains.add(domain)
+        updated = True
+    if combined and (updated or not normalized_current):
+        icp["seeds_list"] = combined
+        state["icp"] = icp
 
 
 async def _maybe_bootstrap_profile_from_site(state: GraphState, website_url: str, *, force_refresh: bool = False) -> None:
@@ -3612,7 +3781,7 @@ async def _maybe_bootstrap_profile_from_site(state: GraphState, website_url: str
                 if website_url
                 else "Here’s the company profile I’ve captured so far:"
             )
-            _prompt_profile_confirmation(state, header=header, require_confirmation=False)
+            _prompt_profile_confirmation(state, header=header, require_confirmation=True)
             state["site_profile_bootstrap_url"] = website_url
             state["site_profile_summary_sent"] = True
             _emit_onboarding_event(
@@ -3668,7 +3837,7 @@ async def _maybe_bootstrap_profile_from_site(state: GraphState, website_url: str
             if website_url
             else "Here’s the company profile I’ve captured so far (based on your business site):"
         )
-        _prompt_profile_confirmation(state, header=header, require_confirmation=False)
+        _prompt_profile_confirmation(state, header=header, require_confirmation=True)
         summary_emitted = True
     if summary_emitted:
         state["site_profile_bootstrap_url"] = website_url
@@ -3788,129 +3957,6 @@ async def _maybe_bootstrap_icp_profile_from_seeds(state: GraphState) -> None:
         header="Here’s the ICP profile I inferred from your customer sites:",
         require_confirmation=False,
     )
-
-
-def _tokenize_feedback_values(text: str) -> List[str]:
-    if not text:
-        return []
-    segments = re.split(r"[,/]|(?:\band\b)|(?:&)|(?:;)|(?:\n)|(?:\bor\b)", text, flags=re.IGNORECASE)
-    values: List[str] = []
-    for seg in segments:
-        cleaned = seg.strip(" :-–—.\t ")
-        if not cleaned:
-            continue
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        if len(cleaned) < 2:
-            continue
-        values.append(cleaned)
-    out: List[str] = []
-    seen = set()
-    for v in values:
-        key = v.lower()
-        if key and key not in seen:
-            seen.add(key)
-            out.append(v)
-    return out[:8]
-
-
-def _strip_profile_feedback_value(value: str) -> str:
-    txt = (value or "").strip(" .,:;\"'()-")
-    if not txt:
-        return ""
-    txt = PROFILE_UPDATE_VERB_RE.sub("", txt).strip(" .,:;\"'()-")
-    return txt
-
-
-def _extract_profile_feedback_updates(feedback: str) -> Dict[str, List[str]]:
-    updates: Dict[str, List[str]] = {}
-    if not feedback:
-        return updates
-    for field, pattern in PROFILE_FEEDBACK_HINTS:
-        try:
-            match = re.search(pattern + r"[^\w]*(.+)", feedback, flags=re.IGNORECASE | re.DOTALL)
-        except re.error:
-            match = None
-        if not match:
-            continue
-        tail = match.group(1) or ""
-        sentence = tail.split(".")[0]
-        values = [
-            _strip_profile_feedback_value(val) for val in _tokenize_feedback_values(sentence)
-        ]
-        values = [v for v in values if v]
-        if values:
-            updates[field] = values
-            continue
-        verb_match = None
-        try:
-            verb_match = re.search(
-                rf"(?:add|include|plus|focus|target|expand|prioritize|emphasize)\s+(.+?)\s+(?:in|to|for)\s+(?:the\s+)?{pattern}",
-                feedback,
-                flags=re.IGNORECASE,
-            )
-        except re.error:
-            verb_match = None
-        if verb_match:
-            tail = verb_match.group(1) or ""
-            values = [_strip_profile_feedback_value(val) for val in _tokenize_feedback_values(tail)]
-            values = [v for v in values if v]
-            if values:
-                updates[field] = values
-    return updates
-
-
-def _apply_profile_feedback_updates(state: GraphState, updates: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    if not updates:
-        return {}
-    prof = dict(state.get("company_profile") or {})
-    applied: Dict[str, List[str]] = {}
-    for field, values in updates.items():
-        existing_prof = [v for v in prof.get(field) or [] if isinstance(v, str)]
-        changed_vals: List[str] = []
-        for val in values:
-            low = val.lower()
-            if any(low == (v or "").lower() for v in existing_prof):
-                continue
-            existing_prof.append(val)
-            changed_vals.append(val)
-        if changed_vals:
-            prof[field] = existing_prof
-            applied[field] = changed_vals
-    if applied:
-        prof["website_url"] = prof.get("website_url") or state.get("site_profile_bootstrap_url")
-        state["company_profile"] = prof
-        state["company_profile_confirmed"] = False
-        _remember_company_profile(state, prof)
-    return applied
-
-
-def _apply_icp_profile_feedback_updates(state: GraphState, updates: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    if not updates:
-        return {}
-    prof = dict(state.get("icp_profile") or {})
-    applied: Dict[str, List[str]] = {}
-    for field, values in updates.items():
-        existing_prof = [v for v in prof.get(field) or [] if isinstance(v, str)]
-        changed_vals: List[str] = []
-        for val in values:
-            low = val.lower()
-            if any(low == (v or "").lower() for v in existing_prof):
-                continue
-            existing_prof.append(val)
-            changed_vals.append(val)
-        if changed_vals:
-            prof[field] = existing_prof
-            applied[field] = changed_vals
-    if applied:
-        state["icp_profile"] = prof
-        state["icp_profile_confirmed"] = False
-        state["icp_profile_user_confirmed"] = False
-        state["icp_profile_soft_confirmation_open"] = True
-        _persist_icp_profile_sync(state, prof, confirmed=False, user_confirmed=False)
-        _remember_icp_profile(state, prof)
-    return applied
-
-
 def _has_company_profile_context(state: Mapping[str, Any]) -> bool:
     prof = state.get("company_profile")
     if not (isinstance(prof, dict) and prof):
@@ -4003,6 +4049,8 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                     state["site_profile_bootstrap_url"] = rec.get("source_url")
                 if rec.get("confirmed") is not None:
                     state["company_profile_confirmed"] = bool(rec.get("confirmed"))
+
+    _rehydrate_icp_seeds_from_context(state)
     if state.get("company_profile_confirmed"):
         state["awaiting_profile_confirmation"] = False
         state["company_profile_pending"] = False
@@ -4042,16 +4090,11 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                         "Great! I’ll keep that profile locked. Next we’ll capture your best customers so I can infer signals and propose micro‑ICP segments."
                     )
                 ]
-                try:
-                    icp_f = dict(state.get("icp") or {})
-                except Exception:
-                    icp_f = {}
-                need_seeds = True
-                try:
-                    seeds = icp_f.get("seeds_list") or []
-                    need_seeds = not (isinstance(seeds, list) and len(seeds) >= 5)
-                except Exception:
-                    need_seeds = True
+                need_seeds = not _icp_seeds_ready(state)
+                logger.info(
+                    "icp_flow: company_profile_auto_confirm detected seeds_ready=%s",
+                    not need_seeds,
+                )
                 if need_seeds:
                     asks = dict(state.get("ask_counts") or {})
                     asks["seeds"] = asks.get("seeds", 0) + 1
@@ -4099,6 +4142,7 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
     if awaiting:
         new_url = _parse_website(reply)
         if new_url:
+            logger.info("icp_flow: company_profile_gate received_new_url=%s", new_url)
             _reset_company_profile_loop(state)
             try:
                 state.pop("company_profile", None)
@@ -4111,11 +4155,13 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                 pass
             return "continue"
         if _is_profile_show_request(reply, icp=False):
+            logger.info("icp_flow: company_profile_gate replaying_snapshot_during_confirmation")
             _prompt_profile_confirmation(
                 state, header="Here’s the latest company profile snapshot:", require_confirmation=True
             )
             return "await"
         if _is_profile_update_request(reply, icp=False):
+            logger.info("icp_flow: company_profile_gate received_structured_update")
             state["awaiting_profile_confirmation"] = False
             state["profile_feedback_last_text"] = reply
             _prompt_profile_confirmation(state)
@@ -4146,16 +4192,8 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
                 )
             ]
             # Ask for seeds immediately if missing
-            try:
-                icp_f = dict(state.get("icp") or {})
-            except Exception:
-                icp_f = {}
-            need_seeds = True
-            try:
-                seeds = icp_f.get("seeds_list") or []
-                need_seeds = not (isinstance(seeds, list) and len(seeds) >= 5)
-            except Exception:
-                need_seeds = True
+            need_seeds = not _icp_seeds_ready(state)
+            logger.info("icp_flow: company_profile_confirmed_by_user seeds_ready=%s", not need_seeds)
             if need_seeds:
                 asks = dict(state.get("ask_counts") or {})
                 asks["seeds"] = asks.get("seeds", 0) + 1
@@ -4188,10 +4226,19 @@ def _handle_profile_confirmation_gate(state: GraphState, user_text: str) -> str:
         manual_notes.append(feedback)
         prof["manual_notes"] = manual_notes[-10:]
         state["company_profile"] = prof
+        logger.info(
+            "icp_flow: company_profile_feedback captured notes_count=%s awaiting_reprompt=True",
+            len(manual_notes[-10:]),
+        )
         _remember_company_profile(state, prof)
         state["company_profile_confirmed"] = False
-        updates = _extract_profile_feedback_updates(feedback)
-        applied = _apply_profile_feedback_updates(state, updates)
+        applied: dict[str, Dict[str, List[str]]] = {}
+        try:
+            llm_upd = extract_company_profile_update_sync(feedback)
+        except Exception:
+            llm_upd = None
+        if llm_upd is not None:
+            applied = _apply_company_profile_llm_update(state, llm_upd)
         if applied:
             _emit_onboarding_event(
                 state,
@@ -4268,54 +4315,34 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     manual_text_trigger = (awaiting or soft_gate_triggered) and incoming_text and incoming_text != last_feedback_text
     has_new_input = has_new_human or manual_text_trigger or soft_gate_triggered
 
-    # Resilient: if user explicitly says "confirm icp profile" but we're not awaiting,
-    # honor it as long as there is ICP profile context.
+    # Resilient path: if the user says "confirm icp profile" while the gate is closed,
+    # re-open the confirmation loop by replaying the ICP snapshot so awaiting=True again.
     try:
         _icp_confirm_cmd = False
         if incoming_text:
             _icp_confirm_cmd = _matches_profile_confirm_command(incoming_text, icp=True)
-        if (not awaiting) and _icp_confirm_cmd and _has_icp_profile_context(state):
-            state["icp_profile_confirmed"] = True
-            state["awaiting_icp_profile_confirmation"] = False
-            state["icp_profile_pending"] = False
-            state["icp_profile_newly_confirmed"] = True
-            state["icp_profile_user_confirmed"] = True
-            state["icp_profile_soft_confirmation_open"] = False
-            prof_snapshot = dict(state.get("icp_profile") or {})
-            _remember_icp_profile(state, prof_snapshot)
-            _persist_icp_profile_sync(
-                state,
-                prof_snapshot,
-                confirmed=True,
-                seed_urls=_current_seed_urls(state),
-                user_confirmed=True,
-            )
-            _merge_icp_profile_into_state(state, prof_snapshot)
+        if (not awaiting) and _icp_confirm_cmd:
+            if _has_icp_profile_context(state):
+                logger.info(
+                    "icp_flow: icp_profile_confirm command received with gate closed; re-prompting snapshot"
+                )
+                _prompt_icp_profile_confirmation(
+                    state,
+                    header="Here’s the latest ICP profile snapshot:",
+                    require_confirmation=True,
+                )
+                state["icp_profile_feedback_last_text"] = incoming_text
+                state["icp_profile_feedback_handled_len"] = msg_len
+                return "prompted"
             state["messages"] = add_messages(
                 state.get("messages") or [],
                 [
                     AIMessage(
-                        "Great! I’ll keep that ICP profile locked. Next I’ll use it to plan discovery and micro‑ICPs."
+                        "I don't have an ICP profile snapshot on hand yet — share 5–15 of your best customers (Company — website) so I can generate it."
                     )
                 ],
             )
-            _prompt_icp_discovery_confirmation(state)
-            telemetry = {
-                "icp_profile": prof_snapshot,
-                "icp_profile_keys": _nonempty_profile_keys(prof_snapshot),
-            }
-            tenant_id = state.get("tenant_id")
-            if tenant_id:
-                telemetry["tenant_id"] = tenant_id
-            if incoming_text:
-                telemetry["confirmation_text"] = incoming_text
-            _emit_onboarding_event(
-                state,
-                "icp_profile_verified",
-                "User confirmed the customer-derived ICP profile.",
-                telemetry,
-            )
-            return "continue"
+            return "await"
     except Exception:
         pass
 
@@ -4323,6 +4350,9 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
         return "continue"
 
     if not awaiting and not soft_gate_triggered and needs_prompt:
+        logger.info(
+            "icp_flow: icp_profile_prompt_trigger needs_prompt=True awaiting=False soft_gate=False"
+        )
         _prompt_icp_profile_confirmation(state)
         if incoming_text:
             state["icp_profile_feedback_last_text"] = incoming_text
@@ -4369,6 +4399,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
             user_confirmed=True,
         )
         _merge_icp_profile_into_state(state, prof_snapshot)
+        _sync_icp_seed_profiles(state)
         state["messages"] = add_messages(
             state.get("messages") or [],
             [
@@ -4376,6 +4407,10 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
                     "Great! I’ll keep that ICP profile locked. Next I’ll use it to plan discovery and micro‑ICPs."
                 )
             ],
+        )
+        logger.info(
+            "icp_flow: icp_profile_confirmed_by_user seed_count=%s",
+            len(_current_seed_urls(state)),
         )
         _prompt_icp_discovery_confirmation(state)
         telemetry = {
@@ -4396,6 +4431,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
         return "continue"
 
     if _is_profile_show_request(reply, icp=True):
+        logger.info("icp_flow: icp_profile_gate replaying_snapshot_during_confirmation")
         _prompt_icp_profile_confirmation(
             state, header="Here’s the latest ICP profile snapshot:", require_confirmation=True
         )
@@ -4407,14 +4443,19 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
             icp_upd = extract_icp_profile_update_sync(reply)
         except Exception:
             icp_upd = None
+        logger.info(
+            "icp_flow: icp_profile_gate received_structured_update structured=%s",
+            icp_upd is not None,
+        )
+        applied_structured: dict[str, Dict[str, List[str]]] = {}
         if icp_upd is not None:
-            _apply_icp_profile_llm_update(state, icp_upd)
+            applied_structured = _apply_icp_profile_llm_update(state, icp_upd)
         state["awaiting_icp_profile_confirmation"] = False
         state["icp_profile_feedback_last_text"] = reply
         _prompt_icp_profile_confirmation(
             state,
             header=(
-                "Updated. Here’s the latest ICP profile snapshot:" if icp_upd else
+                "Updated. Here’s the latest ICP profile snapshot:" if applied_structured else
                 "Sure — here’s the latest ICP profile snapshot:"
             ),
         )
@@ -4429,22 +4470,23 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
     manual_notes.append(feedback)
     prof["manual_notes"] = manual_notes[-10:]
     state["icp_profile"] = prof
+    logger.info(
+        "icp_flow: icp_profile_feedback captured notes_count=%s",
+        len(manual_notes[-10:]),
+    )
     _remember_icp_profile(state, prof)
     state["icp_profile_confirmed"] = False
     state["icp_profile_user_confirmed"] = False
     state["icp_profile_soft_confirmation_open"] = True
     # Keep drafts in memory only; do not persist until confirm
     # Try LLM-driven merge for additional structure
-    applied: dict[str, list[str]] = {}
+    applied: dict[str, Dict[str, List[str]]] = {}
     try:
         icp_upd = extract_icp_profile_update_sync(feedback)
         if icp_upd is not None:
             applied = _apply_icp_profile_llm_update(state, icp_upd)
     except Exception:
-        pass
-    if not applied:
-        updates = _extract_profile_feedback_updates(feedback)
-        applied = _apply_icp_profile_feedback_updates(state, updates)
+        applied = {}
     if applied:
         _emit_onboarding_event(
             state,
@@ -4506,6 +4548,10 @@ def _prompt_micro_icp_confirmation(state: GraphState) -> None:
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
     state["awaiting_micro_icp_confirmation"] = True
     state["micro_icp_confirmed"] = False
+    logger.info(
+        "icp_flow: prompt_micro_icp_confirmation suggestion_count=%s",
+        len(suggestions),
+    )
     _emit_onboarding_event(
         state,
         "micro_icp_prompted",
@@ -4534,6 +4580,10 @@ def _handle_micro_icp_confirmation_response(state: GraphState, user_text: str) -
         anti.append(reply)
         icp["anti_icp"] = anti[-10:]
         state["icp"] = icp
+        logger.info(
+            "icp_flow: micro_icp_gate captured_anti_note notes_count=%s",
+            len(notes[-10:]),
+        )
         state["messages"] = add_messages(
             state.get("messages") or [],
             [
@@ -4552,6 +4602,10 @@ def _handle_micro_icp_confirmation_response(state: GraphState, user_text: str) -
     if MICRO_CONFIRM_RE.search(reply):
         state["micro_icp_confirmed"] = True
         state["awaiting_micro_icp_confirmation"] = False
+        logger.info(
+            "icp_flow: micro_icp_confirmed_by_user suggestion_count=%s",
+            len(state.get("micro_icp_suggestions") or []),
+        )
         state["messages"] = add_messages(
             state.get("messages") or [],
             [
@@ -4568,6 +4622,7 @@ def _handle_micro_icp_confirmation_response(state: GraphState, user_text: str) -
         )
         return "continue"
     # Treat everything else as clarification but keep waiting for explicit confirm
+    logger.info("icp_flow: micro_icp_feedback captured awaiting_explicit_confirm")
     state["messages"] = add_messages(
         state.get("messages") or [],
         [
@@ -4863,11 +4918,20 @@ async def extract_update_from_text(text: str) -> ICPUpdate:
 # ------------------------------
 
 
+class ProfileFieldDelta(BaseModel):
+    add: list[str] = Field(default_factory=list)
+    remove: list[str] = Field(default_factory=list)
+    replace_with: list[str] | None = Field(
+        default=None,
+        description="If present, overwrite the field with this exact list (empty list clears it).",
+    )
+
+
 class CompanyProfileUpdate(BaseModel):
-    industries: list[str] = Field(default_factory=list)
-    buyer_titles: list[str] = Field(default_factory=list)
-    geos: list[str] = Field(default_factory=list)
-    signals: list[str] = Field(default_factory=list)
+    industries: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    buyer_titles: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    geos: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    signals: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
     summary_override: str | None = Field(
         default=None, description="If user provided a replacement summary, set it here"
     )
@@ -4876,11 +4940,11 @@ class CompanyProfileUpdate(BaseModel):
 COMPANY_PROFILE_UPDATE_SYS = SystemMessage(
     content=(
         "You interpret a user's natural-language request to UPDATE a Company Profile.\n"
-        "Return JSON ONLY with fields to add/adjust: industries (list[str]), buyer_titles (list[str]), geos (list[str]), signals (list[str]), summary_override (str|nullable).\n"
-        "- Extract only the NEW items the user asked to add or replace.\n"
-        "- If the user asked to 'add automation to industries', return industries:[\"automation\"].\n"
+        "Return JSON ONLY with: industries/buyer_titles/geos/signals objects each containing add/remove arrays and optional replace_with array, plus summary_override (str|nullable).\n"
+        "- add: values to append; remove: values to drop; replace_with: if provided, overwrite the field entirely with that list (empty list means clear).\n"
+        "- Handle natural phrasing like 'add automation to industries', 'remove healthcare from ICP industries', or 'replace buyer titles with founders and operators'.\n"
         "- If the user provided a new summary text, put it entirely in summary_override; otherwise leave summary_override null.\n"
-        "- Do not invent information; if uncertain, return empty arrays and null."
+        "- Do not invent information; if uncertain, leave arrays empty and summary_override null."
     )
 )
 
@@ -4890,39 +4954,111 @@ async def extract_company_profile_update(text: str) -> CompanyProfileUpdate:
     return await structured.ainvoke([COMPANY_PROFILE_UPDATE_SYS, HumanMessage(text)])
 
 
-def _apply_company_profile_llm_update(state: GraphState, upd: CompanyProfileUpdate) -> dict[str, list[str]]:
+def extract_company_profile_update_sync(text: str) -> CompanyProfileUpdate:
+    structured = EXTRACT_LLM.with_structured_output(CompanyProfileUpdate)
+    return structured.invoke([COMPANY_PROFILE_UPDATE_SYS, HumanMessage(text)])
+
+
+def _apply_company_profile_llm_update(state: GraphState, upd: CompanyProfileUpdate) -> dict[str, Dict[str, List[str]]]:
     prof = dict(state.get("company_profile") or {})
-    applied: dict[str, list[str]] = {}
-    def _merge_list(field: str, values: list[str]):
+    applied: dict[str, Dict[str, List[str]]] = {}
+
+    def _apply_delta(field: str, delta: ProfileFieldDelta) -> None:
         nonlocal prof, applied
-        if not values:
-            return
         cur = [v for v in prof.get(field) or [] if isinstance(v, str)]
-        changed: list[str] = []
-        for val in values:
-            low = (val or "").strip().lower()
-            if not low:
-                continue
-            if any((v or "").strip().lower() == low for v in cur):
-                continue
-            cur.append(val)
-            changed.append(val)
-        if changed:
-            prof[field] = cur
-            applied[field] = changed
-    _merge_list("industries", upd.industries or [])
-    _merge_list("buyer_titles", upd.buyer_titles or [])
-    _merge_list("geos", upd.geos or [])
-    _merge_list("signals", upd.signals or [])
-    if (upd.summary_override or "").strip():
-        prof["summary"] = (upd.summary_override or "").strip()
-        applied.setdefault("summary", [])
+        updated, summary = _apply_profile_field_delta(cur, delta)
+        if summary:
+            prof[field] = updated
+            applied[field] = summary
+
+    _apply_delta("industries", upd.industries)
+    _apply_delta("buyer_titles", upd.buyer_titles)
+    _apply_delta("geos", upd.geos)
+    _apply_delta("signals", upd.signals)
+    if upd.summary_override is not None:
+        summary_text = (upd.summary_override or "").strip()
+        prof_summary = str(prof.get("summary") or "").strip()
+        if summary_text != prof_summary:
+            prof["summary"] = summary_text
+            applied["summary"] = {"replaced_with": [summary_text] if summary_text else []}
     if applied:
         prof["website_url"] = prof.get("website_url") or state.get("site_profile_bootstrap_url")
         state["company_profile"] = prof
         state["company_profile_confirmed"] = False
         _remember_company_profile(state, prof)
+        if state.get("tenant_id") is not None:
+            try:
+                _persist_company_profile_sync(state, prof, confirmed=False)
+            except Exception:
+                logger.debug("company_profile draft persist failed", exc_info=True)
     return applied
+
+
+def _apply_profile_field_delta(
+    existing: List[str],
+    delta: ProfileFieldDelta,
+) -> tuple[List[str], Dict[str, List[str]]]:
+    values = [v for v in existing if isinstance(v, str)]
+    summary: Dict[str, List[str]] = {}
+    changed = False
+
+    def _normalize_list(items: Iterable[str]) -> List[str]:
+        seen: set[str] = set()
+        result: List[str] = []
+        for raw in items:
+            text = (raw or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(text)
+        return result
+
+    if delta.replace_with is not None:
+        replacement = _normalize_list(delta.replace_with)
+        orig_keys = [str(v or "").strip().lower() for v in values]
+        repl_keys = [val.lower() for val in replacement]
+        if orig_keys != repl_keys:
+            summary["replaced_with"] = replacement
+            changed = True
+        values = replacement
+
+    if delta.remove:
+        removal_keys = { (val or "").strip().lower() for val in delta.remove if (val or "").strip() }
+        if removal_keys:
+            kept: List[str] = []
+            removed: List[str] = []
+            for val in values:
+                key = (val or "").strip().lower()
+                if key and key in removal_keys:
+                    removed.append(val)
+                    changed = True
+                else:
+                    kept.append(val)
+            if removed:
+                summary["removed"] = removed
+                values = kept
+
+    if delta.add:
+        additions: List[str] = []
+        present_keys = { (val or "").strip().lower() for val in values if (val or "").strip() }
+        for val in delta.add:
+            text = (val or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in present_keys:
+                continue
+            present_keys.add(key)
+            values.append(text)
+            additions.append(text)
+            changed = True
+        if additions:
+            summary["added"] = additions
+
+    return (values if changed else values.copy()), summary
 
 
 # ------------------------------
@@ -4931,22 +5067,22 @@ def _apply_company_profile_llm_update(state: GraphState, upd: CompanyProfileUpda
 
 
 class ICPProfileUpdate(BaseModel):
-    industries: list[str] = Field(default_factory=list)
-    buyer_titles: list[str] = Field(default_factory=list)
-    size_bands: list[str] = Field(default_factory=list)
-    geos: list[str] = Field(default_factory=list)
-    integrations: list[str] = Field(default_factory=list)
-    triggers: list[str] = Field(default_factory=list)
-    exclusions: list[str] = Field(default_factory=list)
+    industries: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    buyer_titles: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    size_bands: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    geos: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    integrations: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    triggers: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
+    exclusions: ProfileFieldDelta = Field(default_factory=ProfileFieldDelta)
 
 
 ICP_PROFILE_UPDATE_SYS = SystemMessage(
     content=(
         "You interpret a user's natural-language request to UPDATE an ICP Profile.\n"
-        "Return JSON ONLY with fields to add/adjust: industries (list[str]), buyer_titles (list[str]), size_bands (list[str]), geos (list[str]), integrations (list[str]), triggers (list[str]), exclusions (list[str]).\n"
-        "- Extract only the NEW items the user asked to add or emphasize.\n"
-        "- Example: 'add healthcare and fintech to ICP industries' → industries:[\"healthcare\",\"fintech\"].\n"
-        "- Do not invent information; leave arrays empty if unspecified."
+        "Return JSON ONLY with objects for industries/buyer_titles/size_bands/geos/integrations/triggers/exclusions where each object has add/remove arrays and optional replace_with array.\n"
+        "- add: append new entries, remove: delete entries, replace_with: overwrite the field entirely with that list (empty list clears it).\n"
+        "- Handle natural phrasing such as 'remove healthcare from the ICP industries' or 'replace size bands with 50-100 seats'.\n"
+        "- Do not invent information; leave arrays empty when the user did not mention them."
     )
 )
 
@@ -4965,36 +5101,25 @@ def extract_icp_profile_update_sync(text: str) -> ICPProfileUpdate:
     return structured.invoke([ICP_PROFILE_UPDATE_SYS, HumanMessage(text)])
 
 
-def _apply_icp_profile_llm_update(state: GraphState, upd: ICPProfileUpdate) -> dict[str, list[str]]:
+def _apply_icp_profile_llm_update(state: GraphState, upd: ICPProfileUpdate) -> dict[str, Dict[str, List[str]]]:
     prof = dict(state.get("icp_profile") or {})
-    applied: dict[str, list[str]] = {}
-    def _merge(field: str, values: list[str]):
+    applied: dict[str, Dict[str, List[str]]] = {}
+
+    def _apply(field: str, delta: ProfileFieldDelta) -> None:
         nonlocal prof, applied
-        if not values:
-            return
         cur = [v for v in prof.get(field) or [] if isinstance(v, str)]
-        changed: list[str] = []
-        for val in values:
-            low = (val or "").strip().lower()
-            if not low:
-                continue
-            if any((v or "").strip().lower() == low for v in cur):
-                continue
-            cur.append(val)
-            changed.append(val)
-        if changed:
-            prof[field] = cur
-            applied[field] = changed
-    _merge("industries", upd.industries or [])
-    _merge("buyer_titles", upd.buyer_titles or [])
-    # Prefer size_bands field; many callers also alias as company_sizes downstream
-    if upd.size_bands:
-        _merge("size_bands", upd.size_bands)
-    _merge("geos", upd.geos or [])
-    # Integrations/signals
-    _merge("integrations", upd.integrations or [])
-    _merge("triggers", upd.triggers or [])
-    _merge("exclusions", upd.exclusions or [])
+        updated, summary = _apply_profile_field_delta(cur, delta)
+        if summary:
+            prof[field] = updated
+            applied[field] = summary
+
+    _apply("industries", upd.industries)
+    _apply("buyer_titles", upd.buyer_titles)
+    _apply("size_bands", upd.size_bands)
+    _apply("geos", upd.geos)
+    _apply("integrations", upd.integrations)
+    _apply("triggers", upd.triggers)
+    _apply("exclusions", upd.exclusions)
     if applied:
         state["icp_profile"] = prof
         state["icp_profile_confirmed"] = False
@@ -5557,7 +5682,7 @@ async def icp_node(state: GraphState) -> GraphState:
                 icp_upd = await extract_icp_profile_update(feedback)
             except Exception:
                 icp_upd = None
-            applied_updates: dict[str, list[str]] = {}
+            applied_updates: dict[str, Dict[str, List[str]]] = {}
             if icp_upd is not None:
                 applied_updates = _apply_icp_profile_llm_update(state, icp_upd)
             state["icp_profile_feedback_last_text"] = feedback
@@ -5582,22 +5707,29 @@ async def icp_node(state: GraphState) -> GraphState:
             prof0["manual_notes"] = notes[-10:]
             state["company_profile"] = prof0
             # LLM-driven: extract and apply structured updates (industries, buyers, geos, signals, summary)
-            updates: dict[str, list[str]] = {}
+            updates: dict[str, Dict[str, List[str]]] = {}
             try:
                 llm_upd = await extract_company_profile_update(feedback)
             except Exception:
-                llm_upd = None  # fallback to pattern-based if LLM fails
+                llm_upd = None
             if llm_upd is not None:
-                applied_llm = _apply_company_profile_llm_update(state, llm_upd)
-                updates.update(applied_llm)
-            if not updates:
-                # Fallback: light pattern-based extraction as a safety net
-                fb_updates = _extract_profile_feedback_updates(feedback)
-                _ = _apply_profile_feedback_updates(state, fb_updates)
-                updates.update(fb_updates)
+                updates = _apply_company_profile_llm_update(state, llm_upd)
             # Re-prompt with the updated snapshot; mark as awaiting confirmation again
             state["profile_feedback_last_text"] = feedback
             state["awaiting_profile_confirmation"] = False
+            if updates:
+                _emit_onboarding_event(
+                    state,
+                    "company_profile_adjusted_structured",
+                    "User provided structured adjustments to the company profile.",
+                    {"updates": updates},
+                )
+            _emit_onboarding_event(
+                state,
+                "company_profile_adjusted",
+                "User provided adjustments to the company profile.",
+                {"feedback": feedback},
+            )
             _prompt_profile_confirmation(
                 state,
                 header=(
@@ -5624,10 +5756,13 @@ async def icp_node(state: GraphState) -> GraphState:
             return state
 
     profile_gate = "continue"
-    if not (state.get("awaiting_icp_profile_confirmation") or state.get("icp_profile_pending")):
+    awaiting_company = bool(state.get("awaiting_profile_confirmation"))
+    awaiting_icp_gate = bool(state.get("awaiting_icp_profile_confirmation") or state.get("icp_profile_pending"))
+    force_company_gate = awaiting_company or _matches_profile_confirm_command(text, icp=False)
+    if force_company_gate or not awaiting_icp_gate:
         profile_gate = _handle_profile_confirmation_gate(state, text)
-    if profile_gate in ("await", "prompted"):
-        return state
+        if profile_gate in ("await", "prompted"):
+            return state
 
     # If the user already confirmed but ICP is incomplete, proactively ask the next question
     # to avoid router loops where the last message remains the user's "confirm".
@@ -7960,7 +8095,13 @@ async def score_node(state: GraphState) -> GraphState:
 def router(state: GraphState) -> str:
     msgs = state.get("messages") or []
     msg_len = len(msgs)
-    icp = state.get("icp") or {}
+    _rehydrate_icp_seeds_from_context(state)
+    _sync_icp_seed_profiles(state)
+    try:
+        icp = state.get("icp") or {}
+    except Exception:
+        icp = {}
+    workflow_status = _profile_workflow_status(state)
 
     text_raw = _last_user_text(state)
     text = text_raw.lower()
@@ -7969,14 +8110,20 @@ def router(state: GraphState) -> str:
     normalized_command = text_raw.strip().lower()
     has_company_profile_ctx = _has_company_profile_context(state)
     has_icp_profile_ctx = _has_icp_profile_context(state)
+    human_turns = _human_turn_count(state)
     confirm_handled_len = int(state.get("confirm_handled_len") or 0)
     if msg_len < confirm_handled_len:
         confirm_handled_len = 0
     user_confirmed_now = _user_just_confirmed(state)
     just_confirmed_user = False
-    if user_confirmed_now and msg_len != confirm_handled_len:
-        just_confirmed_user = True
-        state["confirm_handled_len"] = msg_len
+    last_handled_human = int(state.get("confirm_handled_human_idx") or 0)
+    if user_confirmed_now:
+        if human_turns != last_handled_human:
+            just_confirmed_user = True
+            state["confirm_handled_human_idx"] = human_turns
+            state["confirm_handled_len"] = msg_len
+        else:
+            user_confirmed_now = False
     recent_company_confirm = bool(state.get("company_profile_newly_confirmed"))
     recent_icp_confirm = bool(state.get("icp_profile_newly_confirmed"))
     recent_manual_confirm = recent_company_confirm or recent_icp_confirm
@@ -8335,32 +8482,40 @@ def router(state: GraphState) -> str:
         if (
             just_confirmed
             and not recent_icp_confirm
-            and state.get("company_profile_confirmed")
-            and not state.get("icp_profile_confirmed")
+            and workflow_status.company_ready
+            and not workflow_status.icp_ready
         ):
             if not _icp_seeds_ready(state):
-                logger.info("router -> end (requesting best customers before ICP confirmation)")
-                _prompt_best_customer_seeds(
-                    state,
-                    header="Great! Company profile locked. Next, list 5–15 of your best customers so I can synthesize the ICP profile.",
+                logger.info("router -> prompt_best_customers (requesting best customers before ICP confirmation)")
+                state["prompt_best_customers_header"] = (
+                    "Great! Company profile locked. Next, list 5–15 of your best customers so I can synthesize the ICP profile."
                 )
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "prompt_best_customers"
             elif _should_prompt_icp_profile_confirmation(state):
                 logger.info("router -> end (prompted ICP confirmation after company profile lock)")
                 _prompt_icp_profile_confirmation(state)
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "end"
             else:
-                logger.info("router -> end (ICP profile not ready; re-requesting seeds)")
-                _prompt_best_customer_seeds(state)
-            try:
-                state["last_routed_text"] = text
-            except Exception:
-                pass
-            return "end"
+                logger.info("router -> icp (ICP profile not ready; refreshing profile workflow)")
+                try:
+                    state["last_routed_text"] = text
+                except Exception:
+                    pass
+                return "icp"
         if recent_icp_confirm:
             state["icp_profile_newly_confirmed"] = False
             if not state.get("icp_discovery_confirmed"):
                 logger.info("router -> icp_discovery_prompt (awaiting discovery confirmation after ICP lock)")
                 return "icp_discovery_prompt"
-        if not state.get("icp_profile_confirmed"):
+        if not workflow_status.icp_ready:
             logger.info("router -> icp (confirmation gated until ICP profile locked)")
             _remind_icp_confirmation_required(state)
             try:
@@ -8368,7 +8523,7 @@ def router(state: GraphState) -> str:
             except Exception:
                 pass
             return "icp"
-        if not state.get("icp_discovery_confirmed"):
+        if not workflow_status.discovery_ready:
             logger.info("router -> icp_discovery_prompt (icp discovery pending explicit approval)")
             return "icp_discovery_prompt"
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
@@ -8523,8 +8678,17 @@ def icp_discovery_prompt_node(state: GraphState) -> GraphState:
         _prompt_icp_discovery_confirmation(state)
     try:
         state["confirm_handled_len"] = len(state.get("messages") or [])
+        state["confirm_handled_human_idx"] = _human_turn_count(state)
     except Exception:
         pass
+    return state
+
+
+@log_node("prompt_best_customers")
+def prompt_best_customer_seeds_node(state: GraphState) -> GraphState:
+    """Dedicated node to emit the best customers ask so it streams like other replies."""
+    header = state.pop("prompt_best_customers_header", None)
+    _prompt_best_customer_seeds(state, header=header)
     return state
 
 
@@ -8589,6 +8753,7 @@ def build_graph():
     # Accept micro‑ICP selection node
     g.add_node("accept", accept_micro_icp)
     g.add_node("icp_discovery_prompt", icp_discovery_prompt_node)
+    g.add_node("prompt_best_customers", prompt_best_customer_seeds_node)
     # Central router: every node returns here so we can advance the workflow
     mapping = {
         "icp": "icp",
@@ -8596,6 +8761,7 @@ def build_graph():
         "confirm": "confirm",
         "accept": "accept",
         "icp_discovery_prompt": "icp_discovery_prompt",
+        "prompt_best_customers": "prompt_best_customers",
         "enrich": "enrich",
         "score": "score",
         "leadgen_qa": "leadgen_qa",
@@ -8606,7 +8772,7 @@ def build_graph():
     g.set_entry_point("router")
     g.add_conditional_edges("router", router, mapping)
     # Every worker node loops back to the router (welcome now flows back so the same run can process the user input)
-    for node in ("welcome", "icp", "candidates", "confirm", "accept", "enrich", "score"):
+    for node in ("welcome", "icp", "candidates", "confirm", "accept", "enrich", "score", "prompt_best_customers"):
         g.add_edge(node, "router")
     g.add_edge("icp_discovery_prompt", END)
     return g.compile()
