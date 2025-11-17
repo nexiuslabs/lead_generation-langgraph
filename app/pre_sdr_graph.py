@@ -3538,6 +3538,38 @@ def _prompt_icp_profile_confirmation(
         state["icp_profile_soft_confirmation_open"] = True
 
 
+def _prompt_best_customer_seeds(state: GraphState, header: Optional[str] = None) -> None:
+    """Ask the user to share seed customers so we can synthesize the ICP profile."""
+    asks = dict(state.get("ask_counts") or {})
+    count = asks.get("seeds", 0) + 1
+    asks["seeds"] = count
+    state["ask_counts"] = asks
+    state["icp_last_focus"] = "seeds"
+    lines = [
+        header
+        or "Great! To produce your ICP profile I still need 5–15 of your best customers (Company — website).",
+        "Share them one per line, e.g., `Acme — https://acme.com`.",
+    ]
+    state["messages"] = add_messages(state.get("messages") or [], [AIMessage("\n".join(lines))])
+    _maybe_emit_progress_recap(state, header="Progress recap", require_completed=False)
+
+
+def _icp_seeds_ready(state: GraphState) -> bool:
+    try:
+        icp = state.get("icp") or {}
+    except Exception:
+        icp = {}
+    seeds = icp.get("seeds_list") or []
+    if isinstance(seeds, list) and len(seeds) >= 5:
+        return True
+    prof = state.get("icp_profile") or {}
+    if isinstance(prof, dict):
+        prof_seeds = prof.get("seed_urls") or prof.get("seeds_list") or []
+        if isinstance(prof_seeds, list) and len(prof_seeds) >= 5:
+            return True
+    return False
+
+
 async def _maybe_bootstrap_profile_from_site(state: GraphState, website_url: str, *, force_refresh: bool = False) -> None:
     """Fetch a quick site summary and prompt for confirmation even before seeds."""
     if not website_url:
@@ -8061,17 +8093,25 @@ def router(state: GraphState) -> str:
 
     # Direct "confirm profile" commands should re-enter ICP node to finalize the loop
     try:
-        if re.search(r"\bconfirm\s+(company\s+)?profile\b", text) and not state.get("company_profile_confirmed"):
+        try:
+            company_confirm_cmd = _matches_profile_confirm_command(text_raw, icp=False)
+        except Exception:
+            company_confirm_cmd = False
+        try:
+            icp_confirm_cmd = _matches_profile_confirm_command(text_raw, icp=True)
+        except Exception:
+            icp_confirm_cmd = False
+        if company_confirm_cmd and not state.get("company_profile_confirmed"):
             logger.info("router -> icp (confirm company profile command)")
             _remember_procedural_step(state, "confirm_company_profile")
             state["last_routed_text"] = text
             return "icp"
-        if re.search(r"\bconfirm\s+(icp\s+)?profile\b", text) and state.get("icp_profile_confirmed") and not state.get("icp_discovery_confirmed"):
+        if icp_confirm_cmd and state.get("icp_profile_confirmed") and not state.get("icp_discovery_confirmed"):
             logger.info("router -> icp_discovery_prompt (ICP already locked; prompting discovery confirmation)")
             _remember_procedural_step(state, "confirm_icp_profile_repeat")
             state["last_routed_text"] = text
             return "icp_discovery_prompt"
-        if re.search(r"\bconfirm\s+(icp\s+)?profile\b", text) and not state.get("icp_profile_confirmed"):
+        if icp_confirm_cmd and not state.get("icp_profile_confirmed"):
             gate_status = _handle_icp_profile_confirmation_gate(state, text_raw)
             if state.get("icp_profile_confirmed"):
                 if not state.get("icp_discovery_confirmed"):
@@ -8292,6 +8332,29 @@ def router(state: GraphState) -> str:
     if just_confirmed:
         if recent_company_confirm:
             state["company_profile_newly_confirmed"] = False
+        if (
+            just_confirmed
+            and not recent_icp_confirm
+            and state.get("company_profile_confirmed")
+            and not state.get("icp_profile_confirmed")
+        ):
+            if not _icp_seeds_ready(state):
+                logger.info("router -> end (requesting best customers before ICP confirmation)")
+                _prompt_best_customer_seeds(
+                    state,
+                    header="Great! Company profile locked. Next, list 5–15 of your best customers so I can synthesize the ICP profile.",
+                )
+            elif _should_prompt_icp_profile_confirmation(state):
+                logger.info("router -> end (prompted ICP confirmation after company profile lock)")
+                _prompt_icp_profile_confirmation(state)
+            else:
+                logger.info("router -> end (ICP profile not ready; re-requesting seeds)")
+                _prompt_best_customer_seeds(state)
+            try:
+                state["last_routed_text"] = text
+            except Exception:
+                pass
+            return "end"
         if recent_icp_confirm:
             state["icp_profile_newly_confirmed"] = False
             if not state.get("icp_discovery_confirmed"):
