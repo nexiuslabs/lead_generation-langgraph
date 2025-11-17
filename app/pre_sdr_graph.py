@@ -1159,6 +1159,8 @@ def _reset_icp_profile_loop(state: dict) -> None:
     state["icp_profile_pending"] = False
     state["icp_profile_user_confirmed"] = False
     state["icp_profile_soft_confirmation_open"] = False
+    state["awaiting_icp_discovery_confirmation"] = False
+    state["icp_discovery_confirmed"] = False
     # Keep previously synthesized profile in case we need to re-display without re-running agents.
 
 
@@ -2947,6 +2949,8 @@ class GraphState(TypedDict):
     icp_profile_feedback_handled_len: NotRequired[int]
     icp_profile_feedback_last_text: NotRequired[str]
     icp_profile_seed_fingerprint: NotRequired[str]
+    awaiting_icp_discovery_confirmation: NotRequired[bool]
+    icp_discovery_confirmed: NotRequired[bool]
 
 
 def _ensure_memory_dict(state: GraphState) -> Dict[str, Any]:
@@ -3043,6 +3047,35 @@ def _remind_icp_confirmation_required(state: GraphState) -> None:
         )
     except Exception:
         pass
+
+
+def _matches_discovery_confirm_command(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    stripped = text.strip().lower()
+    if DISCOVERY_CONFIRM_RE.search(stripped):
+        return True
+    return stripped in {"start discovery", "run discovery", "yes start discovery"}
+
+
+def _prompt_icp_discovery_confirmation(state: GraphState) -> None:
+    state["messages"] = add_messages(
+        state.get("messages") or [],
+        [AIMessage(ICP_DISCOVERY_CONFIRMATION_PROMPT)],
+    )
+    state["awaiting_icp_discovery_confirmation"] = True
+    state["icp_discovery_confirmed"] = False
+
+
+def _ack_icp_discovery_confirmation(state: GraphState, *, silent: bool = False) -> None:
+    state["awaiting_icp_discovery_confirmation"] = False
+    state["icp_discovery_confirmed"] = True
+    if silent:
+        return
+    state["messages"] = add_messages(
+        state.get("messages") or [],
+        [AIMessage("Great — I'll start ICP discovery now.")],
+    )
 
 
 def _log_new_messages_to_memory(state: GraphState, messages: List[BaseMessage]) -> None:
@@ -3220,6 +3253,10 @@ MICRO_CONFIRM_RE = re.compile(
     r"\b(confirm(\s+micro)?-?icp|looks good|sounds good|ready|locked in)\b",
     flags=re.IGNORECASE,
 )
+DISCOVERY_CONFIRM_RE = re.compile(
+    r"\b((start|run|begin|kick\s*off)\s+(the\s+)?(icp\s+)?discovery|confirm\s+discovery|start\s+finder)\b",
+    flags=re.IGNORECASE,
+)
 ICP_KEYWORD_RE = re.compile(r"\b(icp|icps|ideal\s+customer|ideal\s+client)\b", flags=re.IGNORECASE)
 COMPANY_PROFILE_KEYWORD_RE = re.compile(
     r"\b(company|business|organisation|organization|org|startup|firm|hq)\b",
@@ -3230,6 +3267,9 @@ ICP_CONFIRM_CLARIFICATION = (
     "reply **confirm icp profile** (or tell me what to change)."
 )
 DISCOVERY_CONFIRMATION_REQUIRED = "Please confirm your ICP profile first so I can use it for discovery."
+ICP_DISCOVERY_CONFIRMATION_PROMPT = (
+    "Ready for me to start ICP discovery and refresh the micro-ICP suggestions? Reply **start discovery** (or tell me what to adjust)."
+)
 ANTI_ICP_HINTS = ("avoid", "exclude", "not a fit", "bad fit", "no longer", "skip", "without", "except")
 PROFILE_FEEDBACK_HINTS = (
     ("industries", r"industr(?:y|ies)"),
@@ -4227,6 +4267,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
                     )
                 ],
             )
+            _prompt_icp_discovery_confirmation(state)
             telemetry = {
                 "icp_profile": prof_snapshot,
                 "icp_profile_keys": _nonempty_profile_keys(prof_snapshot),
@@ -4304,6 +4345,7 @@ def _handle_icp_profile_confirmation_gate(state: GraphState, user_text: str) -> 
                 )
             ],
         )
+        _prompt_icp_discovery_confirmation(state)
         telemetry = {
             "icp_profile": prof_snapshot,
             "icp_profile_keys": _nonempty_profile_keys(prof_snapshot),
@@ -8000,6 +8042,23 @@ def router(state: GraphState) -> str:
             pass
         return "icp"
 
+    if state.get("awaiting_icp_discovery_confirmation"):
+        if not _last_is_human(msgs):
+            logger.info("router -> end (awaiting discovery confirmation, no new human reply)")
+            return "end"
+        if _matches_discovery_confirm_command(text_raw):
+            logger.info("router -> confirm (user approved ICP discovery)")
+            _ack_icp_discovery_confirmation(state)
+            _remember_procedural_step(state, "confirm_icp_profile_discovery")
+            state["last_routed_text"] = text
+            return "confirm"
+        logger.info("router -> icp (awaiting discovery confirmation)")
+        try:
+            state["last_routed_text"] = text
+        except Exception:
+            pass
+        return "icp"
+
     # Direct "confirm profile" commands should re-enter ICP node to finalize the loop
     try:
         if re.search(r"\bconfirm\s+(company\s+)?profile\b", text) and not state.get("company_profile_confirmed"):
@@ -8007,9 +8066,19 @@ def router(state: GraphState) -> str:
             _remember_procedural_step(state, "confirm_company_profile")
             state["last_routed_text"] = text
             return "icp"
+        if re.search(r"\bconfirm\s+(icp\s+)?profile\b", text) and state.get("icp_profile_confirmed") and not state.get("icp_discovery_confirmed"):
+            logger.info("router -> icp_discovery_prompt (ICP already locked; prompting discovery confirmation)")
+            _remember_procedural_step(state, "confirm_icp_profile_repeat")
+            state["last_routed_text"] = text
+            return "icp_discovery_prompt"
         if re.search(r"\bconfirm\s+(icp\s+)?profile\b", text) and not state.get("icp_profile_confirmed"):
             gate_status = _handle_icp_profile_confirmation_gate(state, text_raw)
             if state.get("icp_profile_confirmed"):
+                if not state.get("icp_discovery_confirmed"):
+                    logger.info("router -> icp_discovery_prompt (ICP locked; awaiting discovery confirmation)")
+                    _remember_procedural_step(state, "confirm_icp_profile")
+                    state["last_routed_text"] = text
+                    return "icp_discovery_prompt"
                 logger.info("router -> confirm (ICP profile locked via command)")
                 _remember_procedural_step(state, "confirm_icp_profile")
                 state["last_routed_text"] = text
@@ -8134,7 +8203,7 @@ def router(state: GraphState) -> str:
     # 2) If assistant spoke last and no pending work, wait for user input (covered by early guard)
 
     # Discovery guard: require confirmed ICP before planner/enrichment
-    if "run discovery" in text:
+    if _matches_discovery_confirm_command(text_raw):
         if not state.get("icp_profile_confirmed"):
             logger.info("router -> end (run discovery blocked until ICP confirmed)")
             _remind_icp_confirmation_required(state)
@@ -8143,6 +8212,8 @@ def router(state: GraphState) -> str:
             except Exception:
                 pass
             return "end"
+        if not state.get("icp_discovery_confirmed"):
+            _ack_icp_discovery_confirmation(state)
         logger.info("router -> confirm (user requested discovery run)")
         try:
             state["last_routed_text"] = text
@@ -8223,6 +8294,9 @@ def router(state: GraphState) -> str:
             state["company_profile_newly_confirmed"] = False
         if recent_icp_confirm:
             state["icp_profile_newly_confirmed"] = False
+            if not state.get("icp_discovery_confirmed"):
+                logger.info("router -> icp_discovery_prompt (awaiting discovery confirmation after ICP lock)")
+                return "icp_discovery_prompt"
         if not state.get("icp_profile_confirmed"):
             logger.info("router -> icp (confirmation gated until ICP profile locked)")
             _remind_icp_confirmation_required(state)
@@ -8231,6 +8305,9 @@ def router(state: GraphState) -> str:
             except Exception:
                 pass
             return "icp"
+        if not state.get("icp_discovery_confirmed"):
+            logger.info("router -> icp_discovery_prompt (icp discovery pending explicit approval)")
+            return "icp_discovery_prompt"
         # Finder: if minimal intake present (website + seeds), allow confirm pipeline even if core ICP incomplete
         if ENABLE_ICP_INTAKE:
             _maybe_backfill_icp_basics_from_context(state)
@@ -8365,6 +8442,29 @@ def accept_micro_icp(state: GraphState) -> GraphState:
     state["messages"] = add_messages(state.get("messages") or [], [AIMessage(f"Accepted: {title}. You can now type 'run enrichment' to proceed.")])
     return state
 
+
+@log_node("icp_discovery_prompt")
+def icp_discovery_prompt_node(state: GraphState) -> GraphState:
+    """Emit the ICP discovery confirmation request as a standard assistant message."""
+    msgs = state.get("messages") or []
+    already_prompted = False
+    if state.get("awaiting_icp_discovery_confirmation"):
+        last = msgs[-1] if msgs else None
+        try:
+            text = _to_text(getattr(last, "content", ""))
+        except Exception:
+            text = ""
+        if isinstance(last, AIMessage) and text.strip() == ICP_DISCOVERY_CONFIRMATION_PROMPT.strip():
+            already_prompted = True
+    if not already_prompted:
+        _prompt_icp_discovery_confirmation(state)
+    try:
+        state["confirm_handled_len"] = len(state.get("messages") or [])
+    except Exception:
+        pass
+    return state
+
+
 def build_graph():
     g = StateGraph(GraphState)
     # Central router node (no-op) to hub all control flow
@@ -8425,12 +8525,14 @@ def build_graph():
     g.add_node("leadgen_qa", leadgen_qa)
     # Accept micro‑ICP selection node
     g.add_node("accept", accept_micro_icp)
+    g.add_node("icp_discovery_prompt", icp_discovery_prompt_node)
     # Central router: every node returns here so we can advance the workflow
     mapping = {
         "icp": "icp",
         "candidates": "candidates",
         "confirm": "confirm",
         "accept": "accept",
+        "icp_discovery_prompt": "icp_discovery_prompt",
         "enrich": "enrich",
         "score": "score",
         "leadgen_qa": "leadgen_qa",
@@ -8443,6 +8545,7 @@ def build_graph():
     # Every worker node loops back to the router (welcome now flows back so the same run can process the user input)
     for node in ("welcome", "icp", "candidates", "confirm", "accept", "enrich", "score"):
         g.add_edge(node, "router")
+    g.add_edge("icp_discovery_prompt", END)
     return g.compile()
 
 

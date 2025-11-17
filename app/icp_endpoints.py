@@ -25,6 +25,10 @@ from src.jobs import (
 from src.enrichment import enrich_company_with_tavily  # async enrich by company_id
 from src.chat_events import emit as emit_chat_event
 
+ICP_DISCOVERY_CONFIRMATION_PROMPT = (
+    "Ready for me to start ICP discovery and refresh the micro-ICP suggestions? Reply **start discovery** (or tell me what to adjust)."
+)
+
 router = APIRouter(prefix="/icp", tags=["icp"])
 log = logging.getLogger("icp_endpoints")
 
@@ -847,6 +851,13 @@ async def get_top10(
         from src.icp_pipeline import winner_profile
         profile = winner_profile(int(tid)) if tid is not None else {}
         emit_chat_event(x_session_id, tid, "icp:profile_ready", "ICP Profile produced.", {})
+        emit_chat_event(
+            x_session_id,
+            tid,
+            "icp:discovery_confirmation_needed",
+            ICP_DISCOVERY_CONFIRMATION_PROMPT,
+            {},
+        )
         emit_chat_event(x_session_id, tid, "icp:candidates_found", f"Found {len(top or [])} ICP candidates. We can enrich 10 now…", {"count": len(top or [])})
     except Exception:
         pass

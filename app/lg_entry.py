@@ -499,18 +499,32 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm_msgs = [_to_message(m) for m in msgs] or [HumanMessage(content="")]
     state: Dict[str, Any] = {"messages": norm_msgs}
 
-    # Propagate tenant_id from context or input for multi-user runs
+    # Propagate tenant_id and session_id from context/input for multi-user runs
     tenant_candidates: List[Any] = []
+    session_candidates: List[Any] = []
     try:
         ctx = payload.get("context") or data.get("context") or {}
         if isinstance(ctx, dict):
             tenant_candidates.append(ctx.get("tenant_id"))
+            session_candidates.append(ctx.get("session_id"))
         tenant_candidates.append(data.get("tenant_id"))
+        session_candidates.append(data.get("session_id"))
         meta = payload.get("metadata")
         if isinstance(meta, dict):
             tenant_candidates.append(meta.get("tenant_id"))
+            session_candidates.append(meta.get("session_id"))
+        configurable = payload.get("configurable")
+        if isinstance(configurable, dict):
+            session_candidates.append(configurable.get("session_id"))
     except Exception:
         pass
+    for cand in session_candidates:
+        if isinstance(cand, str) and cand.strip():
+            state["session_id"] = cand.strip()
+            break
+        if isinstance(cand, (int, float)):
+            state["session_id"] = str(cand)
+            break
     env_tid = os.getenv("DEFAULT_TENANT_ID")
     if env_tid:
         tenant_candidates.append(env_tid)
