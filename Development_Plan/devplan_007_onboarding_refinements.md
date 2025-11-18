@@ -34,6 +34,7 @@ last_reviewed: 2025-04-06
 
 ### 3.2 Company Profile Verification Loop
 - After company URL ingestion and profile synthesis node completes, present summary + verification prompt.
+- Immediately acknowledge the submitted URL with a message that explains we are drafting the profile and will surface it for confirmation (so users see a response right after sharing the link).
 - Capture user response; if corrections are supplied, feed them into profile refinement tool and loop until user confirms.
 - Store sanitized profile delta for telemetry.
 
@@ -97,4 +98,3 @@ last_reviewed: 2025-04-06
 - **Day 2:** Build verification and confirmation loops with anti-ICP capture.
 - **Day 3:** Update prompts, telemetry, and regression tests; run full suite.
 - **Day 4:** Conduct copy review, finalize documentation, prep release notes.
-

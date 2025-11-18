@@ -4,7 +4,8 @@ import os
 import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langgraph.graph import StateGraph, END
-from app.pre_sdr_graph import build_graph, GraphState  # new dynamic builder
+from langgraph.graph.message import add_messages
+from app.pre_sdr_graph import build_graph, GraphState, synthesize_welcome_message  # new dynamic builder
 from app.langgraph_logging import LangGraphTroubleshootHandler
 from src.database import get_conn
 from src.icp import _find_ssic_codes_by_terms
@@ -498,14 +499,44 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
     norm_msgs = [_to_message(m) for m in msgs] or [HumanMessage(content="")]
     state: Dict[str, Any] = {"messages": norm_msgs}
 
-    # Propagate tenant_id from context or input for multi-user runs
+    # Propagate tenant_id and session_id from context/input for multi-user runs
+    tenant_candidates: List[Any] = []
+    session_candidates: List[Any] = []
     try:
         ctx = payload.get("context") or data.get("context") or {}
-        tid = ctx.get("tenant_id") or data.get("tenant_id")
-        if tid is not None:
-            state["tenant_id"] = tid
+        if isinstance(ctx, dict):
+            tenant_candidates.append(ctx.get("tenant_id"))
+            session_candidates.append(ctx.get("session_id"))
+        tenant_candidates.append(data.get("tenant_id"))
+        session_candidates.append(data.get("session_id"))
+        meta = payload.get("metadata")
+        if isinstance(meta, dict):
+            tenant_candidates.append(meta.get("tenant_id"))
+            session_candidates.append(meta.get("session_id"))
+        configurable = payload.get("configurable")
+        if isinstance(configurable, dict):
+            session_candidates.append(configurable.get("session_id"))
     except Exception:
         pass
+    for cand in session_candidates:
+        if isinstance(cand, str) and cand.strip():
+            state["session_id"] = cand.strip()
+            break
+        if isinstance(cand, (int, float)):
+            state["session_id"] = str(cand)
+            break
+    env_tid = os.getenv("DEFAULT_TENANT_ID")
+    if env_tid:
+        tenant_candidates.append(env_tid)
+    for cand in tenant_candidates:
+        if cand is None:
+            continue
+        try:
+            tid_val = int(str(cand).strip())
+        except Exception:
+            continue
+        state["tenant_id"] = tid_val
+        break
 
     # Best-effort: if we have a tenant_id (or can infer one), pre-load the last saved ICP rule
     # and reuse it to prime the chat state so users don't need to re-enter ICP each session.
@@ -530,6 +561,11 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 row = _cur.fetchone()
                 payload_rule = row[0] if row and row[0] is not None else None
+                _cur.execute(
+                    "SELECT profile, confirmed, source_url FROM tenant_company_profiles WHERE tenant_id=%s",
+                    (int(tenant_id),),
+                )
+                company_row = _cur.fetchone()
             if isinstance(payload_rule, dict) and payload_rule:
                 # Map rule payload into chat state icp fields and an icp_profile for agent discovery
                 icp_ic = {}
@@ -564,6 +600,15 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                     state["icp"] = icp_ic
                 if prof:
                     state["icp_profile"] = prof
+            if company_row:
+                comp_profile = company_row[0] if isinstance(company_row[0], dict) else {}
+                if comp_profile:
+                    state["company_profile"] = comp_profile
+                confirmed = bool(company_row[1]) if company_row[1] is not None else False
+                if confirmed:
+                    state["company_profile_confirmed"] = True
+                if company_row[2]:
+                    state["site_profile_bootstrap_url"] = company_row[2]
     except Exception:
         # Non-fatal; proceed without priming
         pass
@@ -670,11 +715,35 @@ def make_graph(config: Dict[str, Any] | None = None):
         # type: ignore[return-value] — runtime shape matches PreSDRState
         return state  # type: ignore
 
+    def bootstrap_welcome(state: GraphState) -> GraphState:
+        try:
+            if state.get("greeting_sent"):
+                return state
+            msgs = state.get("messages") or []
+            # If there is already meaningful human content, let router handle greeting.
+            has_human_text = any(
+                isinstance(m, HumanMessage) and (m.content or "").strip() for m in msgs
+            )
+            has_ai = any(isinstance(m, AIMessage) for m in msgs)
+            if has_human_text or has_ai:
+                if has_ai:
+                    state["greeting_sent"] = True
+                return state
+            msg = synthesize_welcome_message(state)
+            state["messages"] = add_messages(msgs, [AIMessage(msg)])
+            state["greeting_sent"] = True
+            state["welcomed"] = True
+        except Exception:
+            pass
+        return state
+
     outer = StateGraph(GraphState)
     outer.add_node("normalize", normalize_node)
+    outer.add_node("bootstrap_welcome", bootstrap_welcome)
     outer.add_node("presdr", inner)
     outer.set_entry_point("normalize")
-    outer.add_edge("normalize", "presdr")
+    outer.add_edge("normalize", "bootstrap_welcome")
+    outer.add_edge("bootstrap_welcome", "presdr")
     outer.add_edge("presdr", END)
     compiled = outer.compile()
     handler = LangGraphTroubleshootHandler(context=_extract_log_context(config))
