@@ -3101,6 +3101,93 @@ def _log_workflow_status_change(state: GraphState, workflow_status: ProfileWorkf
         pass
 
 
+def _hydrate_company_profile_from_persistence(state: GraphState) -> None:
+    """Load the tenant's saved company profile into state if it isn't already present."""
+    prof = state.get("company_profile")
+    if isinstance(prof, dict) and prof:
+        return
+    mem_prof = _get_semantic_memory(state, "company_profile")
+    if isinstance(mem_prof, dict) and mem_prof:
+        state["company_profile"] = dict(mem_prof)
+        logger.info(
+            "router hydration :: loaded company_profile from semantic memory (keys=%s)",
+            sorted(mem_prof.keys()),
+        )
+        return
+    try:
+        tid = _resolve_tenant_id_for_write_sync(state)
+    except Exception:
+        tid = None
+    if not tid:
+        return
+    rec = _fetch_company_profile_record(tid)
+    if not rec:
+        return
+    prof_rec = rec.get("profile")
+    if isinstance(prof_rec, dict) and prof_rec:
+        snapshot = dict(prof_rec)
+        state["company_profile"] = snapshot
+        _remember_company_profile(state, snapshot)
+        logger.info(
+            "router hydration :: loaded company_profile from persistence (keys=%s)",
+            sorted(snapshot.keys()),
+        )
+    source_url = rec.get("source_url")
+    if isinstance(source_url, str) and source_url.strip():
+        state["site_profile_bootstrap_url"] = source_url.strip()
+    if rec.get("confirmed") is not None:
+        state["company_profile_confirmed"] = bool(rec.get("confirmed"))
+    if state.get("company_profile"):
+        state["site_profile_summary_sent"] = True
+
+
+def _hydrate_icp_profile_from_persistence(state: GraphState) -> None:
+    """Load the tenant's saved ICP profile into state if available."""
+    prof = state.get("icp_profile")
+    if isinstance(prof, dict) and prof:
+        return
+    mem_prof = _get_semantic_memory(state, "icp_profile")
+    if isinstance(mem_prof, dict) and mem_prof:
+        state["icp_profile"] = dict(mem_prof)
+        logger.info(
+            "router hydration :: loaded icp_profile from semantic memory (keys=%s)",
+            sorted(mem_prof.keys()),
+        )
+        return
+    before = bool(state.get("icp_profile"))
+    _has_icp_profile_context(state)
+    after_prof = state.get("icp_profile")
+    if not before and isinstance(after_prof, dict) and after_prof:
+        logger.info(
+            "router hydration :: loaded icp_profile from persistence (keys=%s)",
+            sorted(after_prof.keys()),
+        )
+
+
+def _hydrate_router_profiles(state: GraphState) -> None:
+    """Ensure router sees persisted company/ICP snapshots even on fresh threads."""
+    _hydrate_company_profile_from_persistence(state)
+    _hydrate_icp_profile_from_persistence(state)
+    _maybe_backfill_icp_basics_from_context(state)
+    _rehydrate_icp_seeds_from_context(state)
+    if state.get("icp"):
+        try:
+            seeds = state.get("icp", {}).get("seeds_list") or []
+        except Exception:
+            seeds = []
+        if isinstance(seeds, list) and seeds:
+            logger.info("router hydration :: seed list ready (count=%s)", len(seeds))
+
+
+def _apply_icp_confirmation_state(state: GraphState, require_confirmation: bool) -> None:
+    """Keep ICP confirmation flags consistent when resurfacing snapshots."""
+    if require_confirmation:
+        state["icp_profile_user_confirmed"] = False
+    else:
+        # Viewing an already-confirmed profile shouldn't leave the router thinking it was just confirmed.
+        state["icp_profile_newly_confirmed"] = False
+
+
 def _set_profile_focus(state: GraphState, focus: str) -> None:
     try:
         state["profile_workflow_focus"] = focus
@@ -8063,6 +8150,7 @@ def router(state: GraphState) -> str:
 
 def router_entry(state: GraphState) -> GraphState:
     """No-op node so we can attach conditional edges to a central router hub."""
+    _hydrate_router_profiles(state)
     return state
 
 
