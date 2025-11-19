@@ -53,7 +53,7 @@ SYSTEM_REFERENCE = (
     "- run enrichment: enrich current candidates now (small batch), schedule remainder nightly.\n\n"
     "ICP Intake (Finder on):\n"
     "1) Ask website URL.\n"
-    "2) Ask 5–15 best customers as 'Company — website' (seeds).\n"
+"2) Ask 5–15 best customers plus their websites (any natural phrasing is fine) so they can be used as seeds.\n"
     "3) Ask industries, employee range, geographies, buying signals (skip allowed).\n"
     "4) Optionals: ACV, cycle length, price floor, champion titles, triggers.\n"
     "5) After synthesizing the company profile, show the summary back and wait for **confirm profile** or corrections.\n"

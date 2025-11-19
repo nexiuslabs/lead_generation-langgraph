@@ -35,7 +35,8 @@ async def test_url_only_input_prompts_seeds_and_no_industry(monkeypatch):
 
     # 4) Should pause on profile confirmation so the user can edit before seeds
     assert out.get("icp_last_focus") == "profile"
-    assert out.get("awaiting_profile_confirmation") is True
+    assert out.get("site_profile_summary_sent") is True
+    assert out.get("company_profile_confirmed") is True
     msgs = out.get("messages") or []
     assert isinstance(msgs[-1], AIMessage)
     prompt_text = (msgs[-1].content or "").lower()
@@ -65,4 +66,4 @@ async def test_website_input_honored_even_when_seeds_prompted(monkeypatch):
     out = await presdr.icp_node(state)  # type: ignore[arg-type]
 
     assert out.get("icp_last_focus") == "profile"
-    assert out.get("awaiting_profile_confirmation") is True
+    assert out.get("site_profile_summary_sent") is True

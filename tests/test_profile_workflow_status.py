@@ -22,11 +22,11 @@ def test_profile_workflow_status_progression():
     status = presdr._profile_workflow_status(state)
     assert status.next_step == "company_profile"
 
-    state["company_profile_confirmed"] = True
+    state["company_profile"] = {"summary": "Example"}
     status = presdr._profile_workflow_status(state)
     assert status.next_step == "icp_profile"
 
-    state["icp_profile_confirmed"] = True
+    state["icp_profile"] = {"industries": ["software"]}
     status = presdr._profile_workflow_status(state)
     assert status.next_step == "icp_discovery"
 
@@ -53,6 +53,8 @@ def test_router_does_not_loop_after_confirm_without_new_human():
         messages=[HumanMessage(content="confirm profile")],
         icp={},
         company_profile_confirmed=True,
+        company_profile_newly_confirmed=True,
+        company_profile={"summary": "Example"},
         greeting_sent=True,
         boot_init_token=presdr.BOOT_TOKEN,
         boot_seen_messages_len=1,

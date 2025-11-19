@@ -16,7 +16,6 @@ def _router_state(user_text: str):
 
 def test_router_routes_profile_update_back_to_icp_when_waiting_confirmation():
     state = _router_state("update industries to add automation")
-    state["awaiting_profile_confirmation"] = True
     state["site_profile_summary_sent"] = True
 
     assert presdr.router(state) == "icp"
@@ -24,16 +23,14 @@ def test_router_routes_profile_update_back_to_icp_when_waiting_confirmation():
 
 def test_router_routes_confirm_profile_even_without_persisted_snapshot():
     state = _router_state("confirm profile")
-    state["awaiting_profile_confirmation"] = True
     state["site_profile_summary_sent"] = True
     state["company_profile"] = {}
 
     assert presdr.router(state) == "icp"
 
 
-def test_router_handles_icp_profile_updates_when_confirmation_pending():
+def test_router_handles_icp_profile_updates():
     state = _router_state("update icp profile to add automation buyers")
-    state["awaiting_icp_profile_confirmation"] = True
     state["icp_profile_summary_sent"] = True
     state["icp"] = {"seeds_list": [{}] * 5}
 
@@ -63,3 +60,12 @@ def test_router_allows_run_discovery_once_icp_confirmed():
     state["icp_profile_confirmed"] = True
 
     assert presdr.router(state) == "confirm"
+
+
+def test_router_confirm_icp_profile_routes_to_discovery_prompt():
+    state = _router_state("confirm icp profile")
+    state["icp_profile"] = {"industries": ["saas"]}
+    state["icp_profile_confirmed"] = True
+    state["icp_discovery_confirmed"] = False
+
+    assert presdr.router(state) == "icp_discovery_prompt"

@@ -1,10 +1,16 @@
 # app/lg_entry.py
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Union, Mapping
 import os
 import asyncio
+from contextvars import Token
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.base import CheckpointTuple
+from langgraph.constants import CONFIG_KEY_CHECKPOINTER
 from app.pre_sdr_graph import build_graph, GraphState, synthesize_welcome_message  # new dynamic builder
 from app.langgraph_logging import LangGraphTroubleshootHandler
 from src.database import get_conn
@@ -19,6 +25,7 @@ if not logger.handlers:
     h.setFormatter(fmt)
     logger.addHandler(h)
 logger.setLevel("INFO")
+CHECKPOINTER = MemorySaver()
 
 Content = Union[str, List[dict], dict, None]
 
@@ -621,6 +628,7 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # Feature 18: Upsert up to 10 synchronously and kick off enrichment immediately; enqueue remainder for nightly
     try:
+        allow_staging = True
         inds = _collect_industry_terms(state.get("messages"))
         if inds and STAGING_UPSERT_MODE != "off":
             # Gate staging upsert/enrichment while ICP Finder intake is active to prevent early runs
@@ -633,9 +641,9 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                 txt = " ".join([(m.content or "") for m in norm_msgs if isinstance(m, HumanMessage)])
                 if not re.search(r"\brun enrichment\b", txt, flags=re.IGNORECASE):
                     logger.info("Deferring staging upsert/enrich while ICP Finder is active; inds=%s", inds)
-                    return state
+                    allow_staging = False
             head = max(0, int(UPSERT_SYNC_LIMIT))
-            if head > 0:
+            if allow_staging and head > 0:
                 try:
                     # Reuse helper from app.main to perform head upsert and enrichment
                     from app.main import upsert_by_industries_head, _trigger_enrichment_async
@@ -650,18 +658,19 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception as e:
                     logger.info("sync head upsert/enrich skipped: %s", e)
             # Enqueue remainder for nightly processing (best-effort)
-            try:
-                from src.icp import _find_ssic_codes_by_terms as _resolve_ssic
-                resolved = _resolve_ssic(inds) if inds else []
-                if not resolved:
-                    logger.info(
-                        "Skip enqueue nightly: no SSIC codes resolved for terms=%s",
-                        inds,
-                    )
-                else:
-                    from src.jobs import enqueue_staging_upsert
-                    # Resolve tenant best-effort; allow None
-                    tid = None
+            if allow_staging:
+                try:
+                    from src.icp import _find_ssic_codes_by_terms as _resolve_ssic
+                    resolved = _resolve_ssic(inds) if inds else []
+                    if not resolved:
+                        logger.info(
+                            "Skip enqueue nightly: no SSIC codes resolved for terms=%s",
+                            inds,
+                        )
+                    else:
+                        from src.jobs import enqueue_staging_upsert
+                        # Resolve tenant best-effort; allow None
+                        tid = None
                     try:
                         from app.odoo_connection_info import get_odoo_connection_info
                         info = asyncio.run(
@@ -671,8 +680,8 @@ def _normalize(payload: Dict[str, Any]) -> Dict[str, Any]:
                     except Exception:
                         tid = None
                     enqueue_staging_upsert(tid, inds)
-            except Exception as _qe:
-                logger.info("enqueue nightly staging_upsert failed: %s", _qe)
+                except Exception as _qe:
+                    logger.info("enqueue nightly staging_upsert failed: %s", _qe)
     except Exception as _e:
         logger.warning("input-normalization staging handling failed: %s", _e)
 
@@ -700,6 +709,179 @@ def _extract_log_context(config: Dict[str, Any] | None) -> Dict[str, Any]:
     return ctx
 
 
+def _looks_like_state(candidate: Any) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    msgs = candidate.get("messages")
+    if not isinstance(msgs, list):
+        return False
+    return any(isinstance(m, BaseMessage) for m in msgs)
+
+
+def _merge_state(base: Mapping[str, Any], updates: Mapping[str, Any]) -> GraphState:
+    merged: GraphState = dict(base)  # type: ignore[assignment]
+    new_messages = updates.get("messages")
+    if isinstance(new_messages, list) and new_messages:
+        merged["messages"] = new_messages
+    elif "messages" not in merged:
+        merged["messages"] = []
+    for key, value in updates.items():
+        if key == "messages":
+            continue
+        merged[key] = value
+    return merged
+
+
+def _resolve_runnable_config(config: RunnableConfig | None) -> dict | None:
+    if isinstance(config, dict):
+        return config
+    try:
+        ctx_config = var_child_runnable_config.get()
+    except LookupError:
+        ctx_config = None
+    if isinstance(ctx_config, dict):
+        logger.debug("normalize: pulled runnable config from context var")
+        return ctx_config
+    return None
+
+
+class _ConfigAwareGraph:
+    def __init__(self, inner: Runnable):
+        self._inner = inner
+
+    def __getattr__(self, item: str):  # pragma: no cover
+        return getattr(self._inner, item)
+
+    def _set_config(self, config: RunnableConfig | None) -> Token | None:
+        if isinstance(config, dict):
+            return var_child_runnable_config.set(config)
+        return None
+
+    def _reset_config(self, token: Token | None) -> None:
+        if token is not None:
+            var_child_runnable_config.reset(token)
+
+    def invoke(self, input, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            return self._inner.invoke(input, config=config, **kwargs)
+        finally:
+            self._reset_config(token)
+
+    async def ainvoke(self, input, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            return await self._inner.ainvoke(input, config=config, **kwargs)
+        finally:
+            self._reset_config(token)
+
+    def batch(self, inputs, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            return self._inner.batch(inputs, config=config, **kwargs)
+        finally:
+            self._reset_config(token)
+
+    async def abatch(self, inputs, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            return await self._inner.abatch(inputs, config=config, **kwargs)
+        finally:
+            self._reset_config(token)
+
+    def stream(self, input, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            yield from self._inner.stream(input, config=config, **kwargs)
+        finally:
+            self._reset_config(token)
+
+    async def astream(self, input, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            async for chunk in self._inner.astream(input, config=config, **kwargs):
+                yield chunk
+        finally:
+            self._reset_config(token)
+
+    async def astream_log(self, input, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            async for event in self._inner.astream_log(input, config=config, **kwargs):
+                yield event
+        finally:
+            self._reset_config(token)
+
+    async def astream_events(self, input, config: RunnableConfig | None = None, /, **kwargs):
+        token = self._set_config(config)
+        try:
+            async for event in self._inner.astream_events(input, config=config, **kwargs):
+                yield event
+        finally:
+            self._reset_config(token)
+
+
+
+
+def _load_checkpoint_state(config: RunnableConfig | None) -> Dict[str, Any] | None:
+    config_dict = _resolve_runnable_config(config)
+    if not isinstance(config_dict, dict):
+        return None
+    configurable = config_dict.get("configurable") or {}
+    thread_id = configurable.get("thread_id")
+    if not thread_id:
+        logger.debug("normalize: no thread_id on config; skipping checkpoint load")
+        return None
+    checkpointer = configurable.get(CONFIG_KEY_CHECKPOINTER) or CHECKPOINTER
+    if not hasattr(checkpointer, "get_tuple"):
+        logger.debug("normalize: checkpointer missing get_tuple for thread=%s", thread_id)
+        return None
+    request: Dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+        }
+    }
+    checkpoint_ns = configurable.get("checkpoint_ns")
+    if checkpoint_ns:
+        request["configurable"]["checkpoint_ns"] = checkpoint_ns
+    try:
+        stored: CheckpointTuple | None = checkpointer.get_tuple(request)  # type: ignore[call-arg]
+    except Exception:
+        logger.exception("normalize: checkpoint load failed for thread=%s", thread_id)
+        return None
+    if not stored:
+        logger.debug("normalize: no checkpoint found for thread=%s", thread_id)
+        return None
+    checkpoint = stored.checkpoint or {}
+    channel_values = checkpoint.get("channel_values")
+    if isinstance(channel_values, dict):
+        keys = sorted(channel_values.keys())
+        logger.info(
+            "normalize: restored checkpoint state for thread=%s keys=%s",
+            thread_id,
+            keys,
+        )
+        return dict(channel_values)
+    logger.debug(
+        "normalize: checkpoint for thread=%s missing channel_values", thread_id
+    )
+    return None
+
+
+def normalize_payload(payload: Dict[str, Any]) -> GraphState:
+    # When LangGraph replays a stored checkpoint it passes the GraphState
+    # directly, so just forward it along untouched.
+    if "input" not in payload and _looks_like_state(payload):
+        return payload  # type: ignore[return-value]
+
+    updates = _normalize(payload)
+    existing = payload.get("state")
+    if isinstance(existing, dict):
+        return _merge_state(existing, updates)
+    # type: ignore[return-value] — runtime shape matches PreSDRState
+    return updates  # type: ignore
+
+
 def make_graph(config: Dict[str, Any] | None = None):
     """Called by `langgraph dev` to get a valid compiled Graph.
 
@@ -709,11 +891,14 @@ def make_graph(config: Dict[str, Any] | None = None):
     """
     inner = build_graph()  # compiled inner graph (dynamic Pre-SDR pipeline)
 
-    def normalize_node(payload: Dict[str, Any]) -> GraphState:
-        # Accept raw UI payload and coerce into graph state
-        state = _normalize(payload)
-        # type: ignore[return-value] — runtime shape matches PreSDRState
-        return state  # type: ignore
+    def normalize_node(payload: Dict[str, Any], config: RunnableConfig | None = None) -> GraphState:
+        if "input" not in payload and _looks_like_state(payload):
+            return payload  # type: ignore[return-value]
+        restored = _load_checkpoint_state(config)
+        updates = normalize_payload(payload)
+        if restored:
+            return _merge_state(restored, updates)
+        return updates
 
     def bootstrap_welcome(state: GraphState) -> GraphState:
         try:
@@ -745,6 +930,7 @@ def make_graph(config: Dict[str, Any] | None = None):
     outer.add_edge("normalize", "bootstrap_welcome")
     outer.add_edge("bootstrap_welcome", "presdr")
     outer.add_edge("presdr", END)
-    compiled = outer.compile()
+    compiled = outer.compile(checkpointer=CHECKPOINTER)
+    wrapped = _ConfigAwareGraph(compiled)
     handler = LangGraphTroubleshootHandler(context=_extract_log_context(config))
-    return compiled.with_config(callbacks=[handler])
+    return wrapped.with_config(callbacks=[handler])

@@ -1,5 +1,12 @@
 ICP Finder: Intake → Candidate Generation (Tools & Quality Gates)
 
+> **Note:** The intake flow now relies on three lightweight guardrails instead of multi-step confirmation loops:
+> 1. Company profile snapshot shared → `company_ready=True`
+> 2. ICP profile snapshot shared once ≥5 normalized seeds exist → `icp_ready=True`
+> 3. Single discovery approval prompt → `discovery_ready=True`
+>
+> Snapshots are always available via “show company profile / show ICP profile,” and edits are applied immediately without reopening any gating state. Discovery/enrichment commands are the only actions blocked until the final approval is granted.
+
 1) Intake (5‑Minute Wizard)
 - Input: Website; 5 best seeds; 3 lost (reason); industries; employee band; geos; integrations; ACV; deal cycle; price floor; champion titles; triggers.
 - Actions: Ask‑then‑parse (chat). Normalize seeds/domains; clean list/tokens; accept “skip/none” for optional fields.
@@ -76,4 +83,3 @@ ICP Finder: Intake → Candidate Generation (Tools & Quality Gates)
 - Input: Patterns + early candidate set.
 - Actions: Propose 3–5 micro‑ICPs; show evidence counts; flag low‑density segments.
 - Output: Segments ready to confirm/tweak or drive enrichment batch.
-

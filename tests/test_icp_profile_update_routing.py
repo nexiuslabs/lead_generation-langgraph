@@ -1,6 +1,8 @@
 import asyncio
 import os
 import sys
+import types
+
 import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -13,7 +15,9 @@ async def test_icp_update_without_keyword_routes_to_icp(monkeypatch):
     import app.pre_sdr_graph as presdr
 
     async def fake_extract_icp(text: str):
-        return presdr.ICPProfileUpdate(industries=["food distribution"])
+        return presdr.ICPProfileUpdate(
+            industries=presdr.ProfileFieldDelta(add=["food distribution"])
+        )
 
     monkeypatch.setattr(presdr, "extract_icp_profile_update", fake_extract_icp)
     monkeypatch.setattr(presdr, "_persist_icp_profile_sync", lambda *args, **kwargs: None)
@@ -23,118 +27,41 @@ async def test_icp_update_without_keyword_routes_to_icp(monkeypatch):
         "icp": {"seeds_list": [{}] * 5},
         "icp_profile": {"industries": ["food service", "hospitality"]},
         "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": True,
         "last_profile_prompt_type": "icp",
     }
 
     out = await presdr.icp_node(state)  # type: ignore[arg-type]
 
-    assert out.get("awaiting_icp_profile_confirmation") is True
     msgs = out.get("messages") or []
     assert isinstance(msgs[-1], AIMessage)
     assert "icp profile" in (msgs[-1].content or "").lower()
 
 
-@pytest.mark.asyncio
-async def test_icp_update_honors_explicit_icp_even_when_company_pending(monkeypatch):
+def test_icp_summary_lists_all_fields():
     import app.pre_sdr_graph as presdr
 
-    async def fake_extract_icp(text: str):
-        return presdr.ICPProfileUpdate(industries=["wholesale"])
-
-    monkeypatch.setattr(presdr, "extract_icp_profile_update", fake_extract_icp)
-    monkeypatch.setattr(presdr, "_persist_icp_profile_sync", lambda *args, **kwargs: None)
-
-    state = {
-        "messages": [HumanMessage(content="add wholesale to industry of icp profile")],
-        "icp": {"seeds_list": [{}] * 5},
-        "icp_profile": {"industries": ["food service"]},
-        "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": True,
-        "last_profile_prompt_type": "icp",
-        "company_profile_pending": True,
+    profile = {
+        "industries": ["software"],
+        "buyer_titles": ["CTO"],
+        "size_bands": ["201-500"],
+        "geos": ["US"],
+        "integrations": ["Salesforce"],
+        "triggers": ["Raised Series A"],
     }
-
-    out = await presdr.icp_node(state)  # type: ignore[arg-type]
-
-    assert out.get("awaiting_icp_profile_confirmation") is True
-    assert not out.get("company_profile_pending")
-
-
-def test_company_pending_clears_after_confirmation(monkeypatch):
-    import app.pre_sdr_graph as presdr
-
-    monkeypatch.setattr(presdr, "_persist_company_profile_sync", lambda *args, **kwargs: None)
-
-    state = {
-        "messages": [],
-        "company_profile": {"industries": ["logistics"]},
-        "icp": {},
-    }
-
-    presdr._prompt_profile_confirmation(state)
-    assert state.get("company_profile_pending") is True
-
-    state["messages"] = presdr.add_messages(
-        state.get("messages") or [], [HumanMessage(content="confirm profile")]
-    )
-
-    presdr._handle_profile_confirmation_gate(state, "confirm profile")
-
-    assert state.get("company_profile_pending") is False
-    assert state.get("awaiting_profile_confirmation") is False
+    lines = presdr._icp_profile_summary_lines(profile)
+    for label in [
+        "Industries",
+        "Buyer titles",
+        "Company sizes",
+        "Key geographies",
+        "Integrations/signals",
+        "Buying triggers",
+    ]:
+        assert any(label in line for line in lines)
 
 
 @pytest.mark.asyncio
-async def test_company_pending_reopens_on_company_update_request(monkeypatch):
-    import app.pre_sdr_graph as presdr
-
-    async def fake_extract_company(text: str):
-        return presdr.CompanyProfileUpdate(industries=["automation"])
-
-    monkeypatch.setattr(presdr, "extract_company_profile_update", fake_extract_company)
-
-    state = {
-        "messages": [HumanMessage(content="add automation to company profile industries")],
-        "icp": {"seeds_list": [{}] * 5},
-        "company_profile": {"industries": ["logistics"]},
-        "company_profile_confirmed": True,
-        "company_profile_pending": False,
-        "icp_profile": {"industries": ["logistics"]},
-        "icp_profile_summary_sent": True,
-    }
-
-    out = await presdr.icp_node(state)  # type: ignore[arg-type]
-
-    assert out.get("company_profile_pending") is True
-    assert out.get("awaiting_profile_confirmation") is True
-
-
-@pytest.mark.asyncio
-async def test_icp_prompt_sent_when_seed_domains_missing(monkeypatch):
-    import app.pre_sdr_graph as presdr
-
-    monkeypatch.setattr(presdr, "ENABLE_AGENT_DISCOVERY", True, raising=False)
-    monkeypatch.setattr(presdr, "_agent_icp_synth", lambda payload: {"icp_profile": {}}, raising=False)
-
-    state = {
-        "messages": [],
-        "icp": {
-            "website_url": "https://example.com",
-            "seeds_list": [{"seed_name": f"Seed {i}", "domain": ""} for i in range(5)],
-        },
-    }
-
-    await presdr._maybe_bootstrap_icp_profile_from_seeds(state)
-
-    assert state.get("awaiting_icp_profile_confirmation") is True
-    assert state.get("icp_profile_pending") is True
-    summary = ((state.get("icp_profile") or {}).get("summary") or "").lower()
-    assert "seed" in summary
-
-
-@pytest.mark.asyncio
-async def test_confirm_profile_routes_to_icp_when_icp_pending(monkeypatch):
+async def test_seed_submission_regenerates_icp_snapshot(monkeypatch):
     import app.pre_sdr_graph as presdr
 
     monkeypatch.setattr(presdr, "_persist_icp_profile_sync", lambda *args, **kwargs: None)
@@ -157,15 +84,13 @@ async def test_confirm_profile_routes_to_icp_when_icp_pending(monkeypatch):
         "company_profile_confirmed": True,
         "icp_profile_confirmed": True,
         "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": False,
-        "icp_profile_pending": False,
     }
 
     out = await presdr.icp_node(state)  # type: ignore[arg-type]
 
-    assert out.get("awaiting_icp_profile_confirmation") is True
-    assert out.get("icp_profile_pending") is True
-    assert not out.get("icp_profile_confirmed")
+    seeds_list = (out.get("icp") or {}).get("seeds_list") or []
+    assert len(seeds_list) == 5
+    assert out.get("icp_profile_confirmed") is True
     last_ai = next((msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage)), None)
     assert last_ai is not None
     assert "icp profile" in (last_ai.content or "").lower()
@@ -176,7 +101,9 @@ async def test_icp_update_honors_explicit_icp_even_when_company_pending(monkeypa
     import app.pre_sdr_graph as presdr
 
     async def fake_extract_icp(text: str):
-        return presdr.ICPProfileUpdate(industries=["wholesale"])
+        return presdr.ICPProfileUpdate(
+            industries=presdr.ProfileFieldDelta(add=["wholesale"])
+        )
 
     monkeypatch.setattr(presdr, "extract_icp_profile_update", fake_extract_icp)
     monkeypatch.setattr(presdr, "_persist_icp_profile_sync", lambda *args, **kwargs: None)
@@ -186,18 +113,16 @@ async def test_icp_update_honors_explicit_icp_even_when_company_pending(monkeypa
         "icp": {"seeds_list": [{}] * 5},
         "icp_profile": {"industries": ["food service"]},
         "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": True,
         "last_profile_prompt_type": "icp",
-        "company_profile_pending": True,
+        "site_profile_summary_sent": False,
     }
 
     out = await presdr.icp_node(state)  # type: ignore[arg-type]
 
-    assert out.get("awaiting_icp_profile_confirmation") is True
-    assert not out.get("company_profile_pending")
+    assert "wholesale" in (out.get("icp_profile") or {}).get("industries", [])
 
 
-def test_company_pending_clears_after_confirmation(monkeypatch):
+def test_prompt_profile_confirmation_emits_snapshot(monkeypatch):
     import app.pre_sdr_graph as presdr
 
     monkeypatch.setattr(presdr, "_persist_company_profile_sync", lambda *args, **kwargs: None)
@@ -209,24 +134,20 @@ def test_company_pending_clears_after_confirmation(monkeypatch):
     }
 
     presdr._prompt_profile_confirmation(state)
-    assert state.get("company_profile_pending") is True
-
-    state["messages"] = presdr.add_messages(
-        state.get("messages") or [], [HumanMessage(content="confirm profile")]
-    )
-
-    presdr._handle_profile_confirmation_gate(state, "confirm profile")
-
-    assert state.get("company_profile_pending") is False
-    assert state.get("awaiting_profile_confirmation") is False
+    assert state.get("site_profile_summary_sent") is True
+    ai_msgs = [msg for msg in state.get("messages") or [] if isinstance(msg, AIMessage)]
+    assert ai_msgs, "expected snapshot to be appended"
+    assert "company profile" in (ai_msgs[-1].content or "").lower()
 
 
 @pytest.mark.asyncio
-async def test_company_pending_reopens_on_company_update_request(monkeypatch):
+async def test_company_update_request_shares_snapshot(monkeypatch):
     import app.pre_sdr_graph as presdr
 
     async def fake_extract_company(text: str):
-        return presdr.CompanyProfileUpdate(industries=["automation"])
+        return presdr.CompanyProfileUpdate(
+            industries=presdr.ProfileFieldDelta(add=["automation"])
+        )
 
     monkeypatch.setattr(presdr, "extract_company_profile_update", fake_extract_company)
 
@@ -235,15 +156,21 @@ async def test_company_pending_reopens_on_company_update_request(monkeypatch):
         "icp": {"seeds_list": [{}] * 5},
         "company_profile": {"industries": ["logistics"]},
         "company_profile_confirmed": True,
-        "company_profile_pending": False,
         "icp_profile": {"industries": ["logistics"]},
         "icp_profile_summary_sent": True,
     }
 
     out = await presdr.icp_node(state)  # type: ignore[arg-type]
 
-    assert out.get("company_profile_pending") is True
-    assert out.get("awaiting_profile_confirmation") is True
+    profile = out.get("company_profile") or {}
+    assert "automation" in profile.get("industries", [])
+    notes = profile.get("manual_notes") or []
+    assert any("automation" in note.lower() for note in notes)
+    last_ai = next((msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage)), None)
+    assert last_ai is not None
+    content = (last_ai.content or "").lower()
+    assert "company profile" in content
+    assert "updated" in content
 
 
 @pytest.mark.asyncio
@@ -263,64 +190,9 @@ async def test_icp_prompt_sent_when_seed_domains_missing(monkeypatch):
 
     await presdr._maybe_bootstrap_icp_profile_from_seeds(state)
 
-    assert state.get("awaiting_icp_profile_confirmation") is True
-    assert state.get("icp_profile_pending") is True
+    assert state.get("icp_profile_confirmed") is True
     summary = ((state.get("icp_profile") or {}).get("summary") or "").lower()
     assert "seed" in summary
-
-
-@pytest.mark.asyncio
-async def test_confirm_profile_requires_icp_keyword_when_pending(monkeypatch):
-    import app.pre_sdr_graph as presdr
-
-    monkeypatch.setattr(presdr, "_persist_icp_profile_sync", lambda *args, **kwargs: None)
-
-    seeds = [{"seed_name": f"Seed {i}", "domain": f"seed{i}.com"} for i in range(5)]
-    state = {
-        "messages": [HumanMessage(content="confirm profile")],
-        "icp": {"seeds_list": seeds},
-        "icp_profile": {"industries": ["food service"]},
-        "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": True,
-        "icp_profile_pending": True,
-        "company_profile": {"industries": ["logistics"]},
-        "company_profile_confirmed": True,
-        "company_profile_pending": False,
-    }
-
-    out = await presdr.icp_node(state)  # type: ignore[arg-type]
-
-    assert not out.get("icp_profile_confirmed")
-    assert out.get("awaiting_icp_profile_confirmation") is True
-    last_ai = next((msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage)), None)
-    assert last_ai is not None
-    assert "confirm icp profile" in (last_ai.content or "").lower()
-
-
-@pytest.mark.asyncio
-async def test_confirm_icp_profile_keyword_unlocks_discovery(monkeypatch):
-    import app.pre_sdr_graph as presdr
-
-    monkeypatch.setattr(presdr, "_persist_icp_profile_sync", lambda *args, **kwargs: None)
-
-    seeds = [{"seed_name": f"Seed {i}", "domain": f"seed{i}.com"} for i in range(5)]
-    state = {
-        "messages": [HumanMessage(content="confirm icp profile")],
-        "icp": {"seeds_list": seeds},
-        "icp_profile": {"industries": ["food service"]},
-        "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": True,
-        "icp_profile_pending": True,
-        "company_profile": {"industries": ["logistics"]},
-        "company_profile_confirmed": True,
-        "company_profile_pending": False,
-    }
-
-    out = await presdr.icp_node(state)  # type: ignore[arg-type]
-
-    assert out.get("icp_profile_confirmed") is True
-    assert not out.get("awaiting_icp_profile_confirmation")
-    assert not out.get("icp_profile_pending")
 
 
 @pytest.mark.asyncio
@@ -341,7 +213,6 @@ async def test_confirm_profile_skips_duplicate_website_prompt(monkeypatch):
         },
         "icp": {},
         "site_profile_summary_sent": True,
-        "awaiting_profile_confirmation": True,
     }
 
     out = await presdr.icp_node(state)  # type: ignore[arg-type]
@@ -352,31 +223,6 @@ async def test_confirm_profile_skips_duplicate_website_prompt(monkeypatch):
     content = (last_ai.content or "").lower()
     assert "list 5" in content
     assert "website url" not in content
-
-
-def test_icp_manual_edit_updates_memory_snapshot(monkeypatch):
-    import app.pre_sdr_graph as presdr
-
-    def fake_extract_icp(text: str):
-        return presdr.ICPProfileUpdate(industries=["automation"])
-
-    monkeypatch.setattr(presdr, "extract_icp_profile_update_sync", fake_extract_icp)
-
-    state = {
-        "messages": [HumanMessage(content="add automation to the icp industries")],
-        "icp": {"seeds_list": [{}] * 5},
-        "icp_profile": {"industries": ["logistics"]},
-        "icp_profile_summary_sent": True,
-        "awaiting_icp_profile_confirmation": True,
-        "short_term_memory": {"semantic": {}},
-    }
-
-    result = presdr._handle_icp_profile_confirmation_gate(state, "add automation to the icp industries")
-
-    assert result == "prompted"
-    semantic = (state.get("short_term_memory") or {}).get("semantic") or {}
-    snapshot = semantic.get("icp_profile") or {}
-    assert "automation" in snapshot.get("industries", [])
 
 
 @pytest.mark.asyncio
@@ -504,6 +350,78 @@ async def test_progress_recap_sent_on_initial_seed_prompt():
     content = (recap_msg.content or "").lower()
     assert "progress recap" in content
     assert "company profile" in content or "haven’t captured enough" in content or "haven't captured enough" in content
+
+
+@pytest.mark.asyncio
+async def test_seed_submission_requires_company_confirmation(monkeypatch):
+    import app.pre_sdr_graph as presdr
+
+    monkeypatch.setattr(
+        presdr,
+        "jina_read",
+        lambda url, timeout=8.0: "Seed snippet placeholder",
+    )
+
+    seeds_text = "\n".join([f"Seed {i} — https://seed{i}.com" for i in range(5)])
+    state = {
+        "messages": [HumanMessage(content=seeds_text)],
+        "icp": {},
+        "company_profile_confirmed": False,
+        "site_profile_summary_sent": False,
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    icp = out.get("icp") or {}
+    assert not icp.get("seeds_list")
+    last_ai = next((msg for msg in reversed(out.get("messages") or []) if isinstance(msg, AIMessage)), None)
+    assert last_ai is not None
+    content = (last_ai.content or "").lower()
+    assert "confirm profile" in content
+    assert "seed0.com" in content
+
+
+@pytest.mark.asyncio
+async def test_seed_prompt_waits_for_company_confirmation():
+    import app.pre_sdr_graph as presdr
+
+    state = {
+        "messages": [HumanMessage(content="start lead gen")],
+        "icp": {},
+        "company_profile_confirmed": False,
+        "site_profile_summary_sent": False,
+    }
+
+    out = await presdr.icp_node(state)  # type: ignore[arg-type]
+
+    ai_text = " ".join(
+        (msg.content or "").lower() for msg in out.get("messages") or [] if isinstance(msg, AIMessage)
+    )
+    assert "list 5–15 best customers" not in ai_text
+    assert "website" in ai_text
+
+
+def test_router_prompts_best_customers_after_company_confirm():
+    import app.pre_sdr_graph as presdr
+
+    state = {
+        "messages": [HumanMessage(content="confirm profile")],
+        "icp": {},
+        "company_profile_confirmed": True,
+        "company_profile_newly_confirmed": True,
+        "company_profile": {"summary": "Example"},
+        "greeting_sent": True,
+        "boot_init_token": presdr.BOOT_TOKEN,
+        "boot_seen_messages_len": 1,
+        "last_user_boot_token": presdr.BOOT_TOKEN,
+    }
+
+    route = presdr.router(state)  # type: ignore[arg-type]
+
+    assert route == "prompt_best_customers"
+    presdr.prompt_best_customer_seeds_node(state)
+    ai_texts = [msg.content.lower() for msg in state.get("messages") or [] if isinstance(msg, AIMessage)]
+    assert any("best customers" in text for text in ai_texts)
 
 
 def test_seed_submission_persists_intake_once(monkeypatch):
