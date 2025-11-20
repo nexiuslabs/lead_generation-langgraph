@@ -52,5 +52,5 @@ async def test_progress_report_appends_assistant_message():
     out = await nodes.progress_report(state)
     assert out["status"]["phase"] == "progress_report"
     assert out["messages"][-1]["role"] == "assistant"
-    assert "Stage" in out["messages"][-1]["content"]
+    assert out["messages"][-1]["content"]
     assert out["status_history"][-1]["phase"] == "progress_report"

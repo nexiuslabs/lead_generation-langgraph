@@ -35,7 +35,14 @@ def build_orchestrator_graph():
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "profile_builder")
     graph.add_edge("profile_builder", "journey_guard")
-    graph.add_edge("journey_guard", "normalize")
+    graph.add_conditional_edges(
+        "journey_guard",
+        lambda state: "ready" if state.get("journey_ready") else "pending",
+        {
+            "ready": "normalize",
+            "pending": "progress_report",
+        },
+    )
     graph.add_edge("normalize", "refresh_icp")
     graph.add_edge("refresh_icp", "decide_strategy")
     graph.add_edge("decide_strategy", "ssic_fallback")
