@@ -16,11 +16,13 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
 from urllib.parse import urlparse
+import requests
 
 from src.icp import icp_by_ssic_agent, icp_refresh_agent, normalize_agent
 from src.lead_scoring import lead_scoring_agent
 from src.jobs import enqueue_web_discovery_bg_enrich
 from src.jina_reader import read_url as jina_read
+from app.pre_sdr_graph import _persist_company_profile_sync, _persist_icp_profile_sync  # type: ignore
 
 from .llm import call_llm_json
 from .state import OrchestrationState, ProfileState
@@ -79,6 +81,7 @@ def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
     profile.setdefault("outstanding_prompts", [])
     profile.setdefault("company_profile", {})
     profile.setdefault("icp_profile", {})
+    profile.setdefault("customer_websites", [])
     state["profile_state"] = profile
     return profile
 
@@ -110,10 +113,26 @@ def _fetch_site_excerpt(url: str, max_chars: int = 1500) -> str | None:
     except Exception as exc:  # pragma: no cover - network variability
         logger.warning("jina_read failed for %s: %s", url, exc)
         raw = ""
-    cleaned = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        raw = _http_fetch_plain(url)
+    cleaned = re.sub(r"\s+", " ", raw or "").strip()
     if not cleaned:
         return None
     return cleaned[:max_chars]
+
+
+def _http_fetch_plain(url: str, timeout: int = 8) -> str:
+    try:
+        headers = {"User-Agent": "LeadGen-Orchestrator/0.1"}
+        resp = requests.get(url, timeout=timeout, headers=headers)
+        if resp.status_code >= 400:
+            alt = url.replace("https://", "http://") if url.startswith("https://") else url.replace("http://", "https://", 1)
+            if alt != url:
+                resp = requests.get(alt, timeout=timeout, headers=headers)
+        return (resp.text or "")[:8000]
+    except Exception as exc:
+        logger.warning("direct fetch failed for %s: %s", url, exc)
+        return ""
 
 
 def _structure_company_profile(website: str, snippet: str, recent: List[str]) -> Dict[str, Any]:
@@ -186,7 +205,7 @@ If you lack info, infer based on the domain (e.g., Nexius Labs) and invite the u
     return structured
 
 
-def _maybe_capture_company_website(profile: ProfileState, history: Iterable[Any]) -> bool:
+def _maybe_capture_company_website(state: OrchestrationState, profile: ProfileState, history: Iterable[Any]) -> bool:
     company = profile.get("company_profile") or {}
     if company.get("website"):
         return False
@@ -202,13 +221,14 @@ def _maybe_capture_company_website(profile: ProfileState, history: Iterable[Any]
             company["website"] = website
             summary_pack = _summarize_company_site(website, history_list)
             company.update(summary_pack)
+            _persist_company_profile_state(state, company, confirmed=False)
             updated = True
             break
     profile["company_profile"] = company
     return updated
 
 
-def _ensure_company_summary(profile: ProfileState, history: Iterable[Any]) -> bool:
+def _ensure_company_summary(state: OrchestrationState, profile: ProfileState, history: Iterable[Any]) -> bool:
     company = profile.get("company_profile") or {}
     if not company.get("website"):
         return False
@@ -218,6 +238,7 @@ def _ensure_company_summary(profile: ProfileState, history: Iterable[Any]) -> bo
     history_list = list(history)
     summary_pack = _summarize_company_site(company["website"], history_list)
     company.update(summary_pack)
+    _persist_company_profile_state(state, company, confirmed=False)
     profile["company_profile"] = company
     return True
 
@@ -240,6 +261,82 @@ def _format_company_profile(company: Dict[str, Any]) -> str:
     if proof_points:
         parts.append("Proof points: " + ", ".join(proof_points[:3]))
     return " | ".join(parts)
+
+
+def _persist_company_profile_state(state: OrchestrationState, profile: Dict[str, Any], confirmed: bool = False) -> None:
+    ctx = state.get("entry_context") or {}
+    tenant_id = ctx.get("tenant_id") or state.get("tenant_id")
+    if not tenant_id:
+        return
+    state["tenant_id"] = tenant_id
+    persist_state = {
+        "tenant_id": tenant_id,
+        "company_profile_confirmed": confirmed,
+        "site_profile_bootstrap_url": profile.get("website"),
+    }
+    try:
+        _persist_company_profile_sync(persist_state, dict(profile or {}), confirmed=confirmed, source_url=profile.get("website"))
+    except Exception:
+        logger.warning("Failed to persist company profile", exc_info=True)
+
+
+def _persist_icp_profile_state(state: OrchestrationState, icp_profile: Dict[str, Any], seed_urls: List[str]) -> None:
+    ctx = state.get("entry_context") or {}
+    tenant_id = ctx.get("tenant_id") or state.get("tenant_id")
+    if not tenant_id:
+        return
+    persist_state = {"tenant_id": tenant_id}
+    try:
+        _persist_icp_profile_sync(persist_state, dict(icp_profile or {}), confirmed=True, seed_urls=seed_urls, user_confirmed=False)
+    except Exception:
+        logger.warning("Failed to persist ICP profile", exc_info=True)
+
+
+def _generate_icp_from_customers(state: OrchestrationState, profile: ProfileState) -> bool:
+    sites = profile.get("customer_websites") or []
+    if len(sites) < 5:
+        return False
+    snippets = []
+    for url in sites[:5]:
+        snippet = _fetch_site_excerpt(url)
+        if snippet:
+            snippets.append({"url": url, "snippet": snippet})
+    if not snippets:
+        return False
+    prompt = f"""
+You are an ICP strategist. Analyze these existing customer websites and summarize the ideal customer profile for a lead-generation campaign.
+Customers:
+{snippets!r}
+Return JSON with keys: summary, industries, company_sizes, regions, pains, buying_triggers, persona_titles, proof_points.
+Each list should contain up to 4 concise items.
+"""
+    fallback = {
+        "summary": "Ideal customers resemble the provided reference customers—please refine if needed.",
+        "industries": [],
+        "company_sizes": [],
+        "regions": [],
+        "pains": [],
+        "buying_triggers": [],
+        "persona_titles": [],
+        "proof_points": [],
+    }
+    result = call_llm_json(prompt, fallback)
+    icp = {
+        "summary": (result.get("summary") or fallback["summary"]).strip(),
+        "industries": [s.strip() for s in (result.get("industries") or []) if str(s).strip()],
+        "company_sizes": [s.strip() for s in (result.get("company_sizes") or []) if str(s).strip()],
+        "regions": [s.strip() for s in (result.get("regions") or []) if str(s).strip()],
+        "pains": [s.strip() for s in (result.get("pains") or []) if str(s).strip()],
+        "buying_triggers": [s.strip() for s in (result.get("buying_triggers") or []) if str(s).strip()],
+        "persona_titles": [s.strip() for s in (result.get("persona_titles") or []) if str(s).strip()],
+        "proof_points": [s.strip() for s in (result.get("proof_points") or []) if str(s).strip()],
+        "sources": sites[:5],
+    }
+    profile["icp_profile"] = icp
+    profile["icp_profile_confirmed"] = True
+    _persist_icp_profile_state(state, icp, sites[:5])
+    _log_step("icp_profile_generated", sites=sites[:5], summary_preview=icp["summary"][:120])
+    return True
 
 
 def _heuristic_intent(text: str) -> str:
@@ -330,6 +427,8 @@ Intent options: run_enrichment, confirm_company, confirm_icp, accept_micro_icp, 
             }
         )
         state["entry_context"] = ctx
+        if ctx.get("tenant_id"):
+            state["tenant_id"] = ctx["tenant_id"]
         _log_step(
             "ingest",
             role=role,
@@ -369,11 +468,17 @@ Current profile: {profile!r}
         profile[key] = bool(result.get(key, fallback[key]))
     profile["company_profile"] = result.get("company_profile") or fallback["company_profile"]
     profile["icp_profile"] = result.get("icp_profile") or fallback["icp_profile"]
-    captured_new_site = _maybe_capture_company_website(profile, history)
+    captured_new_site = _maybe_capture_company_website(state, profile, history)
     if captured_new_site:
         profile["company_profile_confirmed"] = False
-    elif _ensure_company_summary(profile, history):
+    elif _ensure_company_summary(state, profile, history):
         profile["company_profile_confirmed"] = False
+    messages = state.get("messages", [])
+    company_url = (profile.get("company_profile") or {}).get("website")
+    profile["customer_websites"] = _collect_customer_sites(messages, company_url)
+    if len(profile.get("customer_websites") or []) >= 5 and not profile.get("icp_profile_confirmed"):
+        if _generate_icp_from_customers(state, profile):
+            profile["icp_profile_confirmed"] = True
     profile["last_updated_at"] = datetime.now(timezone.utc).isoformat()
     _log_step(
         "profile_builder",
@@ -397,9 +502,13 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     state["journey_ready"] = journey_ready
     company_profile = profile.get("company_profile") or {}
     needs_website = (not company_ready) and _needs_company_website(profile)
+    customer_sites = profile.get("customer_websites") or []
+    if company_ready and company_profile:
+        _persist_company_profile_state(state, company_profile, confirmed=True)
     if not needs_website:
-        if _ensure_company_summary(profile, state.get("messages", [])[-8:]):
+        if _ensure_company_summary(state, profile, state.get("messages", [])[-8:]):
             company_profile = profile.get("company_profile") or {}
+    explanation = None
     if company_ready and icp_ready:
         profile["outstanding_prompts"] = []
         msg = "Prerequisites satisfied. Proceeding to normalization."
@@ -411,6 +520,11 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
 
         if needs_website:
             prompt_parts.append("To get started, please share your business website so I can draft your company profile.")
+        elif company_ready and len(customer_sites) < 5:
+            remaining = 5 - len(customer_sites)
+            prompt_parts.append(
+                f"Great! Now share {remaining} more of your best customer website URLs (total of 5) so I can learn from them."
+            )
         elif not company_ready:
             summary = (company_profile.get("summary") or "").strip()
             company_name = company_profile.get("name") or "your company"
@@ -424,7 +538,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 prompt_parts.append(f"I've saved {website} as your website. I'll summarize it once you confirm.")
             prompt_parts.append("Does that look right? Please confirm so we can continue to your ICP.")
         elif not icp_ready:
-            prompt_parts.append("Great! Next, could you describe your ideal customer profile (industries, sizes, triggers) so I can line up candidates?")
+            prompt_parts.append("I'm synthesizing your ICP from the customer sites you shared—one moment while I finish up.")
         else:
             prompt_parts.append("Almost ready—just a quick confirmation on your inputs and I'll proceed.")
 
@@ -747,3 +861,39 @@ def _message_text(message: Any) -> str:
                 parts.append(str(chunk))
         return " ".join(p for p in parts if p)
     return str(content)
+def _normalize_url(url: str) -> str:
+    try:
+        parsed = urlparse(url if url.startswith("http") else ("https://" + url))
+        scheme = parsed.scheme or "https"
+        netloc = (parsed.netloc or parsed.path).lower()
+        path = parsed.path if parsed.netloc else ""
+        base = f"{scheme}://{netloc}{path}"
+        return base.rstrip("/")
+    except Exception:
+        return url.rstrip("/")
+
+
+def _extract_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    return [match.rstrip(".,)") for match in URL_RE.findall(text)]
+
+
+def _collect_customer_sites(messages: List[Dict[str, Any]], company_url: Optional[str]) -> List[str]:
+    normalized_company = _normalize_url(company_url) if company_url else None
+    seen = set()
+    urls: List[str] = []
+    for message in messages:
+        if _message_role(message) != "user":
+            continue
+        for raw in _extract_urls(_message_text(message)):
+            norm = _normalize_url(raw)
+            if normalized_company and norm == normalized_company:
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            urls.append(norm)
+            if len(urls) >= 5:
+                return urls
+    return urls
