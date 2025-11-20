@@ -17,6 +17,10 @@ app-migrations:
 nightly:
 	$(PY) -m scripts.run_nightly
 
+.PHONY: run-orchestrator
+run-orchestrator:
+	$(PY) -m scripts.run_orchestrator --tenant-id $(TID) --input "$(INPUT)"
+
 .PHONY: logs-tail
 logs-tail:
 	@LOG_DIR=$${TROUBLESHOOT_API_LOG_DIR:-.log_api}; \

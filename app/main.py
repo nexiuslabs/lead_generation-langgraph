@@ -1,5 +1,5 @@
 # app/main.py
-from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query
+from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPException, Path, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
@@ -12,6 +12,9 @@ from app.middleware_request_id import CorrelationMiddleware
 from app.odoo_store import OdooStore
 from src.settings import OPENAI_API_KEY
 from src.troubleshoot_log import log_json
+from app.langgraph_logging import LangGraphTroubleshootHandler
+from my_agent.agent import build_orchestrator_graph
+from my_agent.utils.state import OrchestrationState
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path as PathlibPath
 import os
@@ -26,6 +29,8 @@ import time
 import threading
 import asyncio
 import math
+import uuid
+from typing import Any, Dict, List, Optional
 
 fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
 
@@ -263,12 +268,105 @@ except Exception as _e:
 # keep concerns separated.
 
 # ---------------------------------------------------------------
+# Orchestrator API
+# ---------------------------------------------------------------
+
+
+def _normalize_message_payload(messages: Any) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    if not isinstance(messages, list):
+        return normalized
+    for item in messages:
+        try:
+            role = str(item.get("role") or "user")
+            content = str(item.get("content") or "")
+            if content:
+                normalized.append({"role": role, "content": content})
+        except Exception:
+            continue
+    return normalized
+
+
+@app.post("/api/orchestrations")
+async def start_orchestration(
+    request: Request,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    identity: Dict[str, Any] = Depends(require_auth),
+):
+    thread_id = str(payload.get("thread_id") or uuid.uuid4())
+    tenant_id = getattr(request.state, "tenant_id", None)
+    state: OrchestrationState = {
+        "messages": _normalize_message_payload(payload.get("messages")),
+        "input": str(payload.get("input") or ""),
+        "input_role": str(payload.get("role") or "user"),
+        "entry_context": {
+            "thread_id": thread_id,
+            "tenant_id": tenant_id,
+            "user_id": identity.get("sub"),
+        },
+        "icp_payload": payload.get("icp_payload") or {},
+    }
+    context = {
+        "thread_id": thread_id,
+        "tenant_id": tenant_id,
+        "source": "api",
+        "user_id": identity.get("sub"),
+    }
+    log_json("orchestrator", "info", "run_start", context)
+    t0 = time.perf_counter()
+    result = await ORCHESTRATOR.ainvoke(
+        state,
+        config={
+            "configurable": {"thread_id": thread_id},
+            "callbacks": _orchestrator_callbacks(context),
+        },
+    )
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    log_json(
+        "orchestrator",
+        "info",
+        "run_complete",
+        {
+            "thread_id": thread_id,
+            "tenant_id": tenant_id,
+            "output_status": (result or {}).get("status"),
+            "duration_ms": duration_ms,
+        },
+    )
+    status = (result or {}).get("status") or {}
+    status_history = (result or {}).get("status_history") or []
+    return {
+        "thread_id": thread_id,
+        "status": status,
+        "status_history": status_history,
+        "output": status.get("message"),
+    }
+
+
+@app.get("/api/orchestrations/{thread_id}")
+async def get_orchestration_status(
+    thread_id: str,
+    request: Request,
+    identity: Dict[str, Any] = Depends(require_auth),
+):
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = ORCHESTRATOR.get_state(config)
+    values = getattr(snapshot, "values", None) if snapshot else None
+    if not values:
+        raise HTTPException(status_code=404, detail="Orchestration not found")
+    status = values.get("status") or {}
+    status_history = values.get("status_history") or []
+    return {
+        "thread_id": thread_id,
+        "status": status,
+        "output": status.get("message"),
+        "status_history": status_history,
+        "state": values,
+    }
+
+# ---------------------------------------------------------------
 # Utilities: SendGrid email smoke test (no enrichment required)
 # ---------------------------------------------------------------
-from typing import Optional
-from fastapi import Body
-
-
 @app.post("/email/test")
 async def email_test(
     to: Optional[str] = Query(default=None, description="Recipient email"),
@@ -2213,3 +2311,10 @@ async def admin_run_nightly(background: BackgroundTasks, request: Request, claim
         return {"status": "scheduled", "tenant_id": tenant_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule failed: {e}")
+# Build orchestrator graph once for API + chat entry
+ORCHESTRATOR = build_orchestrator_graph()
+
+
+def _orchestrator_callbacks(context: Dict[str, Any] | None = None):
+    ctx = context or {}
+    return [LangGraphTroubleshootHandler(context=ctx)]

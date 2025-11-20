@@ -3,6 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import inspect
+import warnings
+
+warnings.warn(
+    "app.pre_sdr_graph is deprecated and will be removed once the LangGraph orchestrator rollout completes.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 import logging
 import os
 import re

@@ -1,13 +1,10 @@
-{
-  "dependencies": ["."],
-  "env": ".env",
-  "graphs": {
-    "agent": "./app/lg_entry.py:make_graph"
-  },
-  "auth": {
-    "path": "./app/lg_auth.py:auth"
-  },
-  "http": {
-    "app": "./app/main.py:app"
+ {
+    "dependencies": [
+      "my_agent",
+      "app",
+      "src"
+    ],
+    "graphs": {
+      "orchestrator": "my_agent.agent:build_orchestrator_graph"
+    }
   }
-}

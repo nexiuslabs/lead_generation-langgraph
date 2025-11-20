@@ -40,8 +40,8 @@ class RelevanceJudgment(BaseModel):
 # A concise, embedded reference of what this agent can do and how it works.
 # Q&A answers MUST rely only on this reference and any provided runtime context.
 SYSTEM_REFERENCE = (
-    "Agent: Pre‑SDR lead‑gen assistant under LangGraph Server. Router-controlled chat graph.\n"
-    "Entry: app/lg_entry.py:make_graph → app/pre_sdr_graph.build_graph.\n"
+    "Agent: LangGraph orchestrator (my_agent/agent.py) with ingest/profile/journey_guard + backend pipeline.\n"
+    "Entry: app/lg_entry.py.handle_turn → my_agent.agent.build_orchestrator_graph().\n"
     "Safety: No auto‑start or auto‑enrichment; explicit user commands required. Greetings and Q&A are terminal.\n"
     "Tone: Explain jargon inline (e.g., 'ICP (ideal customer profile)').\n\n"
     "User Commands:\n"

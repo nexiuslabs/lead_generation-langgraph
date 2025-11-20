@@ -6,9 +6,8 @@ After=network.target
 Type=simple
 WorkingDirectory=%h/lead_generation-main
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/env python -m scripts.run_nightly
+ExecStart=/usr/bin/env python scripts/run_orchestrator.py --tenant-id 1 --input "run full pipeline"
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
-
