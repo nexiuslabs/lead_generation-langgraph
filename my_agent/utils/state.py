@@ -10,9 +10,11 @@ class ProfileState(TypedDict, total=False):
     icp_profile: Dict[str, Any]
     company_profile_confirmed: bool
     icp_profile_confirmed: bool
+    icp_profile_generated: bool
     micro_icp_selected: bool
     awaiting_discovery_confirmation: bool
     outstanding_prompts: List[str]
+    customer_websites: List[str]
     last_updated_at: Optional[str]
 
 

@@ -81,6 +81,7 @@ def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
     profile.setdefault("outstanding_prompts", [])
     profile.setdefault("company_profile", {})
     profile.setdefault("icp_profile", {})
+    profile.setdefault("icp_profile_generated", bool(profile.get("icp_profile")))
     profile.setdefault("customer_websites", [])
     state["profile_state"] = profile
     return profile
@@ -263,6 +264,27 @@ def _format_company_profile(company: Dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
+def _format_icp_profile(icp: Dict[str, Any]) -> str:
+    summary = (icp.get("summary") or "").strip()
+    pieces: List[str] = []
+    if summary:
+        pieces.append(f"Summary: {summary}")
+
+    def _add(label: str, values: List[str], limit: int = 4) -> None:
+        cleaned = [v.strip() for v in (values or []) if str(v).strip()]
+        if cleaned:
+            pieces.append(f"{label}: {', '.join(cleaned[:limit])}")
+
+    _add("Industries", icp.get("industries") or [], limit=3)
+    _add("Company sizes", icp.get("company_sizes") or [], limit=3)
+    _add("Regions", icp.get("regions") or [], limit=3)
+    _add("Key pains", icp.get("pains") or [], limit=3)
+    _add("Buying triggers", icp.get("buying_triggers") or [], limit=3)
+    _add("Personas", icp.get("persona_titles") or [], limit=3)
+    _add("Proof points", icp.get("proof_points") or [], limit=3)
+    return " | ".join(pieces)
+
+
 def _persist_company_profile_state(state: OrchestrationState, profile: Dict[str, Any], confirmed: bool = False) -> None:
     ctx = state.get("entry_context") or {}
     tenant_id = ctx.get("tenant_id") or state.get("tenant_id")
@@ -333,7 +355,8 @@ Each list should contain up to 4 concise items.
         "sources": sites[:5],
     }
     profile["icp_profile"] = icp
-    profile["icp_profile_confirmed"] = True
+    profile["icp_profile_generated"] = True
+    profile["icp_profile_confirmed"] = False
     _persist_icp_profile_state(state, icp, sites[:5])
     _log_step("icp_profile_generated", sites=sites[:5], summary_preview=icp["summary"][:120])
     return True
@@ -476,9 +499,9 @@ Current profile: {profile!r}
     messages = state.get("messages", [])
     company_url = (profile.get("company_profile") or {}).get("website")
     profile["customer_websites"] = _collect_customer_sites(messages, company_url)
-    if len(profile.get("customer_websites") or []) >= 5 and not profile.get("icp_profile_confirmed"):
-        if _generate_icp_from_customers(state, profile):
-            profile["icp_profile_confirmed"] = True
+    customer_sites = profile.get("customer_websites") or []
+    if len(customer_sites) >= 5 and not profile.get("icp_profile_generated"):
+        _generate_icp_from_customers(state, profile)
     profile["last_updated_at"] = datetime.now(timezone.utc).isoformat()
     _log_step(
         "profile_builder",
@@ -501,6 +524,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     last_intent = ctx.get("intent") or (_heuristic_intent(question) if question else None)
     state["journey_ready"] = journey_ready
     company_profile = profile.get("company_profile") or {}
+    icp_profile = profile.get("icp_profile") or {}
     needs_website = (not company_ready) and _needs_company_website(profile)
     customer_sites = profile.get("customer_websites") or []
     if company_ready and company_profile:
@@ -538,7 +562,12 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 prompt_parts.append(f"I've saved {website} as your website. I'll summarize it once you confirm.")
             prompt_parts.append("Does that look right? Please confirm so we can continue to your ICP.")
         elif not icp_ready:
-            prompt_parts.append("I'm synthesizing your ICP from the customer sites you shared—one moment while I finish up.")
+            icp_overview = _format_icp_profile(icp_profile)
+            if icp_overview:
+                prompt_parts.append(f"Here's the ICP I drafted from the customer sites you shared: {icp_overview}")
+                prompt_parts.append("Does that look right? Confirm or suggest edits before I start discovery.")
+            else:
+                prompt_parts.append("I'm synthesizing your ICP from the customer sites you shared—one moment while I finish up.")
         else:
             prompt_parts.append("Almost ready—just a quick confirmation on your inputs and I'll proceed.")
 
