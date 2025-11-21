@@ -217,6 +217,25 @@ async def test_profile_builder_confirms_icp_from_affirmative_text():
 
 
 @pytest.mark.asyncio
+async def test_profile_builder_enrichment_confirmed_without_explicit_intent():
+    state: OrchestrationState = {
+        "messages": [],
+        "entry_context": {"intent": "chat", "last_user_command": "please enrich 10 now"},
+        "profile_state": {
+            "company_profile_confirmed": True,
+            "icp_profile_confirmed": True,
+            "icp_discovery_confirmed": True,
+            "awaiting_enrichment_confirmation": True,
+            "enrichment_confirmed": False,
+            "icp_profile": {"summary": "test"},
+        },
+    }
+    out = await nodes.profile_builder(state)
+    assert out["profile_state"]["enrichment_confirmed"] is True
+    assert out["profile_state"]["awaiting_enrichment_confirmation"] is False
+
+
+@pytest.mark.asyncio
 async def test_profile_builder_handles_informal_discovery_confirmation():
     state: OrchestrationState = {
         "messages": [],

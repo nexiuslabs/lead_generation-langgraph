@@ -521,7 +521,7 @@ def _heuristic_intent(text: str) -> str:
         return "confirm_icp"
     if "micro icp" in lowered or lowered.strip().endswith("?"):
         return "question"
-    if "run enrichment" in lowered or "start enrichment" in lowered:
+    if "run enrichment" in lowered or "start enrichment" in lowered or "enrich" in lowered:
         return "run_enrichment"
     return "chat"
 
@@ -759,8 +759,11 @@ Current profile: {profile!r}
             "looks good",
             "confirm",
             "yes",
+            "top 10",
+            "ten",
         )
-        if last_intent == "run_enrichment" or any(phrase in last_command for phrase in confirm_phrases):
+        normalized = normalized_command
+        if last_intent == "run_enrichment" or any(phrase in normalized for phrase in confirm_phrases):
             profile["enrichment_confirmed"] = True
             profile["awaiting_enrichment_confirmation"] = False
 
