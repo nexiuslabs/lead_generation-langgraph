@@ -24,6 +24,19 @@ from src.jobs import enqueue_web_discovery_bg_enrich
 from src.jina_reader import read_url as jina_read
 from app.pre_sdr_graph import _persist_company_profile_sync, _persist_icp_profile_sync  # type: ignore
 
+try:
+    from src.settings import ENABLE_AGENT_DISCOVERY as _SETTINGS_AGENT_DISCOVERY  # type: ignore
+except Exception:  # pragma: no cover - optional settings module
+    _SETTINGS_AGENT_DISCOVERY = False  # type: ignore
+
+try:
+    from src.agents_icp import compliance_guard as _agent_compliance_guard  # type: ignore
+    from src.agents_icp import discovery_planner as _agent_discovery_planner  # type: ignore
+except Exception:  # pragma: no cover - agent bundle optional
+    _agent_discovery_planner = None  # type: ignore
+    _agent_compliance_guard = None  # type: ignore
+
+
 from .llm import call_llm_json
 from .state import OrchestrationState, ProfileState
 
@@ -38,7 +51,24 @@ except Exception:  # pragma: no cover
     plan_top10_with_reasons = None
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_mcp_reader_enabled() -> None:
+    try:
+        from src import settings as _app_settings  # type: ignore
+    except Exception:  # pragma: no cover
+        return
+    try:
+        if not getattr(_app_settings, "ENABLE_MCP_READER", False):
+            setattr(_app_settings, "ENABLE_MCP_READER", True)
+            logger.info("ENABLE_MCP_READER not set; defaulting to True for orchestrator runs.")
+    except Exception:
+        pass
+
+
+_ensure_mcp_reader_enabled()
 OFFLINE = (os.getenv("ORCHESTRATOR_OFFLINE") or "").lower() in {"1", "true", "yes"}
+AGENT_DISCOVERY_ENABLED = bool(_SETTINGS_AGENT_DISCOVERY)
 
 
 def _log_step(step: str, **info: Any) -> None:
@@ -82,6 +112,11 @@ def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
     profile.setdefault("company_profile", {})
     profile.setdefault("icp_profile", {})
     profile.setdefault("icp_profile_generated", bool(profile.get("icp_profile")))
+    profile.setdefault("icp_discovery_confirmed", False)
+    profile.setdefault("awaiting_discovery_confirmation", False)
+    profile.setdefault("awaiting_enrichment_confirmation", False)
+    profile.setdefault("enrichment_confirmed", False)
+    profile.setdefault("discovery_retry_requested", False)
     profile.setdefault("customer_websites", [])
     state["profile_state"] = profile
     return profile
@@ -314,6 +349,30 @@ def _persist_icp_profile_state(state: OrchestrationState, icp_profile: Dict[str,
         logger.warning("Failed to persist ICP profile", exc_info=True)
 
 
+def _plan_web_candidates(icp_profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not (AGENT_DISCOVERY_ENABLED and _agent_discovery_planner is not None):
+        return {}
+    try:
+        planned = _agent_discovery_planner({"icp_profile": icp_profile or {}}) or {}
+        guarded = planned
+        if _agent_compliance_guard is not None:
+            try:
+                guarded = _agent_compliance_guard(dict(planned)) or guarded
+            except Exception:
+                pass
+        domains = [
+            str(d).strip().lower()
+            for d in (guarded.get("discovery_candidates") or planned.get("discovery_candidates") or [])
+            if isinstance(d, str) and d.strip()
+        ]
+        snippets = guarded.get("jina_snippets") or planned.get("jina_snippets") or {}
+        capped = domains[:50]
+        return {"domains": capped, "snippets": {d: snippets.get(d) for d in capped if snippets.get(d)}}
+    except Exception as exc:  # pragma: no cover - agent optional
+        logger.warning("web discovery planner failed: %s", exc)
+        return {}
+
+
 def _generate_icp_from_customers(state: OrchestrationState, profile: ProfileState) -> bool:
     sites = profile.get("customer_websites") or []
     if len(sites) < 5:
@@ -474,6 +533,7 @@ Return JSON with keys:
   - company_profile_confirmed (bool)
   - icp_profile_confirmed (bool)
   - micro_icp_selected (bool)
+  - icp_discovery_confirmed (bool)
   - company_profile (object with website/name/summary fields when mentioned)
   - icp_profile (object summarizing the ICP when provided)
 History: {history!r}
@@ -482,12 +542,13 @@ Current profile: {profile!r}
     fallback = {
         "company_profile_confirmed": bool(profile.get("company_profile_confirmed")),
         "icp_profile_confirmed": bool(profile.get("icp_profile_confirmed")),
+        "icp_discovery_confirmed": bool(profile.get("icp_discovery_confirmed")),
         "micro_icp_selected": bool(profile.get("micro_icp_selected")),
         "company_profile": profile.get("company_profile") or {},
         "icp_profile": profile.get("icp_profile") or {},
     }
     result = call_llm_json(prompt, fallback)
-    for key in ("company_profile_confirmed", "icp_profile_confirmed", "micro_icp_selected"):
+    for key in ("company_profile_confirmed", "icp_profile_confirmed", "micro_icp_selected", "icp_discovery_confirmed"):
         profile[key] = bool(result.get(key, fallback[key]))
     profile["company_profile"] = result.get("company_profile") or fallback["company_profile"]
     profile["icp_profile"] = result.get("icp_profile") or fallback["icp_profile"]
@@ -502,6 +563,54 @@ Current profile: {profile!r}
     customer_sites = profile.get("customer_websites") or []
     if len(customer_sites) >= 5 and not profile.get("icp_profile_generated"):
         _generate_icp_from_customers(state, profile)
+
+    ctx = state.get("entry_context") or {}
+    last_intent = (ctx.get("intent") or "").strip().lower()
+    last_command = (ctx.get("last_user_command") or "").strip().lower()
+    awaiting_discovery = bool(profile.get("awaiting_discovery_confirmation"))
+    if awaiting_discovery and not profile.get("icp_discovery_confirmed"):
+        positive_intents = {"run_enrichment", "accept_micro_icp", "confirm_icp"}
+        positive_phrases = {
+            "yes",
+            "yep",
+            "yeah",
+            "sure",
+            "do it",
+            "go ahead",
+            "looks good",
+            "start discovery",
+            "start icp",
+            "run discovery",
+            "run icp",
+            "proceed",
+        }
+        normalized = last_command.translate(str.maketrans("", "", ".!?")).strip()
+        if last_intent in positive_intents or any(phrase in normalized for phrase in positive_phrases):
+            profile["icp_discovery_confirmed"] = True
+            profile["awaiting_discovery_confirmation"] = False
+
+    if profile.get("icp_discovery_confirmed"):
+        profile["awaiting_discovery_confirmation"] = False
+
+    retry_triggers = ("retry discovery", "retry icp", "search again")
+    if any(trigger in last_command for trigger in retry_triggers):
+        profile["discovery_retry_requested"] = True
+        profile["awaiting_enrichment_confirmation"] = False
+        profile["enrichment_confirmed"] = False
+    if profile.get("awaiting_enrichment_confirmation"):
+        confirm_phrases = (
+            "enrich",
+            "start enrichment",
+            "proceed",
+            "go ahead",
+            "looks good",
+            "confirm",
+            "yes",
+        )
+        if last_intent == "run_enrichment" or any(phrase in last_command for phrase in confirm_phrases):
+            profile["enrichment_confirmed"] = True
+            profile["awaiting_enrichment_confirmation"] = False
+
     profile["last_updated_at"] = datetime.now(timezone.utc).isoformat()
     _log_step(
         "profile_builder",
@@ -518,7 +627,9 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     profile = _ensure_profile_state(state)
     company_ready = bool(profile.get("company_profile_confirmed"))
     icp_ready = bool(profile.get("icp_profile_confirmed"))
-    journey_ready = bool(company_ready and icp_ready)
+    discovery_ready = bool(profile.get("icp_discovery_confirmed"))
+    enrichment_ready = bool(profile.get("enrichment_confirmed"))
+    journey_ready = bool(company_ready and icp_ready and discovery_ready and enrichment_ready)
     ctx = state.get("entry_context") or {}
     question = ctx.get("last_user_command") or _latest_user_text(state)
     last_intent = ctx.get("intent") or (_heuristic_intent(question) if question else None)
@@ -527,14 +638,16 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     icp_profile = profile.get("icp_profile") or {}
     needs_website = (not company_ready) and _needs_company_website(profile)
     customer_sites = profile.get("customer_websites") or []
+    discovery_state = state.get("discovery") or {}
     if company_ready and company_profile:
         _persist_company_profile_state(state, company_profile, confirmed=True)
     if not needs_website:
         if _ensure_company_summary(state, profile, state.get("messages", [])[-8:]):
             company_profile = profile.get("company_profile") or {}
     explanation = None
-    if company_ready and icp_ready:
+    if journey_ready:
         profile["outstanding_prompts"] = []
+        profile["awaiting_discovery_confirmation"] = False
         msg = "Prerequisites satisfied. Proceeding to normalization."
     else:
         explanation = _maybe_explain_question(question, last_intent)
@@ -543,13 +656,16 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             prompt_parts.append(explanation)
 
         if needs_website:
+            profile["awaiting_discovery_confirmation"] = False
             prompt_parts.append("To get started, please share your business website so I can draft your company profile.")
         elif company_ready and len(customer_sites) < 5:
+            profile["awaiting_discovery_confirmation"] = False
             remaining = 5 - len(customer_sites)
             prompt_parts.append(
                 f"Great! Now share {remaining} more of your best customer website URLs (total of 5) so I can learn from them."
             )
         elif not company_ready:
+            profile["awaiting_discovery_confirmation"] = False
             summary = (company_profile.get("summary") or "").strip()
             company_name = company_profile.get("name") or "your company"
             website = company_profile.get("website")
@@ -562,12 +678,41 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 prompt_parts.append(f"I've saved {website} as your website. I'll summarize it once you confirm.")
             prompt_parts.append("Does that look right? Please confirm so we can continue to your ICP.")
         elif not icp_ready:
+            profile["awaiting_discovery_confirmation"] = False
             icp_overview = _format_icp_profile(icp_profile)
             if icp_overview:
                 prompt_parts.append(f"Here's the ICP I drafted from the customer sites you shared: {icp_overview}")
                 prompt_parts.append("Does that look right? Confirm or suggest edits before I start discovery.")
             else:
                 prompt_parts.append("I'm synthesizing your ICP from the customer sites you shared—one moment while I finish up.")
+        elif not discovery_ready:
+            profile["awaiting_discovery_confirmation"] = True
+            prompt_parts.append("You're all set on profiles. Ready for me to start ICP discovery and pull candidate lists?")
+            prompt_parts.append("Reply with 'start discovery' (or similar) when you're ready, or share tweaks if you'd like adjustments first.")
+        elif discovery_ready and not enrichment_ready:
+            profile["awaiting_discovery_confirmation"] = False
+            if profile.get("discovery_retry_requested"):
+                discovery_state.pop("web_candidates", None)
+            candidates = discovery_state.get("web_candidates") or []
+            if not candidates:
+                plan = _plan_web_candidates(icp_profile)
+                candidates = plan.get("domains") or []
+                if candidates:
+                    discovery_state["web_candidates"] = candidates
+                snippets = plan.get("snippets") or {}
+                if snippets:
+                    discovery_state["web_snippets"] = snippets
+                profile["discovery_retry_requested"] = False
+            if candidates:
+                preview = ", ".join(candidates[:10])
+                prompt_parts.append(
+                    f"I found {len(candidates)} ICP candidate websites. Top picks: {preview}. Ready for me to enrich the best 10 now?"
+                )
+                prompt_parts.append("Reply 'enrich 10' (or similar) to proceed, or say 'retry discovery' and I'll search again.")
+                profile["awaiting_enrichment_confirmation"] = True
+            else:
+                prompt_parts.append("I couldn't find solid ICP candidates. Say 'retry discovery' to search again or adjust your ICP details.")
+                profile["awaiting_enrichment_confirmation"] = False
         else:
             prompt_parts.append("Almost ready—just a quick confirmation on your inputs and I'll proceed.")
 
@@ -575,10 +720,13 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
         profile["outstanding_prompts"] = [prompt]
         msg = prompt
         _append_message(state, "assistant", prompt)
+    state["discovery"] = discovery_state
     _log_step(
         "journey_guard",
         company_ready=company_ready,
         icp_ready=icp_ready,
+        discovery_ready=discovery_ready,
+        enrichment_ready=enrichment_ready,
         intent=last_intent,
         explanation_provided=bool(explanation),
         needs_website=needs_website,
@@ -612,6 +760,11 @@ async def normalize(state: OrchestrationState) -> OrchestrationState:
 async def refresh_icp(state: OrchestrationState) -> OrchestrationState:
     payload = state.get("icp_payload") or {}
     discovery = state.get("discovery") or {}
+    profile = _ensure_profile_state(state)
+    if not profile.get("enrichment_confirmed"):
+        _log_step("refresh_icp", skipped=True, reason="awaiting_enrichment_confirmation")
+        _set_status(state, "refresh_icp", "Waiting for enrichment confirmation")
+        return state
     if OFFLINE:
         discovery["candidate_ids"] = [101, 102, 103]
         discovery["diagnostics"] = {"payload": payload, "offline": True}
@@ -632,6 +785,7 @@ async def refresh_icp(state: OrchestrationState) -> OrchestrationState:
         "refresh_icp",
         candidates=len(discovery.get("candidate_ids") or []),
         diagnostics=discovery.get("diagnostics"),
+        web_candidates=len(discovery.get("web_candidates") or []),
     )
     _set_status(state, "refresh_icp", msg)
     return state
@@ -796,6 +950,7 @@ async def progress_report(state: OrchestrationState) -> OrchestrationState:
         "candidates": len(state.get("discovery", {}).get("candidate_ids") or []),
         "confirmed_company": bool(state.get("profile_state", {}).get("company_profile_confirmed")),
         "confirmed_icp": bool(state.get("profile_state", {}).get("icp_profile_confirmed")),
+        "web_candidates": len(state.get("discovery", {}).get("web_candidates") or []),
     }
     outstanding = (state.get("profile_state") or {}).get("outstanding_prompts") or []
     if outstanding:
@@ -807,7 +962,15 @@ Focus on next steps instead of internal phase names.
 State: {summary!r}
 Return JSON {{"message": "..."}}
 """
-        fallback_message = "I'm reviewing your inputs. Please confirm your company profile and ideal customer profile so I can continue."
+        all_web_candidates = state.get("discovery", {}).get("web_candidates") or []
+        if all_web_candidates:
+            preview = ", ".join(all_web_candidates[:5])
+            fallback_message = (
+                f"Pulled {len(all_web_candidates)} fresh ICP candidates via live web search. "
+                f"Sample: {preview}. Moving on to enrichment."
+            )
+        else:
+            fallback_message = "I'm reviewing your inputs. Please confirm your company profile and ideal customer profile so I can continue."
         result = call_llm_json(prompt, {"message": fallback_message})
         message = result.get("message", fallback_message)
     _log_step("progress_report", outstanding=bool(outstanding), message=message)

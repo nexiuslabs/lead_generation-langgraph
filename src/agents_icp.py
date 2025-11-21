@@ -567,7 +567,14 @@ def _mcp_search_domains(query: str, max_results: int = 25, country: str | None =
             log.info("[mcp] search domains=%d", len(doms))
         except Exception:
             pass
-        return doms[:max_results]
+        if doms:
+            return doms[:max_results]
+        # No DOMs returned—fall back to DDG so discovery can proceed
+        try:
+            log.info("[mcp] search returned 0 domains; falling back to DDG")
+        except Exception:
+            pass
+        return _ddg_search_domains(query, max_results=max_results, country=country)
     except Exception as e:
         try:
             log.info("[mcp] search fallback to DDG due to: %s", (str(e) or type(e).__name__))

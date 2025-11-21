@@ -11,8 +11,12 @@ class ProfileState(TypedDict, total=False):
     company_profile_confirmed: bool
     icp_profile_confirmed: bool
     icp_profile_generated: bool
+    icp_discovery_confirmed: bool
     micro_icp_selected: bool
     awaiting_discovery_confirmation: bool
+    awaiting_enrichment_confirmation: bool
+    enrichment_confirmed: bool
+    discovery_retry_requested: bool
     outstanding_prompts: List[str]
     customer_websites: List[str]
     last_updated_at: Optional[str]
