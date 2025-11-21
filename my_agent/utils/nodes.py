@@ -10,6 +10,8 @@ possible so behavior matches the legacy stack.
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import logging
 import os
 import re
@@ -52,6 +54,44 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+RUN_ENRICH_PHRASES = {
+    "enrich",
+    "start enrichment",
+    "run enrichment",
+    "enrich 10",
+    "top 10",
+    "enrich ten",
+    "please enrich",
+}
+DEFAULT_COMPANY_PROFILE = {
+    "name": "Nexius Labs",
+    "website": "https://nexiuslabs.com",
+    "summary": (
+        "NEXIUS Labs provides AI-powered automation to help lean teams win more customers "
+        "while reducing operational overhead, centered on the Nexius Agent AI business partner "
+        "plus courses and pre-built workflows for sales, invoicing, and ops."
+    ),
+    "industries": ["AI & Automation", "SaaS", "Business Operations"],
+    "offerings": [
+        "Nexius Agent (AI business partner for automating key operations)",
+        "NEXIUS Academy (AI courses and resources)",
+        "Pre-built automation workflows (lead engine, invoicing, ops dashboard)",
+        "Open-source AI stacks and integrations",
+    ],
+    "ideal_customers": [
+        "Founders and solo founders",
+        "Lean teams and small businesses",
+        "SMBs scaling without expensive software",
+    ],
+    "proof_points": [
+        "Average 45% efficiency boost (claimed)",
+        "Trusted by founders and lean teams",
+        "Starter workflows live in days",
+    ],
+    "summary_source": "seeded",
+}
+_EVENT_TOKEN_RE = re.compile(r"^[a-z0-9_]+:[a-z0-9_]+$", re.IGNORECASE)
+
 
 def _ensure_mcp_reader_enabled() -> None:
     try:
@@ -88,10 +128,43 @@ def _ensure_messages(state: OrchestrationState) -> None:
 
 
 def _append_message(state: OrchestrationState, role: str, content: str) -> None:
-    if not content.strip():
+    if content is None:
+        return
+    text = str(content)
+    if _should_suppress_message(role, text):
         return
     _ensure_messages(state)
-    state["messages"].append({"role": role, "content": content})
+    state["messages"].append({"role": role, "content": text})
+
+
+def _looks_like_json_blob(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped[0] not in "{[":
+        return False
+    if stripped[-1] not in "]}":
+        return False
+    try:
+        payload = json.loads(stripped)
+    except Exception:
+        return False
+    return isinstance(payload, (dict, list))
+
+
+def _should_suppress_message(role: str, content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return True
+    if role != "assistant":
+        return False
+    if _EVENT_TOKEN_RE.match(stripped):
+        logger.debug("suppressing telemetry event: %s", stripped)
+        return True
+    if _looks_like_json_blob(stripped):
+        logger.debug("suppressing JSON payload: %s", stripped[:120])
+        return True
+    return False
 
 
 def _set_status(state: OrchestrationState, phase: str, message: str) -> None:
@@ -118,13 +191,24 @@ def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
     profile.setdefault("enrichment_confirmed", False)
     profile.setdefault("discovery_retry_requested", False)
     profile.setdefault("customer_websites", [])
+    seeded = False
+    if not profile["company_profile"]:
+        profile["company_profile"] = copy.deepcopy(DEFAULT_COMPANY_PROFILE)
+        profile["company_profile_confirmed"] = False
+        seeded = True
+    if "seeded_company_profile" not in profile:
+        profile["seeded_company_profile"] = seeded
+    elif seeded:
+        profile["seeded_company_profile"] = True
     state["profile_state"] = profile
     return profile
 
 
 def _needs_company_website(profile: ProfileState) -> bool:
     company = profile.get("company_profile") or {}
-    return not bool((company.get("website") or "").strip())
+    seeded = bool(profile.get("seeded_company_profile"))
+    has_website = bool((company.get("website") or "").strip())
+    return seeded or not has_website
 
 
 def _domain_from_value(url: str) -> str:
@@ -263,7 +347,7 @@ If you lack info, infer based on the domain (e.g., Nexius Labs) and invite the u
 
 def _maybe_capture_company_website(state: OrchestrationState, profile: ProfileState, history: Iterable[Any]) -> bool:
     company = profile.get("company_profile") or {}
-    if company.get("website"):
+    if company.get("website") and not profile.get("seeded_company_profile"):
         return False
     history_list = list(history)
     updated = False
@@ -281,6 +365,8 @@ def _maybe_capture_company_website(state: OrchestrationState, profile: ProfileSt
             updated = True
             break
     profile["company_profile"] = company
+    if updated:
+        profile["seeded_company_profile"] = False
     return updated
 
 
@@ -296,6 +382,7 @@ def _ensure_company_summary(state: OrchestrationState, profile: ProfileState, hi
     company.update(summary_pack)
     _persist_company_profile_state(state, company, confirmed=False)
     profile["company_profile"] = company
+    profile["seeded_company_profile"] = False
     return True
 
 
@@ -305,39 +392,45 @@ def _format_company_profile(company: Dict[str, Any]) -> str:
     offerings = company.get("offerings") or []
     ideal_customers = company.get("ideal_customers") or []
     proof_points = company.get("proof_points") or []
-    parts: List[str] = []
+    blocks: List[str] = []
     if summary:
-        parts.append(f"Summary: {summary}")
-    if industries:
-        parts.append("Industries: " + ", ".join(industries[:3]))
-    if offerings:
-        parts.append("Offerings: " + ", ".join(offerings[:4]))
-    if ideal_customers:
-        parts.append("Ideal customers: " + ", ".join(ideal_customers[:3]))
-    if proof_points:
-        parts.append("Proof points: " + ", ".join(proof_points[:3]))
-    return " | ".join(parts)
+        blocks.append(f"**Summary**\n{summary}")
+
+    def _format_section(label: str, values: Sequence[str], limit: int) -> None:
+        cleaned = [str(v).strip() for v in values if str(v).strip()]
+        if not cleaned:
+            return
+        snippet_lines = "\n".join(f"- {item}" for item in cleaned[:limit])
+        blocks.append(f"**{label}**\n{snippet_lines}")
+
+    _format_section("Industries", industries, 3)
+    _format_section("Offerings", offerings, 4)
+    _format_section("Ideal Customers", ideal_customers, 3)
+    _format_section("Proof Points", proof_points, 3)
+    return "\n\n".join(blocks)
 
 
 def _format_icp_profile(icp: Dict[str, Any]) -> str:
     summary = (icp.get("summary") or "").strip()
-    pieces: List[str] = []
+    sections: List[str] = []
     if summary:
-        pieces.append(f"Summary: {summary}")
+        sections.append(f"**Summary**\n{summary}")
 
-    def _add(label: str, values: List[str], limit: int = 4) -> None:
-        cleaned = [v.strip() for v in (values or []) if str(v).strip()]
-        if cleaned:
-            pieces.append(f"{label}: {', '.join(cleaned[:limit])}")
+    def _append(label: str, values: List[str], limit: int = 4) -> None:
+        cleaned = [str(v).strip() for v in (values or []) if str(v).strip()]
+        if not cleaned:
+            return
+        bullets = "\n".join(f"- {item}" for item in cleaned[:limit])
+        sections.append(f"**{label}**\n{bullets}")
 
-    _add("Industries", icp.get("industries") or [], limit=3)
-    _add("Company sizes", icp.get("company_sizes") or [], limit=3)
-    _add("Regions", icp.get("regions") or [], limit=3)
-    _add("Key pains", icp.get("pains") or [], limit=3)
-    _add("Buying triggers", icp.get("buying_triggers") or [], limit=3)
-    _add("Personas", icp.get("persona_titles") or [], limit=3)
-    _add("Proof points", icp.get("proof_points") or [], limit=3)
-    return " | ".join(pieces)
+    _append("Industries", icp.get("industries") or [], limit=3)
+    _append("Company Sizes", icp.get("company_sizes") or [], limit=3)
+    _append("Regions", icp.get("regions") or [], limit=3)
+    _append("Key Pains", icp.get("pains") or [], limit=3)
+    _append("Buying Triggers", icp.get("buying_triggers") or [], limit=3)
+    _append("Personas", icp.get("persona_titles") or [], limit=3)
+    _append("Proof Points", icp.get("proof_points") or [], limit=3)
+    return "\n\n".join(sections)
 
 
 def _persist_company_profile_state(state: OrchestrationState, profile: Dict[str, Any], confirmed: bool = False) -> None:
@@ -541,6 +634,12 @@ Text: {raw!r}
     return (result or fallback)["intent"]
 
 
+def _wants_enrichment(intent: str | None, normalized_command: str) -> bool:
+    normalized_intent = (intent or "").strip().lower()
+    normalized_text = (normalized_command or "").strip().lower()
+    return normalized_intent == "run_enrichment" or any(phrase in normalized_text for phrase in RUN_ENRICH_PHRASES)
+
+
 def _maybe_explain_question(question: str, intent: str | None = None) -> str | None:
     clean = (question or "").strip()
     if not clean:
@@ -700,6 +799,11 @@ Current profile: {profile!r}
         if last_intent in {"confirm_icp", "run_enrichment"} or _includes_phrase(normalized_command, icp_confirm_phrases):
             profile["icp_profile_confirmed"] = True
 
+    enrichment_requested = _wants_enrichment(last_intent, normalized_command)
+    if profile.get("icp_discovery_confirmed") and enrichment_requested:
+        profile["enrichment_confirmed"] = True
+        profile["awaiting_enrichment_confirmation"] = False
+
     awaiting_discovery = bool(profile.get("awaiting_discovery_confirmation"))
     if awaiting_discovery and not profile.get("icp_discovery_confirmed"):
         positive_intents = {"run_enrichment", "accept_micro_icp", "confirm_icp"}
@@ -737,7 +841,7 @@ Current profile: {profile!r}
         elif "icp" in normalized and any(
             trigger in normalized for trigger in ("start", "run", "begin", "ready", "proceed", "go ahead")
         ):
-            confirm_discovery = True
+                confirm_discovery = True
         if confirm_discovery:
             profile["icp_discovery_confirmed"] = True
             profile["awaiting_discovery_confirmation"] = False
@@ -750,7 +854,7 @@ Current profile: {profile!r}
         profile["discovery_retry_requested"] = True
         profile["awaiting_enrichment_confirmation"] = False
         profile["enrichment_confirmed"] = False
-    if profile.get("awaiting_enrichment_confirmation"):
+    if profile.get("awaiting_enrichment_confirmation") and not profile.get("enrichment_confirmed"):
         confirm_phrases = (
             "enrich",
             "start enrichment",
@@ -763,9 +867,12 @@ Current profile: {profile!r}
             "ten",
         )
         normalized = normalized_command
-        if last_intent == "run_enrichment" or any(phrase in normalized for phrase in confirm_phrases):
+        if enrichment_requested or any(phrase in normalized for phrase in confirm_phrases):
             profile["enrichment_confirmed"] = True
             profile["awaiting_enrichment_confirmation"] = False
+
+    if profile.get("seeded_company_profile"):
+        profile["company_profile_confirmed"] = False
 
     profile["last_updated_at"] = datetime.now(timezone.utc).isoformat()
     _log_step(
@@ -785,10 +892,16 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     icp_ready = bool(profile.get("icp_profile_confirmed"))
     discovery_ready = bool(profile.get("icp_discovery_confirmed"))
     enrichment_ready = bool(profile.get("enrichment_confirmed"))
-    journey_ready = bool(company_ready and icp_ready and discovery_ready and enrichment_ready)
     ctx = state.get("entry_context") or {}
     question = ctx.get("last_user_command") or _latest_user_text(state)
-    last_intent = ctx.get("intent") or (_heuristic_intent(question) if question else None)
+    last_intent = (ctx.get("intent") or (_heuristic_intent(question) if question else "")).strip().lower()
+    last_command = (ctx.get("last_user_command") or "").strip().lower()
+    normalized_command = last_command.translate(str.maketrans("", "", ".!?")).strip()
+    if discovery_ready and not enrichment_ready and _wants_enrichment(last_intent, normalized_command):
+        profile["enrichment_confirmed"] = True
+        profile["awaiting_enrichment_confirmation"] = False
+        enrichment_ready = True
+    journey_ready = bool(company_ready and icp_ready and discovery_ready and enrichment_ready)
     state["journey_ready"] = journey_ready
     company_profile = profile.get("company_profile") or {}
     icp_profile = profile.get("icp_profile") or {}
