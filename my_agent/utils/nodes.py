@@ -14,7 +14,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Sequence
 from urllib.parse import urlparse
 import requests
 
@@ -125,6 +125,26 @@ def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
 def _needs_company_website(profile: ProfileState) -> bool:
     company = profile.get("company_profile") or {}
     return not bool((company.get("website") or "").strip())
+
+
+def _domain_from_value(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or parsed.path or url or "").strip().lower()
+    except Exception:
+        host = (url or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("http://"):
+        host = host[7:]
+    elif host.startswith("https://"):
+        host = host[8:]
+    for sep in ("/", "?", "#"):
+        if sep in host:
+            host = host.split(sep, 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
 def _name_from_domain(url: str) -> str:
@@ -349,28 +369,98 @@ def _persist_icp_profile_state(state: OrchestrationState, icp_profile: Dict[str,
         logger.warning("Failed to persist ICP profile", exc_info=True)
 
 
+def _format_candidate_table(records: Sequence[Dict[str, Any]], limit: int = 50) -> str:
+    if not records:
+        return ""
+    header = ["#", "Name", "Domain", "Bucket", "Score", "ICP Match"]
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+    for idx, item in enumerate(records[:limit], start=1):
+        domain = _domain_from_value(str(item.get("domain") or ""))
+        display_name = item.get("name") or _name_from_domain(domain)
+        bucket = str(item.get("bucket") or "").upper() or "-"
+        score = item.get("score")
+        try:
+            score_txt = f"{int(score)}"
+        except Exception:
+            score_txt = "-" if score in (None, "", []) else str(score)
+        reason = (
+            item.get("why")
+            or item.get("reason")
+            or item.get("match_reason")
+            or item.get("snippet")
+            or "Matches your ICP focus."
+        )
+        reason_clean = " ".join(str(reason or "").split())
+        if len(reason_clean) > 120:
+            reason_clean = reason_clean[:117].rstrip() + "..."
+        lines.append(f"| {idx} | {display_name} | {domain or '-'} | {bucket} | {score_txt} | {reason_clean or '-'} |")
+    return "\n".join(lines)
+
+
 def _plan_web_candidates(icp_profile: Dict[str, Any]) -> Dict[str, Any]:
-    if not (AGENT_DISCOVERY_ENABLED and _agent_discovery_planner is not None):
+    if not AGENT_DISCOVERY_ENABLED:
+        return {}
+    details: List[Dict[str, Any]] = []
+    snippets: Dict[str, str] = {}
+    domains: List[str] = []
+    if plan_top10_with_reasons is not None:
+        try:
+            planned_items = plan_top10_with_reasons(icp_profile, tenant_id=None) or []
+            for item in planned_items:
+                domain = _domain_from_value(str(item.get("domain") or ""))
+                if not domain:
+                    continue
+                details.append(
+                    {
+                        "domain": domain,
+                        "name": _name_from_domain(domain),
+                        "bucket": (item.get("bucket") or "").upper() or None,
+                        "score": item.get("score"),
+                        "why": item.get("why") or item.get("reason"),
+                        "snippet": item.get("snippet"),
+                        "lead_profile": item.get("lead_profile"),
+                    }
+                )
+                snippet_val = str(item.get("snippet") or "").strip()
+                if snippet_val:
+                    snippets[domain] = snippet_val
+            if details:
+                domains = [d["domain"] for d in details]
+        except Exception:  # pragma: no cover - optional agent
+            details = []
+            snippets = {}
+            domains = []
+    if not domains and not (_agent_discovery_planner and AGENT_DISCOVERY_ENABLED):
         return {}
     try:
-        planned = _agent_discovery_planner({"icp_profile": icp_profile or {}}) or {}
-        guarded = planned
-        if _agent_compliance_guard is not None:
-            try:
-                guarded = _agent_compliance_guard(dict(planned)) or guarded
-            except Exception:
-                pass
-        domains = [
-            str(d).strip().lower()
-            for d in (guarded.get("discovery_candidates") or planned.get("discovery_candidates") or [])
-            if isinstance(d, str) and d.strip()
-        ]
-        snippets = guarded.get("jina_snippets") or planned.get("jina_snippets") or {}
-        capped = domains[:50]
-        return {"domains": capped, "snippets": {d: snippets.get(d) for d in capped if snippets.get(d)}}
+        if not domains and _agent_discovery_planner is not None:
+            planned = _agent_discovery_planner({"icp_profile": icp_profile or {}}) or {}
+            guarded = planned
+            if _agent_compliance_guard is not None:
+                try:
+                    guarded = _agent_compliance_guard(dict(planned)) or guarded
+                except Exception:
+                    pass
+            raw_domains = [
+                _domain_from_value(str(d))
+                for d in (guarded.get("discovery_candidates") or planned.get("discovery_candidates") or [])
+                if isinstance(d, str) and d.strip()
+            ]
+            domains = [d for d in raw_domains if d][:50]
+            guard_snips = guarded.get("jina_snippets") or planned.get("jina_snippets") or {}
+            if guard_snips:
+                snippets.update({d: guard_snips.get(d) for d in domains if guard_snips.get(d)})
     except Exception as exc:  # pragma: no cover - agent optional
         logger.warning("web discovery planner failed: %s", exc)
         return {}
+    result: Dict[str, Any] = {"domains": domains[:50]}
+    if snippets:
+        result["snippets"] = {d: snippets.get(d) for d in domains if snippets.get(d)}
+    if details:
+        domain_rank = {d: idx for idx, d in enumerate(domains)}
+        ordered = sorted(details, key=lambda item: domain_rank.get(item.get("domain") or "", 0))
+        result["details"] = ordered[:50]
+    return result
 
 
 def _generate_icp_from_customers(state: OrchestrationState, profile: ProfileState) -> bool:
@@ -567,6 +657,49 @@ Current profile: {profile!r}
     ctx = state.get("entry_context") or {}
     last_intent = (ctx.get("intent") or "").strip().lower()
     last_command = (ctx.get("last_user_command") or "").strip().lower()
+    normalized_command = last_command.translate(str.maketrans("", "", ".!?")).strip()
+
+    def _includes_phrase(text: str, phrases: Iterable[str]) -> bool:
+        if not text:
+            return False
+        return any(phrase in text for phrase in phrases)
+
+    if not profile.get("company_profile_confirmed"):
+        company_confirm_phrases = {
+            "confirm company",
+            "company looks good",
+            "company ok",
+            "company okay",
+            "that's correct",
+            "that's right",
+            "looks good",
+            "sounds good",
+            "ok confirmed",
+            "okay confirmed",
+            "confirm",
+        }
+        if last_intent == "confirm_company" or _includes_phrase(normalized_command, company_confirm_phrases):
+            profile["company_profile_confirmed"] = True
+
+    if profile.get("company_profile_confirmed") and not profile.get("icp_profile_confirmed"):
+        icp_confirm_phrases = {
+            "confirm icp",
+            "icp looks good",
+            "icp ok",
+            "icp okay",
+            "looks great",
+            "looks good",
+            "sounds good",
+            "ready for discovery",
+            "start discovery",
+            "begin discovery",
+            "proceed",
+            "go ahead",
+            "do it",
+        }
+        if last_intent in {"confirm_icp", "run_enrichment"} or _includes_phrase(normalized_command, icp_confirm_phrases):
+            profile["icp_profile_confirmed"] = True
+
     awaiting_discovery = bool(profile.get("awaiting_discovery_confirmation"))
     if awaiting_discovery and not profile.get("icp_discovery_confirmed"):
         positive_intents = {"run_enrichment", "accept_micro_icp", "confirm_icp"}
@@ -574,18 +707,38 @@ Current profile: {profile!r}
             "yes",
             "yep",
             "yeah",
+            "yup",
             "sure",
+            "ok",
+            "okay",
+            "k",
+            "kk",
+            "alright",
             "do it",
             "go ahead",
+            "go for it",
             "looks good",
             "start discovery",
             "start icp",
             "run discovery",
             "run icp",
+            "begin discovery",
+            "begin icp",
             "proceed",
         }
-        normalized = last_command.translate(str.maketrans("", "", ".!?")).strip()
+        normalized = normalized_command
+        confirm_discovery = False
         if last_intent in positive_intents or any(phrase in normalized for phrase in positive_phrases):
+            confirm_discovery = True
+        elif "discovery" in normalized and any(
+            trigger in normalized for trigger in ("start", "run", "begin", "kick off", "ready", "lets", "let's", "proceed")
+        ):
+            confirm_discovery = True
+        elif "icp" in normalized and any(
+            trigger in normalized for trigger in ("start", "run", "begin", "ready", "proceed", "go ahead")
+        ):
+            confirm_discovery = True
+        if confirm_discovery:
             profile["icp_discovery_confirmed"] = True
             profile["awaiting_discovery_confirmation"] = False
 
@@ -693,22 +846,46 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             profile["awaiting_discovery_confirmation"] = False
             if profile.get("discovery_retry_requested"):
                 discovery_state.pop("web_candidates", None)
+                discovery_state.pop("web_candidate_details", None)
+                discovery_state.pop("web_candidate_table", None)
             candidates = discovery_state.get("web_candidates") or []
+            candidate_details = discovery_state.get("web_candidate_details") or []
             if not candidates:
-                plan = _plan_web_candidates(icp_profile)
+                plan = _plan_web_candidates(icp_profile) or {}
                 candidates = plan.get("domains") or []
                 if candidates:
                     discovery_state["web_candidates"] = candidates
                 snippets = plan.get("snippets") or {}
                 if snippets:
                     discovery_state["web_snippets"] = snippets
+                details = plan.get("details") or []
+                if details:
+                    discovery_state["web_candidate_details"] = details
+                    candidate_details = details
                 profile["discovery_retry_requested"] = False
             if candidates:
-                preview = ", ".join(candidates[:10])
+                if not candidate_details:
+                    candidate_details = [
+                        {
+                            "domain": d,
+                            "name": _name_from_domain(d),
+                            "bucket": None,
+                            "score": None,
+                            "why": "Matches your ICP inputs.",
+                        }
+                        for d in candidates
+                    ]
+                    discovery_state["web_candidate_details"] = candidate_details
+                table = _format_candidate_table(candidate_details, limit=50)
+                discovery_state["web_candidate_table"] = table
+                found_count = min(50, len(candidate_details))
                 prompt_parts.append(
-                    f"I found {len(candidates)} ICP candidate websites. Top picks: {preview}. Ready for me to enrich the best 10 now?"
+                    f"I found {len(candidates)} ICP candidate websites. Here's the latest {found_count} with match details:\n{table}"
                 )
-                prompt_parts.append("Reply 'enrich 10' (or similar) to proceed, or say 'retry discovery' and I'll search again.")
+                prompt_parts.append(
+                    "\n\nReady for me to enrich the best 10 now? Reply 'enrich 10' (or similar) to proceed, "
+                    "or say 'retry discovery' and I'll search again."
+                )
                 profile["awaiting_enrichment_confirmation"] = True
             else:
                 prompt_parts.append("I couldn't find solid ICP candidates. Say 'retry discovery' to search again or adjust your ICP details.")

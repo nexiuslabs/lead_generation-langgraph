@@ -141,9 +141,11 @@ async def test_journey_guard_prompts_for_enrichment_confirmation(monkeypatch):
         },
     }
     out = await nodes.journey_guard(state)
-    assert "enrich the best 10" in out["status"]["message"]
+    assert "enrich 10" in out["status"]["message"]
+    assert "| # |" in out["status"]["message"]
     assert out["profile_state"]["awaiting_enrichment_confirmation"] is True
     assert out["discovery"]["web_candidates"] == ["alpha.com", "beta.com"]
+    assert len(out["discovery"].get("web_candidate_details") or []) == 2
 
 
 @pytest.mark.asyncio
@@ -171,6 +173,54 @@ async def test_profile_builder_marks_discovery_confirmed_on_positive_intent():
     state: OrchestrationState = {
         "messages": [],
         "entry_context": {"intent": "run_enrichment", "last_user_command": "start discovery"},
+        "profile_state": {
+            "company_profile_confirmed": True,
+            "icp_profile_confirmed": True,
+            "icp_profile": {"summary": "test"},
+            "awaiting_discovery_confirmation": True,
+            "icp_discovery_confirmed": False,
+        },
+    }
+    out = await nodes.profile_builder(state)
+    assert out["profile_state"]["icp_discovery_confirmed"] is True
+    assert out["profile_state"]["awaiting_discovery_confirmation"] is False
+
+
+@pytest.mark.asyncio
+async def test_profile_builder_confirms_company_from_affirmative_text():
+    state: OrchestrationState = {
+        "messages": [],
+        "entry_context": {"intent": "confirm_company", "last_user_command": "company looks good"},
+        "profile_state": {
+            "company_profile_confirmed": False,
+            "icp_profile_confirmed": False,
+            "icp_profile": {"summary": "test"},
+        },
+    }
+    out = await nodes.profile_builder(state)
+    assert out["profile_state"]["company_profile_confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_profile_builder_confirms_icp_from_affirmative_text():
+    state: OrchestrationState = {
+        "messages": [],
+        "entry_context": {"intent": "chat", "last_user_command": "looks great and start discovery"},
+        "profile_state": {
+            "company_profile_confirmed": True,
+            "icp_profile_confirmed": False,
+            "icp_profile": {"summary": "test"},
+        },
+    }
+    out = await nodes.profile_builder(state)
+    assert out["profile_state"]["icp_profile_confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_profile_builder_handles_informal_discovery_confirmation():
+    state: OrchestrationState = {
+        "messages": [],
+        "entry_context": {"intent": "chat", "last_user_command": "Ok let's start discovery now!"},
         "profile_state": {
             "company_profile_confirmed": True,
             "icp_profile_confirmed": True,
