@@ -24,7 +24,11 @@ from src.icp import icp_by_ssic_agent, icp_refresh_agent, normalize_agent
 from src.lead_scoring import lead_scoring_agent
 from src.jobs import enqueue_web_discovery_bg_enrich
 from src.jina_reader import read_url as jina_read
-from app.pre_sdr_graph import _persist_company_profile_sync, _persist_icp_profile_sync  # type: ignore
+from app.pre_sdr_graph import (
+    _persist_company_profile_sync,
+    _persist_icp_profile_sync,
+    _persist_web_candidates_to_staging,
+)  # type: ignore
 
 try:
     from src.settings import ENABLE_AGENT_DISCOVERY as _SETTINGS_AGENT_DISCOVERY  # type: ignore
@@ -460,6 +464,45 @@ def _persist_icp_profile_state(state: OrchestrationState, icp_profile: Dict[str,
         _persist_icp_profile_sync(persist_state, dict(icp_profile or {}), confirmed=True, seed_urls=seed_urls, user_confirmed=False)
     except Exception:
         logger.warning("Failed to persist ICP profile", exc_info=True)
+
+
+def _persist_discovery_candidates(state: OrchestrationState, details: Sequence[Dict[str, Any]]) -> None:
+    ctx = state.get("entry_context") or {}
+    tenant_id = ctx.get("tenant_id") or state.get("tenant_id")
+    if not tenant_id:
+        return
+    domains: List[str] = []
+    per_meta: Dict[str, Dict[str, Any]] = {}
+    for idx, item in enumerate(details or []):
+        if not isinstance(item, dict):
+            continue
+        dom = (item.get("domain") or "").strip().lower()
+        if not dom:
+            continue
+        domains.append(dom)
+        meta = {
+            "preview": idx < 10,
+            "score": item.get("score"),
+            "bucket": item.get("bucket"),
+            "why": item.get("why"),
+            "table_row": item,
+            "provenance": {
+                "agent": "orchestrator.discovery",
+                "stage": "preview" if idx < 10 else "staging",
+            },
+        }
+        per_meta[dom] = meta
+    if not domains:
+        return
+    try:
+        _persist_web_candidates_to_staging(
+            domains,
+            int(tenant_id) if isinstance(tenant_id, int) or str(tenant_id).isdigit() else None,
+            per_domain_meta=per_meta,
+            ai_metadata={"provenance": {"agent": "orchestrator.discovery"}},
+        )
+    except Exception:
+        logger.debug("staging persistence skipped", exc_info=True)
 
 
 def _format_candidate_table(records: Sequence[Dict[str, Any]], limit: int = 50) -> str:
@@ -995,6 +1038,9 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 table = _format_candidate_table(candidate_details, limit=50)
                 discovery_state["web_candidate_table"] = table
                 found_count = min(50, len(candidate_details))
+                if candidate_details and not discovery_state.get("staging_persisted"):
+                    _persist_discovery_candidates(state, candidate_details)
+                    discovery_state["staging_persisted"] = True
                 prompt_parts.append(
                     f"I found {len(candidates)} ICP candidate websites. Here's the latest {found_count} with match details:\n{table}"
                 )

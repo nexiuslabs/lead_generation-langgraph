@@ -1,6 +1,136 @@
 Agents Guide — lead_generation-main
 
-Purpose
+## Frontend & Backend Agent Standards (LangChain + LangGraph + Codex)
+
+This repository (frontend and backend orchestration alike) uses a multi-agent architecture powered by LangChain, LangGraph, and Codex. All agents must follow the common standards below to ensure reliable, safe, and maintainable behavior.
+
+1. Architectural Philosophy  
+   1.1 **Agentic Loop Standard** – User Input → LLM Intent Evaluation → Tool Selection → Tool Execution → Observe Result → Continue or Conclude.  
+   - Prefer tools whenever possible, avoid hallucinating logic.  
+   - Stop only when the LLM determines no more tool calls are needed.
+
+2. Agent Roles & Responsibilities  
+   - Supervisor Agent routes tasks, maintains workflow context, enforces gates, validates results, merges outputs, and asks clarifying questions.  
+   - Five specialist agents: Architecture, Code Generation, Testing, Optimization, Documentation.  
+     - **Architecture Agent** – system design, data modeling, APIs, scalability.  
+     - **Code Generation Agent** – feature implementation, production-quality code, conventions.  
+     - **Testing Agent** – unit/integration/E2E coverage, edge cases, CI recommendations.  
+     - **Optimization Agent** – refactors, performance tuning, security review.  
+     - **Documentation Agent** – docs/README/API references with consistent Markdown.  
+   - Supervisor parses intent, selects the right specialist, passes relevant context only, validates specialist outputs, and aggregates responses.
+
+3. Coding Standards for LLM-Generated Code  
+   - Produce full runnable files with imports, dependencies, and usage guidance.  
+   - Comment only non-trivial logic; follow PEP8/ESLint/Prettier as applicable.  
+   - Avoid placeholders (`TODO`, `xxx`).  
+   - Python: prefer Pydantic v2, async for network work, no globals.  
+   - JS/TS: ES modules, TypeScript when possible, async/await, DRY patterns.
+
+4. LangChain Agent Implementation Rules  
+   - Every agent created via `langchain.agents.create_agent`.  
+   - Tools decorated with `@tool`, typed args, deterministic behavior, clear docstrings.  
+   - System prompts must define role, responsibilities, expected outputs, failure/safety rules.
+
+5. LangGraph Rules  
+   - Use LangGraph for routing, orchestration, persistence, HITL, long tasks.  
+   - Graph state defined with `TypedDict`.  
+   - Nodes must be idempotent.
+
+6. Context Engineering Standards  
+   - Agents extract language, framework, conventions, constraints, dependencies, environment from user context.  
+   - Supervisor detects ambiguity, asks clarifying questions, avoids assumptions.
+
+7. Tooling Standards  
+   - Single-responsibility tools returning structured outputs (JSON or typed).  
+   - Docstrings must explicitly say when to use the tool.
+
+8. Multi-Agent Routing Rules  
+   - Supervisor routing table:  
+     - System design → Architecture Agent  
+     - Generate/modify code → Code Generation Agent  
+     - Bugs/errors → Testing Agent  
+     - Performance/refactoring → Optimization Agent  
+     - Documentation → Documentation Agent  
+     - Ambiguous → ask clarifying question
+
+9. Safety & Guardrails  
+   - No fabricated packages/APIs/frameworks, no invalid syntax, no bare code execution.  
+   - Supervisor pauses for confirmation on destructive actions, remote API calls, code deletion, schema migrations.
+
+10. Folder Structure & Conventions  
+   ```
+   /agents
+       supervisor.py
+       architecture.py
+       codegen.py
+       testing.py
+       optimization.py
+       documentation.py
+
+   /tools
+       database.py
+       email.py
+       context.py
+       quality.py
+
+   /graphs
+       router_graph.py
+       workflow_graph.py
+
+   /prompts
+       supervisor_system.txt
+       codegen_system.txt
+       architecture_system.txt
+       ...
+   ```
+
+11. Commit Rules for AI-Generated Code  
+   - Every PR records which agent produced code, reasoning summary, tests, human-review checklist.
+
+12. Supervisor Agent Selection Logic  
+   - Always weighs user intent, desired output, necessary tools, specialist capabilities, conversation context.  
+   - Example: “Optimize this function” → Optimization Agent.
+
+13. Encouraged Patterns  
+   - ReAct loop, Toolformer-style calls, LangGraph state machines, multi-agent DAG workflows, Supervisor + specialists, retrieval-augmented agents.
+
+## Unified Orchestrator Flow (Code-Backed)
+
+The production flow in `my_agent/agent.py` wires the LangGraph nodes defined in `my_agent/utils/nodes.py`. The graph below mirrors the exact code paths (including the conditional gate coming out of `journey_guard`):
+
+```mermaid
+graph TD
+    A[ingest\nnodes.ingest_message] --> B[profile_builder\nnodes.profile_builder]
+    B --> C[journey_guard\nnodes.journey_guard]
+    C -->|ready| D[normalize]
+    C -->|pending| P[progress_report]
+    D --> E[refresh_icp] --> F[decide_strategy] --> G[ssic_fallback]
+    G --> H[plan_top10] --> I[enrich_batch] --> J[score_leads] --> K[export]
+    K --> P --> S[summary]
+```
+
+### Conversational gating
+1. **`ingest_message`** – normalizes each chat turn with an LLM, tags the intent (`run_enrichment`, `confirm_company`, `question`, etc.), stores the canonical text, and seeds `entry_context` (tenant, timestamps, tags).
+2. **`profile_builder`** – keeps the authoritative `profile_state`: captures company website/name/summary, tracks whether ICP + micro ICP were confirmed, harvests up to 5 customer URLs from chat, and persists company/ICP snapshots through `_persist_company_profile_sync` / `_persist_icp_profile_sync` when confirmations land.
+3. **`journey_guard`** – enforces prerequisites before any backend work. It requires: confirmed company profile (website present), confirmed ICP, five customer websites, discovery confirmation, and enrichment confirmation. When data is missing it pushes tailored prompts (requesting website, more customer URLs, or ICP confirmation). Once discovery search produces ≥1 candidate it formats the 50-row table, persists all candidate domains plus 10-row preview into `staging_global_companies` via `_persist_discovery_candidates`, and flips `awaiting_enrichment_confirmation=True`. Only when `company_ready`, `icp_ready`, `discovery_ready`, and `enrichment_ready` are true does the graph continue to `normalize`; otherwise the run branches to `progress_report`/`summary` with the outstanding prompt echoed back to the user.
+
+### Discovery + enrichment backend
+4. **`normalize`** – calls `src.icp.normalize_agent` to clean freshly ingested company rows (mirrors the legacy Pre-SDR normalization step). The result is stored on `state["normalize"]`.
+5. **`refresh_icp`** – runs `src.icp.icp_refresh_agent` once enrichment is confirmed, yielding `discovery["candidate_ids"]` plus diagnostics. Offline mode seeds dummy IDs so downstream nodes still execute.
+6. **`decide_strategy`** – lightweight LLM policy that chooses `use_cached`, `regenerate`, or `ssic_fallback` based on counts + last SSIC attempt; the choice is recorded on `discovery["strategy"]`.
+7. **`ssic_fallback`** – always invoked (the graph edges force it) and, when industries exist, calls `src.icp.icp_by_ssic_agent` to backfill candidate IDs from ACRA/SSIC data.
+8. **`plan_top10`** – runs `src.agents_icp.plan_top10_with_reasons` to rank the best candidates for enrichment. Results include rationales and timestamps.
+9. **`enrich_batch`** – iterates through `discovery["candidate_ids"]` and calls `src.enrichment.enrich_company_with_tavily` (network I/O). Failures are captured per company so `score_leads` can still run.
+10. **`score_leads`** – sync call into `src.lead_scoring.lead_scoring_agent` to convert enrichment outputs into lead scores + reasons, stored on `state["scoring"]`.
+11. **`export_results`** – packages outcomes, queues Next-40 enrichment via `src.jobs.enqueue_web_discovery_bg_enrich` (using the tenant ID pulled from `entry_context`), and leaves an Odoo placeholder flag for future sync.
+12. **`progress_report` / `summary`** – `progress_report` either replays the outstanding prompt from `journey_guard` or uses an LLM to summarize the status (including candidate totals). `summary` simply mirrors the latest status message and ends the run.
+
+### Persistence & side effects
+- Company/ICP confirmations auto-sync into Postgres (`app/pre_sdr_graph`) so manual re-entry isn’t needed.
+- Discovered websites (preview 10 + remaining up to 50) are staged in `staging_global_companies` with metadata capturing bucket/score/reason, matching the behavior in `_persist_discovery_candidates`.
+- Candidate IDs from `refresh_icp` / `ssic_fallback` are what drive enrichment, scoring, exporting, and the Next-40 enqueue—so skipping those nodes would orphan the downstream steps.
+
+## Purpose
 - Pre-SDR pipeline: normalize → ICP candidates → deterministic crawl + Tavily/Apify → ZeroBounce verify → scoring + rationale → export → optional Odoo sync.
 
 Run API

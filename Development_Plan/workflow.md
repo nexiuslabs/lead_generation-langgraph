@@ -23,25 +23,22 @@ flowchart TD
     end
     guard -->|missing info| ask((ask user)) --> ingest
 
-    %% Backend pipeline
-    guard -->|ready| normalize["normalize_agent node"]
-    normalize --> refresh["icp_refresh_agent node"]
-    refresh --> strategy["decide_strategy LLM"]
-    strategy -->|use cached| plan["plan_top10\n(agents_icp)"]
-    strategy -->|regenerate| planAlt["plan_top10 regen"]
-    strategy -->|SSIC fallback| ssic["SSIC fallback\n(src/icp.py)"] --> plan
-    planAlt --> plan
-    plan --> enrich["enrichment subgraph"]
-    enrich --> score["lead_scoring_agent"]
-    score --> export["export / jobs node"]
-    export --> report["progress_report LLM"]
+    %% Enrichment pipeline once ready
+    guard -->|journey_ready| refresh["refresh_icp\nhydrate candidate IDs"]
+    refresh --> select10["select top 10\n(plan_top10 + discovery evidence)"]
+    select10 --> enrich["enrich_batch\n(crawl 10 leads)"]
+    enrich --> score["score_leads\n(lead scoring agent)"]
+    score --> export["export_results\nOdoo sync + reporting"]
+    export --> bg["enqueue Next-40 job\nbackground enrichment"]
+    bg --> report["progress_report LLM"]
     report --> summary["summary / completion"]
 
     %% Shared outputs
-    plan --> top10[(Top-10 cache)]
-    enrich --> companies[(companies table)]
+    select10 --> shortlist[(Top-10 cache)]
+    enrich --> icpCompanies[(companies table)]
     score --> leadScores[(lead_scores)]
-    export --> jobs[(Next-40 queue / nightly staging)]
+    export --> odoo[(Odoo / tenant exports)]
+    bg --> next40[(Next-40 queue)]
     summary --> checkpoints[(LangGraph checkpoints / LangSmith traces)]
 ```
 
