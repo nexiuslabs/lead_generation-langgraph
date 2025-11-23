@@ -120,7 +120,7 @@ graph TD
 6. **`decide_strategy`** – lightweight LLM policy that chooses `use_cached`, `regenerate`, or `ssic_fallback` based on counts + last SSIC attempt; the choice is recorded on `discovery["strategy"]`.
 7. **`ssic_fallback`** – always invoked (the graph edges force it) and, when industries exist, calls `src.icp.icp_by_ssic_agent` to backfill candidate IDs from ACRA/SSIC data.
 8. **`plan_top10`** – runs `src.agents_icp.plan_top10_with_reasons` to rank the best candidates for enrichment. Results include rationales and timestamps.
-9. **`enrich_batch`** – iterates through `discovery["candidate_ids"]` and calls `src.enrichment.enrich_company_with_tavily` (network I/O). Failures are captured per company so `score_leads` can still run.
+9. **`enrich_batch`** – iterates through `discovery["candidate_ids"]` and calls `src.enrichment.enrich_company_with_tavily`, whose crawl stack fetches pages via Jina MCP first and only falls back to Tavily when `ENABLE_TAVILY_FALLBACK=true`. Failures are captured per company so `score_leads` can still run.
 10. **`score_leads`** – sync call into `src.lead_scoring.lead_scoring_agent` to convert enrichment outputs into lead scores + reasons, stored on `state["scoring"]`.
 11. **`export_results`** – packages outcomes, queues Next-40 enrichment via `src.jobs.enqueue_web_discovery_bg_enrich` (using the tenant ID pulled from `entry_context`), and leaves an Odoo placeholder flag for future sync.
 12. **`progress_report` / `summary`** – `progress_report` either replays the outstanding prompt from `journey_guard` or uses an LLM to summarize the status (including candidate totals). `summary` simply mirrors the latest status message and ends the run.
@@ -131,7 +131,7 @@ graph TD
 - Candidate IDs from `refresh_icp` / `ssic_fallback` are what drive enrichment, scoring, exporting, and the Next-40 enqueue—so skipping those nodes would orphan the downstream steps.
 
 ## Purpose
-- Pre-SDR pipeline: normalize → ICP candidates → deterministic crawl + Tavily/Apify → ZeroBounce verify → scoring + rationale → export → optional Odoo sync.
+- Pre-SDR pipeline: normalize → ICP candidates → deterministic crawl + Jina MCP page reads (with Tavily strictly as fallback) + Apify → ZeroBounce verify → scoring + rationale → export → optional Odoo sync.
 
 Run API
 - python -m venv .venv && source .venv/bin/activate
@@ -146,7 +146,7 @@ Run Orchestrator (one-off)
 Key Env Vars (src/settings.py)
 - POSTGRES_DSN (required)
 - OPENAI_API_KEY, LANGCHAIN_MODEL=gpt-4o-mini, TEMPERATURE=0.3
-- TAVILY_API_KEY?, ZEROBOUNCE_API_KEY?
+- ZEROBOUNCE_API_KEY? (TAVILY_API_KEY optional; only required if you enable the fallback crawler)
 - APIFY_TOKEN (required for Apify), ENABLE_APIFY_LINKEDIN=true
 - Optional: APIFY_INPUT_JSON to pass a custom actor input JSON template.
   - Use placeholders: %%QUERY%% for a single query string, %%QUERIES%% for an array of queries.
@@ -175,7 +175,7 @@ Common Ops
 
 Troubleshooting
 - Postgres connect errors: verify POSTGRES_DSN and DB reachable.
-- Tavily/Apify/ZeroBounce: missing keys → fallbacks/pathways skip gracefully; check settings flags.
+- Jina MCP handles all primary reads; Tavily/Apify/ZeroBounce keys are optional fallbacks—missing keys simply skip those pathways per the feature flags.
 
 Apify Usage
 - Nightly ACRA/ACRA Direct: use existing Apify name→company→employees→profiles chain as before.

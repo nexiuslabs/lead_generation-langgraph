@@ -33,6 +33,13 @@ class DiscoveryState(TypedDict, total=False):
     strategy: str
     last_ssic_attempt: Optional[str]
     diagnostics: Dict[str, Any]
+    planned_candidates: List[Dict[str, Any]]
+    top10_ids: List[int]
+    next40_ids: List[int]
+    top10_domains: List[str]
+    next40_domains: List[str]
+    top10_details: List[Dict[str, Any]]
+    next40_details: List[Dict[str, Any]]
 
 
 class EnrichmentResult(TypedDict, total=False):

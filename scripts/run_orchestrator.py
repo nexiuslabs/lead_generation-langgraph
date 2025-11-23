@@ -37,6 +37,7 @@ async def _ainvoke(payload: Dict[str, Any]) -> Dict[str, Any]:
             "tenant_id": payload.get("tenant_id"),
             "user_id": payload.get("user_id"),
             "source": "cli",
+            "run_mode": payload.get("run_mode") or "chat_top10",
         },
         "icp_payload": payload.get("icp_payload") or {},
     }
@@ -55,6 +56,13 @@ def main():
     parser.add_argument("--tenant-id", type=int, help="Tenant ID context", required=False)
     parser.add_argument("--input", type=str, help="User input text", default="run enrichment")
     parser.add_argument("--icp-payload", type=str, help="JSON string with ICP payload", default="{}")
+    parser.add_argument(
+        "--run-mode",
+        type=str,
+        choices=["chat_top10", "nightly_acra", "acra_direct"],
+        default="chat_top10",
+        help="Run mode for orchestrator (defaults to chat_top10)",
+    )
     args = parser.parse_args()
 
     try:
@@ -67,6 +75,7 @@ def main():
         "input": args.input,
         "icp_payload": icp_payload,
         "role": "user",
+        "run_mode": args.run_mode,
     }
     result = asyncio.run(_ainvoke(payload))
     status = (result or {}).get("status") or {}

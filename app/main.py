@@ -303,6 +303,7 @@ async def start_orchestration(
             "thread_id": thread_id,
             "tenant_id": tenant_id,
             "user_id": identity.get("sub"),
+            "run_mode": str(payload.get("run_mode") or "chat_top10"),
         },
         "icp_payload": payload.get("icp_payload") or {},
     }
