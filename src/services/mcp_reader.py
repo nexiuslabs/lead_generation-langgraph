@@ -729,6 +729,25 @@ def _extract_urls_from_text(text: str) -> List[str]:
         return []
 
 
+def _extract_urls_from_jsonlike(obj: Any) -> List[str]:
+    urls: List[str] = []
+    try:
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                if key in {"url", "link", "href"} and isinstance(val, str):
+                    urls.append(val)
+                else:
+                    urls.extend(_extract_urls_from_jsonlike(val))
+        elif isinstance(obj, list):
+            for item in obj:
+                urls.extend(_extract_urls_from_jsonlike(item))
+        elif isinstance(obj, str):
+            urls.extend(_extract_urls_from_text(obj))
+    except Exception:
+        return []
+    return urls
+
+
 def _extract_list_from_result(result: Any) -> List[str]:
     # Accept multiple shapes: dict with results, list, or content text with URLs/JSON
     try:
@@ -738,9 +757,20 @@ def _extract_list_from_result(result: Any) -> List[str]:
             content = result.get("content")
             if isinstance(content, list):
                 texts: List[str] = []
+                urls_from_blocks: List[str] = []
                 for p in content:
                     if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
-                        texts.append(p["text"])  
+                        texts.append(p["text"])  # standard text block
+                    elif isinstance(p, dict) and p.get("type") in {"output_text", "observation"} and isinstance(p.get("text"), str):
+                        texts.append(p["text"])
+                    elif isinstance(p, dict) and p.get("type") in {"application/json", "json", "output_json"}:
+                        payload = p.get("data")
+                        if payload is None and isinstance(p.get("text"), str):
+                            try:
+                                payload = json.loads(p["text"])
+                            except Exception:
+                                payload = None
+                        urls_from_blocks.extend(_extract_urls_from_jsonlike(payload))
                 if texts:
                     joined = "\n".join(texts)
                     # Try parse JSON list
@@ -751,7 +781,11 @@ def _extract_list_from_result(result: Any) -> List[str]:
                     except Exception:
                         pass
                     # Fallback: URL extraction
-                    return _extract_urls_from_text(joined)
+                    extracted = _extract_urls_from_text(joined)
+                    if extracted:
+                        return extracted
+                if urls_from_blocks:
+                    return urls_from_blocks[:200]
         elif isinstance(result, list):
             return [str(x) for x in result if isinstance(x, (str, bytes))][:200]
         # Fallback: treat as text and extract URLs

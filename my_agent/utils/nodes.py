@@ -9,20 +9,19 @@ possible so behavior matches the legacy stack.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 import requests
 
 from src.icp import icp_by_ssic_agent, icp_refresh_agent, normalize_agent
 from src.lead_scoring import lead_scoring_agent
-from src.jobs import enqueue_web_discovery_bg_enrich
+from src.jobs import enqueue_web_discovery_bg_enrich, _odoo_export_for_ids
 from src.jina_reader import read_url as jina_read
 from src.database import get_conn
 from app.pre_sdr_graph import (
@@ -57,6 +56,11 @@ try:
 except Exception:  # pragma: no cover
     plan_top10_with_reasons = None
 
+try:
+    from src.icp_pipeline import collect_evidence_for_domain
+except Exception:  # pragma: no cover
+    collect_evidence_for_domain = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 RUN_ENRICH_PHRASES = {
@@ -67,6 +71,37 @@ RUN_ENRICH_PHRASES = {
     "top 10",
     "enrich ten",
     "please enrich",
+}
+DISCOVERY_CONFIRM_PHRASES = {
+    "start discovery",
+    "begin discovery",
+    "run discovery",
+    "start icp",
+    "run icp",
+    "begin icp",
+    "start icp discovery",
+    "kick off discovery",
+    "kickoff discovery",
+    "ready for discovery",
+    "ready to start discovery",
+    "proceed with discovery",
+    "proceed to discovery",
+    "go ahead with discovery",
+}
+DISCOVERY_CONFIRM_TRIGGERS = {
+    "start",
+    "run",
+    "begin",
+    "kick off",
+    "kickoff",
+    "ready",
+    "lets",
+    "let's",
+    "proceed",
+    "go ahead",
+    "do it",
+    "beginning",
+    "launch",
 }
 DEFAULT_COMPANY_PROFILE = {
     "name": "Nexius Labs",
@@ -161,13 +196,16 @@ def _should_suppress_message(role: str, content: str) -> bool:
     stripped = content.strip()
     if not stripped:
         return True
-    if role != "assistant":
+    if role == "assistant":
+        if _EVENT_TOKEN_RE.match(stripped):
+            logger.debug("suppressing telemetry event: %s", stripped)
+            return True
+        if _looks_like_json_blob(stripped):
+            logger.debug("suppressing JSON payload: %s", stripped[:120])
+            return True
         return False
-    if _EVENT_TOKEN_RE.match(stripped):
-        logger.debug("suppressing telemetry event: %s", stripped)
-        return True
-    if _looks_like_json_blob(stripped):
-        logger.debug("suppressing JSON payload: %s", stripped[:120])
+    if role and role != "user" and _looks_like_json_blob(stripped):
+        logger.debug("suppressing %s payload: %s", role, stripped[:120])
         return True
     return False
 
@@ -195,6 +233,21 @@ def _get_run_mode(state: OrchestrationState) -> str:
         ctx["run_mode"] = mode
         state["entry_context"] = ctx
     return mode
+
+
+def _get_tenant_id(state: OrchestrationState) -> Optional[int]:
+    ctx = state.get("entry_context") or {}
+    tenant_id = ctx.get("tenant_id") or state.get("tenant_id")
+    if isinstance(tenant_id, int):
+        return tenant_id
+    if isinstance(tenant_id, str):
+        raw = tenant_id.strip()
+        if raw.isdigit():
+            try:
+                return int(raw)
+            except Exception:
+                return None
+    return None
 
 
 def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
@@ -261,6 +314,20 @@ def _name_from_domain(url: str) -> str:
     base = base.split(".")[0]
     value = base.replace("-", " ").title()
     return value or "Your company"
+
+
+def _looks_like_discovery_confirmation(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+    normalized = normalized.translate(str.maketrans("", "", ".!?"))
+    if any(phrase in normalized for phrase in DISCOVERY_CONFIRM_PHRASES):
+        return True
+    if ("discovery" in normalized or "icp" in normalized) and any(
+        trigger in normalized for trigger in DISCOVERY_CONFIRM_TRIGGERS
+    ):
+        return True
+    return False
 
 
 def _fetch_site_excerpt(url: str, max_chars: int = 1500) -> str | None:
@@ -519,6 +586,132 @@ def _persist_discovery_candidates(state: OrchestrationState, details: Sequence[D
         logger.debug("staging persistence skipped", exc_info=True)
 
 
+def _cache_discovery_details(
+    state: OrchestrationState, discovery_state: Dict[str, Any], details: Sequence[Dict[str, Any]]
+) -> None:
+    if not details:
+        return
+    detail_list = [item for item in details if isinstance(item, dict)]
+    if not detail_list:
+        return
+    deduped: List[Dict[str, Any]] = []
+    domains: List[str] = []
+    seen: set[str] = set()
+    for item in detail_list:
+        dom = _domain_from_value(str(item.get("domain") or ""))
+        if not dom or dom in seen:
+            continue
+        seen.add(dom)
+        domains.append(dom)
+        deduped.append(dict(item))
+    if not deduped:
+        return
+    discovery_state["planned_candidates"] = deduped
+    discovery_state["web_candidate_details"] = deduped
+    if domains:
+        discovery_state["web_candidates"] = domains
+    top_slice = deduped[:10]
+    next_slice = deduped[10:50]
+    discovery_state["top10_details"] = top_slice
+    discovery_state["next40_details"] = next_slice
+    discovery_state["top10_domains"] = domains[:10]
+    discovery_state["next40_domains"] = domains[10:50]
+    tenant_ctx = _get_tenant_id(state)
+    id_map = _ensure_company_ids_for_domains(domains, tenant_ctx)
+    top_ids = [id_map.get(dom) for dom in discovery_state["top10_domains"] if id_map.get(dom)]
+    next_ids = [id_map.get(dom) for dom in discovery_state["next40_domains"] if id_map.get(dom)]
+    if top_ids:
+        discovery_state["top10_ids"] = top_ids
+        discovery_state["candidate_ids"] = top_ids
+    if next_ids:
+        discovery_state["next40_ids"] = next_ids
+
+
+def _candidate_domain_lookup(discovery_state: Dict[str, Any]) -> Dict[int, str]:
+    lookup: Dict[int, str] = {}
+    primary_ids = discovery_state.get("top10_ids") or []
+    primary_domains = discovery_state.get("top10_domains") or []
+    for raw_id, raw_dom in zip(primary_ids, primary_domains):
+        try:
+            cid = int(raw_id)
+        except Exception:
+            continue
+        dom = _domain_from_value(str(raw_dom or ""))
+        if dom:
+            lookup[cid] = dom
+    if lookup:
+        return lookup
+    fallback_ids = discovery_state.get("candidate_ids") or []
+    fallback_domains = discovery_state.get("web_candidates") or []
+    for raw_id, raw_dom in zip(fallback_ids, fallback_domains):
+        try:
+            cid = int(raw_id)
+        except Exception:
+            continue
+        dom = _domain_from_value(str(raw_dom or ""))
+        if dom:
+            lookup[cid] = dom
+    return lookup
+
+
+async def _attempt_jina_enrichment(
+    tenant_id: Optional[int], company_id: int, domain: str
+) -> Tuple[bool, Optional[str]]:
+    cleaned = _domain_from_value(domain)
+    if not cleaned:
+        return False, "missing_domain"
+    if collect_evidence_for_domain is not None and tenant_id:
+        try:
+            inserted = await collect_evidence_for_domain(int(tenant_id), int(company_id), cleaned)
+            return (inserted > 0, None if inserted else "no_evidence")
+        except Exception as exc:  # pragma: no cover - network/DB variability
+            return False, str(exc)
+    try:
+        snapshot = jina_read(f"https://{cleaned}", timeout=8)
+        if snapshot:
+            return True, None
+        return False, "empty_snapshot"
+    except Exception as exc:  # pragma: no cover
+        return False, str(exc)
+
+
+async def _export_top10_to_odoo(tenant_id: Optional[int], company_ids: Sequence[int]) -> bool:
+    if tenant_id is None:
+        return False
+    normalized: List[int] = []
+    seen: set[int] = set()
+    for raw in company_ids or []:
+        try:
+            cid = int(raw)
+        except Exception:
+            continue
+        if cid <= 0 or cid in seen:
+            continue
+        seen.add(cid)
+        normalized.append(cid)
+    if not normalized:
+        return False
+    rows: List[Tuple[int, str, Optional[str]]] = []
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT company_id, name, uen FROM companies WHERE company_id = ANY(%s)",
+                (normalized,),
+            )
+            rows = cur.fetchall() or []
+    except Exception as exc:
+        logger.warning("fetching companies for Odoo export failed: %s", exc)
+        return False
+    if not rows:
+        return False
+    try:
+        await _odoo_export_for_ids(int(tenant_id), rows)
+        return True
+    except Exception as exc:  # pragma: no cover - network variability
+        logger.warning("odoo export failed: %s", exc)
+        return False
+
+
 def _ensure_company_ids_for_domains(domains: Sequence[str], tenant_id: Optional[int]) -> Dict[str, int]:
     """Ensure each domain has a row in companies and return {domain: company_id}."""
     cleaned: List[str] = []
@@ -591,6 +784,77 @@ def _format_candidate_table(records: Sequence[Dict[str, Any]], limit: int = 50) 
         if len(reason_clean) > 120:
             reason_clean = reason_clean[:117].rstrip() + "..."
         lines.append(f"| {idx} | {display_name} | {domain or '-'} | {bucket} | {score_txt} | {reason_clean or '-'} |")
+    return "\n".join(lines)
+
+
+def _lookup_primary_emails(company_ids: Sequence[int]) -> Dict[int, str]:
+    if not company_ids:
+        return {}
+    normalized_ids = sorted({int(cid) for cid in company_ids if isinstance(cid, int)})
+    if not normalized_ids:
+        return {}
+    emails: Dict[int, str] = {}
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT company_id, email FROM lead_emails WHERE company_id = ANY(%s)",
+                (normalized_ids,),
+            )
+            for row in cur.fetchall() or []:
+                try:
+                    cid = int(row[0])
+                except Exception:
+                    continue
+                email = (row[1] or "").strip()
+                if email:
+                    emails[cid] = email
+    except Exception:
+        logger.debug("email lookup failed", exc_info=True)
+    return emails
+
+
+def _format_lead_score_table(scores: Sequence[Dict[str, Any]], discovery: Dict[str, Any], email_map: Dict[int, str]) -> str:
+    if not scores:
+        return ""
+    detail_lookup: Dict[int, Dict[str, Any]] = {}
+    details = discovery.get("top10_details") or []
+    ids = discovery.get("top10_ids") or []
+    for raw_id, detail in zip(ids, details):
+        if not isinstance(detail, dict):
+            continue
+        try:
+            cid = int(raw_id)
+        except Exception:
+            continue
+        detail_lookup[cid] = detail
+    has_email = any(
+        email_map.get(int(row.get("company_id") or 0))
+        for row in scores
+        if row.get("company_id") is not None
+    )
+    header = ["#", "Company", "Domain", "Score", "Bucket"]
+    if has_email:
+        header.append("Email")
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+    for idx, score_row in enumerate(scores, start=1):
+        try:
+            cid = int(score_row.get("company_id"))
+        except Exception:
+            cid = None
+        detail = detail_lookup.get(cid or -1, {}) if cid is not None else {}
+        name = detail.get("name") or _name_from_domain(detail.get("domain") or "")
+        domain = _domain_from_value(detail.get("domain") or "")
+        score_val = score_row.get("score")
+        try:
+            shown_score = f"{int(round(float(score_val)))}"
+        except Exception:
+            shown_score = str(score_val or "-")
+        bucket = str(score_row.get("bucket") or detail.get("bucket") or "-").upper()
+        row = [str(idx), name or "-", domain or "-", shown_score, bucket or "-"]
+        if has_email:
+            email = email_map.get(cid or -1, "") if cid is not None else ""
+            row.append(email or "-")
+        lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines)
 
 
@@ -716,6 +980,8 @@ def _heuristic_intent(text: str) -> str:
         return "confirm_company"
     if "confirm" in lowered and "icp" in lowered:
         return "confirm_icp"
+    if _looks_like_discovery_confirmation(text):
+        return "confirm_discovery"
     if "micro icp" in lowered or lowered.strip().endswith("?"):
         return "question"
     if "run enrichment" in lowered or "start enrichment" in lowered or "enrich" in lowered:
@@ -730,7 +996,7 @@ def _simple_intent(text: str) -> str:
     heuristic = _heuristic_intent(raw)
     prompt = f"""
 Classify the user's intention for the lead-generation orchestrator.
-Return JSON {{"intent": one of [run_enrichment, confirm_icp, confirm_company, accept_micro_icp, question, chat]}}.
+Return JSON {{"intent": one of [run_enrichment, confirm_icp, confirm_company, confirm_discovery, accept_micro_icp, question, chat]}}.
 Text: {raw!r}
 """
     fallback = {"intent": heuristic}
@@ -780,11 +1046,12 @@ async def ingest_message(state: OrchestrationState) -> OrchestrationState:
     role = state.get("input_role", "user")
     if incoming:
         _append_message(state, role, incoming)
+        _log_step("user_message", role=role, text=incoming[:500])
         prompt = f"""
 You normalize chat inputs for a lead-generation orchestrator.
 Respond with JSON {{"normalized_text": "...", "intent": "...", "tags": [...]}}.
 Input: {incoming!r}
-Intent options: run_enrichment, confirm_company, confirm_icp, accept_micro_icp, question, chat, idle.
+Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery, accept_micro_icp, question, chat, idle.
 """
         fallback = {
             "normalized_text": incoming,
@@ -900,7 +1167,11 @@ Current profile: {profile!r}
             "go ahead",
             "do it",
         }
-        if last_intent in {"confirm_icp", "run_enrichment"} or _includes_phrase(normalized_command, icp_confirm_phrases):
+        if (
+            last_intent in {"confirm_icp", "run_enrichment"}
+            or _includes_phrase(normalized_command, icp_confirm_phrases)
+            or _looks_like_discovery_confirmation(normalized_command)
+        ):
             profile["icp_profile_confirmed"] = True
 
     enrichment_requested = _wants_enrichment(last_intent, normalized_command)
@@ -910,7 +1181,7 @@ Current profile: {profile!r}
 
     awaiting_discovery = bool(profile.get("awaiting_discovery_confirmation"))
     if awaiting_discovery and not profile.get("icp_discovery_confirmed"):
-        positive_intents = {"run_enrichment", "accept_micro_icp", "confirm_icp"}
+        positive_intents = {"run_enrichment", "accept_micro_icp", "confirm_icp", "confirm_discovery"}
         positive_phrases = {
             "yes",
             "yep",
@@ -938,14 +1209,8 @@ Current profile: {profile!r}
         confirm_discovery = False
         if last_intent in positive_intents or any(phrase in normalized for phrase in positive_phrases):
             confirm_discovery = True
-        elif "discovery" in normalized and any(
-            trigger in normalized for trigger in ("start", "run", "begin", "kick off", "ready", "lets", "let's", "proceed")
-        ):
+        elif _looks_like_discovery_confirmation(normalized):
             confirm_discovery = True
-        elif "icp" in normalized and any(
-            trigger in normalized for trigger in ("start", "run", "begin", "ready", "proceed", "go ahead")
-        ):
-                confirm_discovery = True
         if confirm_discovery:
             profile["icp_discovery_confirmed"] = True
             profile["awaiting_discovery_confirmation"] = False
@@ -1095,7 +1360,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                         }
                         for d in candidates
                     ]
-                    discovery_state["web_candidate_details"] = candidate_details
+                _cache_discovery_details(state, discovery_state, candidate_details)
                 table = _format_candidate_table(candidate_details, limit=50)
                 discovery_state["web_candidate_table"] = table
                 found_count = min(50, len(candidate_details))
@@ -1204,11 +1469,17 @@ async def refresh_icp(state: OrchestrationState) -> OrchestrationState:
 
 async def decide_strategy(state: OrchestrationState) -> OrchestrationState:
     discovery = state.get("discovery") or {}
-    if _get_run_mode(state) == "chat_top10" and (discovery.get("top10_ids") or discovery.get("top10_details")):
-        _log_step("decide_strategy", action="use_cached", reason="chat_top10_cached")
+    profile = state.get("profile_state") or {}
+    run_mode = _get_run_mode(state)
+    has_cached = bool(discovery.get("top10_details") or discovery.get("web_candidate_details"))
+    wants_retry = bool(profile.get("discovery_retry_requested"))
+    if has_cached and not wants_retry:
+        reason = "chat_top10_cached" if run_mode == "chat_top10" else "cached_discovery"
+        _log_step("decide_strategy", action="use_cached", reason=reason)
         discovery["strategy"] = "use_cached"
         state["discovery"] = discovery
-        _set_status(state, "decide_strategy", "Reusing confirmed Top-10 candidates")
+        message = "Reusing confirmed Top-10 candidates" if run_mode == "chat_top10" else "Reusing cached discovery candidates"
+        _set_status(state, "decide_strategy", message)
         return state
     candidate_count = len(discovery.get("candidate_ids") or [])
     last_ssic = discovery.get("last_ssic_attempt")
@@ -1230,6 +1501,12 @@ Last SSIC attempt: {last_ssic}
 
 async def ssic_fallback(state: OrchestrationState) -> OrchestrationState:
     discovery = state.get("discovery") or {}
+    strategy = discovery.get("strategy")
+    if strategy == "use_cached" and (discovery.get("top10_details") or discovery.get("web_candidate_details")):
+        _log_step("ssic_fallback", skipped=True, reason="cached_discovery")
+        _set_status(state, "ssic_fallback", "SSIC fallback skipped (cached discovery)")
+        state["discovery"] = discovery
+        return state
     if _get_run_mode(state) == "chat_top10" and (discovery.get("top10_ids") or discovery.get("top10_details")):
         _log_step("ssic_fallback", skipped=True, reason="chat_top10_cached")
         _set_status(state, "ssic_fallback", "SSIC fallback skipped for confirmed Top-10 run")
@@ -1255,14 +1532,23 @@ async def ssic_fallback(state: OrchestrationState) -> OrchestrationState:
 
 
 async def plan_top10(state: OrchestrationState) -> OrchestrationState:
-    icp_profile = state.get("profile_state", {}).get("icp_profile") or {}
+    profile_state = state.get("profile_state") or {}
+    icp_profile = profile_state.get("icp_profile") or {}
     items: List[Dict[str, Any]] = []
     run_mode = _get_run_mode(state)
     discovery = state.get("discovery") or {}
-    cached_top10 = discovery.get("top10_details") or []
-    if run_mode == "chat_top10" and cached_top10:
-        _log_step("plan_top10", skipped=True, reason="chat_top10_cached")
-        _set_status(state, "plan_top10", "Reusing previously confirmed Top-10 candidates")
+    cached_details = discovery.get("web_candidate_details") or discovery.get("top10_details") or []
+    strategy = discovery.get("strategy")
+    wants_retry = bool(profile_state.get("discovery_retry_requested"))
+    if strategy == "use_cached" and cached_details and not wants_retry:
+        _cache_discovery_details(state, discovery, cached_details)
+        state["top10"] = {"items": cached_details, "generated_at": datetime.now(timezone.utc).isoformat()}
+        state["discovery"] = discovery
+        profile_state["discovery_retry_requested"] = False
+        state["profile_state"] = profile_state
+        reuse_reason = "chat_top10_cached" if run_mode == "chat_top10" else "cached_discovery"
+        _log_step("plan_top10", planned=len(cached_details), reused=True, reason=reuse_reason)
+        _set_status(state, "plan_top10", "Reusing cached discovery candidates")
         return state
     if OFFLINE:
         items = [
@@ -1281,27 +1567,7 @@ async def plan_top10(state: OrchestrationState) -> OrchestrationState:
             msg = "Top-10 planning failed"
     state["top10"] = {"items": items, "generated_at": datetime.now(timezone.utc).isoformat()}
     if items:
-        discovery["planned_candidates"] = items
-        if run_mode == "chat_top10":
-            top_slice = items[:10]
-            next_slice = items[10:50]
-            discovery["top10_details"] = top_slice
-            discovery["next40_details"] = next_slice
-            domains_ordered = [
-                _domain_from_value(str(it.get("domain") or ""))
-                for it in items
-                if isinstance(it, dict) and it.get("domain")
-            ]
-            tenant_id = state.get("entry_context", {}).get("tenant_id")
-            try:
-                tenant_ctx = int(tenant_id) if isinstance(tenant_id, int) or str(tenant_id).isdigit() else None
-            except Exception:
-                tenant_ctx = None
-            id_map = _ensure_company_ids_for_domains(domains_ordered, tenant_ctx)
-            discovery["top10_domains"] = domains_ordered[:10]
-            discovery["next40_domains"] = domains_ordered[10:50]
-            discovery["top10_ids"] = [id_map.get(dom) for dom in domains_ordered[:10] if id_map.get(dom)]
-            discovery["next40_ids"] = [id_map.get(dom) for dom in domains_ordered[10:50] if id_map.get(dom)]
+        _cache_discovery_details(state, discovery, items)
     state["discovery"] = discovery
     _log_step("plan_top10", planned=len(items))
     _set_status(state, "plan_top10", msg)
@@ -1315,48 +1581,87 @@ async def plan_top10(state: OrchestrationState) -> OrchestrationState:
 
 async def enrich_batch(state: OrchestrationState) -> OrchestrationState:
     discovery = state.get("discovery") or {}
-    run_mode = _get_run_mode(state)
-    candidate_ids = discovery.get("candidate_ids") or []
-    if run_mode == "chat_top10":
-        candidate_ids = discovery.get("top10_ids") or candidate_ids
-    candidate_ids = [int(cid) for cid in candidate_ids if isinstance(cid, (int, str)) and str(cid).strip()]
+    tenant_id = _get_tenant_id(state)
+    candidate_ids = discovery.get("top10_ids") or discovery.get("candidate_ids") or []
+    unique_ids: List[int] = []
+    seen_ids: set[int] = set()
+    for raw in candidate_ids:
+        if not isinstance(raw, (int, str)) or not str(raw).strip():
+            continue
+        try:
+            cid = int(raw)
+        except Exception:
+            continue
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        unique_ids.append(cid)
+    domain_lookup = _candidate_domain_lookup(discovery)
     results: List[Dict[str, Any]] = []
-    if not candidate_ids:
+    if not unique_ids:
         msg = "No candidates to enrich"
-    elif OFFLINE:
+        state["enrichment_results"] = results
+        _log_step("enrich_batch", attempts=0, offline=OFFLINE, had_candidates=False)
+        _set_status(state, "enrich_batch", msg)
+        return state
+    if OFFLINE:
         for cid in candidate_ids:
-            results.append({"company_id": int(cid), "completed": True, "error": None, "offline": True})
+            results.append({"company_id": int(cid), "completed": True, "error": None, "source": "offline"})
         msg = f"[offline] Enrichment simulated for {len(results)} companies"
-    elif enrich_company_with_tavily is None:  # pragma: no cover
-        msg = "Enrichment helper unavailable; skipping"
-    else:
-        for cid in candidate_ids:  # pragma: no cover - network I/O
+        state["enrichment_results"] = results
+        _log_step("enrich_batch", attempts=len(results), offline=True, had_candidates=True)
+        _set_status(state, "enrich_batch", msg)
+        return state
+
+    for cid in unique_ids:
+        domain = domain_lookup.get(int(cid))
+        success = False
+        error: Optional[str] = None
+        source = "mcp"
+        if domain:
+            success, error = await _attempt_jina_enrichment(tenant_id, int(cid), domain)
+        else:
+            error = "missing_domain"
+        if not success and enrich_company_with_tavily is not None:
             try:
-                asyncio.run(enrich_company_with_tavily(int(cid), search_policy="require_existing"))
-                results.append({"company_id": int(cid), "completed": True, "error": None})
-            except Exception as exc:
+                await enrich_company_with_tavily(int(cid), search_policy="require_existing")
+                success = True
+                error = None
+                source = "tavily"
+            except Exception as exc:  # pragma: no cover - network variability
                 logger.warning("enrich_company_with_tavily failed for %s: %s", cid, exc)
-                results.append({"company_id": int(cid), "completed": False, "error": str(exc)})
-        msg = f"Enrichment attempted for {len(results)} companies"
+                error = str(exc)
+        results.append({"company_id": int(cid), "completed": success, "error": error, "source": source})
+
     state["enrichment_results"] = results
-    _log_step("enrich_batch", attempts=len(results), offline=OFFLINE, had_candidates=bool(candidate_ids))
+    completed = len([r for r in results if r.get("completed")])
+    msg = (
+        f"Enrichment attempted for {len(results)} companies; {completed} succeeded."
+        if results
+        else "No candidates to enrich"
+    )
+    _log_step(
+        "enrich_batch",
+        attempts=len(results),
+        succeeded=completed,
+        used_fallback=any(r.get("source") == "tavily" for r in results),
+        offline=OFFLINE,
+        had_candidates=True,
+    )
     _set_status(state, "enrich_batch", msg)
     return state
 
 
 async def score_leads(state: OrchestrationState) -> OrchestrationState:
     discovery = state.get("discovery") or {}
-    run_mode = _get_run_mode(state)
-    candidate_ids = discovery.get("candidate_ids") or []
-    if run_mode == "chat_top10":
-        candidate_ids = discovery.get("top10_ids") or candidate_ids
+    candidate_ids = discovery.get("top10_ids") or discovery.get("candidate_ids") or []
     candidate_ids = [int(cid) for cid in candidate_ids if isinstance(cid, (int, str)) and str(cid).strip()]
     if OFFLINE:
         scores = [{"company_id": cid, "score": 0.8, "reason": "offline stub"} for cid in candidate_ids]
         msg = f"[offline] Scored {len(scores)} companies"
     else:
         try:
-            scoring_state = lead_scoring_agent.invoke(
+            scoring_state = await lead_scoring_agent.ainvoke(
                 {"candidate_ids": candidate_ids, "lead_features": [], "lead_scores": [], "icp_payload": state.get("icp_payload", {})}
             )
             scores = scoring_state.get("lead_scores") or []
@@ -1366,6 +1671,11 @@ async def score_leads(state: OrchestrationState) -> OrchestrationState:
             scores = []
             msg = "Lead scoring failed"
     state["scoring"] = {"scores": scores, "last_run_at": datetime.now(timezone.utc).isoformat()}
+    if scores:
+        email_map = _lookup_primary_emails([int(s.get("company_id")) for s in scores if s.get("company_id") is not None])
+        table = _format_lead_score_table(scores, discovery, email_map)
+        if table:
+            _append_message(state, "assistant", "Lead Score summary:\n" + table)
     _log_step("score_leads", scored=len(scores))
     _set_status(state, "score_leads", msg)
     return state
@@ -1399,15 +1709,31 @@ async def export_results(state: OrchestrationState) -> OrchestrationState:
             msg_extra = "; Next-40 enqueue failed"
     else:
         msg_extra = "; no Next-40 enqueue"
-    # TODO: wire Odoo export when available
+
+    # Trigger Odoo export for completed Top-10 enrichment when tenant context present
+    enriched_ids = [
+        int(r.get("company_id"))
+        for r in state.get("enrichment_results") or []
+        if r.get("completed") and isinstance(r.get("company_id"), (int, str)) and str(r.get("company_id")).strip()
+    ]
+    odoo_msg = "; Odoo export skipped"
+    if tenant_id and enriched_ids:
+        exported = await _export_top10_to_odoo(int(tenant_id), enriched_ids)
+        exports["odoo_exported"] = exported
+        odoo_msg = "; Odoo export triggered" if exported else "; Odoo export failed"
+    elif tenant_id:
+        exports["odoo_exported"] = False
+    else:
+        odoo_msg = "; Odoo tenant missing"
+
     state["exports"] = exports
     _log_step(
         "export",
         next40=exports.get("next40_enqueued"),
         jobs=exports.get("job_ids"),
-        msg_extra=msg_extra,
+        msg_extra=f"{msg_extra}{odoo_msg}",
     )
-    _set_status(state, "export", f"Export stage complete{msg_extra}")
+    _set_status(state, "export", f"Export stage complete{msg_extra}{odoo_msg}")
     return state
 
 

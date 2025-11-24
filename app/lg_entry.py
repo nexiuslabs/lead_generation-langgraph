@@ -97,17 +97,25 @@ async def handle_turn(payload: Dict[str, Any], config: RunnableConfig | None = N
     prior_messages = payload.get("messages") or []
     for msg in prior_messages:
         if isinstance(msg, AIMessage):
-            state["messages"].append({"role": "assistant", "content": msg.content})
+            nodes._append_message(state, "assistant", msg.content)
         elif isinstance(msg, HumanMessage):
-            state["messages"].append({"role": "user", "content": msg.content})
+            nodes._append_message(state, "user", msg.content)
 
     result = await ORCHESTRATOR.ainvoke(state, config=config)
     status = (result or {}).get("status") or {}
     message = status.get("message", "Processing complete.")
     status_history = result.get("status_history") or []
+    filtered_messages = []
+    for msg in result.get("messages") or []:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(role, str) and isinstance(content, str):
+            if nodes._should_suppress_message(role, content):
+                continue
+        filtered_messages.append(msg)
     # Return minimal structure for the chat UI
     return {
-        "messages": result.get("messages") or [],
+        "messages": filtered_messages,
         "status": status,
         "status_history": status_history,
         "output": message,

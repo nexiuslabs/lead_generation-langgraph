@@ -27,11 +27,8 @@ def test_dual_read_sampling_returns_http_and_logs(monkeypatch):
     out = jina_reader.read_url("https://example.com", timeout=1)
     assert out == "HTTP_TEXT"
     assert calls["count"] == 1
-    # Ensure logged fields exist
-    assert "http_txt" not in calls["last"]  # not passed directly
-    # lengths present when texts are strings
-    assert "http_len" in calls["last"]
-    assert "mcp_len" in calls["last"]
+    assert calls["last"]["http_txt"] == "HTTP_TEXT"
+    assert calls["last"]["mcp_txt"] == "MCP_TEXT"
 
 
 def test_mcp_enabled_prefers_mcp_when_no_dual_and_applies_cleaner(monkeypatch):
@@ -76,3 +73,32 @@ def test_mcp_error_falls_back_to_http(monkeypatch):
     out = jina_reader.read_url("https://example.com", timeout=1)
     assert out == "HTTP_TEXT_FALLBACK"
 
+
+def test_extract_list_from_result_json_block():
+    from src.services.mcp_reader import _extract_list_from_result
+
+    payload = {
+        "content": [
+            {
+                "type": "application/json",
+                "data": {"results": [{"url": "https://alpha.com"}, {"url": "https://beta.com"}]},
+            }
+        ]
+    }
+    urls = _extract_list_from_result(payload)
+    assert urls == ["https://alpha.com", "https://beta.com"]
+
+
+def test_extract_list_from_result_output_text():
+    from src.services.mcp_reader import _extract_list_from_result
+
+    payload = {
+        "content": [
+            {
+                "type": "output_text",
+                "text": "1. https://alpha.com\n2. https://beta.com/details ",
+            }
+        ]
+    }
+    urls = _extract_list_from_result(payload)
+    assert urls == ["https://alpha.com", "https://beta.com/details"]

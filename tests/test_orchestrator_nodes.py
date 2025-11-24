@@ -1,6 +1,7 @@
 import uuid
 
 import pytest
+from typing import Dict, List
 
 from my_agent.utils import nodes
 from my_agent.utils.state import OrchestrationState
@@ -18,6 +19,10 @@ REAL_COMPANY = {
     "summary_source": "user",
     "industries": ["SaaS"],
 }
+
+
+def test_simple_intent_detects_discovery():
+    assert nodes._simple_intent("Start discovery now please!") == "confirm_discovery"
 
 
 def test_mcp_reader_auto_enabled(monkeypatch):
@@ -132,6 +137,34 @@ async def test_journey_guard_requests_discovery_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_profile_builder_confirms_discovery_from_start_command():
+    state: OrchestrationState = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "https://a.com https://b.com https://c.com https://d.com https://e.com",
+            }
+        ],
+        "entry_context": {"intent": "chat", "last_user_command": "start discovery"},
+        "icp_payload": {},
+        "profile_state": {
+            "company_profile_confirmed": True,
+            "icp_profile_confirmed": True,
+            "icp_discovery_confirmed": False,
+            "awaiting_discovery_confirmation": True,
+            "company_profile": dict(REAL_COMPANY),
+            "icp_profile": {"summary": "Lean food distributors.", "industries": ["F&B"]},
+            "seeded_company_profile": False,
+            "outstanding_prompts": [],
+        },
+    }
+    out = await nodes.profile_builder(state)
+    profile = out["profile_state"]
+    assert profile["icp_discovery_confirmed"] is True
+    assert profile["awaiting_discovery_confirmation"] is False
+
+
+@pytest.mark.asyncio
 async def test_journey_guard_prompts_for_enrichment_confirmation(monkeypatch):
     monkeypatch.setattr(nodes, "_plan_web_candidates", lambda icp: {"domains": ["alpha.com", "beta.com"], "snippets": {}})
     state: OrchestrationState = {
@@ -161,6 +194,8 @@ async def test_journey_guard_prompts_for_enrichment_confirmation(monkeypatch):
     assert out["profile_state"]["awaiting_enrichment_confirmation"] is True
     assert out["discovery"]["web_candidates"] == ["alpha.com", "beta.com"]
     assert len(out["discovery"].get("web_candidate_details") or []) == 2
+    assert [row.get("domain") for row in (out["discovery"].get("top10_details") or [])] == ["alpha.com", "beta.com"]
+    assert [row.get("domain") for row in (out["discovery"].get("top10_details") or [])] == ["alpha.com", "beta.com"]
 
 
 @pytest.mark.asyncio
@@ -362,6 +397,106 @@ async def test_profile_builder_sets_retry_flag():
 
 
 @pytest.mark.asyncio
+async def test_decide_strategy_reuses_cached_candidates():
+    state: OrchestrationState = {
+        "discovery": {
+            "top10_details": [{"domain": "alpha.com"}],
+            "candidate_ids": [1, 2, 3],
+        },
+        "profile_state": {"discovery_retry_requested": False},
+        "entry_context": {},
+    }
+    out = await nodes.decide_strategy(state)
+    assert out["discovery"]["strategy"] == "use_cached"
+    assert "Reusing" in out["status"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_plan_top10_skips_when_cached(monkeypatch):
+    def _should_not_run(*_args, **_kwargs):
+        raise AssertionError("plan_top10_with_reasons should be skipped")
+
+    monkeypatch.setattr(nodes, "plan_top10_with_reasons", _should_not_run, raising=False)
+    cached = [
+        {"domain": "alpha.com", "name": "Alpha"},
+        {"domain": "beta.com", "name": "Beta"},
+    ]
+    state: OrchestrationState = {
+        "discovery": {"strategy": "use_cached", "web_candidate_details": cached},
+        "profile_state": {"discovery_retry_requested": False},
+        "entry_context": {},
+    }
+    out = await nodes.plan_top10(state)
+    assert out["status"]["message"] == "Reusing cached discovery candidates"
+    assert [row.get("domain") for row in out["discovery"].get("top10_details") or []][:2] == ["alpha.com", "beta.com"]
+
+
+@pytest.mark.asyncio
+async def test_enrich_batch_prefers_jina(monkeypatch):
+    called: List[tuple] = []
+
+    async def fake_collect(tenant_id, company_id, domain):
+        called.append((tenant_id, company_id, domain))
+        return 1
+
+    monkeypatch.setattr(nodes, "collect_evidence_for_domain", fake_collect, raising=False)
+    monkeypatch.setattr(nodes, "enrich_company_with_tavily", None, raising=False)
+    state: OrchestrationState = {
+        "entry_context": {"tenant_id": 7},
+        "discovery": {"top10_ids": [123], "top10_domains": ["alpha.com"]},
+    }
+    out = await nodes.enrich_batch(state)
+    assert called
+    assert out["enrichment_results"][0]["completed"] is True
+    assert out["enrichment_results"][0]["source"] == "mcp"
+
+
+@pytest.mark.asyncio
+async def test_enrich_batch_falls_back_to_tavily(monkeypatch):
+    async def fake_collect(tenant_id, company_id, domain):
+        return 0
+
+    fallback_called: List[int] = []
+
+    async def fake_tavily(company_id, **kwargs):
+        fallback_called.append(int(company_id))
+
+    monkeypatch.setattr(nodes, "collect_evidence_for_domain", fake_collect, raising=False)
+    monkeypatch.setattr(nodes, "enrich_company_with_tavily", fake_tavily, raising=False)
+    state: OrchestrationState = {
+        "entry_context": {"tenant_id": 7},
+        "discovery": {"top10_ids": [456], "top10_domains": ["beta.com"]},
+    }
+    out = await nodes.enrich_batch(state)
+    assert fallback_called == [456]
+    assert out["enrichment_results"][0]["completed"] is True
+    assert out["enrichment_results"][0]["source"] == "tavily"
+
+
+@pytest.mark.asyncio
+async def test_enrich_batch_dedupes_candidate_ids(monkeypatch):
+    called: List[int] = []
+
+    async def fake_collect(tenant_id, company_id, domain):
+        called.append(company_id)
+        return 1
+
+    monkeypatch.setattr(nodes, "collect_evidence_for_domain", fake_collect, raising=False)
+    monkeypatch.setattr(nodes, "enrich_company_with_tavily", None, raising=False)
+    state: OrchestrationState = {
+        "entry_context": {"tenant_id": 9},
+        "discovery": {
+            "candidate_ids": [111, "111", 222],
+            "top10_ids": [111, 222],
+            "top10_domains": ["alpha.com", "beta.com"],
+        },
+    }
+    out = await nodes.enrich_batch(state)
+    assert called == [111, 222]
+    assert len(out["enrichment_results"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_refresh_icp_waits_for_enrichment_confirmation():
     state: OrchestrationState = {
         "profile_state": {"enrichment_confirmed": False},
@@ -387,6 +522,30 @@ async def test_refresh_icp_runs_after_enrichment_confirmation(monkeypatch):
     }
     out = await nodes.refresh_icp(state)
     assert out["discovery"]["candidate_ids"] == [7, 8]
+
+
+@pytest.mark.asyncio
+async def test_score_leads_uses_async_agent(monkeypatch):
+    called: Dict[str, Any] = {}
+
+    class FakeAgent:
+        async def ainvoke(self, payload):
+            called["payload"] = payload
+            return {"lead_scores": [{"company_id": 99, "score": 42, "bucket": "B"}]}
+
+    monkeypatch.setattr(nodes, "lead_scoring_agent", FakeAgent())
+    monkeypatch.setattr(nodes, "_lookup_primary_emails", lambda ids: {99: "test@example.com"})
+    state: OrchestrationState = {
+        "discovery": {"candidate_ids": ["99"], "top10_ids": [99], "top10_details": [{"name": "Alpha", "domain": "alpha.com"}]},
+        "icp_payload": {"foo": "bar"},
+        "profile_state": {},
+        "messages": [],
+    }
+    out = await nodes.score_leads(state)
+    assert called["payload"]["candidate_ids"] == [99]
+    assert out["scoring"]["scores"] == [{"company_id": 99, "score": 42, "bucket": "B"}]
+    assert "Lead Score summary" in out["messages"][-1]["content"]
+    assert "test@example.com" in out["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -419,6 +578,14 @@ def test_append_message_filters_json_payloads():
     assert state["messages"][-1]["content"] == "Here is a summary."
     nodes._append_message(state, "user", '{"is_question": false, "answer": ""}')
     assert state["messages"][-1]["content"] == '{"is_question": false, "answer": ""}'
+
+
+def test_append_message_suppresses_system_json():
+    state: OrchestrationState = {}
+    nodes._append_message(state, "system", '{"foo": "bar"}')
+    assert not state.get("messages")
+    nodes._append_message(state, "user", '{"foo": "bar"}')
+    assert state["messages"][-1]["content"].startswith('{"foo"')
 
 
 def test_profile_state_seeded_with_default_company():
