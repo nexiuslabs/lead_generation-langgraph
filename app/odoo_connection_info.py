@@ -85,7 +85,24 @@ def _infer_db_from_dsn() -> Optional[str]:
 
 
 def _resolve_tenant_id(email: str, claim_tid: Optional[int]) -> Optional[int]:
-    # Priority 1: DSN → active odoo_connections mapping
+    # Priority 1: tenant_id from claim (if present)
+    if claim_tid is not None:
+        try:
+            return int(claim_tid)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring non-numeric claim_tid=%r", claim_tid)
+
+    # Priority 2: Existing user mapping by email
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+    except Exception:
+        pass
+
+    # Priority 3: DSN → active odoo_connections mapping (fallback when no claim/user mapping)
     inferred_db = _infer_db_from_dsn()
     if inferred_db:
         try:
@@ -99,23 +116,6 @@ def _resolve_tenant_id(email: str, claim_tid: Optional[int]) -> Optional[int]:
                     return int(row[0])
         except Exception:
             pass
-
-    # Priority 2: tenant_id from claim (if present)
-    if claim_tid is not None:
-        try:
-            return int(claim_tid)
-        except (TypeError, ValueError):
-            logger.warning("Ignoring non-numeric claim_tid=%r", claim_tid)
-
-    # Priority 3: Existing user mapping by email
-    try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT tenant_id FROM tenant_users WHERE user_id=%s LIMIT 1", (email,))
-            row = cur.fetchone()
-            if row:
-                return int(row[0])
-    except Exception:
-        pass
     return None
 
 
