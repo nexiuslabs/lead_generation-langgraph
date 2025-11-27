@@ -8,12 +8,13 @@ import asyncpg
 import re
 
 from src.settings import POSTGRES_DSN
-from src.jobs import run_web_discovery_bg_enrich
+from src.jobs import run_web_discovery_bg_enrich, run_icp_discovery_enrich
 from src.troubleshoot_log import log_json
 
 
 def bg_event(event: str, level: str = "info", **data) -> None:
-    log_json("background_next40", level, event, data or None)
+    # Unified background worker (was 'background_next40' in earlier revisions)
+    log_json("background_worker", level, event, data or None)
 
 
 class BGWorker:
@@ -123,7 +124,7 @@ class BGWorker:
         except Exception:
             return None
 
-    async def _spawn_until_full(self, pool: asyncpg.Pool) -> None:
+    async def _spawn_for(self, pool: asyncpg.Pool, job_type: str, runner) -> None:
         async with pool.acquire() as conn:
             # Maintenance pass: requeue stale 'running' and bounded-retry 'error' jobs for this worker type
             try:
@@ -142,11 +143,11 @@ class BGWorker:
                     UPDATE background_jobs b
                        SET status='queued', started_at=NULL, ended_at=NULL
                      WHERE b.status='running'
-                       AND b.job_type='web_discovery_bg_enrich'
+                       AND b.job_type=$2
                        AND b.started_at IS NOT NULL
                        AND b.started_at < now() - make_interval(mins => $1::int)
                     """,
-                    stale_minutes,
+                    stale_minutes, job_type,
                 )
                 # 'error' with retries left → 'queued' and increment params.retries
                 await conn.execute(
@@ -156,34 +157,32 @@ class BGWorker:
                            params = jsonb_set(COALESCE(b.params, '{}'::jsonb), '{retries}',
                                               to_jsonb(COALESCE((b.params->>'retries')::int, 0) + 1), true)
                      WHERE b.status='error'
-                       AND b.job_type='web_discovery_bg_enrich'
-                       AND COALESCE((b.params->>'retries')::int, 0) < $1::int
+                       AND b.job_type=$2
+                        AND COALESCE((b.params->>'retries')::int, 0) < $1::int
                     """,
-                    max_retries,
+                    max_retries, job_type,
                 )
             except Exception:
                 pass
             # Best-effort log of queue depth for visibility
             try:
-                q = await conn.fetchval(
-                    "SELECT COUNT(*) FROM background_jobs WHERE status='queued' AND job_type='web_discovery_bg_enrich'"
-                )
+                q = await conn.fetchval("SELECT COUNT(*) FROM background_jobs WHERE status='queued' AND job_type=$1", job_type)
                 if q and int(q) > 0:
-                    bg_event("queue_depth", queued=int(q))
+                    bg_event("queue_depth", queued=int(q), job_type=job_type)
             except Exception:
                 pass
             while len(self._tasks) < self._max and not self._stop.is_set():
-                jid = await self._claim_one(conn, "web_discovery_bg_enrich")
+                jid = await self._claim_one(conn, job_type)
                 if not jid:
                     break
-                t = asyncio.create_task(self._run_job(jid))
+                t = asyncio.create_task(self._run_job(jid, job_type, runner))
                 self._tasks.add(t)
                 t.add_done_callback(lambda tt: self._tasks.discard(tt))
 
-    async def _run_job(self, job_id: int) -> None:
+    async def _run_job(self, job_id: int, job_type: str, runner) -> None:
         try:
-            bg_event("job_start", job_id=int(job_id), job_type="web_discovery_bg_enrich")
-            await run_web_discovery_bg_enrich(int(job_id))
+            bg_event("job_start", job_id=int(job_id), job_type=job_type)
+            await runner(int(job_id))
             bg_event("job_complete", job_id=int(job_id))
         except Exception:
             # Errors are handled inside the job call; ensure task finishes cleanly
@@ -204,7 +203,9 @@ class BGWorker:
         listen_task = asyncio.create_task(self._listen())
         try:
             while not self._stop.is_set():
-                await self._spawn_until_full(pool)
+                # Fill capacity by pulling from both queues
+                await self._spawn_for(pool, "web_discovery_bg_enrich", run_web_discovery_bg_enrich)
+                await self._spawn_for(pool, "icp_discovery_enrich", run_icp_discovery_enrich)
                 # Wait for either notify, a task to finish, or timeout
                 waiters = []
                 # notify event

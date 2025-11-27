@@ -27,7 +27,10 @@ from src.obs import bump_vendor as _obs_bump, log_event as _log_obs_event
 from src.retry import with_retry, RetryableError, CircuitBreaker, BackoffPolicy
 
 from src.jina_reader import read_url as jina_read
-from src.lusha_client import AsyncLushaClient, LushaError
+try:
+    from src.services.jina_deep_research import deep_research_for_domain as _dr_for_domain
+except Exception:  # pragma: no cover
+    _dr_for_domain = None  # type: ignore
 from src.vendors.apify_linkedin import (
     run_sync_get_dataset_items as apify_run,
     build_queries as apify_build_queries,
@@ -46,13 +49,10 @@ from src.settings import (
     CRAWLER_TIMEOUT_S,
     CRAWLER_USER_AGENT,
     ENABLE_TAVILY_FALLBACK,
-    ENABLE_LUSHA_FALLBACK,
     ENABLE_APIFY_LINKEDIN,
     EXTRACT_CORPUS_CHAR_LIMIT,
     LANGCHAIN_MODEL,
     TEMPERATURE,
-    LUSHA_API_KEY,
-    LUSHA_PREFERRED_TITLES,
     PERSIST_CRAWL_CORPUS,
     POSTGRES_DSN,
     TAVILY_API_KEY,
@@ -311,7 +311,6 @@ _VENDOR_COUNTERS: dict[str, int] = {
     "tavily_queries": 0,
     "tavily_crawl_calls": 0,
     "tavily_extract_calls": 0,
-    "lusha_lookups": 0,
     "apify_linkedin_calls": 0,
 }
 _VENDOR_CAPS: dict[str, int | None] = {"tavily_units": None, "contact_lookups": None}
@@ -429,7 +428,7 @@ def _units_used(key: str) -> int:
         # usually dominate cost. Adjust if your billing model differs.
         return _VENDOR_COUNTERS["tavily_queries"] + _VENDOR_COUNTERS["tavily_extract_calls"]
     if key == "contact_lookups":
-        return _VENDOR_COUNTERS["lusha_lookups"] + _VENDOR_COUNTERS["apify_linkedin_calls"]
+        return _VENDOR_COUNTERS["apify_linkedin_calls"]
     return 0
 
 def _dec_cap(key: str, need: int = 1) -> bool:
@@ -791,12 +790,11 @@ def _get_contact_stats(company_id: int):
 
             # founder / leadership presence by title
             if "title" in cols:
-                terms = [
-                    (t or "").strip().lower()
-                    for t in (LUSHA_PREFERRED_TITLES or "").split(",")
-                    if (t or "").strip()
-                ]
-                # If titles list is empty, use a default set
+                # Prefer tenant-specific titles; fall back to CONTACT_TITLES or a sane default
+                try:
+                    terms = [str(t).strip().lower() for t in (CONTACT_TITLES or []) if str(t).strip()]
+                except Exception:
+                    terms = []
                 if not terms:
                     terms = [
                         "founder",
@@ -829,72 +827,7 @@ def _get_contact_stats(company_id: int):
     return total, has_named, founder_present
 
 
-def _normalize_lusha_contact(c: dict) -> dict:
-    """Flatten/normalize contact from Lusha enrich payload to a common schema."""
-    out = {}
-    out["lusha_contact_id"] = (
-        c.get("lushaContactId") or c.get("contactId") or c.get("id")
-    )
-    out["first_name"] = c.get("firstName")
-    out["last_name"] = c.get("lastName")
-    name = c.get("name")
-    if not name and (out["first_name"] or out["last_name"]):
-        name = " ".join([p for p in [out["first_name"], out["last_name"]] if p])
-    out["full_name"] = name
-    out["title"] = c.get("jobTitle") or c.get("title")
-    out["linkedin_url"] = (
-        c.get("linkedinUrl") or c.get("linkedinProfileUrl") or c.get("linkedin")
-    )
-    out["company_name"] = c.get("companyName")
-    out["company_domain"] = c.get("companyDomain")
-    out["seniority"] = c.get("seniority")
-    out["department"] = c.get("department")
-    out["city"] = (
-        c.get("city") or (c.get("location") or {}).get("city")
-        if isinstance(c.get("location"), dict)
-        else c.get("location")
-    )
-    out["country"] = (
-        c.get("country") or (c.get("location") or {}).get("country")
-        if isinstance(c.get("location"), dict)
-        else None
-    )
-
-    # Emails
-    emails = []
-    src_emails = c.get("emailAddresses") or c.get("emails") or c.get("email_addresses")
-    if isinstance(src_emails, list):
-        for e in src_emails:
-            if isinstance(e, dict):
-                v = e.get("email") or e.get("value")
-                if v:
-                    emails.append(v)
-            elif isinstance(e, str):
-                emails.append(e)
-    elif isinstance(src_emails, str):
-        emails.append(src_emails)
-    out["emails"] = [e for e in emails if e]
-
-    # Phones
-    phones = []
-    src_phones = c.get("phoneNumbers") or c.get("phones") or c.get("phone_numbers")
-    if isinstance(src_phones, list):
-        for p in src_phones:
-            if isinstance(p, dict):
-                v = (
-                    p.get("internationalNumber")
-                    or p.get("number")
-                    or p.get("value")
-                    or p.get("e164")
-                )
-                if v:
-                    phones.append(v)
-            elif isinstance(p, str):
-                phones.append(p)
-    elif isinstance(src_phones, str):
-        phones.append(src_phones)
-    out["phones"] = [p for p in phones if p]
-    return out
+## Lusha contact normalization and upsert functions removed.
 
 
 def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
@@ -981,132 +914,7 @@ def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
     return inserted, updated
 
 
-def upsert_contacts_from_lusha(
-    company_id: int, lusha_contacts: list[dict]
-) -> tuple[int, int]:
-    """Upsert contacts from Lusha into contacts table. Returns (inserted, updated)."""
-    if not lusha_contacts:
-        return (0, 0)
-    inserted = 0
-    updated = 0
-    conn = get_db_connection()
-    try:
-        cols = _get_table_columns(conn, "contacts")
-        has_email = "email" in cols
-        has_updated_at = "updated_at" in cols
-        for raw in lusha_contacts:
-            c = _normalize_lusha_contact(raw)
-            emails = c.get("emails") or [None]
-            phone_primary = (c.get("phones") or [None])[0]
-            for email in emails:
-                # Build payload dynamically based on existing columns
-                row = {"company_id": company_id, "contact_source": "lusha"}
-                if "lusha_contact_id" in cols and c.get("lusha_contact_id"):
-                    row["lusha_contact_id"] = c.get("lusha_contact_id")
-                if "first_name" in cols and c.get("first_name"):
-                    row["first_name"] = c.get("first_name")
-                if "last_name" in cols and c.get("last_name"):
-                    row["last_name"] = c.get("last_name")
-                if "full_name" in cols and c.get("full_name"):
-                    row["full_name"] = c.get("full_name")
-                if "title" in cols and c.get("title"):
-                    row["title"] = c.get("title")
-                if "linkedin_url" in cols and c.get("linkedin_url"):
-                    row["linkedin_url"] = c.get("linkedin_url")
-                if "seniority" in cols and c.get("seniority"):
-                    row["seniority"] = c.get("seniority")
-                if "department" in cols and c.get("department"):
-                    row["department"] = c.get("department")
-                if "city" in cols and c.get("city"):
-                    row["city"] = c.get("city")
-                if "country" in cols and c.get("country"):
-                    row["country"] = c.get("country")
-                # phones
-                if "phone_number" in cols and phone_primary:
-                    row["phone_number"] = phone_primary
-                elif "phone" in cols and phone_primary:
-                    row["phone"] = phone_primary
-                # email and verification placeholders
-                if has_email:
-                    row["email"] = email
-                if "email_verified" in cols and email is not None:
-                    row["email_verified"] = None
-                if "verification_confidence" in cols and email is not None:
-                    row["verification_confidence"] = None
-
-                # Decide existence
-                with conn, conn.cursor() as cur:
-                    exists = False
-                    if has_email:
-                        cur.execute(
-                            "SELECT 1 FROM contacts WHERE company_id=%s AND email IS NOT DISTINCT FROM %s LIMIT 1",
-                            (company_id, email),
-                        )
-                        exists = bool(cur.fetchone())
-                    # Build SQL dynamically
-                    if exists:
-                        set_cols = [
-                            k for k in row.keys() if k not in ("company_id", "email")
-                        ]
-                        if set_cols:
-                            assignments = ", ".join([f"{k}=%s" for k in set_cols])
-                            params = [row[k] for k in set_cols]
-                            where_clause = (
-                                "company_id=%s AND email IS NOT DISTINCT FROM %s"
-                                if has_email
-                                else "company_id=%s"
-                            )
-                            params.extend(
-                                [company_id, email] if has_email else [company_id]
-                            )
-                            if has_updated_at:
-                                assignments = assignments + ", updated_at=now()"
-                            cur.execute(
-                                f"UPDATE contacts SET {assignments} WHERE {where_clause}",
-                                params,
-                            )
-                            updated += cur.rowcount or 0
-                    else:
-                        cols_list = list(row.keys())
-                        placeholders = ",".join(["%s"] * len(cols_list))
-                        cur.execute(
-                            f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
-                            [row[k] for k in cols_list],
-                        )
-                        inserted += cur.rowcount or 0
-                        # Also mirror into lead_emails if available
-                        if has_email and email:
-                            try:
-                                cur.execute(
-                                    """
-                                    INSERT INTO lead_emails (email, company_id, first_name, last_name, role_title, source)
-                                    VALUES (%s,%s,%s,%s,%s,%s)
-                                    ON CONFLICT (email) DO UPDATE SET company_id=EXCLUDED.company_id,
-                                      first_name=COALESCE(EXCLUDED.first_name, lead_emails.first_name),
-                                      last_name=COALESCE(EXCLUDED.last_name, lead_emails.last_name),
-                                      role_title=COALESCE(EXCLUDED.role_title, lead_emails.role_title),
-                                      source=EXCLUDED.source
-                                    """,
-                                    (
-                                        email,
-                                        company_id,
-                                        row.get("first_name"),
-                                        row.get("last_name"),
-                                        row.get("title"),
-                                        "lusha",
-                                    ),
-                                )
-                            except Exception:
-                                pass
-        return inserted, updated
-    except Exception as e:
-        print(f"       ↳ Lusha contacts upsert failed: {e}")
-        return (inserted, updated)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+## Lusha contacts upsert removed.
 
 
 # -------------- Tavily merged-corpus helpers --------------
@@ -1611,7 +1419,6 @@ async def enrich_company_with_tavily(
         "extracted_pages": [],
         "chunks": [],
         "data": {},
-        "lusha_used": False,
         "completed": False,
         "error": None,
         "degraded_reasons": [],
@@ -1698,7 +1505,6 @@ class EnrichmentState(TypedDict, total=False):
     chunks: List[str]
     data: Dict[str, Any]
     deterministic_summary: Dict[str, Any]
-    lusha_used: bool
     completed: bool
     error: Optional[str]
     degraded_reasons: List[str]
@@ -1769,41 +1575,7 @@ async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
                 error_code="domain_discovery_error",
             )
             logger.warning("   ↳ Domain discovery failed", exc_info=True)
-    # Lusha fallback if needed
-    if (not domains) and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
-        try:
-            logger.info("   ↳ No domain via search; trying Lusha fallback…")
-            tid = int(_RUN_CTX.get("tenant_id") or 0)
-            lusha_domain = None
-            if _cb_allows(tid, "lusha"):
-                async with AsyncLushaClient() as lc:
-                    async def _call():
-                        return await lc.find_company_domain(name)
-                    try:
-                        lusha_domain = await with_retry(_call, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
-                        _VENDOR_COUNTERS["lusha_lookups"] += 1
-                        _obs_vendor("lusha", calls=1)
-                        if tid:
-                            _CB.on_success(tid, "lusha")
-                    except Exception:
-                        if tid:
-                            _CB.on_error(tid, "lusha")
-                        lusha_domain = None
-            if lusha_domain:
-                normalized = (
-                    lusha_domain
-                    if lusha_domain.startswith("http")
-                    else f"https://{lusha_domain}"
-                )
-                domains = [normalized]
-                state["lusha_used"] = True
-                logger.info(f"   ↳ Lusha provided domain: {normalized}")
-        except Exception as e:
-            logger.warning("   ↳ Lusha domain fallback failed", exc_info=True)
-            try:
-                (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
-            except Exception:
-                pass
+    # Lusha fallback removed
     # 3) DuckDuckGo HTML fallback (no API key required)
     if not domains:
         try:
@@ -1911,48 +1683,6 @@ async def node_discover_urls(state: EnrichmentState) -> EnrichmentState:
         return state
     home = state["home"]
     filtered_urls: List[str] = await _discover_relevant_urls(home, CRAWL_MAX_PAGES)
-    if not filtered_urls and ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY:
-        try:
-            tid = int(_RUN_CTX.get("tenant_id") or 0)
-            lusha_domain = None
-            if _cb_allows(tid, "lusha"):
-                async with AsyncLushaClient() as lc:
-                    async def _call():
-                        return await lc.find_company_domain(state.get("company_name") or "")
-                    try:
-                        lusha_domain = await with_retry(_call, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
-                        _VENDOR_COUNTERS["lusha_lookups"] += 1
-                        _obs_vendor("lusha", calls=1)
-                        if tid:
-                            _CB.on_success(tid, "lusha")
-                    except Exception:
-                        if tid:
-                            _CB.on_error(tid, "lusha")
-                        lusha_domain = None
-            if lusha_domain:
-                candidate_home = (
-                    lusha_domain
-                    if lusha_domain.startswith("http")
-                    else f"https://{lusha_domain}"
-                )
-                if (
-                    urlparse(candidate_home).netloc
-                    and urlparse(candidate_home).netloc != urlparse(home).netloc
-                ):
-                    logger.info(
-                        f"   ↳ Using Lusha-discovered domain for crawl: {candidate_home}"
-                    )
-                    state["home"] = candidate_home
-                    state["lusha_used"] = True
-                    filtered_urls = await _discover_relevant_urls(
-                        candidate_home, CRAWL_MAX_PAGES
-                    )
-        except Exception as e:
-            logger.warning("   ↳ Lusha fallback for filtered URLs failed", exc_info=True)
-            try:
-                (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
-            except Exception:
-                pass
     if not filtered_urls:
         filtered_urls = [state["home"]]
         try:
@@ -2209,6 +1939,21 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
     try:
+        # Optional: use Deep Research summary/pages first to seed corpus
+        try:
+            if _dr_for_domain is not None:
+                from urllib.parse import urlparse as _up
+                dom = _up(state["home"]).netloc or state["home"]
+                pack = _dr_for_domain(dom)
+                if isinstance(pack, dict):
+                    summ = (pack.get("summary") or "")
+                    if summ and not state.get("deterministic_summary"):
+                        state["deterministic_summary"] = {"url": state["home"], "content_summary": summ[:1000], "signals": {}}
+                    pg = pack.get("pages") or []
+                    if pg and not state.get("extracted_pages"):
+                        state["extracted_pages"] = [{"url": p.get("url"), "title": "", "raw_content": p.get("summary") or ""} for p in pg if p]
+        except Exception:
+            pass
         # Mark that we'll attempt a r.jina snapshot in this node to avoid
         # re-attempting the same fetch in node_extract_pages fallback.
         try:
@@ -2578,14 +2323,12 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
         # Prefer Apify when enabled, or when Lusha fallback is disabled/missing
         tid = int(_RUN_CTX.get("tenant_id") or 0)
         rid = _RUN_CTX.get("run_id")
-        prefer_apify = (
-            ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
-        )
+        prefer_apify = ENABLE_APIFY_LINKEDIN
         if prefer_apify and trigger and _dec_cap("contact_lookups", 1):
             # Use Apify LinkedIn Actor for contact discovery when trigger conditions met
             titles_env = CONTACT_TITLES or []
             titles_tenant = icp_preferred_titles_for_tenant(tid if tid else None)
-            titles = titles_tenant or titles_env or LUSHA_PREFERRED_TITLES
+            titles = titles_tenant or titles_env
             company_name = state.get("company_name") or ""
             queries = apify_build_queries(company_name, titles)
             if queries:
@@ -2819,126 +2562,10 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                             (state.setdefault("degraded_reasons", [])) .append("APIFY_LINKEDIN_FAIL")
                         except Exception:
                             pass
-        elif ENABLE_LUSHA_FALLBACK and LUSHA_API_KEY and trigger and _dec_cap("contact_lookups", 1):
-            website_hint = data.get("website_domain") or state.get("home") or ""
-            try:
-                if website_hint.startswith("http"):
-                    company_domain = urlparse(website_hint).netloc
-                else:
-                    company_domain = urlparse(f"https://{website_hint}").netloc
-            except Exception:
-                company_domain = None
-            lusha_contacts: List[Dict[str, Any]] = []
-            tid = int(_RUN_CTX.get("tenant_id") or 0)
-            if not _cb_allows(tid, "lusha"):
-                lusha_contacts = []
-            else:
-                async with AsyncLushaClient() as lc:
-                    async def _call1():
-                        return await lc.search_and_enrich_contacts(
-                            company_name=state.get("company_name") or "",
-                            company_domain=company_domain,
-                            country=data.get("hq_country"),
-                            titles=LUSHA_PREFERRED_TITLES,
-                            limit=15,
-                        )
-                    try:
-                        lusha_contacts = await with_retry(_call1, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
-                        _VENDOR_COUNTERS["lusha_lookups"] += 1
-                        _obs_vendor("lusha", calls=1)
-                        if tid:
-                            _CB.on_success(tid, "lusha")
-                    except Exception:
-                        if tid:
-                            _CB.on_error(tid, "lusha")
-                        lusha_contacts = []
-                    if not lusha_contacts:
-                        async def _call2():
-                            return await lc.search_and_enrich_contacts(
-                                company_name=state.get("company_name") or "",
-                                company_domain=company_domain,
-                                country=data.get("hq_country"),
-                                titles=None,
-                                limit=15,
-                            )
-                        try:
-                            lusha_contacts = await with_retry(_call2, retry_on=(Exception,), policy=_DEFAULT_RETRY_POLICY)
-                            _VENDOR_COUNTERS["lusha_lookups"] += 1
-                            _obs_vendor("lusha", calls=1)
-                            if tid:
-                                _CB.on_success(tid, "lusha")
-                        except Exception:
-                            if tid:
-                                _CB.on_error(tid, "lusha")
-                            lusha_contacts = []
-            added_emails: List[str] = []
-            added_phones: List[str] = []
-            for c in lusha_contacts or []:
-                for key in ("emails", "emailAddresses", "email_addresses"):
-                    val = c.get(key)
-                    if isinstance(val, list):
-                        for e in val:
-                            if isinstance(e, dict):
-                                v = e.get("email") or e.get("value")
-                                if v:
-                                    added_emails.append(v)
-                            elif isinstance(e, str):
-                                added_emails.append(e)
-                    elif isinstance(val, str):
-                        added_emails.append(val)
-                for key in ("phones", "phoneNumbers", "phone_numbers"):
-                    val = c.get(key)
-                    if isinstance(val, list):
-                        for p in val:
-                            if isinstance(p, dict):
-                                v = (
-                                    p.get("internationalNumber")
-                                    or p.get("number")
-                                    or p.get("value")
-                                )
-                                if v:
-                                    added_phones.append(v)
-                            elif isinstance(p, str):
-                                added_phones.append(p)
-                    elif isinstance(val, str):
-                        added_phones.append(val)
-
-            def _unique(seq: List[str]) -> List[str]:
-                seen: set[str] = set()
-                out: List[str] = []
-                for x in seq:
-                    if not x or x in seen:
-                        continue
-                    seen.add(x)
-                    out.append(x)
-                return out
-
-            if added_emails or added_phones:
-                data["email"] = _unique((data.get("email") or []) + added_emails)
-                data["phone_number"] = _unique(
-                    (data.get("phone_number") or []) + added_phones
-                )
-                logger.info(
-                    f"       ↳ Lusha contacts fallback added {len(added_emails)} emails, {len(added_phones)} phones"
-                )
-            try:
-                ins, upd = upsert_contacts_from_lusha(company_id, lusha_contacts or [])
-                logger.info(
-                    f"       ↳ Lusha contacts upserted: inserted={ins}, updated={upd}"
-                )
-            except Exception as _upsert_exc:
-                logger.warning("       ↳ Lusha contacts upsert error", exc_info=True)
-                try:
-                    (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
-                except Exception:
-                    pass
-            state["lusha_used"] = True
-    except Exception as _lusha_contacts_exc:
-        logger.warning("       ↳ Lusha contacts fallback failed", exc_info=True)
-        try:
-            (state.setdefault("degraded_reasons", [])) .append("LUSHA_FAIL")
-        except Exception:
-            pass
+        # Lusha contacts fallback removed
+    except Exception:
+        # Keep state consistent on unexpected errors
+        pass
     state["data"] = data
     return state
 
@@ -3334,9 +2961,7 @@ async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
                 needs_contacts = total_contacts == 0
                 missing_names = not has_named
                 missing_founder = not founder_present
-                prefer_apify = (
-                    ENABLE_APIFY_LINKEDIN or (not ENABLE_LUSHA_FALLBACK) or (not LUSHA_API_KEY)
-                )
+                prefer_apify = ENABLE_APIFY_LINKEDIN
                 tid = int(_RUN_CTX.get("tenant_id") or 0)
                 # Do not force repeatedly if an attempt has already occurred in this run
                 prior_attempts = 0

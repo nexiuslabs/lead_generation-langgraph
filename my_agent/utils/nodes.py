@@ -44,6 +44,12 @@ except Exception:  # pragma: no cover - agent bundle optional
 
 
 from .llm import call_llm_json
+from langchain_core.runnables.config import var_child_runnable_config  # to read LangGraph run config
+try:
+    # Available when running under LangGraph Server; provides request/headers/thread metadata
+    from langgraph_api.metadata import get_current_metadata as _lg_get_current_metadata  # type: ignore
+except Exception:  # pragma: no cover
+    _lg_get_current_metadata = None  # type: ignore
 from .state import OrchestrationState, ProfileState
 
 try:  # optional dependency (network / vendor credentials)
@@ -535,6 +541,29 @@ def _persist_company_profile_state(state: OrchestrationState, profile: Dict[str,
         logger.warning("Failed to persist company profile", exc_info=True)
 
 
+def _normalized_icp_for_persistence(icp_profile: Dict[str, Any]) -> Dict[str, Any]:
+    profile = dict(icp_profile or {})
+
+    def _copy_list(src: str, dest: str) -> None:
+        if profile.get(dest):
+            return
+        raw = profile.get(src)
+        if isinstance(raw, list):
+            cleaned = [str(v).strip() for v in raw if isinstance(v, str) and v.strip()]
+        elif isinstance(raw, str) and raw.strip():
+            cleaned = [raw.strip()]
+        else:
+            cleaned = []
+        if cleaned:
+            profile[dest] = cleaned
+
+    _copy_list("company_sizes", "size_bands")
+    _copy_list("persona_titles", "buyer_titles")
+    _copy_list("buying_triggers", "triggers")
+    _copy_list("regions", "geos")
+    return profile
+
+
 def _persist_icp_profile_state(state: OrchestrationState, icp_profile: Dict[str, Any], seed_urls: List[str]) -> None:
     ctx = state.get("entry_context") or {}
     tenant_id = ctx.get("tenant_id") or state.get("tenant_id")
@@ -542,7 +571,14 @@ def _persist_icp_profile_state(state: OrchestrationState, icp_profile: Dict[str,
         return
     persist_state = {"tenant_id": tenant_id}
     try:
-        _persist_icp_profile_sync(persist_state, dict(icp_profile or {}), confirmed=True, seed_urls=seed_urls, user_confirmed=False)
+        normalized_profile = _normalized_icp_for_persistence(icp_profile)
+        _persist_icp_profile_sync(
+            persist_state,
+            normalized_profile,
+            confirmed=True,
+            seed_urls=seed_urls,
+            user_confirmed=False,
+        )
     except Exception:
         logger.warning("Failed to persist ICP profile", exc_info=True)
 
@@ -1042,6 +1078,87 @@ User text: {clean!r}
 
 async def ingest_message(state: OrchestrationState) -> OrchestrationState:
     """Normalize incoming payloads using an LLM (fallback to heuristics)."""
+    # Best-effort: hydrate tenant context from LangGraph run config / SDK context / thread metadata
+    try:
+        cfg = var_child_runnable_config.get() or {}
+        conf = cfg.get("configurable", {}) if isinstance(cfg, dict) else {}
+        # Common places the SDK/server pass tenant metadata
+        meta = {}
+        try:
+            # sometimes nested under configurable.metadata
+            m = conf.get("metadata") or {}
+            if isinstance(m, dict):
+                meta.update(m)
+        except Exception:
+            pass
+        try:
+            # updates may carry context from the client submit
+            c = conf.get("context") or {}
+            if isinstance(c, dict):
+                meta.update(c)
+        except Exception:
+            pass
+        # Some deployments may put tenant directly at top-level configurable
+        for key in ("tenant_id", "tenantId"):
+            if key in conf and conf.get(key) is not None:
+                meta.setdefault("tenant_id", conf.get(key))
+        tid = meta.get("tenant_id")
+        if tid is not None:
+            try:
+                tid_int = int(str(tid).strip())
+                ctx0 = state.get("entry_context") or {}
+                if ctx0.get("tenant_id") != tid_int:
+                    ctx0["tenant_id"] = tid_int
+                    state["entry_context"] = ctx0
+                state["tenant_id"] = tid_int
+                _log_step("tenant_context", source="configurable/context/metadata", tenant_id=tid_int)
+            except Exception:
+                pass
+        # Optional: pick up notify_email if the client provided it in context
+        em = meta.get("notify_email") or meta.get("user_email")
+        if isinstance(em, str) and "@" in em:
+            ctx0 = state.get("entry_context") or {}
+            if not ctx0.get("notify_email"):
+                ctx0["notify_email"] = em.strip()
+                state["entry_context"] = ctx0
+        # Finally: check LangGraph Server request metadata for X-Tenant-ID header or thread metadata
+        if _lg_get_current_metadata is not None and (state.get("tenant_id") is None):
+            try:
+                md = _lg_get_current_metadata() or {}
+                headers = {}
+                # Typical shapes: { headers: {...} } or { request: { headers: {...} } }
+                if isinstance(md.get("headers"), dict):
+                    headers = md.get("headers")  # type: ignore[assignment]
+                elif isinstance(md.get("request"), dict) and isinstance(md["request"].get("headers"), dict):  # type: ignore[index]
+                    headers = md["request"]["headers"]  # type: ignore[index,assignment]
+                tid_hdr = None
+                if headers:
+                    # Lower/upper variants depending on server
+                    tid_hdr = headers.get("x-tenant-id") or headers.get("X-Tenant-ID")
+                # Thread metadata (if present)
+                if tid_hdr is None:
+                    tmeta = None
+                    if isinstance(md.get("thread"), dict):
+                        t = md.get("thread")  # type: ignore[assignment]
+                        tmeta = t.get("metadata") if isinstance(t.get("metadata"), dict) else None  # type: ignore[index]
+                    elif isinstance(md.get("metadata"), dict):
+                        tmeta = md.get("metadata")  # type: ignore[assignment]
+                    if tmeta and isinstance(tmeta.get("tenant_id"), (str, int)):
+                        tid_hdr = tmeta.get("tenant_id")
+                if tid_hdr is not None:
+                    tid_int = int(str(tid_hdr).strip())
+                    ctx0 = state.get("entry_context") or {}
+                    if ctx0.get("tenant_id") != tid_int:
+                        ctx0["tenant_id"] = tid_int
+                        state["entry_context"] = ctx0
+                    state["tenant_id"] = tid_int
+                    _log_step("tenant_context", source="lg_metadata(headers/thread)", tenant_id=tid_int)
+            except Exception:
+                pass
+    except Exception:
+        # Never fail ingestion due to config inspection
+        pass
+
     incoming = str(state.get("input") or "").strip()
     role = state.get("input_role", "user")
     if incoming:
@@ -1283,6 +1400,95 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
         if _ensure_company_summary(state, profile, state.get("messages", [])[-8:]):
             company_profile = profile.get("company_profile") or {}
     explanation = None
+    if BG_DISCOVERY_AND_ENRICH and company_ready and icp_ready:
+        # Ensure tenant_id is set; if missing, attempt to read from LangGraph server metadata
+        tenant_id = _get_tenant_id(state) or 0
+        if not tenant_id and _lg_get_current_metadata is not None:
+            try:
+                md = _lg_get_current_metadata() or {}
+                headers = {}
+                if isinstance(md.get("headers"), dict):
+                    headers = md.get("headers")  # type: ignore[assignment]
+                elif isinstance(md.get("request"), dict) and isinstance(md["request"].get("headers"), dict):  # type: ignore[index]
+                    headers = md["request"]["headers"]  # type: ignore[index,assignment]
+                tid = headers.get("x-tenant-id") or headers.get("X-Tenant-ID")
+                if tid is None:
+                    tmeta = None
+                    if isinstance(md.get("thread"), dict):
+                        t = md.get("thread")  # type: ignore[assignment]
+                        tmeta = t.get("metadata") if isinstance(t.get("metadata"), dict) else None  # type: ignore[index]
+                    elif isinstance(md.get("metadata"), dict):
+                        tmeta = md.get("metadata")  # type: ignore[assignment]
+                    if tmeta and isinstance(tmeta.get("tenant_id"), (str, int)):
+                        tid = tmeta.get("tenant_id")
+                if tid is not None:
+                    try:
+                        tid_int = int(str(tid).strip())
+                        ctx2 = state.get("entry_context") or {}
+                        ctx2["tenant_id"] = tid_int
+                        state["entry_context"] = ctx2
+                        state["tenant_id"] = tid_int
+                        tenant_id = tid_int
+                        _log_step("tenant_context", source="journey_guard/lg_metadata", tenant_id=tid_int)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # Resolve notify email using policy similar to API endpoint
+        def _resolve_email() -> Optional[str]:
+            try:
+                ctx2 = state.get("entry_context") or {}
+                em = (ctx2.get("notify_email") or ctx2.get("user_email"))
+                if em and isinstance(em, str) and "@" in em:
+                    return em.strip()
+            except Exception:
+                pass
+            try:
+                if EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL and tenant_id:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT user_id FROM tenant_users WHERE tenant_id=%s LIMIT 5", (int(tenant_id),))
+                        for r in cur.fetchall() or []:
+                            u = r[0] if r and r[0] is not None else None
+                            if u and "@" in str(u):
+                                return str(u).strip()
+            except Exception:
+                pass
+            try:
+                if DEFAULT_NOTIFY_EMAIL and "@" in str(DEFAULT_NOTIFY_EMAIL):
+                    return str(DEFAULT_NOTIFY_EMAIL).strip()
+            except Exception:
+                pass
+            return None
+
+        notify_email = _resolve_email()
+        job_id = None
+        try:
+            if _enqueue_unified is not None and tenant_id:
+                res = _enqueue_unified(int(tenant_id), notify_email=notify_email)
+                job_id = (res or {}).get("job_id")
+        except Exception:
+            job_id = None
+        if tenant_id and job_id:
+            msg = (
+                f"Thanks — I’ve queued background discovery and enrichment for your ICP. "
+                f"I’ll email the results to you at {notify_email or 'your address on file'} when it finishes. "
+                f"Job ID: {job_id}."
+            )
+        elif not tenant_id:
+            msg = (
+                "I couldn’t resolve your tenant session, so I can’t queue the background job yet. "
+                "Please sign in via the app and try again."
+            )
+        else:
+            msg = (
+                f"I attempted to queue the background discovery and enrichment job but couldn’t confirm the job id. "
+                f"Please try again or contact support."
+            )
+        profile["outstanding_prompts"] = [msg]
+        _append_message(state, "assistant", msg)
+        _set_status(state, "journey_guard", msg)
+        return state
+
     if journey_ready:
         profile["outstanding_prompts"] = []
         profile["awaiting_discovery_confirmation"] = False
@@ -1361,20 +1567,23 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                         for d in candidates
                     ]
                 _cache_discovery_details(state, discovery_state, candidate_details)
-                table = _format_candidate_table(candidate_details, limit=50)
-                discovery_state["web_candidate_table"] = table
-                found_count = min(50, len(candidate_details))
-                if candidate_details and not discovery_state.get("staging_persisted"):
-                    _persist_discovery_candidates(state, candidate_details)
-                    discovery_state["staging_persisted"] = True
-                prompt_parts.append(
-                    f"I found {len(candidates)} ICP candidate websites. Here's the latest {found_count} with match details:\n{table}"
-                )
-                prompt_parts.append(
-                    "\n\nReady for me to enrich the best 10 now? Reply 'enrich 10' (or similar) to proceed, "
-                    "or say 'retry discovery' and I'll search again."
-                )
-                profile["awaiting_enrichment_confirmation"] = True
+                if CHAT_DISCOVERY_ENABLED:
+                    table = _format_candidate_table(candidate_details, limit=50)
+                    discovery_state["web_candidate_table"] = table
+                    found_count = min(50, len(candidate_details))
+                    if candidate_details and not discovery_state.get("staging_persisted"):
+                        _persist_discovery_candidates(state, candidate_details)
+                        discovery_state["staging_persisted"] = True
+                    prompt_parts.append(
+                        f"I found {len(candidates)} ICP candidate websites. Here's the latest {found_count} with match details:\n{table}"
+                    )
+                    prompt_parts.append(
+                        "\n\nReady for me to enrich the best 10 now? Reply 'enrich 10' (or similar) to proceed, "
+                        "or say 'retry discovery' and I'll search again."
+                    )
+                    profile["awaiting_enrichment_confirmation"] = True
+                else:
+                    prompt_parts.append("Discovery is ready. Continuing with background processing in this workspace.")
             else:
                 prompt_parts.append("I couldn't find solid ICP candidates. Say 'retry discovery' to search again or adjust your ICP details.")
                 profile["awaiting_enrichment_confirmation"] = False
@@ -1856,6 +2065,24 @@ def _normalize_url(url: str) -> str:
         return base.rstrip("/")
     except Exception:
         return url.rstrip("/")
+
+try:
+    from src.settings import (
+        BG_DISCOVERY_AND_ENRICH,
+        CHAT_DISCOVERY_ENABLED,
+        DEFAULT_NOTIFY_EMAIL,
+        EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL,
+    )
+except Exception:  # pragma: no cover
+    BG_DISCOVERY_AND_ENRICH = False  # type: ignore
+    CHAT_DISCOVERY_ENABLED = False  # type: ignore
+    DEFAULT_NOTIFY_EMAIL = None  # type: ignore
+    EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL = True  # type: ignore
+
+try:
+    from src.jobs import enqueue_icp_discovery_enrich as _enqueue_unified
+except Exception:  # pragma: no cover
+    _enqueue_unified = None  # type: ignore
 
 
 def _extract_urls(text: str) -> List[str]:

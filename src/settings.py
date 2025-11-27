@@ -149,29 +149,7 @@ LLM_CHUNK_TIMEOUT_S = float(os.getenv("LLM_CHUNK_TIMEOUT_S", "30") or 30)
 # Timeout for deterministic merge step during llm_extract (seconds)
 MERGE_DETERMINISTIC_TIMEOUT_S = float(os.getenv("MERGE_DETERMINISTIC_TIMEOUT_S", "10") or 10)
 
-# --- Lusha configuration -------------------------------------------------------
-# Minimal flags and keys for optional Lusha fallbacks
-LUSHA_API_KEY = os.getenv("LUSHA_API_KEY", "")
-LUSHA_BASE_URL = os.getenv("LUSHA_BASE_URL", "https://api.lusha.com")
-
-# Toggle to enable/disable Lusha fallback without redeploying
-# Default disabled now that Apify replaces Lusha in the pipeline
-ENABLE_LUSHA_FALLBACK = os.getenv("ENABLE_LUSHA_FALLBACK", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-# Titles we prefer when using Lusha to search contacts
-LUSHA_PREFERRED_TITLES = [
-    t.strip()
-    for t in os.getenv(
-        "LUSHA_PREFERRED_TITLES",
-        "founder,co-founder,ceo,cto,cfo,owner,director,head of,principal",
-    ).split(",")
-    if t.strip()
-]
+## Lusha integration was removed. All Lusha-related flags and keys have been deleted.
 
 # Persist full merged crawl corpus (Tavily) for transparency (dev default off)
 PERSIST_CRAWL_CORPUS = os.getenv("PERSIST_CRAWL_CORPUS", "false").lower() in (
@@ -479,6 +457,48 @@ except Exception:
 
 # Optional Prometheus exporter toggle (metrics are no-op when disabled)
 PROM_ENABLE = os.getenv("PROM_ENABLE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# --- Jina Deep Research (discovery + enrichment) ------------------------------
+# Toggle Deep Research usage for discovery and enrichment flows
+ENABLE_JINA_DEEP_RESEARCH_DISCOVERY = os.getenv("ENABLE_JINA_DEEP_RESEARCH_DISCOVERY", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ENABLE_JINA_DEEP_RESEARCH_ENRICHMENT = os.getenv("ENABLE_JINA_DEEP_RESEARCH_ENRICHMENT", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+try:
+    JINA_DEEP_RESEARCH_TIMEOUT_S = float(os.getenv("JINA_DEEP_RESEARCH_TIMEOUT_S", "18.0") or 18.0)
+except Exception:
+    JINA_DEEP_RESEARCH_TIMEOUT_S = 18.0
+
+# Background-only discovery+enrichment after ICP confirmation
+BG_DISCOVERY_AND_ENRICH = os.getenv("BG_DISCOVERY_AND_ENRICH", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Optional guards for legacy chat paths
+CHAT_DISCOVERY_ENABLED = os.getenv("CHAT_DISCOVERY_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+CHAT_ENRICHMENT_ENABLED = os.getenv("CHAT_ENRICHMENT_ENABLED", "false").lower() in (
     "1",
     "true",
     "yes",

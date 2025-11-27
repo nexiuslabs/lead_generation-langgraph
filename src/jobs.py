@@ -289,6 +289,226 @@ async def run_manual_research_enrich(job_id: int) -> None:
         log.info("{\"job\":\"manual_research_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
 
 
+def enqueue_icp_discovery_enrich(tenant_id: int, notify_email: Optional[str] = None) -> dict:
+    """Queue a unified background job that performs ICP discovery (50) and enrichment end-to-end.
+
+    Params are stored in background_jobs.params with optional notify_email.
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'icp_discovery_enrich','queued', %s) RETURNING job_id",
+            (tenant_id, Json({**({"notify_email": notify_email} if notify_email else {})})),
+        )
+        row = cur.fetchone()
+        jid = int(row[0]) if row and row[0] is not None else 0
+        try:
+            if jid:
+                payload = json.dumps({"job_id": jid, "type": "icp_discovery_enrich"})
+                cur.execute("NOTIFY bg_jobs, %s", (payload,))
+        except Exception:
+            pass
+        return {"job_id": jid}
+
+
+async def run_icp_discovery_enrich(job_id: int) -> None:
+    """Run discovery (50 candidates) then enrichment for each; export + email on completion.
+
+    Skeleton implementation wiring existing pipelines; discovery uses Deep Research client when configured.
+    """
+    import time
+    from src.obs import (
+        begin_run as _begin_run,
+        finalize_run as _finalize_run,
+        stage_timer as _stage_timer,
+        log_event as _log_event,
+        write_summary as _write_summary,
+        persist_manifest as _persist_manifest,
+    )
+    from src.services.jina_deep_research import deep_research_query
+    from src.lead_scoring import lead_scoring_agent
+    from src.notifications.agentic_email import agentic_send_results
+    from src.settings import ENABLE_JINA_DEEP_RESEARCH_DISCOVERY
+    t0 = time.perf_counter()
+    log.info("{\"job\":\"icp_discovery_enrich\",\"phase\":\"start\",\"job_id\":%s}", job_id)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE background_jobs SET status='running', started_at=now() WHERE job_id=%s", (job_id,))
+        cur.execute("SELECT tenant_id, params FROM background_jobs WHERE job_id=%s", (job_id,))
+        row = cur.fetchone()
+        tenant_id = int(row[0]) if row and row[0] is not None else None
+        params = (row and row[1]) or {}
+    if not tenant_id:
+        return
+    notify_email = None
+    try:
+        notify_email = params.get("notify_email") if isinstance(params, dict) else None
+    except Exception:
+        notify_email = None
+
+    run_id = _begin_run(tenant_id)
+    try:
+        # 1) Discovery via Deep Research (simple seed = tenant name or fallback)
+        # Load a seed/company name from tenant profile or companies table as a placeholder
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT name FROM tenants WHERE tenant_id=%s", (tenant_id,))
+            row = cur.fetchone()
+            seed = (row and row[0]) or f"tenant_{tenant_id}"
+        icp_context = {"industries": [], "buyer_titles": [], "geo": []}
+        domains: List[str] = []
+        with _stage_timer(run_id, tenant_id, "bg_discovery", total_inc=1):
+            if ENABLE_JINA_DEEP_RESEARCH_DISCOVERY:
+                tdr = time.perf_counter()
+                pack = deep_research_query(str(seed), icp_context)
+                domains = list(pack.get("domains") or [])
+                try:
+                    _log_event(
+                        run_id,
+                        tenant_id,
+                        "bg_discovery",
+                        event="dr_query",
+                        status="ok",
+                        duration_ms=int((time.perf_counter() - tdr) * 1000),
+                        extra={"domains": len(domains)},
+                    )
+                except Exception:
+                    pass
+            # persist into staging_global_companies
+            if domains:
+                with get_conn() as conn, conn.cursor() as cur:
+                    for d in domains[:50]:
+                        try:
+                            cur.execute(
+                                "INSERT INTO staging_global_companies(tenant_id, domain, ai_metadata) VALUES (%s,%s,%s)",
+                                (tenant_id, d, Json({"provenance": {"source": "jina_deep_research"}})),
+                            )
+                        except Exception:
+                            continue
+        # 2) Enrichment per company_id resolved by domain (best-effort)
+        processed = 0
+        # Create minimal company rows if not present
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT domain FROM staging_global_companies WHERE tenant_id=%s ORDER BY id ASC LIMIT 50",
+                (tenant_id,),
+            )
+            stage_domains = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+        company_ids: List[int] = []
+        with get_conn() as conn, conn.cursor() as cur:
+            for d in stage_domains:
+                try:
+                    cur.execute("SELECT company_id FROM companies WHERE website_domain=%s LIMIT 1", (d,))
+                    r = cur.fetchone()
+                    if r and r[0]:
+                        company_ids.append(int(r[0]))
+                    else:
+                        cur.execute(
+                            "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,now()) RETURNING company_id",
+                            (d.split(".")[0].title(), d),
+                        )
+                        rr = cur.fetchone()
+                        if rr and rr[0]:
+                            company_ids.append(int(rr[0]))
+                except Exception:
+                    continue
+        # Persist manifest early for traceability
+        try:
+            _persist_manifest(run_id, tenant_id, company_ids)
+        except Exception:
+            pass
+        # Run enrichment for each
+        if enrich_company_with_tavily is None:
+            raise RuntimeError("enrich unavailable")
+        with _stage_timer(run_id, tenant_id, "bg_enrich_run", total_inc=len(company_ids)):
+            for cid in company_ids:
+                t1 = time.perf_counter()
+                try:
+                    await enrich_company_with_tavily(cid, search_policy="require_existing")
+                    processed += 1
+                    _log_event(run_id, tenant_id, "bg_enrich_run", event="company", status="ok", company_id=cid, duration_ms=int((time.perf_counter()-t1)*1000))
+                except Exception as e:
+                    _log_event(run_id, tenant_id, "bg_enrich_run", event="company", status="error", company_id=cid, error_code=type(e).__name__)
+                    continue
+        # Scoring for all enriched companies (best-effort)
+        try:
+            if company_ids:
+                tsc = time.perf_counter()
+                scoring_state = {
+                    "candidate_ids": company_ids,
+                    "lead_features": [],
+                    "lead_scores": [],
+                    "icp_payload": {},
+                }
+                await lead_scoring_agent.ainvoke(scoring_state)
+                try:
+                    _log_event(
+                        run_id,
+                        tenant_id,
+                        "scoring",
+                        event="score_batch",
+                        status="ok",
+                        duration_ms=int((time.perf_counter() - tsc) * 1000),
+                        extra={"companies": len(company_ids)},
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Export to Odoo (best-effort)
+        try:
+            rows: list[tuple] = []
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT company_id, name, uen FROM companies WHERE company_id = ANY(%s)",
+                    (company_ids,),
+                )
+                rows = cur.fetchall() or []
+            if rows:
+                texp = time.perf_counter()
+                await _odoo_export_for_ids(tenant_id, rows)
+                try:
+                    _log_event(
+                        run_id,
+                        tenant_id,
+                        "odoo_export",
+                        event="export_batch",
+                        status="ok",
+                        duration_ms=int((time.perf_counter() - texp) * 1000),
+                        extra={"companies": len(rows)},
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Email notification (best-effort)
+        try:
+            if notify_email:
+                t2 = time.perf_counter()
+                res = await agentic_send_results(notify_email, tenant_id, limit=500)
+                _log_event(run_id, tenant_id, "email_notify", event="send", status=str(res.get("status") or "ok"), duration_ms=int((time.perf_counter()-t2)*1000), extra={"to": notify_email})
+        except Exception:
+            pass
+        # Run summary
+        try:
+            _write_summary(run_id, tenant_id, candidates=len(company_ids), processed=processed, batches=1)
+        except Exception:
+            pass
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
+                (processed, len(company_ids), job_id),
+            )
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("{\"job\":\"icp_discovery_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
+    except Exception as e:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE background_jobs SET status='error', error=%s, ended_at=now() WHERE job_id=%s",
+                (str(e), job_id),
+            )
+        log.exception("icp_discovery_enrich failed: %s", e)
+    finally:
+        _finalize_run(run_id, status="succeeded")
+
+
 def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int], notify_email: Optional[str] = None) -> dict:
     """Queue background enrichment for next‑40 web_discovery preview companies.
 
@@ -382,10 +602,9 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                     pages = final_state.get("extracted_pages") if isinstance(final_state, dict) else None
                     chunks = final_state.get("chunks") if isinstance(final_state, dict) else None
                     data = final_state.get("data") if isinstance(final_state, dict) else None
-                    lusha = final_state.get("lusha_used") if isinstance(final_state, dict) else None
                     degraded = final_state.get("degraded_reasons") if isinstance(final_state, dict) else None
                     log.info(
-                        "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"result\",\"job_id\":%s,\"tenant_id\":%s,\"company_id\":%s,\"completed\":%s,\"error\":%s,\"domains\":%s,\"pages\":%s,\"chunks\":%s,\"emails\":%s,\"lusha_used\":%s,\"degraded\":%s}",
+                        "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"result\",\"job_id\":%s,\"tenant_id\":%s,\"company_id\":%s,\"completed\":%s,\"error\":%s,\"domains\":%s,\"pages\":%s,\"chunks\":%s,\"emails\":%s,\"degraded\":%s}",
                         job_id,
                         tenant_id,
                         int(cid),
@@ -395,7 +614,6 @@ async def run_web_discovery_bg_enrich(job_id: int) -> None:
                         (len(pages) if isinstance(pages, list) else 0),
                         (len(chunks) if isinstance(chunks, list) else 0),
                         (len((data or {}).get("email", [])) if isinstance(data, dict) else 0),
-                        bool(lusha),
                         (json.dumps(degraded) if degraded is not None else "null"),
                     )
                 except Exception:

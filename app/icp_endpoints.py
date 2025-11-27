@@ -24,6 +24,8 @@ from src.jobs import (
 )
 from src.enrichment import enrich_company_with_tavily  # async enrich by company_id
 from src.chat_events import emit as emit_chat_event
+from src.settings import DEFAULT_NOTIFY_EMAIL, EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL
+from src.jobs import enqueue_icp_discovery_enrich
 
 ICP_DISCOVERY_CONFIRMATION_PROMPT = (
     "Ready for me to start ICP discovery and refresh the micro-ICP suggestions? Reply **start discovery** (or tell me what to adjust)."
@@ -52,6 +54,41 @@ def _resolve_tenant_id(req: Request, x_tenant_id: Optional[str]) -> Optional[int
             return int(row[0]) if row and row[0] is not None else None
     except Exception:
         return None
+
+
+def _resolve_notify_email(req: Request, x_notify_email: Optional[str], tenant_id: Optional[int]) -> Optional[str]:
+    # 1) Header override
+    if x_notify_email and "@" in str(x_notify_email):
+        return x_notify_email.strip()
+    # 2) JWT/auth context email
+    try:
+        ctx = getattr(req.state, "auth_ctx", {}) or {}
+        em = ctx.get("email") or ctx.get("user_email")
+        if em and "@" in str(em):
+            return str(em).strip()
+    except Exception:
+        pass
+    # 3) Dev guard: tenant_users.user_id as email if contains '@'
+    try:
+        if EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL and tenant_id:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM tenant_users WHERE tenant_id=%s LIMIT 5",
+                    (int(tenant_id),),
+                )
+                for r in cur.fetchall() or []:
+                    u = r[0] if r and r[0] is not None else None
+                    if u and "@" in str(u):
+                        return str(u).strip()
+    except Exception:
+        pass
+    # 4) DEFAULT_NOTIFY_EMAIL
+    try:
+        if DEFAULT_NOTIFY_EMAIL and "@" in str(DEFAULT_NOTIFY_EMAIL):
+            return DEFAULT_NOTIFY_EMAIL.strip()
+    except Exception:
+        pass
+    return None
 
 
 def _save_icp_rule(tid: int, payload: Dict[str, Any], name: str = "Default ICP") -> None:
@@ -134,6 +171,53 @@ async def post_intake(
         except Exception:
             pass
         return {"status": "queued", "response_id": resp_id}
+
+
+@router.post("/enqueue/discovery-enrich")
+async def post_enqueue_discovery_enrich(
+    req: Request,
+    user=Depends(_auth_dep),
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
+    x_notify_email: Optional[str] = Header(default=None, alias="X-Notify-Email"),
+):
+    tid = _resolve_tenant_id(req, x_tenant_id)
+    if tid is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    email = _resolve_notify_email(req, x_notify_email, tid)
+    try:
+        res = enqueue_icp_discovery_enrich(int(tid), notify_email=email)
+        return {"status": "queued", "job_id": res.get("job_id"), "notify_email": email}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
+
+
+@router.get("/jobs/{job_id}")
+async def get_job_status(job_id: int, req: Request, user=Depends(_auth_dep)):
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, job_type, status, processed, total, error, params, started_at, ended_at FROM background_jobs WHERE job_id=%s",
+                (int(job_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="job not found")
+            job = {
+                "job_id": row[0],
+                "job_type": row[1],
+                "status": row[2],
+                "processed": row[3],
+                "total": row[4],
+                "error": row[5],
+                "params": row[6],
+                "started_at": row[7],
+                "ended_at": row[8],
+            }
+            return job
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"status error: {e}")
 
 
 @router.get("/suggestions", response_model=List[SuggestionCard])

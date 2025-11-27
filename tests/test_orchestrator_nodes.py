@@ -639,3 +639,17 @@ def test_format_icp_profile_returns_markdown():
     assert "**Summary**" in rendered
     assert "- F&B" in rendered
     assert "**Company Sizes**" in rendered
+
+
+def test_normalized_icp_profile_maps_synonyms():
+    profile = {
+        "company_sizes": ["50-250"],
+        "persona_titles": ["Ops Lead"],
+        "buying_triggers": ["Opening outlets"],
+        "regions": ["Singapore"],
+    }
+    normalized = nodes._normalized_icp_for_persistence(profile)
+    assert normalized["size_bands"] == ["50-250"]
+    assert normalized["buyer_titles"] == ["Ops Lead"]
+    assert normalized["triggers"] == ["Opening outlets"]
+    assert normalized["geos"] == ["Singapore"]

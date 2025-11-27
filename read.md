@@ -328,7 +328,7 @@ If your environment disallows writing to `/tmp`, configure a tmpdir for `pytest`
   - `SCHED_DAILY_CAP_PER_TENANT` (default 20)
   - `SCHED_COMPANY_BATCH_SIZE` (per-batch company count)
   - Tavily cap (coarse): `TAVILY_MAX_QUERIES` (units ≈ search + crawl + extract calls)
-  - Contacts cap (coarse): `LUSHA_MAX_CONTACT_LOOKUPS`
+  - Contacts cap (coarse): `APIFY_DAILY_CAP`
   - ZeroBounce caps: `ZEROBOUNCE_MAX_VERIFICATIONS`, `ZEROBOUNCE_BATCH_SIZE`
 - Admin kickoff HTTP:
   - Run all tenants: `POST /admin/runs/nightly`

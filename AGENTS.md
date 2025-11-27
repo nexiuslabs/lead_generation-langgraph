@@ -155,7 +155,7 @@ Key Env Vars (src/settings.py)
 - Optional: APIFY_DEBUG_LOG_ITEMS=true to log a small sample of Apify dataset items and normalized contacts. Control size via APIFY_LOG_SAMPLE_SIZE (default 3).
 - Optional: APIFY_USE_COMPANY_EMPLOYEE_CHAIN=true to use the chain company-by-name → employees → profile-details.
 - APIFY_COMPANY_ACTOR_ID=harvestapi~linkedin-company, APIFY_EMPLOYEES_ACTOR_ID=harvestapi~linkedin-company-employees, APIFY_LINKEDIN_ACTOR_ID=dev_fusion~linkedin-profile-scraper
-- ENABLE_LUSHA_FALLBACK=false (optional; set true only if you want Lusha as a fallback), LUSHA_API_KEY? (optional)
+ 
 - ICP_RULE_NAME=default, CRAWL_MAX_PAGES=6, EXTRACT_CORPUS_CHAR_LIMIT=35000
 - ODOO_POSTGRES_DSN (or resolve per-tenant via odoo_connections)
 
@@ -187,7 +187,7 @@ Scheduler & Cron
 - Limits & caps:
   - `SCHED_DAILY_CAP_PER_TENANT` (default 20 in .env)
   - `SCHED_COMPANY_BATCH_SIZE` (per-batch company count; default 1)
-  - Vendor caps (coarse): `TAVILY_MAX_QUERIES`, `APIFY_DAILY_CAP`, `LUSHA_MAX_CONTACT_LOOKUPS` (only if Lusha fallback enabled)
+  - Vendor caps (coarse): `TAVILY_MAX_QUERIES`, `APIFY_DAILY_CAP`
   - ZeroBounce: `ZEROBOUNCE_MAX_VERIFICATIONS`, `ZEROBOUNCE_BATCH_SIZE`
 
 Admin Kickoff Endpoint

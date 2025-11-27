@@ -86,13 +86,22 @@ async def handle_turn(payload: Dict[str, Any], config: RunnableConfig | None = N
     role = payload.get("role", "user")
     thread_id = (config or {}).get("configurable", {}).get("thread_id") if config else None
     run_mode = str(payload.get("run_mode") or "chat_top10")
+    tenant_id = payload.get("tenant_id")
+    user_id = payload.get("user_id")
+    entry_context = {"thread_id": thread_id, "run_mode": run_mode}
+    if tenant_id is not None:
+        entry_context["tenant_id"] = tenant_id
+    if user_id is not None:
+        entry_context["user_id"] = user_id
     state: OrchestrationState = {
         "messages": [],
         "input": text,
         "input_role": role,
-        "entry_context": {"thread_id": thread_id, "run_mode": run_mode},
+        "entry_context": entry_context,
         "icp_payload": payload.get("icp_payload") or {},
     }
+    if tenant_id is not None:
+        state["tenant_id"] = tenant_id
     # Copy prior messages if provided
     prior_messages = payload.get("messages") or []
     for msg in prior_messages:
