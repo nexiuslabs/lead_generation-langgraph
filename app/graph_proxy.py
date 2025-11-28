@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
+from fastapi.responses import StreamingResponse
 import os
 import httpx
 import logging
@@ -38,12 +39,20 @@ async def _forward(request: Request, method: str, path: str) -> Response:
     headers: dict[str, str] = {}
     headers.update(_auth_headers())
     client_headers = request.headers
-    for name in ("content-type", "x-tenant-id", "cookie"):
+    for name in (
+        "content-type",
+        "x-tenant-id",
+        "cookie",
+        "authorization",
+        "accept",
+    ):
         v = client_headers.get(name)
         if v:
             headers[name] = v
     # Send request
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    timeout_s = float(os.getenv("GRAPH_PROXY_TIMEOUT_SECONDS", "0")) or 600.0
+    http_timeout = httpx.Timeout(timeout_s, read=timeout_s, write=timeout_s, connect=30.0)
+    async with httpx.AsyncClient(timeout=http_timeout, follow_redirects=True) as client:
         body = await request.body() if method.upper() not in ("GET", "HEAD") else None
         # Inject tenant context into run-start payloads so the graph can always resolve tenant_id
         try:
@@ -74,9 +83,80 @@ async def _forward(request: Request, method: str, path: str) -> Response:
             # Best-effort only; never block the proxy
             pass
         tenant_header = headers.get("x-tenant-id") or headers.get("X-Tenant-ID") or request.headers.get("x-tenant-id")
-        logger.info("graph_proxy forward method=%s path=%s tenant=%s", method.upper(), path, tenant_header)
-        resp = await client.request(method=method.upper(), url=target, headers=headers, content=body)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers)
+        logger.info(
+            "graph_proxy forward method=%s path=%s tenant=%s",
+            method.upper(),
+            path,
+            tenant_header,
+        )
+        req = client.build_request(
+            method=method.upper(),
+            url=target,
+            headers=headers,
+            content=body,
+        )
+        resp = await client.send(req, stream=True)
+        if "/runs/stream" in path:
+            logger.info(
+                "graph_proxy upstream response path=%s status=%s content-type=%s",
+                path,
+                resp.status_code,
+                resp.headers.get("content-type"),
+            )
+
+        hop_headers = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "transfer-encoding",
+            "upgrade",
+        }
+
+        def _headers(drop_content_length: bool) -> dict[str, str]:
+            excluded = set(hop_headers)
+            if drop_content_length:
+                excluded.add("content-length")
+            return {
+                key: value
+                for key, value in resp.headers.items()
+                if key.lower() not in excluded
+            }
+
+        content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+        is_event_stream = content_type == "text/event-stream"
+
+        if is_event_stream:
+            async def resp_iterator():
+                try:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+                except httpx.ReadError as exc:
+                    logger.warning(
+                        "graph_proxy stream closed early path=%s tenant=%s error=%s",
+                        path,
+                        tenant_header,
+                        exc,
+                    )
+                finally:
+                    await resp.aclose()
+
+            return StreamingResponse(
+                resp_iterator(),
+                status_code=resp.status_code,
+                headers=_headers(drop_content_length=True),
+                media_type=resp.headers.get("content-type"),
+            )
+
+        content = await resp.aread()
+        await resp.aclose()
+        return Response(
+            content=content,
+            status_code=resp.status_code,
+            headers=_headers(drop_content_length=False),
+        )
 
 
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
