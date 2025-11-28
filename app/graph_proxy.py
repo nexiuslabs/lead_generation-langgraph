@@ -49,6 +49,11 @@ async def _forward(request: Request, method: str, path: str) -> Response:
         v = client_headers.get(name)
         if v:
             headers[name] = v
+    # Ensure Accept header is present for stream endpoints
+    if "/runs/stream" in path:
+        acc = headers.get("accept")
+        if not acc or "text/event-stream" not in acc:
+            headers["accept"] = "text/event-stream"
     # Send request
     timeout_s = float(os.getenv("GRAPH_PROXY_TIMEOUT_SECONDS", "0")) or 600.0
     http_timeout = httpx.Timeout(timeout_s, read=timeout_s, write=timeout_s, connect=30.0)
