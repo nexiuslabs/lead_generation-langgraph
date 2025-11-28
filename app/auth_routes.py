@@ -2,9 +2,11 @@ from fastapi import APIRouter, Response, Request, HTTPException, BackgroundTasks
 import os
 import time
 import httpx
+from typing import Optional
 
 from app.auth import verify_jwt
 from app.onboarding import handle_first_login
+from app.odoo_connection_info import get_odoo_connection_info
 
 router = APIRouter(prefix="/auth", tags=["auth"]) 
 
@@ -73,6 +75,35 @@ def _set_session(resp: Response, access: str, refresh: str | None) -> None:
             max_age=30 * 24 * 3600,
             path="/",
         )
+
+
+def _coerce_int(value: object) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        raw = int(str(value).strip())
+        return raw
+    except (ValueError, TypeError):
+        return None
+
+
+async def _ensure_tenant_id(claims: dict, fallback_email: Optional[str]) -> Optional[int]:
+    # Honor tenant_id claim when present (normalize to int)
+    tid = _coerce_int(claims.get("tenant_id"))
+    if tid is not None:
+        claims["tenant_id"] = tid
+        return tid
+    email = fallback_email or claims.get("email") or claims.get("preferred_username") or claims.get("sub")
+    if not email:
+        return None
+    try:
+        info = await get_odoo_connection_info(email=email, claim_tid=None)
+    except Exception:
+        return None
+    resolved = _coerce_int(info.get("tenant_id")) if isinstance(info, dict) else None
+    if resolved is not None:
+        claims["tenant_id"] = resolved
+    return resolved
 
 
 async def _direct_grant(email: str, password: str, otp: str | None = None) -> dict:
@@ -147,8 +178,9 @@ async def login(body: dict, response: Response):
     if not access:
         raise HTTPException(status_code=500, detail="No token in SSO response")
     claims = verify_jwt(access)
+    tenant_id = await _ensure_tenant_id(claims, email)
     _set_session(response, access, refresh)
-    return {"tenant_id": claims.get("tenant_id"), "roles": claims.get("roles", []), "email": claims.get("email")}
+    return {"tenant_id": tenant_id, "roles": claims.get("roles", []), "email": claims.get("email")}
 
 
 @router.post("/refresh")
@@ -205,8 +237,9 @@ async def exchange(body: dict, response: Response):
     if not token:
         raise HTTPException(status_code=400, detail="id_token or access_token required")
     claims = verify_jwt(token)
+    tenant_id = await _ensure_tenant_id(claims, None)
     _set_session(response, token, refresh)
-    return {"ok": True, "email": claims.get("email"), "tenant_id": claims.get("tenant_id")}
+    return {"ok": True, "email": claims.get("email"), "tenant_id": tenant_id}
 
 
 # --- Optional: Admin-backed Registration via Keycloak Admin API ---
@@ -296,6 +329,7 @@ async def register(body: dict, response: Response, background: BackgroundTasks):
     if not access:
         raise HTTPException(status_code=500, detail="No token after register")
     claims = verify_jwt(access)
+    tenant_id = await _ensure_tenant_id(claims, email)
     _set_session(response, access, refresh)
     # Kick off onboarding immediately so Odoo admin uses the signup password
     try:
@@ -303,7 +337,7 @@ async def register(body: dict, response: Response, background: BackgroundTasks):
     except Exception:
         # Non-fatal if background scheduling fails; UI will still call /onboarding/first_login
         pass
-    return {"tenant_id": claims.get("tenant_id"), "roles": claims.get("roles", []), "email": claims.get("email")}
+    return {"tenant_id": tenant_id, "roles": claims.get("roles", []), "email": claims.get("email")}
 
 
 @router.post("/exchange")
@@ -318,5 +352,6 @@ async def exchange_token(body: dict, response: Response):
         raise HTTPException(status_code=400, detail="id_token required")
     # Verify and set cookie
     claims = verify_jwt(token)
+    tenant_id = await _ensure_tenant_id(claims, None)
     _set_session(response, token, None)
-    return {"ok": True, "email": claims.get("email"), "tenant_id": claims.get("tenant_id")}
+    return {"ok": True, "email": claims.get("email"), "tenant_id": tenant_id}

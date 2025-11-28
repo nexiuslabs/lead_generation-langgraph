@@ -3,8 +3,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response
 import os
 import httpx
+import logging
 
 router = APIRouter(prefix="/graph", tags=["graph-proxy"])
+logger = logging.getLogger("graph_proxy")
 
 
 def _target_base() -> str | None:
@@ -71,6 +73,8 @@ async def _forward(request: Request, method: str, path: str) -> Response:
         except Exception:
             # Best-effort only; never block the proxy
             pass
+        tenant_header = headers.get("x-tenant-id") or headers.get("X-Tenant-ID") or request.headers.get("x-tenant-id")
+        logger.info("graph_proxy forward method=%s path=%s tenant=%s", method.upper(), path, tenant_header)
         resp = await client.request(method=method.upper(), url=target, headers=headers, content=body)
         return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers)
 
