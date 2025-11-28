@@ -59,6 +59,17 @@ except Exception:  # pragma: no cover
     _lg_get_current_metadata = None  # type: ignore
 from .state import OrchestrationState, ProfileState
 
+# Optional: Command return for custom UI events when running under LangGraph server.
+try:
+    # Newer LangGraph versions expose Command here
+    from langgraph.graph import Command as _LGCommand  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        # Fallback import path if API differs
+        from langgraph_api.types import Command as _LGCommand  # type: ignore
+    except Exception:  # pragma: no cover
+        _LGCommand = None  # type: ignore
+
 try:  # optional dependency (network / vendor credentials)
     from src.enrichment import enrich_company_with_tavily
 except Exception:  # pragma: no cover
@@ -1460,6 +1471,37 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                         pass
             except Exception:
                 pass
+        # Final fallback (dev-friendly): if still missing, try first active Odoo connection
+        if not tenant_id:
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        tid_int = int(row[0])
+                        ctx2 = state.get("entry_context") or {}
+                        ctx2["tenant_id"] = tid_int
+                        state["entry_context"] = ctx2
+                        state["tenant_id"] = tid_int
+                        tenant_id = tid_int
+                        _log_step("tenant_context", source="journey_guard/db_fallback", tenant_id=tid_int)
+            except Exception:
+                pass
+        # Short-term UI auto-enqueue path: emit custom event for the UI to call FastAPI with user cookies
+        ui_enqueue = str(os.getenv("UI_ENQUEUE_JOBS", "")).strip().lower() in {"1", "true", "yes", "on"}
+        if ui_enqueue and _LGCommand is not None and tenant_id:
+            evt = {
+                "type": "queue_job",
+                "tenant_id": int(tenant_id),
+                "payload": {"kind": "icp_discovery_enrich"},
+            }
+            msg = "Queuing background discovery and enrichment for your ICP…"
+            profile["outstanding_prompts"] = [msg]
+            _append_message(state, "assistant", msg)
+            _set_status(state, "journey_guard", msg)
+            _log_step("enqueue_ui", tenant_id=int(tenant_id), event_type="queue_job")
+            return _LGCommand(update={}, custom=evt)  # type: ignore
+
         # Resolve notify email using policy similar to API endpoint
         def _resolve_email() -> Optional[str]:
             try:

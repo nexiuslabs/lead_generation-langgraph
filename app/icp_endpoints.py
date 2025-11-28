@@ -185,9 +185,21 @@ async def post_enqueue_discovery_enrich(
         raise HTTPException(status_code=400, detail="tenant_id is required")
     email = _resolve_notify_email(req, x_notify_email, tid)
     try:
+        log.info(
+            "icp:enqueue request tenant_id=%s email=%s from=%s",
+            tid,
+            email,
+            getattr(req.client, "host", None),
+        )
         res = enqueue_icp_discovery_enrich(int(tid), notify_email=email)
+        log.info(
+            "icp:enqueue result tenant_id=%s job_id=%s",
+            tid,
+            res.get("job_id"),
+        )
         return {"status": "queued", "job_id": res.get("job_id"), "notify_email": email}
     except Exception as e:
+        log.exception("icp:enqueue failed tenant_id=%s error=%s", tid, e)
         raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
 
 

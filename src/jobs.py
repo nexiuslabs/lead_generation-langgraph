@@ -519,6 +519,15 @@ def enqueue_icp_discovery_enrich(tenant_id: int, notify_email: Optional[str] = N
         row = cur.fetchone()
         jid = int(row[0]) if row and row[0] is not None else 0
         try:
+            log.info(
+                '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"notify_email":%s}',
+                int(tenant_id),
+                int(jid),
+                json.dumps(notify_email) if notify_email else 'null'
+            )
+        except Exception:
+            pass
+        try:
             if jid:
                 payload = json.dumps({"job_id": jid, "type": "icp_discovery_enrich"})
                 cur.execute("NOTIFY bg_jobs, %s", (payload,))
