@@ -483,6 +483,41 @@ try:
 except Exception:
     JINA_DEEP_RESEARCH_TIMEOUT_S = 18.0
 
+JINA_DEEP_RESEARCH_API_URL = os.getenv(
+    "JINA_DEEP_RESEARCH_API_URL",
+    "https://deepsearch.jina.ai/v1/chat/completions",
+)
+JINA_DEEP_RESEARCH_MODEL = os.getenv("JINA_DEEP_RESEARCH_MODEL", "jina-deepsearch-v1")
+JINA_DEEP_RESEARCH_REASONING_EFFORT = os.getenv(
+    "JINA_DEEP_RESEARCH_REASONING_EFFORT",
+    "low",
+)
+
+try:
+    JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS = int(
+        os.getenv("JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS", "50") or 50
+    )
+except Exception:
+    JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS = 50
+
+try:
+    JINA_DEEP_RESEARCH_SUMMARY_MAX_URLS = int(
+        os.getenv("JINA_DEEP_RESEARCH_SUMMARY_MAX_URLS", "10") or 10
+    )
+except Exception:
+    JINA_DEEP_RESEARCH_SUMMARY_MAX_URLS = 10
+
+def _parse_bad_hostnames(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+
+JINA_DEEP_RESEARCH_BAD_HOSTNAMES = _parse_bad_hostnames(
+    os.getenv("JINA_DEEP_RESEARCH_BAD_HOSTNAMES", "*.gov.sg,*.gov,*.xyz")
+)
+
 # Background-only discovery+enrichment after ICP confirmation
 BG_DISCOVERY_AND_ENRICH = os.getenv("BG_DISCOVERY_AND_ENRICH", "false").lower() in (
     "1",

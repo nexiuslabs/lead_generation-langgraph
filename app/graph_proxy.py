@@ -43,6 +43,34 @@ async def _forward(request: Request, method: str, path: str) -> Response:
     # Send request
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         body = await request.body() if method.upper() not in ("GET", "HEAD") else None
+        # Inject tenant context into run-start payloads so the graph can always resolve tenant_id
+        try:
+            if body and headers.get("content-type", "").lower().startswith("application/json"):
+                # Target path shapes:
+                #   /threads/{id}/runs
+                #   /threads/{id}/runs/stream
+                # We inject { context: { tenant_id: <X-Tenant-ID> } } using the incoming header if present.
+                if "/threads/" in path and "/runs" in path:
+                    raw = body.decode("utf-8")
+                    payload = {}
+                    try:
+                        import json as _json
+                        payload = _json.loads(raw or "{}")
+                    except Exception:
+                        payload = {}
+                    tenant_hdr = request.headers.get("x-tenant-id") or request.headers.get("X-Tenant-ID")
+                    if tenant_hdr:
+                        ctx = payload.get("context") or {}
+                        if not isinstance(ctx, dict):
+                            ctx = {}
+                        # Only set if not already provided by the client
+                        ctx.setdefault("tenant_id", tenant_hdr)
+                        payload["context"] = ctx
+                        body = _json.dumps(payload).encode("utf-8")
+                        headers["content-type"] = "application/json"
+        except Exception:
+            # Best-effort only; never block the proxy
+            pass
         resp = await client.request(method=method.upper(), url=target, headers=headers, content=body)
         return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers)
 
@@ -50,4 +78,3 @@ async def _forward(request: Request, method: str, path: str) -> Response:
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_all(path: str, request: Request):
     return await _forward(request, request.method, path)
-

@@ -105,8 +105,7 @@ graph TD
     C -->|ready| D[normalize]
     C -->|pending| P[progress_report]
     D --> E[refresh_icp] --> F[decide_strategy] --> G[ssic_fallback]
-    G --> H[plan_top10] --> I[enrich_batch] --> J[score_leads] --> K[export]
-    K --> P --> S[summary]
+    G --> P --> S[summary]
 ```
 
 ### Conversational gating
@@ -122,13 +121,13 @@ graph TD
 8. **`plan_top10`** – runs `src.agents_icp.plan_top10_with_reasons` to rank the best candidates for enrichment. Results include rationales and timestamps.
 9. **`enrich_batch`** – iterates through `discovery["candidate_ids"]` and calls `src.enrichment.enrich_company_with_tavily`, whose crawl stack fetches pages via Jina MCP first and only falls back to Tavily when `ENABLE_TAVILY_FALLBACK=true`. Failures are captured per company so `score_leads` can still run.
 10. **`score_leads`** – sync call into `src.lead_scoring.lead_scoring_agent` to convert enrichment outputs into lead scores + reasons, stored on `state["scoring"]`.
-11. **`export_results`** – packages outcomes, queues Next-40 enrichment via `src.jobs.enqueue_web_discovery_bg_enrich` (using the tenant ID pulled from `entry_context`), and leaves an Odoo placeholder flag for future sync.
+11. **`export_results`** – legacy stub; discovery + enrichment already run via the unified `icp_discovery_enrich` job, so this node simply reports status/ODDO export info when invoked.
 12. **`progress_report` / `summary`** – `progress_report` either replays the outstanding prompt from `journey_guard` or uses an LLM to summarize the status (including candidate totals). `summary` simply mirrors the latest status message and ends the run.
 
 ### Persistence & side effects
 - Company/ICP confirmations auto-sync into Postgres (`app/pre_sdr_graph`) so manual re-entry isn’t needed.
 - Discovered websites (preview 10 + remaining up to 50) are staged in `staging_global_companies` with metadata capturing bucket/score/reason, matching the behavior in `_persist_discovery_candidates`.
-- Candidate IDs from `refresh_icp` / `ssic_fallback` are what drive enrichment, scoring, exporting, and the Next-40 enqueue—so skipping those nodes would orphan the downstream steps.
+- Candidate IDs from `refresh_icp` / `ssic_fallback` are what drive the background `icp_discovery_enrich` job (discovery → enrichment → scoring/export/email).
 
 ## Purpose
 - Pre-SDR pipeline: normalize → ICP candidates → deterministic crawl + Jina MCP page reads (with Tavily strictly as fallback) + Apify → ZeroBounce verify → scoring + rationale → export → optional Odoo sync.

@@ -109,15 +109,17 @@ def main() -> int:
         return 2
 
     # Enqueue the job (this will NOTIFY bg_jobs)
-    from src.jobs import enqueue_web_discovery_bg_enrich
+    from src.jobs import enqueue_icp_discovery_enrich
     to_email = (args.notify_email or "").strip() if isinstance(args.notify_email, str) else None
     if not to_email:
         # Fallback to env default when provided (dev convenience)
         from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
         if _DEF_TO and ("@" in str(_DEF_TO)):
             to_email = str(_DEF_TO)
-    job = enqueue_web_discovery_bg_enrich(tenant_id, ids, notify_email=to_email)
-    print(f"[next40-debug] enqueued job_id={job.get('job_id')} count={len(ids)} tenant_id={tenant_id} notify_email={to_email}")
+    job = enqueue_icp_discovery_enrich(tenant_id, notify_email=to_email)
+    print(
+        f"[next40-debug] unified icp_discovery_enrich job_id={job.get('job_id')} tenant_id={tenant_id} notify_email={to_email}"
+    )
     return 0
 
 

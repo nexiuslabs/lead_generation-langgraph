@@ -21,7 +21,14 @@ import requests
 
 from src.icp import icp_by_ssic_agent, icp_refresh_agent, normalize_agent
 from src.lead_scoring import lead_scoring_agent
-from src.jobs import enqueue_web_discovery_bg_enrich, _odoo_export_for_ids
+from src.jobs import _odoo_export_for_ids
+
+try:
+    from src.jobs import enqueue_web_discovery_bg_enrich as _enqueue_next40  # legacy stub
+except Exception:  # pragma: no cover
+    _enqueue_next40 = None  # type: ignore
+
+enqueue_web_discovery_bg_enrich = _enqueue_next40
 from src.jina_reader import read_url as jina_read
 from src.database import get_conn
 from app.pre_sdr_graph import (
@@ -264,7 +271,6 @@ def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
     profile.setdefault("icp_profile_generated", bool(profile.get("icp_profile")))
     profile.setdefault("icp_discovery_confirmed", False)
     profile.setdefault("awaiting_discovery_confirmation", False)
-    profile.setdefault("awaiting_enrichment_confirmation", False)
     profile.setdefault("enrichment_confirmed", False)
     profile.setdefault("discovery_retry_requested", False)
     profile.setdefault("customer_websites", [])
@@ -1080,6 +1086,27 @@ async def ingest_message(state: OrchestrationState) -> OrchestrationState:
     """Normalize incoming payloads using an LLM (fallback to heuristics)."""
     # Best-effort: hydrate tenant context from LangGraph run config / SDK context / thread metadata
     try:
+        # 0) Read tenant from 'context' on state (LangGraph SDK clients often attach it there)
+        try:
+            ctx_in = state.get("context") or {}
+            if isinstance(ctx_in, dict):
+                tid0 = ctx_in.get("tenant_id") or ctx_in.get("tenantId")
+                if tid0 is not None:
+                    tid_int = int(str(tid0).strip())
+                    ctx0 = state.get("entry_context") or {}
+                    if ctx0.get("tenant_id") != tid_int:
+                        ctx0["tenant_id"] = tid_int
+                        state["entry_context"] = ctx0
+                    state["tenant_id"] = tid_int
+                    _log_step("tenant_context", source="state.context", tenant_id=tid_int)
+                em0 = ctx_in.get("notify_email") or ctx_in.get("user_email")
+                if isinstance(em0, str) and "@" in em0:
+                    ctx0 = state.get("entry_context") or {}
+                    if not ctx0.get("notify_email"):
+                        ctx0["notify_email"] = em0.strip()
+                        state["entry_context"] = ctx0
+        except Exception:
+            pass
         cfg = var_child_runnable_config.get() or {}
         conf = cfg.get("configurable", {}) if isinstance(cfg, dict) else {}
         # Common places the SDK/server pass tenant metadata
@@ -1161,6 +1188,8 @@ async def ingest_message(state: OrchestrationState) -> OrchestrationState:
 
     incoming = str(state.get("input") or "").strip()
     role = state.get("input_role", "user")
+    # When no new user input, mark suppress_output to avoid repeating assistant messages on SDK re-connects
+    state["suppress_output"] = False if incoming else True
     if incoming:
         _append_message(state, role, incoming)
         _log_step("user_message", role=role, text=incoming[:500])
@@ -1338,24 +1367,7 @@ Current profile: {profile!r}
     retry_triggers = ("retry discovery", "retry icp", "search again")
     if any(trigger in last_command for trigger in retry_triggers):
         profile["discovery_retry_requested"] = True
-        profile["awaiting_enrichment_confirmation"] = False
         profile["enrichment_confirmed"] = False
-    if profile.get("awaiting_enrichment_confirmation") and not profile.get("enrichment_confirmed"):
-        confirm_phrases = (
-            "enrich",
-            "start enrichment",
-            "proceed",
-            "go ahead",
-            "looks good",
-            "confirm",
-            "yes",
-            "top 10",
-            "ten",
-        )
-        normalized = normalized_command
-        if enrichment_requested or any(phrase in normalized for phrase in confirm_phrases):
-            profile["enrichment_confirmed"] = True
-            profile["awaiting_enrichment_confirmation"] = False
 
     if profile.get("seeded_company_profile"):
         profile["company_profile_confirmed"] = False
@@ -1377,7 +1389,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     company_ready = bool(profile.get("company_profile_confirmed"))
     icp_ready = bool(profile.get("icp_profile_confirmed"))
     discovery_ready = bool(profile.get("icp_discovery_confirmed"))
-    enrichment_ready = bool(profile.get("enrichment_confirmed"))
+    enrichment_ready = True if BG_DISCOVERY_AND_ENRICH else bool(profile.get("enrichment_confirmed"))
     ctx = state.get("entry_context") or {}
     question = ctx.get("last_user_command") or _latest_user_text(state)
     last_intent = (ctx.get("intent") or (_heuristic_intent(question) if question else "")).strip().lower()
@@ -1385,7 +1397,6 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     normalized_command = last_command.translate(str.maketrans("", "", ".!?")).strip()
     if discovery_ready and not enrichment_ready and _wants_enrichment(last_intent, normalized_command):
         profile["enrichment_confirmed"] = True
-        profile["awaiting_enrichment_confirmation"] = False
         enrichment_ready = True
     journey_ready = bool(company_ready and icp_ready and discovery_ready and enrichment_ready)
     state["journey_ready"] = journey_ready
@@ -1401,8 +1412,23 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             company_profile = profile.get("company_profile") or {}
     explanation = None
     if BG_DISCOVERY_AND_ENRICH and company_ready and icp_ready:
-        # Ensure tenant_id is set; if missing, attempt to read from LangGraph server metadata
+        # Ensure tenant_id is set; if missing, attempt to read from client-provided context and LG server metadata
         tenant_id = _get_tenant_id(state) or 0
+        if not tenant_id:
+            try:
+                ctx_in = state.get("context") or {}
+                if isinstance(ctx_in, dict):
+                    tid0 = ctx_in.get("tenant_id") or ctx_in.get("tenantId")
+                    if tid0 is not None:
+                        tid_int = int(str(tid0).strip())
+                        ctx2 = state.get("entry_context") or {}
+                        ctx2["tenant_id"] = tid_int
+                        state["entry_context"] = ctx2
+                        state["tenant_id"] = tid_int
+                        tenant_id = tid_int
+                        _log_step("tenant_context", source="journey_guard/state.context", tenant_id=tid_int)
+            except Exception:
+                pass
         if not tenant_id and _lg_get_current_metadata is not None:
             try:
                 md = _lg_get_current_metadata() or {}
@@ -1474,6 +1500,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 f"I’ll email the results to you at {notify_email or 'your address on file'} when it finishes. "
                 f"Job ID: {job_id}."
             )
+            profile["enrichment_confirmed"] = True
         elif not tenant_id:
             msg = (
                 "I couldn’t resolve your tenant session, so I can’t queue the background job yet. "
@@ -1567,26 +1594,14 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                         for d in candidates
                     ]
                 _cache_discovery_details(state, discovery_state, candidate_details)
-                if CHAT_DISCOVERY_ENABLED:
-                    table = _format_candidate_table(candidate_details, limit=50)
-                    discovery_state["web_candidate_table"] = table
-                    found_count = min(50, len(candidate_details))
-                    if candidate_details and not discovery_state.get("staging_persisted"):
-                        _persist_discovery_candidates(state, candidate_details)
-                        discovery_state["staging_persisted"] = True
-                    prompt_parts.append(
-                        f"I found {len(candidates)} ICP candidate websites. Here's the latest {found_count} with match details:\n{table}"
-                    )
-                    prompt_parts.append(
-                        "\n\nReady for me to enrich the best 10 now? Reply 'enrich 10' (or similar) to proceed, "
-                        "or say 'retry discovery' and I'll search again."
-                    )
-                    profile["awaiting_enrichment_confirmation"] = True
-                else:
-                    prompt_parts.append("Discovery is ready. Continuing with background processing in this workspace.")
+                if candidate_details and not discovery_state.get("staging_persisted"):
+                    _persist_discovery_candidates(state, candidate_details)
+                    discovery_state["staging_persisted"] = True
+                prompt_parts.append(
+                    f"I found {len(candidates)} ICP candidate websites and queued them for background enrichment."
+                )
             else:
                 prompt_parts.append("I couldn't find solid ICP candidates. Say 'retry discovery' to search again or adjust your ICP details.")
-                profile["awaiting_enrichment_confirmation"] = False
         else:
             prompt_parts.append("Almost ready—just a quick confirmation on your inputs and I'll proceed.")
 
@@ -1645,10 +1660,6 @@ async def refresh_icp(state: OrchestrationState) -> OrchestrationState:
         _log_step("refresh_icp", skipped=True, reason="chat_top10_cached")
         _set_status(state, "refresh_icp", "Using confirmed Top-10 candidates")
         state["discovery"] = discovery
-        return state
-    if not profile.get("enrichment_confirmed"):
-        _log_step("refresh_icp", skipped=True, reason="awaiting_enrichment_confirmation")
-        _set_status(state, "refresh_icp", "Waiting for enrichment confirmation")
         return state
     if OFFLINE:
         discovery["candidate_ids"] = [101, 102, 103]
@@ -1892,32 +1903,12 @@ async def score_leads(state: OrchestrationState) -> OrchestrationState:
 
 async def export_results(state: OrchestrationState) -> OrchestrationState:
     exports = state.get("exports") or {
-        "next40_enqueued": False,
         "odoo_exported": False,
         "job_ids": [],
     }
     exports["last_run_at"] = datetime.now(timezone.utc).isoformat()
-    # Background Next-40 enqueue
     tenant_id = (state.get("entry_context") or {}).get("tenant_id")
-    run_mode = _get_run_mode(state)
-    if run_mode == "chat_top10":
-        discovery = state.get("discovery") or {}
-        ids = [int(i) for i in discovery.get("next40_ids") or [] if isinstance(i, (int, str)) and str(i).strip()]
-    else:
-        ids = [r.get("company_id") for r in state.get("enrichment_results") or [] if r.get("completed")]
-    if OFFLINE:
-        msg_extra = "; offline mode: export skipped"
-    elif tenant_id and ids:
-        try:
-            job = enqueue_web_discovery_bg_enrich(int(tenant_id), [int(i) for i in ids if i])
-            exports["next40_enqueued"] = bool(job.get("job_id"))
-            exports.setdefault("job_ids", []).append(job.get("job_id"))
-            msg_extra = f"; Next-40 job {job.get('job_id')} queued"
-        except Exception as exc:  # pragma: no cover
-            logger.warning("enqueue_web_discovery_bg_enrich failed: %s", exc)
-            msg_extra = "; Next-40 enqueue failed"
-    else:
-        msg_extra = "; no Next-40 enqueue"
+    msg_extra = "; background discovery/enrichment already queued"
 
     # Trigger Odoo export for completed Top-10 enrichment when tenant context present
     enriched_ids = [
@@ -1938,7 +1929,6 @@ async def export_results(state: OrchestrationState) -> OrchestrationState:
     state["exports"] = exports
     _log_step(
         "export",
-        next40=exports.get("next40_enqueued"),
         jobs=exports.get("job_ids"),
         msg_extra=f"{msg_extra}{odoo_msg}",
     )
@@ -1977,13 +1967,16 @@ Return JSON {{"message": "..."}}
         message = result.get("message", fallback_message)
     _log_step("progress_report", outstanding=bool(outstanding), message=message)
     _set_status(state, "progress_report", message)
-    _append_message(state, "assistant", message)
+    # Avoid duplicating outputs when this run has no new user input
+    if not state.get("suppress_output"):
+        _append_message(state, "assistant", message)
     return state
 
 
 async def finalize(state: OrchestrationState) -> OrchestrationState:
     msg = state.get("status", {}).get("message") or "Run complete"
-    _append_message(state, "assistant", msg)
+    if not state.get("suppress_output"):
+        _append_message(state, "assistant", msg)
     _set_status(state, "summary", msg)
     _log_step("summary", message=msg)
     return state

@@ -2,10 +2,20 @@ import asyncio
 import json
 import os
 import signal
+import re
+from pathlib import Path
 from typing import Optional
 
 import asyncpg
-import re
+
+try:  # Load environment defaults (so .env toggles like ENABLE_JINA_DEEP_RESEARCH_* apply here)
+    from dotenv import load_dotenv  # type: ignore
+
+    _ROOT = Path(__file__).resolve().parents[1]
+    load_dotenv(_ROOT / ".env")
+    load_dotenv()  # fallback to current working directory
+except Exception:
+    pass
 
 from src.settings import POSTGRES_DSN
 from src.jobs import run_web_discovery_bg_enrich, run_icp_discovery_enrich

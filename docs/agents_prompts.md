@@ -5,6 +5,17 @@ A quick reference of LLM-backed "agents" in this codebase: purpose, location, pr
 Note: Paths are clickable in this workspace. This document reflects actual code in this repo (not just PRD plans).
 
 ## ICP Discovery Agents
+### deep_research_query
+- Purpose: Call Jina DeepResearch to fetch up to `{JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS}` candidate domains for a given seed and ICP context.
+- Location: `src/services/jina_deep_research.py`
+- Prompt (user message): see the inline template in that module. It instructs Jina to return ONLY a JSON array of `{company_name, domain_url}` objects and includes the ICP industries + geo summary plus the seed.
+- Used by: `run_icp_discovery_enrich` (background job) before persisting domains to staging.
+
+### deep_research_for_domain
+- Purpose: Fetch a summary and up to `{JINA_DEEP_RESEARCH_SUMMARY_MAX_URLS}` page URLs for a single domain using Jina DeepResearch (HTTP).
+- Location: `src/services/jina_deep_research.py`
+- Used by: `node_deterministic_crawl` in `src/enrichment.py` to seed `deterministic_summary`/`extracted_pages` prior to MCP/Tavily.
+
 
 ### icp_synthesizer
 - Purpose: Synthesize a micro‑ICP (industries, integrations, buyer titles, size bands, triggers) from seed snippets and prior ICP.

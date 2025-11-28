@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
+from urllib.parse import urlparse
 
 from src.database import get_conn
 import psycopg2
@@ -9,6 +10,7 @@ import asyncio as _asyncio
 from psycopg2.extras import Json
 import json
 import threading
+from src.settings import ICP_RULE_NAME
 
 # Reuse the batched/streaming implementation from lg_entry
 try:
@@ -27,6 +29,221 @@ STAGING_BATCH_SIZE = int(os.getenv("STAGING_BATCH_SIZE", "500") or 500)
 CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "4") or 4)
 
 log = logging.getLogger("jobs")
+_DEFAULT_DISCOVERY_COUNTRY = (os.getenv("MCP_SEARCH_COUNTRY") or os.getenv("DEFAULT_DISCOVERY_COUNTRY") or "").strip() or None
+
+
+def _normalize_domain(value: str) -> Optional[str]:
+    try:
+        s = (value or "").strip()
+        if not s:
+            return None
+        if not s.startswith("http://") and not s.startswith("https://"):
+            s = "https://" + s
+        parsed = urlparse(s)
+        host = (parsed.netloc or parsed.path or "").strip().lower()
+        if not host:
+            return None
+        if host.startswith("www."):
+            host = host[4:]
+        if ":" in host:
+            host = host.split(":", 1)[0]
+        if not host or "." not in host:
+            return None
+        return host
+    except Exception:
+        return None
+
+
+def _build_discovery_queries(seed: str, country_hint: Optional[str]) -> List[str]:
+    site_filter = ""
+    try:
+        if country_hint and country_hint.lower() in {"sg", "singapore"}:
+            site_filter = "site:.sg"
+        elif country_hint and country_hint.strip():
+            site_filter = f"site:.{country_hint.strip().lower()}"
+    except Exception:
+        site_filter = ""
+
+    base = (seed or "").strip()
+    queries: List[str] = []
+
+    def _push(q: str) -> None:
+        qq = q.strip()
+        if not qq:
+            return
+        if site_filter and "site:" not in qq:
+            qq = f"{qq} {site_filter}".strip()
+        if qq not in queries:
+            queries.append(qq)
+
+    if base:
+        _push(f"{base} competitors")
+        _push(f"{base} alternatives")
+        _push(f"companies like {base}")
+    _push("b2b distributors")
+    _push("enterprise software vendors")
+    return queries
+
+
+def _fallback_discovery_domains(
+    seed: str,
+    *,
+    limit: int,
+    country_hint: Optional[str] = None,
+) -> Tuple[List[str], str]:
+    queries = _build_discovery_queries(seed, country_hint)
+    if not queries:
+        queries = ["b2b distributors"]
+    seen: set[str] = set()
+    domains: List[str] = []
+    # 1) Try MCP search tools first
+    try:
+        from src.services import mcp_reader as _mcp  # type: ignore
+
+        for q in queries:
+            try:
+                urls = _mcp.search_web(q, country=country_hint, max_results=limit) or []
+            except Exception as exc:  # pragma: no cover
+                try:
+                    log.info("{\"stage\":\"bg_discovery\",\"event\":\"mcp_fallback_error\",\"query\":\"%s\",\"error\":\"%s\"}", q, str(exc)[:180])
+                except Exception:
+                    pass
+                continue
+            for u in urls:
+                host = _normalize_domain(u)
+                if not host or host in seen:
+                    continue
+                seen.add(host)
+                domains.append(host)
+                if len(domains) >= limit:
+                    return (domains[:limit], "jina_mcp_search")
+        if domains:
+            return (domains[:limit], "jina_mcp_search")
+    except Exception as exc:  # pragma: no cover
+        try:
+            log.info("{\"stage\":\"bg_discovery\",\"event\":\"mcp_import_error\",\"error\":\"%s\"}", str(exc)[:180])
+        except Exception:
+            pass
+
+    # 2) Fallback to DDG HTML via r.jina helper
+    source = "ddg_search"
+    try:
+        from src.ddg_simple import search_domains as _ddg_search
+
+        for q in queries:
+            try:
+                hosts = _ddg_search(q, max_results=limit, country=country_hint)
+            except Exception as exc:  # pragma: no cover
+                try:
+                    log.info("{\"stage\":\"bg_discovery\",\"event\":\"ddg_error\",\"query\":\"%s\",\"error\":\"%s\"}", q, str(exc)[:180])
+                except Exception:
+                    pass
+                continue
+            for h in hosts:
+                host = _normalize_domain(h)
+                if not host or host in seen:
+                    continue
+                seen.add(host)
+                domains.append(host)
+                if len(domains) >= limit:
+                    return (domains[:limit], source)
+    except Exception as exc:  # pragma: no cover
+        try:
+            log.warning("{\"stage\":\"bg_discovery\",\"event\":\"fallback_failed\",\"error\":\"%s\"}", str(exc)[:180])
+        except Exception:
+            pass
+    return (domains[:limit], source)
+
+
+def _load_icp_profile(tenant_id: int) -> Dict[str, Any]:
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            for query, params in (
+                (
+                    """
+                    SELECT payload
+                    FROM icp_rules
+                    WHERE tenant_id=%s AND name=%s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (int(tenant_id), ICP_RULE_NAME),
+                ),
+                (
+                    """
+                    SELECT payload
+                    FROM icp_rules
+                    WHERE tenant_id=%s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (int(tenant_id),),
+                ),
+            ):
+                cur.execute(query, params)
+                row = cur.fetchone()
+                if not row:
+                    continue
+                val = row[0]
+                if isinstance(val, dict):
+                    return val
+                if isinstance(val, str):
+                    try:
+                        import json as _json
+
+                        data = _json.loads(val)
+                        if isinstance(data, dict):
+                            return data
+                    except Exception:
+                        continue
+    except Exception:
+        return {}
+    return {}
+
+
+def _clean_str_list(value: Any, limit: int = 5) -> List[str]:
+    items: List[str] = []
+    try:
+        if isinstance(value, list):
+            for v in value:
+                if isinstance(v, str) and v.strip():
+                    items.append(v.strip())
+        elif isinstance(value, str) and value.strip():
+            items.append(value.strip())
+    except Exception:
+        return []
+    if limit:
+        return items[:limit]
+    return items
+
+
+def _icp_context_from_profile(profile: Dict[str, Any]) -> Dict[str, List[str]]:
+    context = {
+        "industries": [],
+        "buyer_titles": [],
+        "geo": [],
+    }
+    if not profile:
+        return context
+    context["industries"] = _clean_str_list(
+        profile.get("industries")
+        or profile.get("industry")
+        or profile.get("icp_industries")
+        or [],
+    )
+    context["buyer_titles"] = _clean_str_list(
+        profile.get("buyer_titles")
+        or profile.get("titles")
+        or profile.get("preferred_titles")
+        or [],
+    )
+    context["geo"] = _clean_str_list(
+        profile.get("geo")
+        or profile.get("geos")
+        or profile.get("regions")
+        or [],
+    )
+    return context
 
 
 def _insert_job(tenant_id: Optional[int], terms: List[str]) -> int:
@@ -352,11 +569,34 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
             cur.execute("SELECT name FROM tenants WHERE tenant_id=%s", (tenant_id,))
             row = cur.fetchone()
             seed = (row and row[0]) or f"tenant_{tenant_id}"
-        icp_context = {"industries": [], "buyer_titles": [], "geo": []}
+        icp_profile = _load_icp_profile(tenant_id)
+        icp_context = _icp_context_from_profile(icp_profile)
+        try:
+            log.info(
+                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"icp_context\",\"job_id\":%s,\"industries\":%s,\"buyer_titles\":%s,\"geo\":%s}",
+                job_id,
+                len(icp_context.get("industries") or []),
+                len(icp_context.get("buyer_titles") or []),
+                len(icp_context.get("geo") or []),
+            )
+        except Exception:
+            pass
         domains: List[str] = []
+        discovery_source = "jina_deep_research"
         with _stage_timer(run_id, tenant_id, "bg_discovery", total_inc=1):
             if ENABLE_JINA_DEEP_RESEARCH_DISCOVERY:
                 tdr = time.perf_counter()
+                try:
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"deep_research_call\",\"job_id\":%s,\"seed\":\"%s\",\"industries\":%s,\"buyer_titles\":%s,\"geo\":%s}",
+                        job_id,
+                        str(seed).replace("\"", "'")[:120],
+                        ", ".join(icp_context.get("industries") or [])[:200],
+                        ", ".join(icp_context.get("buyer_titles") or [])[:200],
+                        ", ".join(icp_context.get("geo") or [])[:200],
+                    )
+                except Exception:
+                    pass
                 pack = deep_research_query(str(seed), icp_context)
                 domains = list(pack.get("domains") or [])
                 try:
@@ -367,7 +607,43 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                         event="dr_query",
                         status="ok",
                         duration_ms=int((time.perf_counter() - tdr) * 1000),
-                        extra={"domains": len(domains)},
+                        extra={"domains": len(domains), "source": "jina_deep_research"},
+                    )
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery\",\"job_id\":%s,\"source\":\"jina_deep_research\",\"domains\":%s}",
+                        job_id,
+                        len(domains),
+                    )
+                except Exception:
+                    pass
+            if not domains:
+                from src.settings import JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS
+
+                fallback_domains, fallback_source = _fallback_discovery_domains(
+                    str(seed),
+                    limit=JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS,
+                    country_hint=_DEFAULT_DISCOVERY_COUNTRY,
+                )
+                discovery_source = fallback_source or discovery_source
+                domains = list(fallback_domains or [])
+                try:
+                    _log_event(
+                        run_id,
+                        tenant_id,
+                        "bg_discovery",
+                        event="fallback_discovery",
+                        status="ok" if domains else "empty",
+                        extra={
+                            "source": discovery_source,
+                            "domains": len(domains),
+                            "fallback_only": not ENABLE_JINA_DEEP_RESEARCH_DISCOVERY,
+                        },
+                    )
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_fallback\",\"job_id\":%s,\"source\":\"%s\",\"domains\":%s}",
+                        job_id,
+                        discovery_source,
+                        len(domains),
                     )
                 except Exception:
                     pass
@@ -378,10 +654,24 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                         try:
                             cur.execute(
                                 "INSERT INTO staging_global_companies(tenant_id, domain, ai_metadata) VALUES (%s,%s,%s)",
-                                (tenant_id, d, Json({"provenance": {"source": "jina_deep_research"}})),
+                                (tenant_id, d, Json({"provenance": {"source": discovery_source}})),
                             )
                         except Exception:
                             continue
+                try:
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_store\",\"job_id\":%s,\"domains\":%s,\"source\":\"%s\"}",
+                        job_id,
+                        min(len(domains), 50),
+                        discovery_source,
+                    )
+                except Exception:
+                    pass
+            else:
+                log.info(
+                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery\",\"job_id\":%s,\"event\":\"no_domains\"}",
+                    job_id,
+                )
         # 2) Enrichment per company_id resolved by domain (best-effort)
         processed = 0
         # Create minimal company rows if not present
@@ -391,6 +681,14 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 (tenant_id,),
             )
             stage_domains = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+        try:
+            log.info(
+                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_stage\",\"job_id\":%s,\"domains\":%s}",
+                job_id,
+                len(stage_domains),
+            )
+        except Exception:
+            pass
         company_ids: List[int] = []
         with get_conn() as conn, conn.cursor() as cur:
             for d in stage_domains:
@@ -409,6 +707,14 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                             company_ids.append(int(rr[0]))
                 except Exception:
                     continue
+        try:
+            log.info(
+                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"manifest\",\"job_id\":%s,\"company_ids\":%s}",
+                job_id,
+                len(company_ids),
+            )
+        except Exception:
+            pass
         # Persist manifest early for traceability
         try:
             _persist_manifest(run_id, tenant_id, company_ids)
@@ -418,6 +724,14 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
         if enrich_company_with_tavily is None:
             raise RuntimeError("enrich unavailable")
         with _stage_timer(run_id, tenant_id, "bg_enrich_run", total_inc=len(company_ids)):
+            try:
+                log.warning(
+                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"enrich_start\",\"job_id\":%s,\"companies\":%s}",
+                    job_id,
+                    len(company_ids),
+                )
+            except Exception:
+                pass
             for cid in company_ids:
                 t1 = time.perf_counter()
                 try:
@@ -427,6 +741,15 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 except Exception as e:
                     _log_event(run_id, tenant_id, "bg_enrich_run", event="company", status="error", company_id=cid, error_code=type(e).__name__)
                     continue
+        try:
+            log.info(
+                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"enrich\",\"job_id\":%s,\"processed\":%s,\"total\":%s}",
+                job_id,
+                processed,
+                len(company_ids),
+            )
+        except Exception:
+            pass
         # Scoring for all enriched companies (best-effort)
         try:
             if company_ids:
@@ -447,6 +770,14 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                         status="ok",
                         duration_ms=int((time.perf_counter() - tsc) * 1000),
                         extra={"companies": len(company_ids)},
+                    )
+                except Exception:
+                    pass
+                try:
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"scoring\",\"job_id\":%s,\"companies\":%s}",
+                        job_id,
+                        len(company_ids),
                     )
                 except Exception:
                     pass
@@ -484,6 +815,15 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 t2 = time.perf_counter()
                 res = await agentic_send_results(notify_email, tenant_id, limit=500)
                 _log_event(run_id, tenant_id, "email_notify", event="send", status=str(res.get("status") or "ok"), duration_ms=int((time.perf_counter()-t2)*1000), extra={"to": notify_email})
+                try:
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"email\",\"job_id\":%s,\"to\":\"%s\",\"status\":\"%s\"}",
+                        job_id,
+                        notify_email,
+                        str(res.get("status") or "ok"),
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
         # Run summary
@@ -510,250 +850,14 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
 
 
 def enqueue_web_discovery_bg_enrich(tenant_id: int, company_ids: list[int], notify_email: Optional[str] = None) -> dict:
-    """Queue background enrichment for next‑40 web_discovery preview companies.
-
-    Stores the company_ids list in background_jobs.params for processing by the nightly dispatcher.
-    """
-    ids = [int(i) for i in (company_ids or []) if str(i).strip()]
-    if not ids:
-        return {"job_id": 0}
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'web_discovery_bg_enrich','queued', %s) RETURNING job_id",
-            (tenant_id, Json({"company_ids": ids, **({"notify_email": notify_email} if notify_email else {})})),
-        )
-        row = cur.fetchone()
-        jid = int(row[0]) if row and row[0] is not None else 0
-        # Notify listeners (bg worker) so they can pick it up immediately
-        try:
-            if jid:
-                payload = json.dumps({"job_id": jid, "type": "web_discovery_bg_enrich"})
-                cur.execute("NOTIFY bg_jobs, %s", (payload,))
-        except Exception:
-            # Best-effort: notification is optional
-            pass
-        return {"job_id": jid}
-
+    """Deprecated alias delegating to enqueue_icp_discovery_enrich."""
+    log.warning("enqueue_web_discovery_bg_enrich is deprecated; delegating to enqueue_icp_discovery_enrich")
+    return enqueue_icp_discovery_enrich(tenant_id, notify_email=notify_email)
 
 async def run_web_discovery_bg_enrich(job_id: int) -> None:
-    """Process a list of company_ids for Non‑SG next‑40 background enrichment.
-
-    Uses the same enrich function as other flows (Tavily/Apify pipeline), scoped to provided IDs.
-    """
-    import time
-    t0 = time.perf_counter()
-    log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"start\",\"job_id\":%s}", job_id)
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE background_jobs SET status='running', started_at=now() WHERE job_id=%s", (job_id,))
-        cur.execute("SELECT tenant_id, params FROM background_jobs WHERE job_id=%s", (job_id,))
-        row = cur.fetchone()
-        tenant_id = int(row[0]) if row and row[0] is not None else None
-        params = (row and row[1]) or {}
-        ids = [int(i) for i in (params.get('company_ids') or []) if str(i).strip()]
-    processed = 0
-    try:
-        if not ids:
-            raise RuntimeError("company_ids required")
-        if enrich_company_with_tavily is None:
-            raise RuntimeError("enrich unavailable")
-        # Resolve company names/uen for enrichment call signature
-        comp_map: dict[int, tuple[str, str | None]] = {}
-        try:
-            with get_conn() as conn, conn.cursor() as cur:
-                cur.execute(
-                    "SELECT company_id, name, uen FROM companies WHERE company_id = ANY(%s)",
-                    (ids,),
-                )
-                rows = cur.fetchall() or []
-                for r in rows:
-                    try:
-                        cid = int(r[0]) if r and r[0] is not None else None
-                        nm = (r[1] or "").strip() if len(r) > 1 else ""
-                        uen = (r[2] or None) if len(r) > 2 else None
-                        if cid and nm:
-                            comp_map[cid] = (nm, uen)
-                    except Exception:
-                        continue
-        except Exception:
-            comp_map = {}
-        scored_ids: list[int] = []
-        for cid in ids:
-            try:
-                name, uen = comp_map.get(int(cid), (str(cid), None))
-                # Pre-step log per company
-                try:
-                    log.info(
-                        "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"company\",\"job_id\":%s,\"tenant_id\":%s,\"company_id\":%s,\"name\":\"%s\"}",
-                        job_id,
-                        tenant_id,
-                        int(cid),
-                        (name or "").replace("\"", "'")[:200],
-                    )
-                except Exception:
-                    pass
-                final_state = await enrich_company_with_tavily(
-                    int(cid), name, uen, search_policy="require_existing"
-                )
-                # Post-step detailed summary per company
-                try:
-                    completed = bool(final_state.get("completed")) if isinstance(final_state, dict) else None
-                    error = final_state.get("error") if isinstance(final_state, dict) else None
-                    domains = final_state.get("domains") if isinstance(final_state, dict) else None
-                    pages = final_state.get("extracted_pages") if isinstance(final_state, dict) else None
-                    chunks = final_state.get("chunks") if isinstance(final_state, dict) else None
-                    data = final_state.get("data") if isinstance(final_state, dict) else None
-                    degraded = final_state.get("degraded_reasons") if isinstance(final_state, dict) else None
-                    log.info(
-                        "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"result\",\"job_id\":%s,\"tenant_id\":%s,\"company_id\":%s,\"completed\":%s,\"error\":%s,\"domains\":%s,\"pages\":%s,\"chunks\":%s,\"emails\":%s,\"degraded\":%s}",
-                        job_id,
-                        tenant_id,
-                        int(cid),
-                        completed,
-                        (json.dumps(error) if error is not None else "null"),
-                        (len(domains) if isinstance(domains, list) else 0),
-                        (len(pages) if isinstance(pages, list) else 0),
-                        (len(chunks) if isinstance(chunks, list) else 0),
-                        (len((data or {}).get("email", [])) if isinstance(data, dict) else 0),
-                        (json.dumps(degraded) if degraded is not None else "null"),
-                    )
-                except Exception:
-                    pass
-                processed += 1
-                scored_ids.append(int(cid))
-            except Exception:
-                # continue best-effort
-                pass
-        # Robust status update with retry — avoid failing the job after work completes due to transient DB errors
-        for attempt in range(3):
-            try:
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
-                        (processed, len(ids), job_id),
-                    )
-                break
-            except psycopg2.Error:
-                if attempt == 2:
-                    raise
-                await _asyncio.sleep(0.5 * (attempt + 1))
-        # Run lead scoring for enriched companies best-effort
-        try:
-            if scored_ids:
-                from src.lead_scoring import lead_scoring_agent
-                scoring_state = {
-                    "candidate_ids": scored_ids,
-                    "lead_features": [],
-                    "lead_scores": [],
-                    "icp_payload": {},
-                }
-                await lead_scoring_agent.ainvoke(scoring_state)
-        except Exception as e:
-            try:
-                log.warning("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"scoring_error\",\"job_id\":%s,\"error\":\"%s\"}", job_id, str(e)[:200])
-            except Exception:
-                pass
-        dur_ms = int((time.perf_counter() - t0) * 1000)
-        log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
-    except Exception as e:  # pragma: no cover
-        # Best-effort error write with retry as well
-        for attempt in range(3):
-            try:
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE background_jobs SET status='error', error=%s, processed=%s, ended_at=now() WHERE job_id=%s",
-                        (str(e), processed, job_id),
-                    )
-                break
-            except psycopg2.Error:
-                if attempt == 2:
-                    break
-                await _asyncio.sleep(0.5 * (attempt + 1))
-        dur_ms = int((time.perf_counter() - t0) * 1000)
-        log.info("{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"error\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, processed, dur_ms, str(e))
-    # After completion (success or failure on some items), send email once if requested and not already sent
-    try:
-        to_email = None
-        sent_at = None
-        try:
-            to_email = (params or {}).get("notify_email")
-            sent_at = (params or {}).get("email_sent_at")
-        except Exception:
-            to_email = None
-        # Resolve from tenant_users when missing
-        if tenant_id and not to_email:
-            try:
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
-                        (int(tenant_id),),
-                    )
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        candidate = str(row[0])
-                        # Only accept tenant_users.user_id as email when it contains '@' (dev-only guard)
-                        try:
-                            from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL
-                        except Exception:
-                            _ACCEPT_TU_EMAIL = True
-                        if _ACCEPT_TU_EMAIL and ("@" in candidate):
-                            to_email = candidate
-                            # persist source
-                            cur.execute(
-                                "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source', 'tenant_users') WHERE job_id=%s",
-                                (to_email, job_id),
-                            )
-            except Exception:
-                pass
-        # Fallback to DEFAULT_NOTIFY_EMAIL when still missing (useful in dev-bypass)
-        if tenant_id and not to_email:
-            try:
-                from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO
-                if _DEF_TO and ("@" in str(_DEF_TO)):
-                    to_email = str(_DEF_TO)
-                    # persist fallback into params to avoid repeated lookups and document provenance
-                    with get_conn() as conn, conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source', 'default_env') WHERE job_id=%s",
-                            (to_email, job_id),
-                        )
-            except Exception:
-                pass
-        if tenant_id and to_email and not sent_at:
-            from src.notifications.agentic_email import agentic_send_results
-            res = await agentic_send_results(str(to_email), int(tenant_id))
-            # Log outcome for observability
-            try:
-                log.info(
-                    "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"email\",\"job_id\":%s,\"tenant_id\":%s,\"to\":\"%s\",\"status\":%s}",
-                    job_id,
-                    tenant_id,
-                    (to_email or "").replace("\"", "'")[:200],
-                    (res or {}).get("status"),
-                )
-            except Exception:
-                pass
-            # Mark as sent if success to prevent duplicates
-            if (res or {}).get("status") == "sent":
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE background_jobs SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('email_sent_at', now(), 'email_to', %s) WHERE job_id=%s",
-                        (to_email, job_id),
-                    )
-        else:
-            try:
-                reason = "already_sent" if sent_at else "missing_to"
-                log.info(
-                    "{\"job\":\"web_discovery_bg_enrich\",\"phase\":\"email_skip\",\"job_id\":%s,\"tenant_id\":%s,\"reason\":\"%s\"}",
-                    job_id,
-                    tenant_id,
-                    reason,
-                )
-            except Exception:
-                pass
-    except Exception:
-        # Non-fatal
-        pass
-
+    """Deprecated runner delegating to run_icp_discovery_enrich."""
+    log.warning("run_web_discovery_bg_enrich is deprecated; delegating job_id=%s to run_icp_discovery_enrich", job_id)
+    await run_icp_discovery_enrich(job_id)
 
 def enqueue_enrich_candidates(tenant_id: Optional[int], ssic_codes: List[str]) -> dict:
     """Queue an enrich_candidates job keyed by SSIC codes (normalized numeric strings)."""
