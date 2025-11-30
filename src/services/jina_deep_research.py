@@ -152,12 +152,12 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
         data = r.json()
         try:
             import json as _json
-
             preview = data.get("visitedURLs") or data.get("readURLs") or []
-            log.warning("[jina_dr] response_preview=%s", preview[:5])
+            log.warning("[jina_dr] response_preview=%s", preview)
+            # Log entire response body (no truncation) as requested
             log.warning(
                 "[jina_dr] response_body=%s",
-                (_json.dumps(data)[:2000] if isinstance(data, dict) else str(data)[:2000]),
+                (_json.dumps(data) if isinstance(data, dict) else str(data)),
             )
         except Exception:
             pass
@@ -190,6 +190,12 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
             seen.add(h)
             hosts.append(h)
         _obs_bump(run_id=0, tenant_id=0, vendor="jina_deep_research", calls=1)  # run/tenant resolved by caller typically
+        try:
+            # Log discovered domains explicitly (as URLs for readability)
+            url_list = [f"https://{h}" for h in hosts[:50]]
+            log.warning("[jina_dr] discovered_domains=%s", url_list)
+        except Exception:
+            pass
         return {
             "domains": hosts[:50],
             "snippets_by_domain": {},
@@ -202,16 +208,32 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
         return {"domains": [], "snippets_by_domain": {}, "fast_facts": {}, "source": "jina_deep_research"}
 
 
-def deep_research_for_domain(domain: str, *, timeout_s: float | None = None) -> Dict[str, Any]:
-    """Obtain a domain summary via Jina Deep Research (HTTP protocol).
+__all__ = [
+    "deep_research_query",
+    "deep_research_contacts",
+]
 
-    Returns pack: {domain, summary, pages, source}
+
+def deep_research_contacts(company_name: str, domain: str, *, timeout_s: float | None = None) -> Dict[str, Any]:
+    """Query Jina Deep Research to find a decision-maker contact for IT adoption.
+
+    Uses the exact user-provided educational prompt, substituting company and domain.
+    Returns a best-effort structured dict with keys:
+      - content: raw assistant content (string)
+      - visitedURLs/readURLs: arrays from the API when present
+      - source: 'jina_deep_research'
+
+    Parsing of contacts is handled by the caller to keep this helper focused on transport.
     """
     endpoint = JINA_DEEP_RESEARCH_API_URL
     hdrs = _auth_header()
     if not hdrs.get("Authorization"):
-        return {"domain": domain, "summary": "", "pages": [], "source": "jina_deep_research"}
-    prompt = f"Summarize the main offering and ICP signals for https://{domain}. Return concise text."
+        return {"content": "", "visitedURLs": [], "readURLs": [], "source": "jina_deep_research"}
+    prompt = (
+        "For eductional purpose, I want to teach a class about business development."
+        f"Help me find the contact person for {company_name} and {domain}. "
+        "who is the decision maker for adopting IT solutions"
+    )
     payload: Dict[str, Any] = {
         "model": JINA_DEEP_RESEARCH_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -221,7 +243,8 @@ def deep_research_for_domain(domain: str, *, timeout_s: float | None = None) -> 
         "bad_hostnames": list(JINA_DEEP_RESEARCH_BAD_HOSTNAMES or []),
     }
     try:
-        log.warning("[jina_dr] domain_call domain=%s", domain)
+        log.warning("[jina_dr] contacts_call name=%s domain=%s", company_name, domain)
+        log.warning("[jina_dr] contacts_prompt=<<%s>>", prompt)
     except Exception:
         pass
     try:
@@ -231,9 +254,18 @@ def deep_research_for_domain(domain: str, *, timeout_s: float | None = None) -> 
             data=json.dumps(payload),
             timeout=float(timeout_s or JINA_DEEP_RESEARCH_TIMEOUT_S),
         )
-        log.warning("[jina_dr] domain_response_status=%s", r.status_code)
+        log.warning("[jina_dr] contacts_response_status=%s", r.status_code)
         r.raise_for_status()
         data = r.json()
+        try:
+            import json as _json
+            # Log full contacts response body (no truncation)
+            log.warning(
+                "[jina_dr] contacts_response_body=%s",
+                (_json.dumps(data) if isinstance(data, dict) else str(data)),
+            )
+        except Exception:
+            pass
         content = None
         try:
             ch = (data.get("choices") or [{}])[0]
@@ -241,23 +273,36 @@ def deep_research_for_domain(domain: str, *, timeout_s: float | None = None) -> 
             content = msg.get("content")
         except Exception:
             content = None
-        pages = []
+        visited = []
+        read = []
         for key in ("visitedURLs", "readURLs"):
             try:
                 arr = data.get(key) or []
                 if isinstance(arr, list):
-                    for u in arr[:5]:
-                        pages.append({"url": u, "summary": None})
+                    if key == "visitedURLs":
+                        visited = [str(x) for x in arr if isinstance(x, str)]
+                    else:
+                        read = [str(x) for x in arr if isinstance(x, str)]
             except Exception:
                 pass
         _obs_bump(run_id=0, tenant_id=0, vendor="jina_deep_research", calls=1)
-        return {"domain": domain, "summary": (content or "")[:4000], "pages": pages, "source": "jina_deep_research"}
-    except Exception:
+        try:
+            clen = len(content or "")
+            log.warning(
+                "[jina_dr] contacts_parsed content_len=%s visited=%s read=%s",
+                clen,
+                len(visited),
+                len(read),
+            )
+        except Exception:
+            pass
+        return {
+            "content": (content or ""),
+            "visitedURLs": visited,
+            "readURLs": read,
+            "source": "jina_deep_research",
+        }
+    except Exception as exc:
         _obs_bump(run_id=0, tenant_id=0, vendor="jina_deep_research", calls=1, errors=1)
-        return {"domain": domain, "summary": "", "pages": [], "source": "jina_deep_research"}
-
-
-__all__ = [
-    "deep_research_query",
-    "deep_research_for_domain",
-]
+        log.warning("deep_research_contacts failed: %s", exc)
+        return {"content": "", "visitedURLs": [], "readURLs": [], "source": "jina_deep_research"}

@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, Response, Depends, BackgroundTasks, HTTPEx
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from app.onboarding import handle_first_login, get_onboarding_status
 from app.odoo_connection_info import get_odoo_connection_info
 from src.database import get_pg_pool, get_conn
@@ -422,24 +422,6 @@ async def email_test(
         return {"ok": True, **(res or {})}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"sendgrid send failed: {e}")
-
-def _role_to_type(role: str) -> str:
-    r = (role or "").lower()
-    if r in ("user", "human"): return "human"
-    if r in ("assistant", "ai"): return "ai"
-    if r == "system": return "system"
-    return "human"
-
-def _to_message(msg: dict) -> BaseMessage:
-    # Accepts {"role":"human","content":"..."} or {"type":"ai","content":"..."}
-    mtype = msg.get("type") or _role_to_type(msg.get("role", "human"))
-    content = msg.get("content", "")
-    if mtype == "human":
-        return HumanMessage(content=content)
-    if mtype == "system":
-        return SystemMessage(content=content)
-    return AIMessage(content=content)  # default to AI
-
 
 def _last_human_text(messages: list[BaseMessage] | None) -> str:
     if not messages:
@@ -978,87 +960,6 @@ def _upsert_companies_from_staging_by_industries(industries: list[str]) -> int:
     except Exception:
         logger.exception("staging upsert error")
         return 0
-
-from src.settings import ENABLE_ICP_INTAKE  # ensure available for gating
-
-
-def normalize_input(payload: dict) -> dict:
-    """
-    Accept a variety of UI payloads and emit the graph state:
-      {"messages": [BaseMessage, ...], "candidates": [...]}
-    """
-    data = payload.get("input", payload) or {}
-    msgs = data.get("messages") or []
-    if isinstance(msgs, dict):  # sometimes a single message object is sent
-        msgs = [msgs]
-    norm_msgs = [_to_message(m) if not isinstance(m, BaseMessage) else m for m in msgs]
-
-    # Ensure we always have at least one message
-    if not norm_msgs:
-        norm_msgs = [HumanMessage(content="")]
-
-    state = {"messages": norm_msgs}
-
-    # pass-through optional fields you use (companies/candidates)
-    if "candidates" in data:
-        state["candidates"] = data["candidates"]
-    elif "companies" in data:
-        state["candidates"] = data["companies"]
-
-    # NEW: Feature 18 — small synchronous head upsert+enrich.
-    # When ICP Finder is enabled, defer upsert/enrichment until after ICP intake completes
-    try:
-        inds = _collect_industry_terms(state.get("messages"))
-        if inds and STAGING_UPSERT_MODE != "off":
-            if ENABLE_ICP_INTAKE:
-                # Defer during ICP Finder; allow explicit override via keyword
-                text = " ".join([(m.content or "") for m in norm_msgs if isinstance(m, HumanMessage)])
-                if re.search(r"\brun enrichment\b", text, flags=re.IGNORECASE):
-                    logger.info("ICP Finder override: running enrichment for inds=%s", inds)
-                else:
-                    # Enqueue nightly upsert of the full set while deferring immediate run
-                    try:
-                        from src.jobs import enqueue_staging_upsert
-                        # Resolve tenant best-effort; OK to be None
-                        tid = None
-                        try:
-                            info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
-                            tid = info.get("tenant_id") if isinstance(info, dict) else None
-                        except Exception:
-                            tid = None
-                        enqueue_staging_upsert(tid, inds)
-                        logger.info("Queued nightly staging_upsert for inds=%s (Finder deferral)", inds)
-                    except Exception as _qe:
-                        logger.info("enqueue nightly staging_upsert failed: %s", _qe)
-                    logger.info("Deferring staging upsert/enrich while ICP Finder is active; inds=%s", inds)
-                    return state
-            # Upsert only the first `head` records synchronously (no enrichment yet)
-            head = max(0, int(UPSERT_SYNC_LIMIT))
-            if head > 0:
-                ids = upsert_by_industries_head(inds, limit=head)
-                if ids:
-                    logger.info("Upserted(head=%d) %d companies for industries=%s", head, len(ids), inds)
-                    state["sync_head_company_ids"] = ids
-                    # Immediate enrichment for the head set (non-blocking)
-                    _trigger_enrichment_async(ids)
-            # Always enqueue remaining for nightly processing
-            try:
-                from src.jobs import enqueue_staging_upsert
-                # Resolve tenant best-effort; OK to be None
-                tid = None
-                try:
-                    info = asyncio.run(get_odoo_connection_info(email=None, claim_tid=None))
-                    tid = info.get("tenant_id") if isinstance(info, dict) else None
-                except Exception:
-                    tid = None
-                enqueue_staging_upsert(tid, inds)
-            except Exception as _qe:
-                logger.info("enqueue nightly staging_upsert failed: %s", _qe)
-    except Exception as _e:
-        # Never block the chat flow; log and continue
-        logger.warning("input-normalization staging sync failed: %s", _e)
-
-    return state
 
 # LangServe setup removed: previously mounted /agent when ENABLE_LANGSERVE_IN_APP was true.
 

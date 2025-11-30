@@ -94,6 +94,21 @@ This repository (frontend and backend orchestration alike) uses a multi-agent ar
 13. Encouraged Patterns  
    - ReAct loop, Toolformer-style calls, LangGraph state machines, multi-agent DAG workflows, Supervisor + specialists, retrieval-augmented agents.
 
+## Planning Flow
+
+1. Trigger the planning flow at the start of a feature cycle or when resuming the next backlog item.
+2. Review `devplan/masterPRD.md`; capture clarifications directly in the document as inline TODO comments.
+3. While reviewing, explicitly flag any requirements that are now obsolete by marking them “no longer required” in the PRD (note the owner + rationale so downstream plans inherit the context).
+4. For every newly retired requirement, run a repo-wide reference scan to find orphaned functions, deprecated logic, and obsolete workflows tied to it; only schedule removal when no files reference the code, and record the cleanup targets next to the retirement note.
+5. Resolve or explicitly assign every clarification TODO (recording the owner and due date inline) before drafting downstream plans.
+6. Draft a feature PRD in `devplan/featurePRD_##.md` that includes story, acceptance criteria, dependencies, and open questions (open questions must list options, explanations, and a recommendation with justification).
+7. Translate the scope into `devplan/devplan_##.md` covering design, data, migrations, testing strategy, and risks, and include a "Retired Requirements" section that lists any previously committed requirements being dropped along with impacted files/modules and rationale.
+8. Break the work into actionable tasks in `devplan/todo_##.md`, linking each task to the relevant plan sections and fully specifying code-path cleanup work (e.g., remove the scanned orphaned functions/comments/imports, retire legacy modules, update dependent interfaces, adjust telemetry/logging, remove data/scripts, and list regression checks).
+9. Execute tasks sequentially, updating the TODO file as items complete or the scope evolves.
+10. When the TODO list is empty, reread the feature PRD and dev plan; add new tasks if gaps exist.
+11. After each task or scope change (including deletion of obsolete code), record the update in `todo_##.md` **before** writing code.
+12. Archive fully delivered initiatives by moving their PRD, dev plan, and TODO files into `devplan/completed/`, and complete the required completion checklist before archiving.
+
 ## Unified Orchestrator Flow (Code-Backed)
 
 The production flow in `my_agent/agent.py` wires the LangGraph nodes defined in `my_agent/utils/nodes.py`. The graph below mirrors the exact code paths (including the conditional gate coming out of `journey_guard`):
@@ -119,7 +134,9 @@ graph TD
 6. **`decide_strategy`** – lightweight LLM policy that chooses `use_cached`, `regenerate`, or `ssic_fallback` based on counts + last SSIC attempt; the choice is recorded on `discovery["strategy"]`.
 7. **`ssic_fallback`** – always invoked (the graph edges force it) and, when industries exist, calls `src.icp.icp_by_ssic_agent` to backfill candidate IDs from ACRA/SSIC data.
 8. **`plan_top10`** – runs `src.agents_icp.plan_top10_with_reasons` to rank the best candidates for enrichment. Results include rationales and timestamps.
-9. **`enrich_batch`** – iterates through `discovery["candidate_ids"]` and calls `src.enrichment.enrich_company_with_tavily`, whose crawl stack fetches pages via Jina MCP first and only falls back to Tavily when `ENABLE_TAVILY_FALLBACK=true`. Failures are captured per company so `score_leads` can still run.
+9. **`enrich_batch`** – iterates through `discovery["candidate_ids"]` and calls `src.enrichment.enrich_company_with_tavily`.
+   - Page reads: Jina MCP primary; Tavily only as fallback when `ENABLE_TAVILY_FALLBACK=true`.
+   - Contacts: Jina Deep Research primary (decision maker for IT adoption), then Jina MCP reader, then Apify LinkedIn as final fallback.
 10. **`score_leads`** – sync call into `src.lead_scoring.lead_scoring_agent` to convert enrichment outputs into lead scores + reasons, stored on `state["scoring"]`.
 11. **`export_results`** – legacy stub; discovery + enrichment already run via the unified `icp_discovery_enrich` job, so this node simply reports status/ODDO export info when invoked.
 12. **`progress_report` / `summary`** – `progress_report` either replays the outstanding prompt from `journey_guard` or uses an LLM to summarize the status (including candidate totals). `summary` simply mirrors the latest status message and ends the run.

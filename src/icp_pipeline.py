@@ -216,6 +216,23 @@ def persist_evidence_records(
             if not key:
                 continue
             try:
+                try:
+                    # Log DB insert intent (truncate verbose value)
+                    from json import dumps as _dumps
+                    snapshot = None
+                    if isinstance(val, (dict, list)):
+                        try:
+                            snapshot = _dumps(val)[:300]
+                        except Exception:
+                            snapshot = str(val)[:300]
+                    else:
+                        snapshot = str(val)[:120]
+                    log.info(
+                        "[db] INSERT icp_evidence tenant_id=%s company_id=%s key=%s source=%s value_preview=%s",
+                        tenant_id, company_id, key, source, snapshot,
+                    )
+                except Exception:
+                    pass
                 cur.execute(
                     """
                     INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source)
@@ -321,6 +338,13 @@ def acra_anchor_seed(
                 resolved_code, resolved_norm = resolve_industry_fields(ind_code, None)
                 if uen:
                     # Upsert by UEN
+                    try:
+                        log.info(
+                            "[db] UPSERT companies by UEN=%s name=%s industry_code=%s",
+                            uen, nm, resolved_code,
+                        )
+                    except Exception:
+                        pass
                     cur.execute(
                         """
                         INSERT INTO companies(uen, name, industry_code, industry_norm, last_seen)
@@ -344,6 +368,13 @@ def acra_anchor_seed(
                     if r and r[0] is not None:
                         cid = int(r[0])
                     else:
+                        try:
+                            log.info(
+                                "[db] INSERT companies(name=%s, industry_code=%s) [no UEN]",
+                                nm, resolved_code,
+                            )
+                        except Exception:
+                            pass
                         cur.execute(
                             """
                             INSERT INTO companies(name, industry_code, industry_norm, last_seen)
@@ -360,6 +391,16 @@ def acra_anchor_seed(
         # Insert SSIC evidence only when we have a valid company_id to satisfy NOT NULL schema
         if cid is not None:
             try:
+                try:
+                    log.info(
+                        "[db] INSERT icp_evidence(ssic) tenant_id=%s company_id=%s uen=%s matched_name=%s",
+                        tenant_id,
+                        cid,
+                        (acra.get("uen") or ""),
+                        (acra.get("entity_name") or ""),
+                    )
+                except Exception:
+                    pass
                 cur.execute(
                     """
                     INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source)
@@ -424,38 +465,6 @@ def winner_profile(tenant_id: int) -> Dict[str, Any]:
         except Exception:
             pass
     return out
-
-
-def candidate_lookalikes_from_patterns(tenant_id: int, profile: Dict[str, Any], limit: int = 25) -> List[Dict[str, Any]]:
-    """Best-effort lookalikes using company table by SSIC or tech evidence density."""
-    # Use icp_patterns MV if present; else fall back to companies table
-    out: List[Dict[str, Any]] = []
-    codes = [c for (c, _cnt) in (profile.get("ssic") or [])]
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            if codes:
-                cur.execute(
-                    """
-                    SELECT company_id, name, uen, website_domain, industry_code
-                    FROM companies
-                    WHERE regexp_replace(industry_code::text, '\\D', '', 'g') = ANY(%s)
-                    ORDER BY employees_est DESC NULLS LAST, name ASC
-                    LIMIT %s
-                    """,
-                    (codes, int(limit)),
-                )
-                for r in cur.fetchall() or []:
-                    out.append({
-                        "id": int(r[0]),
-                        "name": r[1],
-                        "uen": r[2],
-                        "domain": r[3],
-                        "industry_code": r[4],
-                    })
-        except Exception:
-            pass
-    return out
-
 
 def micro_icp_suggestions_from_profile(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []

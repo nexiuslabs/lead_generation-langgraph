@@ -5,7 +5,7 @@
 - **Non‑Goals:** Replacing the enrichment/scoring pipeline; changing shortlist ranking; redesigning the chat UI beyond small guardrails.
 
 **Problem Statement**
-- Typing an industry in chat triggers `normalize_input()` → `_upsert_companies_from_staging_by_industries()` synchronously.
+- Typing an industry in chat (legacy `normalize_input()` path, now retired) triggered `_upsert_companies_from_staging_by_industries()` synchronously.
 - For “Manufacturing”, this selects up to 1000 staging rows and performs per‑row lookups/updates, blocking the HTTP response.
 - Missing supporting indexes (LOWER(name), website_domain, LOWER(industry_norm)) and use of `ILIKE ANY(...)` exacerbate latency.
 
@@ -59,7 +59,7 @@
 **API Changes**
 - New: `POST /jobs/staging_upsert` → body: `{ terms: string[] }` → `{ job_id }` (schedules work for the nightly runner). Optional `limit` is not supported in v1.
 - New: `GET /jobs/{job_id}` → `{ status, processed, total, errors? }`.
-- Change: `normalize_input()` respects flags and schedules nightly processing; the synchronous head (≤10) is upserted + enriched. A dedicated “preview sample” message is deferred; current UI uses job progress and candidates pages.
+- Change: Legacy `normalize_input()` respected flags and scheduled nightly processing; the synchronous head (≤10) was upserted + enriched. A dedicated “preview sample” message was deferred; current UI uses job progress and candidates pages.
 - Pagination: endpoints that list candidates or scores accept `limit`, `after` cursor; respond with `{ items, nextCursor }`.
 
 **Configuration Flags**

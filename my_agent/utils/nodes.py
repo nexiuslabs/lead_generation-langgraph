@@ -812,34 +812,6 @@ def _ensure_company_ids_for_domains(domains: Sequence[str], tenant_id: Optional[
     return mapping
 
 
-def _format_candidate_table(records: Sequence[Dict[str, Any]], limit: int = 50) -> str:
-    if not records:
-        return ""
-    header = ["#", "Name", "Domain", "Bucket", "Score", "ICP Match"]
-    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
-    for idx, item in enumerate(records[:limit], start=1):
-        domain = _domain_from_value(str(item.get("domain") or ""))
-        display_name = item.get("name") or _name_from_domain(domain)
-        bucket = str(item.get("bucket") or "").upper() or "-"
-        score = item.get("score")
-        try:
-            score_txt = f"{int(score)}"
-        except Exception:
-            score_txt = "-" if score in (None, "", []) else str(score)
-        reason = (
-            item.get("why")
-            or item.get("reason")
-            or item.get("match_reason")
-            or item.get("snippet")
-            or "Matches your ICP focus."
-        )
-        reason_clean = " ".join(str(reason or "").split())
-        if len(reason_clean) > 120:
-            reason_clean = reason_clean[:117].rstrip() + "..."
-        lines.append(f"| {idx} | {display_name} | {domain or '-'} | {bucket} | {score_txt} | {reason_clean or '-'} |")
-    return "\n".join(lines)
-
-
 def _lookup_primary_emails(company_ids: Sequence[int]) -> Dict[int, str]:
     if not company_ids:
         return {}

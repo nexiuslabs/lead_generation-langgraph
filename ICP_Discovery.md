@@ -65,7 +65,7 @@
 - When MCP can’t reach a site (e.g., HTTP 402), the system falls back to `https://r.jina.ai/...` or direct HTTP to keep the flow alive.
 
 ## 13. Scoring, Buckets, ICP Match & Deny Lists
-- **ICP Match column** – The rationale shown in the discovery table (“hq singapore”, “signal match”) comes from the planner’s `why`/`reason` fields. Those are derived from the Jina MCP snapshot and preserved by `_format_candidate_table`; enrichment doesn’t rewrite them.
+- **ICP Match column** – The rationale shown in the discovery table (“hq singapore”, “signal match”) comes from the planner’s `why`/`reason` fields. Those are derived from the Jina MCP snapshot, stored directly on the discovery records, and enrichment doesn’t rewrite them.
 - **Lead scoring pipeline** (`src/lead_scoring.py`):
   1. `fetch_features` pulls firmographics (employees_est, revenue_bucket, sg_registered, incorporation_year, industry_code) plus manual-research counts from `icp_evidence` gathered during enrichment.
   2. `train_and_score` fits a logistic regression (balanced classes). When only positives exist it falls back to heuristics based on your ICP payload (employee range, revenue, incorporation year).

@@ -159,19 +159,6 @@ Raw Content:
 {raw_content}
 ```
 
-### qualify_pages (is this the official site/About page?)
-- Purpose: Score whether a page is likely the official website/About page, used to filter candidates.
-- Location: `lead_generation-main/src/enrichment.py`
-- Prompt template:
-```
-You are a qualifier agent. Given the following page, score 1–5 whether this is our official website or About Us page.
-Return JSON {"score":<int>,"reason":"<reason>"}.
-
-URL: {url}
-Title: {title}
-Content: {content}
-```
-
 ## Rationale Generator
 
 ### generate_rationale
@@ -196,4 +183,3 @@ You are an SDR strategist.
 2) `icp_synthesizer` converts those snippets into a micro‑ICP (industries, integrations, buyer titles, triggers, size bands).
 3) `discovery_planner` feeds the micro‑ICP fields to the LLM using its system/human prompts to produce 3 concise web queries; results are fetched via DDGS (DuckDuckGo) and deduped to candidate domains.
 4) Optional: r.jina.ai snapshots are collected to provide evidence snippets and to enrich sparse micro‑ICP via `ensure_icp_enriched_with_jina`.
-

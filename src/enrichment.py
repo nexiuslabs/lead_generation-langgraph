@@ -28,9 +28,9 @@ from src.retry import with_retry, RetryableError, CircuitBreaker, BackoffPolicy
 
 from src.jina_reader import read_url as jina_read
 try:
-    from src.services.jina_deep_research import deep_research_for_domain as _dr_for_domain
+    from src.services.jina_deep_research import deep_research_contacts as _dr_contacts
 except Exception:  # pragma: no cover
-    _dr_for_domain = None  # type: ignore
+    _dr_contacts = None  # type: ignore
 from src.vendors.apify_linkedin import (
     run_sync_get_dataset_items as apify_run,
     build_queries as apify_build_queries,
@@ -325,9 +325,6 @@ _DEFAULT_RETRY_POLICY = BackoffPolicy(
 
 _RUN_ANY_DEGRADED = False
 
-def was_run_degraded() -> bool:
-    return bool(_RUN_ANY_DEGRADED)
-
 
 def _apify_calls_today(tenant_id: int | None) -> int:
     if not tenant_id:
@@ -393,19 +390,6 @@ def icp_preferred_titles_for_tenant(tenant_id: int | None) -> List[str]:
         return []
     return []
 
-def _cb_allows(tenant_id: int | None, vendor: str) -> bool:
-    try:
-        if (vendor or "").lower() in CB_GLOBAL_EXEMPT_VENDORS:
-            return True
-    except Exception:
-        pass
-    if not tenant_id:
-        return True
-    try:
-        return _CB.allow(int(tenant_id), vendor)
-    except Exception:
-        return True
-
 def set_run_context(run_id: int, tenant_id: int):
     _RUN_CTX["run_id"] = int(run_id)
     _RUN_CTX["tenant_id"] = int(tenant_id)
@@ -413,13 +397,6 @@ def set_run_context(run_id: int, tenant_id: int):
 def set_vendor_caps(tavily_units: int | None = None, contact_lookups: int | None = None):
     _VENDOR_CAPS["tavily_units"] = tavily_units
     _VENDOR_CAPS["contact_lookups"] = contact_lookups
-
-def get_vendor_counters() -> dict[str, int]:
-    return dict(_VENDOR_COUNTERS)
-
-def reset_vendor_counters():
-    for k in _VENDOR_COUNTERS.keys():
-        _VENDOR_COUNTERS[k] = 0
 
 def _units_used(key: str) -> int:
     if key == "tavily_units":
@@ -632,11 +609,19 @@ def _update_company_sg_fields(conn, company_id: int, fields: dict) -> None:
         if not to_set:
             return
         with conn.cursor() as cur:
+            try:
+                logger.info("[db] UPDATE companies SG fields company_id=%s fields=%s", company_id, {k: fields.get(k) for k, _ in to_set})
+            except Exception:
+                pass
             set_sql = ", ".join([f"{k}=%s" for k, _ in to_set])
             cur.execute(
                 f"UPDATE companies SET {set_sql} WHERE company_id=%s",
                 tuple([v for _, v in to_set] + [company_id]),
             )
+            try:
+                logger.info("[db] UPDATE companies SG fields done rows=%s", cur.rowcount)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -736,6 +721,10 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
                             "INSERT INTO enrichment_runs DEFAULT VALUES RETURNING run_id"
                         )
                     rid = cur.fetchone()[0]
+                    try:
+                        logger.info("[db] enrichment_runs insert run_id=%s tenant_id=%s", rid, tid_val)
+                    except Exception:
+                        pass
                     fields["run_id"] = rid
             except Exception:
                 # If we fail to create a run_id, proceed; insert may still work
@@ -747,7 +736,30 @@ def _insert_company_enrichment_run(conn, fields: dict) -> None:
         placeholders = ",".join(["%s"] * len(keys))
         sql = f"INSERT INTO company_enrichment_runs ({', '.join(keys)}) VALUES ({placeholders})"
         with conn.cursor() as cur:
+            try:
+                # Prepare log-friendly snapshot (redact arrays/emails)
+                log_fields = {}
+                for k in keys:
+                    v = fields.get(k)
+                    if k in ("public_emails", "email") and isinstance(v, list):
+                        log_fields[k] = _redact_email_list(v)
+                    elif k == "embedding" and isinstance(v, (list, bytes)):
+                        log_fields[k] = f"<embedding len={len(v)}>"
+                    elif k == "verification_results":
+                        try:
+                            log_fields[k] = f"<verifications n={len(v or [])}>"
+                        except Exception:
+                            log_fields[k] = "<verifications>"
+                    else:
+                        log_fields[k] = v
+                logger.info("[db] INSERT company_enrichment_runs keys=%s values=%s", keys, log_fields)
+            except Exception:
+                pass
             cur.execute(sql, [fields[k] for k in keys])
+            try:
+                logger.info("[db] INSERT company_enrichment_runs done rows=%s", cur.rowcount)
+            except Exception:
+                pass
     except Exception as e:
         # Surface but don't crash callers; they may have follow-up persistence
         logger.warning("insert company_enrichment_runs skipped", exc_info=True)
@@ -893,16 +905,42 @@ def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
                             params.extend([company_id, c.get("linkedin_url")])
                         if has_updated_at:
                             assignments = assignments + ", updated_at=now()"
+                        try:
+                            logger.info(
+                                "[db] UPDATE contacts company_id=%s email=%s fields=%s",
+                                company_id,
+                                _mask_email(email or ""),
+                                {k: row.get(k) for k in set_cols},
+                            )
+                        except Exception:
+                            pass
                         cur.execute(f"UPDATE contacts SET {assignments} WHERE {where_clause}", params)
                         updated += cur.rowcount or 0
+                        try:
+                            logger.info("[db] UPDATE contacts done rows=%s", cur.rowcount)
+                        except Exception:
+                            pass
                 else:
                     cols_list = list(row.keys())
                     placeholders = ",".join(["%s"] * len(cols_list))
+                    try:
+                        logger.info(
+                            "[db] INSERT contacts company_id=%s email=%s fields=%s",
+                            company_id,
+                            _mask_email(email or ""),
+                            {k: row.get(k) for k in cols_list},
+                        )
+                    except Exception:
+                        pass
                     cur.execute(
                         f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
                         [row[k] for k in cols_list],
                     )
                     inserted += cur.rowcount or 0
+                    try:
+                        logger.info("[db] INSERT contacts done rows=%s", cur.rowcount)
+                    except Exception:
+                        pass
     except Exception:
         return (inserted, updated)
     finally:
@@ -971,26 +1009,6 @@ async def _discover_relevant_urls(home_url: str, max_pages: int) -> list[str]:
         return urls
 
 
-def _combine_pages(pages: list[dict], char_limit: int) -> str:
-    """Combine extracted pages (url, title, raw_content) into a single corpus."""
-    blobs: list[str] = []
-    for p in pages:
-        url = p.get("url") or ""
-        title = _clean_text(p.get("title") or "")
-        body = p.get("raw_content") or p.get("content") or p.get("html") or ""
-        if isinstance(body, dict):
-            body = body.get("text") or ""
-        body = _clean_text(body)
-        if not body and title:
-            body = title
-        if not body:
-            continue
-        blobs.append(f"[URL] {url}\n[TITLE] {title}\n[BODY]\n{body}\n")
-    combined = "\n\n".join(blobs)
-    # Debug print can be noisy; keep minimal
-    if len(combined) > char_limit:
-        combined = combined[:char_limit] + "\n\n[TRUNCATED]"
-    return combined
 
 
 def _make_corpus_chunks(pages: list[dict], chunk_char_size: int) -> list[str]:
@@ -1184,7 +1202,22 @@ def update_company_core_fields(company_id: int, data: dict):
                 company_id,
             ]
             assert sql.count("%s") == len(params), "placeholder mismatch"
+            try:
+                # Log only fields that are not None; mask nothing sensitive here
+                keys = [
+                    "name","employees_est","revenue_bucket","incorporation_year","website_domain",
+                    "company_size","annual_revenue","hq_city","hq_country","linkedin_url","founded_year",
+                    "ownership_type","funding_status","employee_turnover","web_traffic","location_city","location_country",
+                ]
+                snapshot = {k: data.get(k) for k in keys if k in data}
+                logger.info("[db] UPDATE companies core company_id=%s fields=%s", company_id, snapshot)
+            except Exception:
+                pass
             cur.execute(sql, params)
+            try:
+                logger.info("[db] UPDATE companies core done rows=%s", cur.rowcount)
+            except Exception:
+                pass
 
 
     except Exception as e:
@@ -1728,6 +1761,10 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         "enable_web_search": False,
                     }
                     t0 = time.perf_counter()
+                    try:
+                        logger.info("[api] TavilyCrawl.run root=%s limit=%s", root, CRAWL_MAX_PAGES)
+                    except Exception:
+                        pass
                     crawl_result = tavily_crawl.run(crawl_input)
                     _VENDOR_COUNTERS["tavily_crawl_calls"] += 1
                     _obs_vendor("tavily", calls=1)
@@ -1737,6 +1774,10 @@ async def node_expand_crawl(state: EnrichmentState) -> EnrichmentState:
                         raw_urls = crawl_result.get("results") or crawl_result.get("urls") or []
                     elif isinstance(crawl_result, list):
                         raw_urls = crawl_result
+                    try:
+                        logger.info("[api] TavilyCrawl results_count=%s root=%s", len(raw_urls or []), root)
+                    except Exception:
+                        pass
                     for item in raw_urls:
                         if isinstance(item, dict) and item.get("url"):
                             page_urls.append(item["url"])
@@ -1840,10 +1881,19 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
             }
             try:
                 t0 = time.perf_counter()
+                logger.info("[api] TavilyExtract.run url=%s", u)
                 raw_data = tavily_extract.run(payload)
                 _obs_vendor("tavily", calls=1)
                 _obs_log("extract", "vendor_call", "ok", company_id=state.get("company_id"), duration_ms=int((time.perf_counter()-t0)*1000), extra={"url": u})
                 raw_content = _extract_raw_from(raw_data)
+                try:
+                    logger.info(
+                        "[api] TavilyExtract content_present=%s url=%s",
+                        bool(raw_content and isinstance(raw_content, str) and raw_content.strip()),
+                        u,
+                    )
+                except Exception:
+                    pass
             except Exception as exc:
                 _obs_vendor("tavily", calls=1, errors=1)
                 _obs_log("extract", "vendor_call", "error", company_id=state.get("company_id"), error_code=type(exc).__name__, extra={"url": u})
@@ -1939,21 +1989,7 @@ async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
     try:
-        # Optional: use Deep Research summary/pages first to seed corpus
-        try:
-            if _dr_for_domain is not None:
-                from urllib.parse import urlparse as _up
-                dom = _up(state["home"]).netloc or state["home"]
-                pack = _dr_for_domain(dom)
-                if isinstance(pack, dict):
-                    summ = (pack.get("summary") or "")
-                    if summ and not state.get("deterministic_summary"):
-                        state["deterministic_summary"] = {"url": state["home"], "content_summary": summ[:1000], "signals": {}}
-                    pg = pack.get("pages") or []
-                    if pg and not state.get("extracted_pages"):
-                        state["extracted_pages"] = [{"url": p.get("url"), "title": "", "raw_content": p.get("summary") or ""} for p in pg if p]
-        except Exception:
-            pass
+        # Deep Research per-domain summary removed by design; rely on Jina MCP snapshot below.
         # Mark that we'll attempt a r.jina snapshot in this node to avoid
         # re-attempting the same fetch in node_extract_pages fallback.
         try:
@@ -2246,6 +2282,103 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
     if not company_id:
         return state
     try:
+        # Primary: Jina Deep Research contact discovery
+        try:
+            company_name = state.get("company_name") or ""
+            # Resolve domain from home URL when available
+            home_url = state.get("home") or ""
+            dom = None
+            try:
+                from urllib.parse import urlparse
+                if home_url:
+                    dom = (urlparse(home_url).netloc or "").lower()
+            except Exception:
+                dom = None
+            if _dr_contacts and company_name and dom:
+                t0 = time.perf_counter()
+                try:
+                    logger.info("[api] JinaDR.contacts name=%s domain=%s", company_name, dom)
+                except Exception:
+                    pass
+                dr = _dr_contacts(company_name, dom)
+                _obs_vendor("jina_deep_research", calls=1)
+                _obs_log(
+                    "contact_discovery",
+                    "primary",
+                    "ok",
+                    company_id=company_id,
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    extra={"domain": dom},
+                )
+                contacts_dr: list[dict] = []
+                # Parse the content for names/titles/emails/LinkedIn
+                try:
+                    content = dr.get("content") if isinstance(dr, dict) else None
+                    if isinstance(content, str) and content.strip():
+                        contacts_dr.extend(_extract_contacts_from_text(content))
+                except Exception:
+                    pass
+                # Skip early MCP page reads here; reserved for final crawl fallback
+                # Upsert and verify if anything was found
+                if contacts_dr:
+                    try:
+                        ins, upd = upsert_contacts_from_site(company_id, contacts_dr)
+                        logger.info(
+                            f"[jina_dr_contacts] upserted: inserted={ins}, updated={upd} company_id={company_id}"
+                        )
+                    except Exception:
+                        ins, upd = 0, 0
+                    try:
+                        emails = [c.get("email") for c in contacts_dr if c.get("email")]
+                        if emails:
+                            verification = verify_emails(emails)
+                            with get_db_connection() as conn:
+                                with conn.cursor() as cur:
+                                    for ver in verification:
+                                        try:
+                                            logger.info(
+                                                "[db] UPSERT lead_emails(email=%s, company_id=%s, src=%s) via JinaDR",
+                                                _mask_email(ver.get("email") or ""),
+                                                company_id,
+                                                "jina_deep_research",
+                                            )
+                                        except Exception:
+                                            pass
+                                        cur.execute(
+                                            """
+                                            INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                            VALUES (%s,%s,%s,%s,%s, now())
+                                            ON CONFLICT (email) DO UPDATE SET
+                                              company_id=EXCLUDED.company_id,
+                                              verification_status=EXCLUDED.verification_status,
+                                              smtp_confidence=EXCLUDED.smtp_confidence,
+                                              source=EXCLUDED.source,
+                                              last_verified_at=EXCLUDED.last_verified_at
+                                            """,
+                                            (
+                                                ver["email"],
+                                                company_id,
+                                                ver.get("status"),
+                                                ver.get("confidence"),
+                                                "jina_deep_research",
+                                            ),
+                                        )
+                    except Exception:
+                        pass
+                    # Check sufficiency post-upsert (require named + at least one verified email)
+                    try:
+                        verified_any_dr = any(str(v.get("status")).lower() in {"valid", "ok"} for v in (verification or []))
+                    except Exception:
+                        verified_any_dr = False
+                    total_contacts, has_named, _ = _get_contact_stats(company_id)
+                    state["contacts_sufficient"] = bool((total_contacts > 0) and has_named and verified_any_dr)
+                    if state["contacts_sufficient"]:
+                        logger.info("[jina_dr_contacts] sufficient contacts found; will proceed to persist")
+                        state["data"] = data
+        except Exception:
+            # Non-blocking: continue to MCP/site extraction then Apify
+            pass
+
         # First, attempt to extract contacts directly from deterministic site pages
         try:
             pages = state.get("extracted_pages") or []
@@ -2305,6 +2438,86 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                     logger.info("[site_contacts] sufficient contacts found; skipping Apify")
                     state["data"] = data
                     return state
+        except Exception:
+            pass
+
+        # Explicit MCP fallback: read common pages via Jina MCP if not already extracted
+        try:
+            root = None
+            home = state.get("home") or ""
+            if home:
+                try:
+                    from urllib.parse import urlparse
+                    p = urlparse(home)
+                    root = f"{p.scheme}://{p.netloc}"
+                except Exception:
+                    root = home
+            if root:
+                mcp_urls = [root, f"{root}/contact-us", f"{root}/contact", f"{root}/about", f"{root}/about-us"]
+                mcp_contacts: list[dict] = []
+                for u in mcp_urls:
+                    try:
+                        logger.info("[api] MCP.read_url url=%s", u)
+                        text = jina_read(u, timeout=6) or ""
+                        if text and len(text.strip()) > 120:
+                            mcp_contacts.extend(_extract_contacts_from_text(text))
+                            try:
+                                logger.info(
+                                    "[mcp_contacts] extracted_candidates=%s from url=%s",
+                                    len(mcp_contacts),
+                                    u,
+                                )
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+                if mcp_contacts:
+                    ins, upd = upsert_contacts_from_site(company_id, mcp_contacts)
+                    logger.info(
+                        f"[mcp_contacts] upserted from Jina MCP: inserted={ins}, updated={upd} company_id={company_id}"
+                    )
+                    emails = [c.get("email") for c in mcp_contacts if c.get("email")]
+                    if emails:
+                        try:
+                            verification = verify_emails(emails)
+                            with get_db_connection() as conn:
+                                with conn.cursor() as cur:
+                                    for ver in verification:
+                                        try:
+                                            logger.info(
+                                                "[db] UPSERT lead_emails(email=%s, company_id=%s, src=%s) via MCP",
+                                                _mask_email(ver.get("email") or ""),
+                                                company_id,
+                                                "mcp_reader",
+                                            )
+                                        except Exception:
+                                            pass
+                                        cur.execute(
+                                            """
+                                            INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                            VALUES (%s,%s,%s,%s,%s, now())
+                                            ON CONFLICT (email) DO UPDATE SET
+                                              company_id=EXCLUDED.company_id,
+                                              verification_status=EXCLUDED.verification_status,
+                                              smtp_confidence=EXCLUDED.smtp_confidence,
+                                              source=EXCLUDED.source,
+                                              last_verified_at=EXCLUDED.last_verified_at
+                                            """,
+                                            (
+                                                ver["email"],
+                                                company_id,
+                                                ver.get("status"),
+                                                ver.get("confidence"),
+                                                "mcp_reader",
+                                            ),
+                                        )
+                        except Exception:
+                            pass
+                    total_contacts, has_named, founder_present = _get_contact_stats(company_id)
+                    if total_contacts > 0 and has_named:
+                        logger.info("[mcp_contacts] sufficient contacts found; skipping Apify")
+                        state["data"] = data
+                        return state
         except Exception:
             pass
         need_emails = not (data.get("email") or [])
@@ -2494,7 +2707,21 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                                 with get_db_connection() as conn:
                                     with conn.cursor() as cur:
                                         for ver in verification:
-                                            email_verified = True if ver.get("status") == "valid" else False
+                                            try:
+                                                logger.info(
+                                                    "[db] UPSERT lead_emails(email=%s, company_id=%s, src=%s) via Apify",
+                                                    _mask_email(ver.get("email") or ""),
+                                                    company_id,
+                                                    "apify_linkedin",
+                                                )
+                                            except Exception:
+                                                pass
+                                            # Track if any verified email present
+                                            try:
+                                                if str(ver.get("status")).lower() in {"valid", "ok"}:
+                                                    state["contacts_sufficient"] = True
+                                            except Exception:
+                                                pass
                                             cur.execute(
                                                 """
                                                 INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
@@ -2632,6 +2859,16 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
                     "hiring_intensity": data.get("hiring_intensity"),
                 }
                 with get_db_connection() as conn, conn.cursor() as cur:
+                    try:
+                        logger.info(
+                            "[db] INSERT icp_evidence(company_id=%s, key=%s, source=%s) value_keys=%s",
+                            int(company_id),
+                            "sg_compliance",
+                            "web_preview",
+                            list(hint.keys()),
+                        )
+                    except Exception:
+                        pass
                     cur.execute(
                         "INSERT INTO icp_evidence(tenant_id, company_id, signal_key, value, source) VALUES (%s,%s,%s,%s,'web_preview')",
                         (
@@ -2641,6 +2878,10 @@ async def node_persist_core(state: EnrichmentState) -> EnrichmentState:
                             Json(hint),
                         ),
                     )
+                    try:
+                        logger.info("[db] INSERT icp_evidence done rows=%s", cur.rowcount)
+                    except Exception:
+                        pass
         except Exception:
             pass
         # Best-effort projection of degradation reasons and firmographics provenance for this company
@@ -2721,12 +2962,24 @@ enrichment_graph.add_node("persist_core", node_persist_core)
 enrichment_graph.add_node("persist_legacy", node_persist_legacy)
 
 enrichment_graph.set_entry_point("find_domain")
-enrichment_graph.add_edge("find_domain", "deterministic_crawl")
+enrichment_graph.add_edge("find_domain", "apify_contacts")
+
+def _after_contacts(state: EnrichmentState) -> str:
+    try:
+        return "persist_core" if bool(state.get("contacts_sufficient")) else "deterministic_crawl"
+    except Exception:
+        return "deterministic_crawl"
 
 
 def _after_deterministic(state: EnrichmentState) -> str:
     return "build_chunks" if state.get("extracted_pages") else "discover_urls"
 
+
+enrichment_graph.add_conditional_edges(
+    "apify_contacts",
+    _after_contacts,
+    {"persist_core": "persist_core", "deterministic_crawl": "deterministic_crawl"},
+)
 
 enrichment_graph.add_conditional_edges(
     "deterministic_crawl",
@@ -2737,8 +2990,7 @@ enrichment_graph.add_edge("discover_urls", "expand_crawl")
 enrichment_graph.add_edge("expand_crawl", "extract_pages")
 enrichment_graph.add_edge("extract_pages", "build_chunks")
 enrichment_graph.add_edge("build_chunks", "llm_extract")
-enrichment_graph.add_edge("llm_extract", "apify_contacts")
-enrichment_graph.add_edge("apify_contacts", "persist_core")
+enrichment_graph.add_edge("llm_extract", "persist_core")
 enrichment_graph.add_edge("persist_core", "persist_legacy")
 
 enrichment_agent = enrichment_graph.compile()
@@ -3064,12 +3316,17 @@ def _find_domain_tavily(company_name: str) -> list[str]:
             if not _dec_cap("tavily_units", 1):
                 break
             try:
+                logger.info("[api] Tavily.search query=%s", q)
                 response = tavily_client.search(q)
                 _VENDOR_COUNTERS["tavily_queries"] += 1
                 _obs_vendor("tavily", calls=1)
             except Exception:
                 response = None
             if isinstance(response, dict) and response.get("results"):
+                try:
+                    logger.info("[api] Tavily.search results_count=%s", len(response.get("results") or []))
+                except Exception:
+                    pass
                 break
         if not isinstance(response, dict) or not response.get("results"):
             return []
@@ -3170,36 +3427,6 @@ def _find_domain_tavily(company_name: str) -> list[str]:
     return []
 
 
-def qualify_pages(pages: list[dict], threshold: int = 4) -> list[dict]:
-    print(f"    🔍 Qualifying {len(pages)} pages")
-    prompt = PromptTemplate(
-        input_variables=["url", "title", "content"],
-        template=(
-            "You are a qualifier agent. Given the following page, score 1–5 whether this is our official website or About Us page.\n"
-            'Return JSON {{"score":<int>,"reason":"<reason>"}}.\n\n'
-            "URL: {url}\n"
-            "Title: {title}\n"
-            "Content: {content}\n"
-        ),
-    )
-    chain = prompt | llm | StrOutputParser()
-    accepted = []
-    for p in pages:
-        url = p.get("url") or ""
-        title = p.get("title") or ""
-        content = p.get("content") or ""
-        try:
-            output = chain.invoke({"url": url, "title": title, "content": content})
-            result = json.loads(output)
-            score = result.get("score", 0)
-            reason = result.get("reason", "")
-            if score >= threshold:
-                p["qualifier_reason"] = reason
-                p["score"] = score
-                accepted.append(p)
-        except Exception as exc:
-            print(f"       ↳ Qualify error for {url}: {exc}")
-    return accepted
 
 
 def extract_website_data(url: str) -> dict:
@@ -3365,6 +3592,10 @@ def verify_emails(emails: list[str]) -> list[dict]:
     Adapter returns dicts: {email, status, confidence, source}.
     """
     print(f"    🔒 ZeroBounce Email Verification for {_redact_email_list(emails)}")
+    try:
+        logger.info("[api] ZeroBounce.verify emails=%s", _redact_email_list(emails))
+    except Exception:
+        pass
     results: list[dict] = []
     if not emails:
         return results
@@ -3464,6 +3695,16 @@ def _persist_corpus(
     try:
         with conn:
             with conn.cursor() as cur:
+                try:
+                    logger.info(
+                        "[db] INSERT crawl_corpus company_id=%s page_count=%s source=%s size_chars=%s",
+                        company_id,
+                        page_count,
+                        source,
+                        len(corpus or ""),
+                    )
+                except Exception:
+                    pass
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS crawl_corpus (
@@ -3483,6 +3724,10 @@ def _persist_corpus(
                     """,
                     (company_id, page_count, source, corpus),
                 )
+                try:
+                    logger.info("[db] INSERT crawl_corpus done rows=%s", cur.rowcount)
+                except Exception:
+                    pass
     finally:
         try:
             conn.close()
@@ -3672,16 +3917,42 @@ def upsert_contacts_from_site(company_id: int, contacts: List[Dict[str, Any]]):
                             params.extend([company_id, c.get("linkedin_url")])
                         if has_updated_at:
                             assignments = assignments + ", updated_at=now()"
+                        try:
+                            logger.info(
+                                "[db] UPDATE contacts(company_id=%s) email=%s fields=%s",
+                                company_id,
+                                _mask_email(email or ""),
+                                {k: row.get(k) for k in set_cols},
+                            )
+                        except Exception:
+                            pass
                         cur.execute(f"UPDATE contacts SET {assignments} WHERE {where_clause}", params)
                         updated += cur.rowcount or 0
+                        try:
+                            logger.info("[db] UPDATE contacts done rows=%s", cur.rowcount)
+                        except Exception:
+                            pass
                 else:
                     cols_list = list(row.keys())
                     placeholders = ",".join(["%s"] * len(cols_list))
+                    try:
+                        logger.info(
+                            "[db] INSERT contacts(company_id=%s) email=%s fields=%s",
+                            company_id,
+                            _mask_email(email or ""),
+                            {k: row.get(k) for k in cols_list},
+                        )
+                    except Exception:
+                        pass
                     cur.execute(
                         f"INSERT INTO contacts ({', '.join(cols_list)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
                         [row[k] for k in cols_list],
                     )
                     inserted += cur.rowcount or 0
+                    try:
+                        logger.info("[db] INSERT contacts done rows=%s", cur.rowcount)
+                    except Exception:
+                        pass
                     # Mirror into lead_emails if present
                     if has_email and email:
                         try:
@@ -3695,6 +3966,15 @@ def upsert_contacts_from_site(company_id: int, contacts: List[Dict[str, Any]]):
                                 """,
                                 (email, company_id, row.get("title"), "site_page"),
                             )
+                            try:
+                                logger.info(
+                                    "[db] UPSERT lead_emails(email=%s, company_id=%s, source=%s)",
+                                    _mask_email(email or ""),
+                                    company_id,
+                                    "site_page",
+                                )
+                            except Exception:
+                                pass
                         except Exception:
                             pass
     except Exception:
@@ -3738,6 +4018,15 @@ def store_enrichment(company_id: int, domain: str, data: dict):
             conn,
             fields2,
         )
+        try:
+            logger.info(
+                "[db] INSERT company_enrichment_runs via store_enrichment company_id=%s public_emails=%s tech_stack_len=%s",
+                company_id,
+                _redact_email_list(fields2.get("public_emails") or []),
+                len(fields2.get("tech_stack") or []),
+            )
+        except Exception:
+            pass
         print("       ↳ history saved")
         with conn.cursor() as cur:
             cur.execute(
@@ -3773,6 +4062,16 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                     company_id,
                 ),
             )
+            try:
+                logger.info(
+                    "[db] UPDATE companies from store_enrichment company_id=%s domain=%s linkedin=%s tech_stack_len=%s",
+                    company_id,
+                    apex,
+                    data.get("linkedin_url"),
+                    len((data.get("tech_stack") or [])),
+                )
+            except Exception:
+                pass
             print("       ↳ companies updated")
 
             for ver in verification:
@@ -3794,6 +4093,16 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                         contact_source,
                     ),
                 )
+                try:
+                    logger.info(
+                        "[db] INSERT contacts(email=%s, company_id=%s, verified=%s, source=%s)",
+                        _mask_email(ver.get("email") or ""),
+                        company_id,
+                        email_verified,
+                        contact_source,
+                    )
+                except Exception:
+                    pass
                 # Also write to lead_emails if table exists
                 try:
                     cur.execute(
@@ -3815,6 +4124,16 @@ def store_enrichment(company_id: int, domain: str, data: dict):
                             contact_source,
                         ),
                     )
+                    try:
+                        logger.info(
+                            "[db] UPSERT lead_emails(email=%s, company_id=%s, status=%s, src=%s)",
+                            _mask_email(ver.get("email") or ""),
+                            company_id,
+                            ver.get("status"),
+                            contact_source,
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             print("       ↳ contacts inserted")

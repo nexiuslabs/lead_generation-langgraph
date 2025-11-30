@@ -95,7 +95,7 @@ State = { messages, candidates?, notify_email?, email_delivery? }
     - Link: `/export/latest_scores.csv?limit=500` (UI/Docs instructs that user must be authenticated when clicking).
 
 ### 4) Capture Recipient in State
-- Location: `app/main.py` normalize_input and ICP endpoints; plus LangGraph state if used.
+- Location: legacy `app/main.py` `normalize_input()` flow (now retired) and ICP endpoints; plus LangGraph state if used.
 - Precedence: override in request/graph input → JWT claim `email|preferred_username|sub`.
 - Store in request‑local context and pass to enrichment routines via:
   - Synchronous chat path: carry `notify_email` through the handlers and finalization.

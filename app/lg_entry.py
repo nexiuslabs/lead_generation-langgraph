@@ -2,66 +2,17 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Union
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_core.runnables.config import var_child_runnable_config
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.constants import CONFIG_KEY_CHECKPOINTER
 
 from my_agent.agent import build_orchestrator_graph
 from my_agent.utils.state import OrchestrationState
 
 Content = Union[str, List[dict], dict, None]
 
-CHECKPOINTER = MemorySaver()
 ORCHESTRATOR = build_orchestrator_graph()
-
-
-def normalize_payload(payload: dict) -> dict:
-    """Convert SDK payloads into LangChain message objects while preserving state."""
-    if not isinstance(payload, dict):
-        return {}
-    messages = payload.get("messages")
-    if isinstance(messages, list) and all(isinstance(m, (HumanMessage, AIMessage)) for m in messages):
-        return payload
-    state = dict(payload.get("state") or {})
-    normalized = []
-    for item in payload.get("input", {}).get("messages", []):
-        if not isinstance(item, dict):
-            continue
-        role = (item.get("role") or item.get("type") or "").lower()
-        content = item.get("content")
-        if not isinstance(content, str):
-            continue
-        if role in {"human", "user"}:
-            normalized.append(HumanMessage(content=content))
-        elif role in {"assistant", "ai"}:
-            normalized.append(AIMessage(content=content))
-    if normalized:
-        state["messages"] = normalized
-    return state
-
-
-def _load_checkpoint_state(config: RunnableConfig | None) -> dict | None:
-    cfg = config or var_child_runnable_config.get()
-    if not cfg:
-        return None
-    configurable = cfg.get("configurable") or {}
-    thread_id = configurable.get("thread_id")
-    saver = configurable.get(CONFIG_KEY_CHECKPOINTER)
-    if not thread_id or saver is None:
-        return None
-    request = {"configurable": {"thread_id": thread_id}}
-    try:
-        checkpoint = saver.get_tuple(request)
-    except Exception:
-        return None
-    if not checkpoint:
-        return None
-    return (checkpoint.checkpoint or {}).get("channel_values")
 
 
 def _flatten_content(content: Content) -> str:

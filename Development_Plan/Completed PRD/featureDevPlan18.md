@@ -65,7 +65,7 @@ We can alternatively record per-batch stats in `run_stage_stats` with `stage='st
 —
 
 Backend Changes (FastAPI)
-1) Normalize Input: upsert+enrich 10 synchronously; enqueue remainder for nightly
+1) Normalize Input: upsert+enrich 10 synchronously; enqueue remainder for nightly *(legacy path retired; snippet kept for archival context.)*
 ```py
 # app/main.py (excerpt)
 STAGING_UPSERT_MODE = os.getenv("STAGING_UPSERT_MODE", "background").lower()

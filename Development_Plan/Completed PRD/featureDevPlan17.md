@@ -164,7 +164,7 @@ group by tenant_id;
   - Finder routing: remove explicit “Industry” prompt (infer from evidence), show early micro‑ICPs with SSIC and industry names, display ACRA totals using `_count_acra_by_ssic_codes` and samples via `_select_acra_by_ssic_codes`.
   - Accept + Enrich: support `accept micro-icp N`; proceed when user types “run enrichment”. Enrich up to 10 now (`CHAT_ENRICH_LIMIT`/`RUN_NOW_LIMIT`), enqueue remainder for nightly.
   - Safety: add boot‑guard to prevent auto‑run on restart; router only advances on explicit human messages; avoid recursion/loops by centralized router.
-- `jobs/icp_tasks.py` (new)
+- `jobs/icp_tasks.py` (legacy helper, since removed)
   - Task functions for mapping, crawl, evidence store, MV refresh, suggestion gen
 - `schemas/icp.py` (new)
   - Pydantic models: IntakePayload, Seed, EvidenceItem, SuggestionCard
@@ -291,14 +291,14 @@ Implementation notes
 Code changes (by file)
 - `app/main.py`:
   - Add routes `/icp/intake`, `/icp/suggestions`, `/icp/accept` and optional `/icp/patterns` (ops).
-  - In `normalize_input`, keep industry inference for legacy threads but prefer ICP Finder path when `ENABLE_ICP_INTAKE=true` and conversation mentions ICP.
+  - In legacy `normalize_input()` (now retired), keep industry inference for legacy threads but prefer ICP Finder path when `ENABLE_ICP_INTAKE=true` and conversation mentions ICP.
 - `app/pre_sdr_graph.py`:
   - Add `icp_finder_intake_node` to collect website + seeds conversationally; post-confirm, call `/icp/intake`; display progress chips; render suggestion cards when available.
   - Suppress old “Ask Industry first” branch when Finder is enabled; route to resolver when matching is ambiguous.
 - `src/icp.py`:
   - Implement `save_icp_intake`, `map_seeds_to_companies`, `refresh_icp_patterns`, `generate_suggestions` helpers.
   - Add normalization utils for domains/titles and fuzzy name cleaner (strip Pte/Ltd/etc.).
-- `jobs/icp_tasks.py` (new):
+- `jobs/icp_tasks.py` (legacy helper, since removed):
   - Task functions invoked by background job runner (`icp_intake_process`).
 - `lead_generation-main/docs`:
   - Add runbook for ICP Finder ops: rerun mapping, inspect patterns, troubleshoot blocks.

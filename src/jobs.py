@@ -520,6 +520,13 @@ def enqueue_icp_discovery_enrich(tenant_id: int, notify_email: Optional[str] = N
         jid = int(row[0]) if row and row[0] is not None else 0
         try:
             log.info(
+                "[db] INSERT background_jobs(job_type=%s, tenant_id=%s) -> job_id=%s",
+                'icp_discovery_enrich', int(tenant_id), int(jid)
+            )
+        except Exception:
+            pass
+        try:
+            log.info(
                 '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"notify_email":%s}',
                 int(tenant_id),
                 int(jid),
@@ -558,6 +565,10 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
     log.info("{\"job\":\"icp_discovery_enrich\",\"phase\":\"start\",\"job_id\":%s}", job_id)
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("UPDATE background_jobs SET status='running', started_at=now() WHERE job_id=%s", (job_id,))
+        try:
+            log.info("[db] UPDATE background_jobs status=running job_id=%s", job_id)
+        except Exception:
+            pass
         cur.execute("SELECT tenant_id, params FROM background_jobs WHERE job_id=%s", (job_id,))
         row = cur.fetchone()
         tenant_id = int(row[0]) if row and row[0] is not None else None
@@ -623,6 +634,13 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                         job_id,
                         len(domains),
                     )
+                    # Also log the exact domain list discovered (up to 50)
+                    import json as _json
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_domains\",\"job_id\":%s,\"list\":%s}",
+                        job_id,
+                        _json.dumps([f"https://{d}" if not d.startswith("http") else d for d in domains[:50]]),
+                    )
                 except Exception:
                     pass
             if not domains:
@@ -654,12 +672,27 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                         discovery_source,
                         len(domains),
                     )
+                    # Log fallback domain list as well
+                    import json as _json
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_domains_fallback\",\"job_id\":%s,\"source\":\"%s\",\"list\":%s}",
+                        job_id,
+                        discovery_source,
+                        _json.dumps([f"https://{d}" if not d.startswith("http") else d for d in (domains[:50] or [])]),
+                    )
                 except Exception:
                     pass
             # persist into staging_global_companies
             if domains:
                 with get_conn() as conn, conn.cursor() as cur:
                     for d in domains[:50]:
+                        try:
+                            log.info(
+                                "[db] INSERT staging_global_companies tenant_id=%s domain=%s source=%s",
+                                tenant_id, d, discovery_source,
+                            )
+                        except Exception:
+                            pass
                         try:
                             cur.execute(
                                 "INSERT INTO staging_global_companies(tenant_id, domain, ai_metadata) VALUES (%s,%s,%s)",
@@ -707,6 +740,10 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     if r and r[0]:
                         company_ids.append(int(r[0]))
                     else:
+                        try:
+                            log.info("[db] INSERT companies(name=%s, website_domain=%s)", d.split(".")[0].title(), d)
+                        except Exception:
+                            pass
                         cur.execute(
                             "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,now()) RETURNING company_id",
                             (d.split(".")[0].title(), d),
@@ -845,6 +882,13 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 "UPDATE background_jobs SET status='done', processed=%s, total=%s, ended_at=now() WHERE job_id=%s",
                 (processed, len(company_ids), job_id),
             )
+            try:
+                log.info(
+                    "[db] UPDATE background_jobs status=done job_id=%s processed=%s total=%s",
+                    job_id, processed, len(company_ids)
+                )
+            except Exception:
+                pass
         dur_ms = int((time.perf_counter() - t0) * 1000)
         log.info("{\"job\":\"icp_discovery_enrich\",\"phase\":\"finish\",\"job_id\":%s,\"processed\":%s,\"duration_ms\":%s}", job_id, processed, dur_ms)
     except Exception as e:
@@ -853,6 +897,10 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 "UPDATE background_jobs SET status='error', error=%s, ended_at=now() WHERE job_id=%s",
                 (str(e), job_id),
             )
+            try:
+                log.info("[db] UPDATE background_jobs status=error job_id=%s", job_id)
+            except Exception:
+                pass
         log.exception("icp_discovery_enrich failed: %s", e)
     finally:
         _finalize_run(run_id, status="succeeded")

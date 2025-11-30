@@ -131,7 +131,7 @@
 ## 17) Implementation Checklist (Code Touchpoints)
 - Chat Flow: `app/pre_sdr_graph.py` (confirm → preview/top‑10 reuse → enrich).
 - Endpoints: `app/icp_endpoints.py` (`/icp/top10`, `/icp/accept`, patterns); add `/icp/enrich/top10`.
-- Intake/Patterns: `src/icp_intake.py`, `src/icp_tasks.py`; MV refresh in scheduler.
+- Intake/Patterns: `src/icp_intake.py` (current) and legacy `src/icp_tasks.py` (now removed); MV refresh in scheduler.
 - Enrichment: `src/enrichment.py` (crawl/merge/score), `src/vendors/apify_linkedin.py`, ZeroBounce in `src/enrichment.py`.
 - Jobs/Scheduler: `src/jobs.py`, `scripts/run_nightly.py`, `scripts/run_scheduler.py`.
  - Add job: `web_discovery_bg_enrich` (background next‑40) and wire agent notification on `/jobs/{id}` completion.

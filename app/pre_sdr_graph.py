@@ -472,64 +472,6 @@ def _maybe_backfill_icp_basics_from_context(state: GraphState) -> None:
 
     if changed:
         state["icp"] = icp
-
-
-def _format_short_currency(value: Optional[float]) -> str:
-    if value is None:
-        return "Skip noted"
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    def _fmt(val: float) -> str:
-        text = f"{val:.1f}"
-        text = text.rstrip("0").rstrip(".")
-        return text
-    if abs(num) >= 1_000_000:
-        return f"${_fmt(num / 1_000_000)}M"
-    if abs(num) >= 1_000:
-        return f"${_fmt(num / 1_000)}K"
-    return f"${int(num):,}"
-
-
-def _format_range(lo: Optional[float], hi: Optional[float], suffix: str) -> Optional[str]:
-    def _token(val: Optional[float]) -> Optional[str]:
-        if val is None:
-            return None
-        try:
-            num = float(val)
-        except (TypeError, ValueError):
-            return str(val)
-        if num.is_integer():
-            return str(int(num))
-        return f"{num:.1f}".rstrip("0").rstrip(".")
-    lo_txt = _token(lo)
-    hi_txt = _token(hi)
-    if lo_txt and hi_txt:
-        return f"{lo_txt}–{hi_txt}{suffix}"
-    if lo_txt:
-        return f"{lo_txt}+{suffix}"
-    if hi_txt:
-        return f"≤{hi_txt}{suffix}"
-    return None
-
-
-def _format_list_preview(values: List[Any], *, empty_note: str = "Skip noted", limit: int = 3) -> str:
-    cleaned = []
-    for val in values:
-        if isinstance(val, str):
-            item = val.strip()
-            if item:
-                cleaned.append(item)
-    if not cleaned:
-        return empty_note
-    preview = ", ".join(cleaned[:limit])
-    extra = len(cleaned) - len(cleaned[:limit])
-    if extra > 0:
-        preview += f" (+{extra} more)"
-    return preview
-
-
 def _collect_icp_progress_steps(state: GraphState) -> List[Dict[str, Any]]:
     icp = dict(state.get("icp") or {})
     steps: List[Dict[str, Any]] = []
@@ -715,25 +657,6 @@ def _merge_icp_profile_into_payload(payload: dict, icp_profile: dict) -> dict:
     if prof.get("summary"):
         out["summary"] = prof.get("summary")
     return out
-
-
-def _merge_icp_profile_into_state(state: GraphState, icp_profile: Dict[str, Any]) -> None:
-    icp = dict(state.get("icp") or {})
-    prof = dict(icp_profile or {})
-    if prof.get("industries"):
-        icp.setdefault("industries", prof.get("industries"))
-    if prof.get("buyer_titles"):
-        icp.setdefault("buyer_titles", prof.get("buyer_titles"))
-    if prof.get("size_bands"):
-        icp.setdefault("company_sizes", prof.get("size_bands"))
-    if prof.get("geos"):
-        icp.setdefault("geos", prof.get("geos"))
-    if prof.get("integrations"):
-        icp.setdefault("signals", prof.get("integrations"))
-    if prof.get("triggers"):
-        icp.setdefault("triggers", prof.get("triggers"))
-    icp["icp_profile_confirmed"] = bool(state.get("icp_profile_confirmed"))
-    state["icp"] = icp
 
 
 def _ensure_company_by_domain(domain: str) -> int | None:
@@ -1010,6 +933,12 @@ def _persist_company_profile_sync(
                     sorted(list((profile or {}).keys()))[:8],
                     confirmed_flag,
                 )
+                logger.info(
+                    "[db] UPSERT tenant_company_profiles OK tenant_id=%s confirmed=%s source_url=%s",
+                    tid,
+                    confirmed_flag,
+                    (src or ""),
+                )
             except Exception:
                 pass
     except Exception:
@@ -1147,8 +1076,21 @@ def _persist_icp_profile_sync(
         payload["icp_profile_user_confirmed"] = bool(confirmed)
     try:
         _upsert_icp_profile_sync(tid, payload, name="Default ICP")
+        try:
+            logger.info(
+                "[icp_profile] persisted tenant_id=%s keys=%s confirmed=%s seeds=%s",
+                tid,
+                sorted(list((payload or {}).keys()))[:8],
+                payload.get("icp_profile_confirmed"),
+                len(payload.get("seed_urls") or []),
+            )
+            logger.info(
+                "[db] UPSERT icp_rules OK tenant_id=%s name=%s", tid, "Default ICP"
+            )
+        except Exception:
+            pass
     except Exception:
-        pass
+        logger.warning("[icp_profile] persist failed tenant_id=%s", tid, exc_info=True)
 
 
 def _reset_icp_profile_loop(state: dict) -> None:
@@ -2961,47 +2903,6 @@ def route(state: PreSDRState) -> str:
     return dest
 
 
-def build_presdr_graph():
-    g = StateGraph(PreSDRState)
-    g.add_node("icp", icp_discovery)
-    g.add_node("confirm", icp_confirm)
-    g.add_node("candidates", parse_candidates)
-    g.add_node("enrich", run_enrichment)
-
-    g.set_entry_point("icp")
-
-    # IMPORTANT: these keys must match what route() returns
-    g.add_conditional_edges(
-        "icp",
-        route,
-        {
-            "confirm": "confirm",
-            "enrich": "enrich",
-            "candidates": "candidates",
-            "icp": "icp",
-        },
-    )
-    g.add_conditional_edges(
-        "confirm",
-        route,
-        {
-            "enrich": "enrich",
-            "candidates": "candidates",
-            "icp": "icp",
-        },
-    )
-    g.add_conditional_edges(
-        "candidates",
-        route,
-        {
-            "enrich": "enrich",
-            "icp": "icp",
-        },
-    )
-    g.add_edge("enrich", END)
-    return g.compile()
-
-
 # ------------------------------
 # New LLM-driven Pre-SDR graph (dynamic Q&A, structured extraction)
 # ------------------------------
@@ -4299,33 +4200,6 @@ async def _regenerate_top10_if_missing(
     return []
 
 
-# None/skip/any detector for buying signals
-NEG_NONE = {
-    "none",
-    "no",
-    "n/a",
-    "na",
-    "skip",
-    "any",
-    "nope",
-    "not important",
-    "no preference",
-    "doesn't matter",
-    "dont care",
-    "don't care",
-    "anything",
-    "no specific",
-    "no specific signals",
-    "no signal",
-    "no signals",
-}
-
-
-def _says_none(text: str) -> bool:
-    t = text.strip().lower()
-    return any(p in t for p in NEG_NONE)
-
-
 def _user_just_confirmed(state: dict) -> bool:
     msgs = state.get("messages") or []
     for m in reversed(msgs):
@@ -4589,12 +4463,6 @@ async def extract_company_profile_update(text: str) -> CompanyProfileUpdate:
     structured = EXTRACT_LLM.with_structured_output(CompanyProfileUpdate)
     return await structured.ainvoke([COMPANY_PROFILE_UPDATE_SYS, HumanMessage(text)])
 
-
-def extract_company_profile_update_sync(text: str) -> CompanyProfileUpdate:
-    structured = EXTRACT_LLM.with_structured_output(CompanyProfileUpdate)
-    return structured.invoke([COMPANY_PROFILE_UPDATE_SYS, HumanMessage(text)])
-
-
 def _apply_company_profile_llm_update(state: GraphState, upd: CompanyProfileUpdate) -> dict[str, Dict[str, List[str]]]:
     prof = dict(state.get("company_profile") or {})
     applied: dict[str, Dict[str, List[str]]] = {}
@@ -4727,16 +4595,6 @@ async def extract_icp_profile_update(text: str) -> ICPProfileUpdate:
     structured = EXTRACT_LLM.with_structured_output(ICPProfileUpdate)
     return await structured.ainvoke([ICP_PROFILE_UPDATE_SYS, HumanMessage(text)])
 
-def extract_icp_profile_update_sync(text: str) -> ICPProfileUpdate:
-    """Synchronous helper for contexts where awaiting is not possible.
-
-    Uses the same structured LLM but via .invoke(). Safe to call from
-    non-async gates that run inside the graph without their own event loop.
-    """
-    structured = EXTRACT_LLM.with_structured_output(ICPProfileUpdate)
-    return structured.invoke([ICP_PROFILE_UPDATE_SYS, HumanMessage(text)])
-
-
 def _apply_icp_profile_llm_update(state: GraphState, upd: ICPProfileUpdate) -> dict[str, Dict[str, List[str]]]:
     prof = dict(state.get("icp_profile") or {})
     applied: dict[str, Dict[str, List[str]]] = {}
@@ -4819,47 +4677,6 @@ QUESTION_SYS = SystemMessage(
         "Keep it brief, concrete, and practical. If ICP looks complete, ask the user to confirm or adjust."
     )
 )
-
-
-def _fmt_icp(icp: Dict[str, Any]) -> str:
-    inds = ", ".join(icp.get("industries") or []) or "Any"
-    emp_min = icp.get("employees_min")
-    emp_max = icp.get("employees_max")
-    if emp_min and emp_max:
-        emp = f"{emp_min}–{emp_max}"
-    elif emp_min:
-        emp = f"{emp_min}+"
-    elif emp_max:
-        emp = f"up to {emp_max}"
-    else:
-        emp = "Any"
-    geos = ", ".join(icp.get("geos") or []) or "Any"
-    rev = icp.get("revenue_bucket") or "Any"
-    y_min = icp.get("year_min")
-    y_max = icp.get("year_max")
-    if y_min and y_max:
-        years = f"{y_min}–{y_max}"
-    elif y_min:
-        years = f"{y_min}+"
-    elif y_max:
-        years = f"up to {y_max}"
-    else:
-        years = "Any"
-    sigs_list = icp.get("signals") or []
-    if not sigs_list and icp.get("signals_done"):
-        sigs = "None specified"
-    else:
-        sigs = ", ".join(sigs_list) or "None specified"
-    return "\n".join(
-        [
-            f"- Industries: {inds}",
-            f"- Employees: {emp}",
-            f"- Revenue: {rev}",
-            f"- Inc. Years: {years}",
-            f"- Geos: {geos}",
-            f"- Signals: {sigs}",
-        ]
-    )
 
 
 # ------------------------------
@@ -5066,97 +4883,6 @@ async def _default_candidates(
         d["name"] = d.get("name") or (d.get("domain") or "Unknown")
         out.append(d)
     return out
-
-
-# ------------------------------
-# ICP industry helpers
-# ------------------------------
-
-def _extract_icp_industries_from_text(text: str) -> list[str]:
-    """Extract user-intended industry phrases from free text (last human message).
-
-    - Splits on common separators/connectors
-    - Removes conversational fillers and bullets
-    - Prefers multi-word phrases and drops contained single-word generics
-    """
-    if not text:
-        return []
-    # Strip URLs to avoid domain tokens becoming "industries"
-    try:
-        text = re.sub(r"https?://\S+", " ", text)
-    except Exception:
-        pass
-    parts = re.split(r"[,\n;]+|\band\b|\bor\b|/|\\\\|\|", text, flags=re.IGNORECASE)
-    stop = {
-        "sg",
-        "singapore",
-        "global",
-        "worldwide",
-        "sea",
-        "apac",
-        "emea",
-        "us",
-        "usa",
-        "uk",
-        "eu",
-        "startup",
-        "startups",
-        "smb",
-        "sme",
-        "enterprise",
-        "b2b",
-        "b2c",
-        "small",
-        "medium",
-        "large",
-        "which",
-        "which geographies",
-        "which industries",
-        "problem spaces",
-        "should we target",
-        "e.g.",
-        "eg",
-        # URL/common web tokens
-        "http",
-        "https",
-        "www",
-    }
-    raw: list[str] = []
-    for p in parts:
-        s = (p or "").strip()
-        if not s or len(s) < 2:
-            continue
-        if s.strip().startswith("-"):
-            continue
-        if any(ch in s for ch in ("?", "(", ")", ":")):
-            continue
-        if not re.search(r"[A-Za-z]", s):
-            continue
-        # Skip bare domains (example.com)
-        try:
-            if re.search(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", s, flags=re.IGNORECASE):
-                continue
-        except Exception:
-            pass
-        sl = s.lower()
-        if sl in stop:
-            continue
-        sl = re.sub(r"\s+", " ", sl)
-        raw.append(sl)
-    # Dedupe preserve order
-    seen = set()
-    out: list[str] = []
-    for t in raw:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    # Prefer multiword phrases; drop single-word tokens contained in multiwords
-    multi = [t for t in out if " " in t]
-    if multi:
-        singles = {t for t in out if " " not in t}
-        singles = {s for s in singles if any(s in m.split() for m in multi)}
-        out = [t for t in out if not (" " not in t and t in singles)]
-    return out[:10]
 
 
 # ------------------------------
@@ -8390,21 +8116,6 @@ def _is_profile_show_request(text: str, *, icp: Optional[bool] = None) -> bool:
     else:
         if mentions_icp and not mentions_company:
             return False
-    return any(hint in lowered for hint in PROFILE_FIELD_HINTS)
-
-
-def _looks_like_profile_feedback(text: str, *, icp: bool = True) -> bool:
-    if not text:
-        return False
-    if _matches_profile_confirm_command(text, icp=icp):
-        return True
-    if _is_profile_update_request(text, icp=icp):
-        return True
-    if _is_profile_show_request(text, icp=icp):
-        return True
-    lowered = text.lower()
-    if icp and "icp" in lowered:
-        return True
     return any(hint in lowered for hint in PROFILE_FIELD_HINTS)
 
 

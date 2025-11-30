@@ -310,7 +310,7 @@ async def export_run_events(run_id: int, _: dict = Depends(require_auth)):
 
 ## QA Sampling
 
-Helper to create QA samples after scoring:
+Helper to create QA samples after scoring (legacy helper now removed from the codebase; retained here for archival context):
 
 ```python
 def create_qa_samples(run_id: int, tenant_id: int, high_bucket_company_ids: list[int], limit: int = 10):
@@ -408,4 +408,3 @@ ORDER BY run_id DESC, vendor;
 4) Set up Metabase charts; wire Slack webhook in staging; simulate alerts.
 5) Add retention job (cron/worker) for event logs and QA samples.
 6) Document runbooks MV-01, CR-02, VQ-03, OA-04, CC-05, OE-06 in ops wiki.
-

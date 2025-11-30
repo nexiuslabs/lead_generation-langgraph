@@ -16,7 +16,15 @@ def begin_run(tenant_id: int, trace_url: Optional[str] = None) -> int:
             """,
             (tenant_id, 'running', trace_url),
         )
-        return int(cur.fetchone()[0])
+        rid = int(cur.fetchone()[0])
+        try:
+            _logging.getLogger("obs.db").info(
+                "[db] INSERT enrichment_runs tenant_id=%s status=%s run_id=%s",
+                tenant_id, 'running', rid,
+            )
+        except Exception:
+            pass
+        return rid
 
 # Simple global run context for vendor usage in modules that don't receive run_id/tenant_id explicitly
 _CTX: Dict[str, Optional[int]] = {"run_id": None, "tenant_id": None}
@@ -34,6 +42,10 @@ def finalize_run(run_id: int, status: str = "succeeded") -> None:
             "UPDATE enrichment_runs SET ended_at = NOW(), status = %s WHERE run_id = %s",
             (status, run_id),
         )
+        try:
+            _logging.getLogger("obs.db").info("[db] UPDATE enrichment_runs run_id=%s status=%s", run_id, status)
+        except Exception:
+            pass
 
 def mark_run_degraded(run_id: int) -> None:
     """Best-effort update to flag a run as degraded when any fallback/degradation occurred.
@@ -64,6 +76,13 @@ def persist_manifest(run_id: int, tenant_id: int, selected_ids: list[int]) -> No
             """,
             (run_id, tenant_id, selected_ids),
         )
+        try:
+            _logging.getLogger("obs.db").info(
+                "[db] UPSERT run_manifests run_id=%s tenant_id=%s count=%s",
+                run_id, tenant_id, len(selected_ids or []),
+            )
+        except Exception:
+            pass
 
 def write_summary(run_id: int, tenant_id: int, *, candidates: int, processed: int, batches: int) -> None:
     with get_conn() as conn, conn.cursor() as cur:
@@ -75,6 +94,13 @@ def write_summary(run_id: int, tenant_id: int, *, candidates: int, processed: in
             """,
             (run_id, tenant_id, candidates, processed, batches),
         )
+        try:
+            _logging.getLogger("obs.db").info(
+                "[db] UPSERT run_summaries run_id=%s tenant_id=%s candidates=%s processed=%s batches=%s",
+                run_id, tenant_id, candidates, processed, batches,
+            )
+        except Exception:
+            pass
 
 def log_event(run_id: int, tenant_id: int, stage: str, event: str, status: str,
               *, company_id: Optional[int] = None, error_code: Optional[str] = None,
@@ -104,6 +130,13 @@ def log_event(run_id: int, tenant_id: int, stage: str, event: str, status: str,
             """,
             (run_id, tenant_id, stage, company_id, event, status, error_code, duration_ms, trace_id, extra),
         )
+        try:
+            _logging.getLogger("obs.db").info(
+                "[db] INSERT run_event_logs run_id=%s tenant_id=%s stage=%s event=%s status=%s company_id=%s",
+                run_id, tenant_id, stage, event, status, company_id,
+            )
+        except Exception:
+            pass
 
 def bump_vendor(run_id: int, tenant_id: int, vendor: str, *, calls: int = 0, errors: int = 0,
                 tokens_in: int = 0, tokens_out: int = 0, cost_usd: float = 0.0,
@@ -140,6 +173,13 @@ def bump_vendor(run_id: int, tenant_id: int, vendor: str, *, calls: int = 0, err
             """,
             (run_id, tenant_id, vendor, calls, errors, tokens_in, tokens_out, cost_usd, rate_limit_hits, quota_exhausted),
         )
+        try:
+            _logging.getLogger("obs.db").info(
+                "[db] UPSERT run_vendor_usage run_id=%s tenant_id=%s vendor=%s calls=%s errors=%s cost=%s",
+                run_id, tenant_id, vendor, calls, errors, round(cost_usd, 6),
+            )
+        except Exception:
+            pass
 
 @contextmanager
 def stage_timer(run_id: int, tenant_id: int, stage: str, *, total_inc: int = 0):
@@ -169,6 +209,13 @@ def _inc_stage(run_id: int, tenant_id: int, stage: str, *, total: int = 0, ok: i
             """,
             (run_id, tenant_id, stage, total, ok, err),
         )
+        try:
+            _logging.getLogger("obs.db").info(
+                "[db] UPSERT run_stage_stats run_id=%s tenant_id=%s stage=%s total=%s ok=%s err=%s",
+                run_id, tenant_id, stage, total, ok, err,
+            )
+        except Exception:
+            pass
 
 
 def aggregate_percentiles(run_id: int, tenant_id: int) -> None:
@@ -195,65 +242,3 @@ def aggregate_percentiles(run_id: int, tenant_id: int) -> None:
             (run_id, tenant_id, run_id, tenant_id),
         )
 
-
-def create_qa_samples(run_id: int, tenant_id: int, company_ids: list[int], limit: int = 10, bucket: str = "High") -> None:
-    """Sample a subset of company_ids for QA checks into qa_samples.
-
-    Uses a static checklist skeleton; ON CONFLICT is ignored to avoid duplicates.
-    """
-    if not company_ids:
-        return
-    import random as _random
-    picks = _random.sample(company_ids, min(limit, len(company_ids)))
-    checklist = {"domain": False, "about_text": False, "contacts": False, "rationale": False}
-    with get_conn() as conn, conn.cursor() as cur:
-        for cid in picks:
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO qa_samples(run_id, tenant_id, company_id, bucket, checks, result)
-                    VALUES (%s,%s,%s,%s,%s::jsonb,'needs_review')
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (run_id, tenant_id, cid, bucket, _json.dumps(checklist)),
-                )
-            except Exception:
-                # Skip errors but continue sampling others
-                pass
-
-def bump_stage_counters(run_id: int, tenant_id: int, stage: str, *, retry_inc: int = 0, fallback_inc: int = 0) -> None:
-    """Increment retry and fallback counters for a stage.
-
-    This assumes `run_stage_stats` has retry_count and fallback_count columns; if not,
-    the UPDATE will no-op due to missing columns and errors will be ignored.
-    """
-    if retry_inc == 0 and fallback_inc == 0:
-        return
-    try:
-        with get_conn() as conn, conn.cursor() as cur:
-            try:
-                # Ensure a row exists; insert zeroes if missing
-                cur.execute(
-                    """
-                    INSERT INTO run_stage_stats(run_id, tenant_id, stage)
-                    VALUES (%s,%s,%s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (run_id, tenant_id, stage),
-                )
-            except Exception:
-                pass
-            try:
-                cur.execute(
-                    """
-                    UPDATE run_stage_stats
-                    SET retry_count = COALESCE(retry_count,0) + %s,
-                        fallback_count = COALESCE(fallback_count,0) + %s
-                    WHERE run_id=%s AND tenant_id=%s AND stage=%s
-                    """,
-                    (retry_inc, fallback_inc, run_id, tenant_id, stage),
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass

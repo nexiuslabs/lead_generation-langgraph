@@ -105,7 +105,7 @@ Implemented LLM agents (new):
   - `mini_crawl_worker` (tool): crawls candidate domains via existing pipeline.
   - `evidence_extractor` (ChatOpenAI structured): normalizes crawl summaries to evidence fields.
   - `scoring_and_gating` (deterministic stub): computes A/B/C; integrate with `lead_scoring.py` in prod. Top‑10 is always filled to 10 via controlled backfills (DDG first, Jina‑only fallback last).
-  - `build_icp_agents_graph()`: composes nodes into a LangGraph for plug‑in or testing.
+  - Legacy `build_icp_agents_graph()` (now removed) composed nodes into a LangGraph for plug‑in or testing.
 
 ## LangChain/LangGraph Integration Map (By File)
 
@@ -118,7 +118,7 @@ Implemented LLM agents (new):
   - Keep deterministic gating in DB; the in‑memory `scoring_and_gating` remains a safe fallback for preview lists only.
 
 - `app/lg_entry.py` (graph entry / testing)
-  - Expose a dev/test endpoint or CLI path to run `build_icp_agents_graph()` against a small state for smoke tests.
+  - Expose a dev/test endpoint or CLI path to run the (now-retired) `build_icp_agents_graph()` against a small state for smoke tests.
   - Optionally add a feature flag `ENABLE_AGENT_DISCOVERY` to route preview discovery through the agents graph for comparison logging.
 
 - `src/icp_pipeline.py` (crawl + evidence)

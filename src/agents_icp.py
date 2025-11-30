@@ -1816,31 +1816,4 @@ def fallback_top10_via_seed_outlinks(seed_domains: List[str], icp_profile: Dict[
         log.info("[top10-seed-outlinks] failed: %s", e)
         return []
 
-def build_icp_agents_graph():
-    """Build a small LangGraph with the core nodes described in PRD19 §6.
-
-    Note: This graph operates on an in‑memory state and does not write to the DB.
-    Integrate with persistence by calling existing modules (e.g., lead_scoring, icp_pipeline) where appropriate.
-    """
-    from langgraph.graph import StateGraph
-
-    def _ensure_async(fn):
-        if asyncio.iscoroutinefunction(fn):
-            return fn
-        async def aw(state):
-            return fn(state)
-        return aw
-
-    g = StateGraph(dict)
-    g.add_node("synthesize_icp", _ensure_async(icp_synthesizer))
-    g.add_node("plan_discovery", _ensure_async(discovery_planner))
-    g.add_node("mini_crawl", mini_crawl_worker)
-    g.add_node("extract_evidence", _ensure_async(evidence_extractor))
-    g.add_node("score_gate", _ensure_async(scoring_and_gating))
-
-    g.set_entry_point("synthesize_icp")
-    g.add_edge("synthesize_icp", "plan_discovery")
-    g.add_edge("plan_discovery", "mini_crawl")
-    g.add_edge("mini_crawl", "extract_evidence")
-    g.add_edge("extract_evidence", "score_gate")
     return g.compile()

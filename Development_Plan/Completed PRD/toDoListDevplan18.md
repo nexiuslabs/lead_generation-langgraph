@@ -40,7 +40,7 @@ Progress summary (manual)
 - [x] Helper module `src/jobs.py` with `enqueue_staging_upsert()` and nightly worker `run_staging_upsert()` — Owner: BE — Status: Done — Updated: now
   - Use batched server‑side cursor implementation from `app/lg_entry.py` under the hood
   - Respect caps: `UPSERT_MAX_PER_JOB`, `STAGING_BATCH_SIZE`
-- [x] Modify `normalize_input()` to upsert + enrich up to 10 synchronously, then enqueue remainder for the nightly runner — Owner: BE — Status: Done — Updated: now
+- [x] (Legacy, retired) `normalize_input()` flow once upserted/enriched up to 10 synchronously, then enqueued the nightly runner — Owner: BE — Status: Done — Updated: now
 - [x] Add endpoints — Owner: BE — Status: Done — Updated: now
   - `POST /jobs/staging_upsert` (body: `{ terms: string[] }`) → `{ job_id }` (queued for nightly)
   - `GET /jobs/{job_id}` → status, processed, total, error
