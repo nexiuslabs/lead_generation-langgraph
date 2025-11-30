@@ -78,6 +78,64 @@ def _extract_urls_from_text(text: str) -> List[str]:
         return []
 
 
+def _extract_domains_from_markdown_table(text: str) -> List[str]:
+    """Extract domain candidates from a Markdown table with a 'domain_url' column.
+
+    Looks for a header row containing 'domain_url' and parses the rows beneath,
+    returning the raw cell values from that column (e.g., 'example.com' or 'foo.sg').
+    """
+    out: List[str] = []
+    if not isinstance(text, str) or not text:
+        return out
+    lines = [ln.strip() for ln in text.splitlines()]
+    # Find header row
+    header_idx = -1
+    for i, ln in enumerate(lines):
+        if "|" in ln and "domain_url" in ln.lower():
+            header_idx = i
+            break
+    if header_idx < 0:
+        return out
+    headers = [h.strip().lower() for h in lines[header_idx].strip("|").split("|")]
+    try:
+        col_idx = headers.index("domain_url")
+    except ValueError:
+        return out
+    # Rows typically start after a separator row; skip next line if it's a --- table rule
+    row_start = header_idx + 1
+    if row_start < len(lines) and set(lines[row_start].replace("|", "").replace("-", "").strip()) == set():
+        row_start += 1
+    # Parse subsequent rows until a blank or non-table line
+    for j in range(row_start, len(lines)):
+        ln = lines[j]
+        if "|" not in ln:
+            # End of table
+            break
+        cols = [c.strip().strip("`") for c in ln.strip("|").split("|")]
+        if not cols or col_idx >= len(cols):
+            continue
+        cell = cols[col_idx]
+        if cell:
+            out.append(cell)
+    return out
+
+
+def _extract_bare_domains(text: str) -> List[str]:
+    """Extract bare domain-like tokens (without scheme) from text.
+
+    Matches tokens like 'example.com', 'foo.co.sg', ignoring trailing punctuation.
+    """
+    out: List[str] = []
+    if not isinstance(text, str) or not text:
+        return out
+    # Simple domain pattern; exclude extremely long TLD parts
+    for m in re.finditer(r"\b([a-z0-9][-a-z0-9]*\.)+[a-z]{2,}\b", text, re.IGNORECASE):
+        token = m.group(0).strip().strip(".,;:()[]{}\"'`")
+        if token and len(token) <= 255:
+            out.append(token)
+    return out
+
+
 def _icp_summary_sentence(industries: str, geo: str) -> str:
     try:
         if industries and geo:
@@ -172,15 +230,9 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
             )
         except Exception:
             pass
-        # Collect candidate URLs from telemetry and assistant content
+        # Candidate URLs come ONLY from assistant content (JSON or regex/table fallback).
+        # We intentionally exclude visitedURLs/readURLs to avoid aggregator/reference links.
         urls: List[str] = []
-        for key in ("visitedURLs", "readURLs"):
-            try:
-                arr = data.get(key) or []
-                if isinstance(arr, list):
-                    urls.extend([str(x) for x in arr if isinstance(x, str)])
-            except Exception:
-                pass
         # Parse assistant content: prefer strict JSON (even when wrapped in ```json fences);
         # fallback to regex URL extraction only when JSON parse fails.
         parsed_content_urls: List[str] = []
@@ -213,16 +265,20 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
                                     if isinstance(du, str) and du.strip():
                                         parsed_content_urls.append(du.strip())
                     else:
-                        # No JSON array found – regex fallback
+                        # No JSON array found — try Markdown table and bare domains, then regex URLs
+                        parsed_content_urls.extend(_extract_domains_from_markdown_table(text))
+                        parsed_content_urls.extend(_extract_bare_domains(text))
                         parsed_content_urls.extend(_extract_urls_from_text(text))
                 except Exception:
-                    # Non-JSON content – regex fallback
+                    # Non-JSON content — try Markdown table and bare domains, then regex URLs
+                    parsed_content_urls.extend(_extract_domains_from_markdown_table(content))
+                    parsed_content_urls.extend(_extract_bare_domains(content))
                     parsed_content_urls.extend(_extract_urls_from_text(content))
         except Exception:
             pass
-        # Prefer domains extracted from assistant's JSON content over telemetry URLs
+        # Use only assistant content for discovery
         if parsed_content_urls:
-            urls = list(parsed_content_urls) + urls
+            urls = list(parsed_content_urls)
         # Normalize → filter bad hostnames → dedupe → sort by rough "corporate-likeness"
         def _is_bad(host: str) -> bool:
             try:
@@ -244,7 +300,15 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
         hosts: List[str] = []
         seen = set()
         for u in urls:
+            # Accept either full URLs (http...) or bare domains
             h = _norm_host(u)
+            if not h:
+                # _norm_host rejects bare domains without scheme; treat u as domain candidate
+                try:
+                    # Add https:// scheme to normalize
+                    h = _norm_host("https://" + str(u))
+                except Exception:
+                    h = None
             if not h or h in seen:
                 continue
             if _is_bad(h):

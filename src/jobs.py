@@ -716,13 +716,8 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 )
         # 2) Enrichment per company_id resolved by domain (best-effort)
         processed = 0
-        # Create minimal company rows if not present
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT domain FROM staging_global_companies WHERE tenant_id=%s ORDER BY id ASC LIMIT 50",
-                (tenant_id,),
-            )
-            stage_domains = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+        # Use only the domains discovered in this run (do not always take 50 from staging)
+        stage_domains = list(domains or [])
         try:
             log.info(
                 "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_stage\",\"job_id\":%s,\"domains\":%s}",
