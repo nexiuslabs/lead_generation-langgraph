@@ -181,7 +181,9 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
                     urls.extend([str(x) for x in arr if isinstance(x, str)])
             except Exception:
                 pass
-        # Parse assistant content: prefer strict JSON; fallback to regex URL extraction
+        # Parse assistant content: prefer strict JSON (even when wrapped in ```json fences);
+        # fallback to regex URL extraction only when JSON parse fails.
+        parsed_content_urls: List[str] = []
         try:
             content = None
             ch = (data.get("choices") or [{}])[0]
@@ -189,21 +191,38 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
             content = msg.get("content")
             if isinstance(content, str):
                 try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, list):
-                        for item in parsed:
-                            if isinstance(item, dict):
-                                du = item.get("domain_url") or item.get("domain") or item.get("url")
-                                if isinstance(du, str) and du.strip():
-                                    urls.append(du.strip())
+                    text = content.strip()
+                    # Attempt to extract JSON array inside fenced block first
+                    m = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text, re.IGNORECASE)
+                    json_text = m.group(1) if m else None
+                    if not json_text:
+                        # Try direct parse; if fails, try to locate first plausible array substring
+                        try:
+                            parsed = json.loads(text)
+                            if isinstance(parsed, list):
+                                json_text = text
+                        except Exception:
+                            m2 = re.search(r"\[[\s\S]*\]", text)
+                            json_text = m2.group(0) if m2 else None
+                    if json_text:
+                        parsed = json.loads(json_text)
+                        if isinstance(parsed, list):
+                            for item in parsed:
+                                if isinstance(item, dict):
+                                    du = item.get("domain_url") or item.get("domain") or item.get("url")
+                                    if isinstance(du, str) and du.strip():
+                                        parsed_content_urls.append(du.strip())
                     else:
-                        # Not a JSON array – regex fallback
-                        urls.extend(_extract_urls_from_text(content))
+                        # No JSON array found – regex fallback
+                        parsed_content_urls.extend(_extract_urls_from_text(text))
                 except Exception:
                     # Non-JSON content – regex fallback
-                    urls.extend(_extract_urls_from_text(content))
+                    parsed_content_urls.extend(_extract_urls_from_text(content))
         except Exception:
             pass
+        # Prefer domains extracted from assistant's JSON content over telemetry URLs
+        if parsed_content_urls:
+            urls = list(parsed_content_urls) + urls
         # Normalize → filter bad hostnames → dedupe → sort by rough "corporate-likeness"
         def _is_bad(host: str) -> bool:
             try:
@@ -281,6 +300,7 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
         try:
             # Log discovered domains explicitly (as URLs for readability)
             url_list = [f"https://{h}" for h in hosts[:50]]
+            log.warning("[jina_dr] parsed_json_items=%s", len(parsed_content_urls) if parsed_content_urls else 0)
             log.warning("[jina_dr] discovered_domains=%s", url_list)
         except Exception:
             pass
