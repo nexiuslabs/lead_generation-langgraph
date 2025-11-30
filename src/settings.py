@@ -518,6 +518,22 @@ JINA_DEEP_RESEARCH_BAD_HOSTNAMES = _parse_bad_hostnames(
     os.getenv("JINA_DEEP_RESEARCH_BAD_HOSTNAMES", "*.gov.sg,*.gov,*.xyz")
 )
 
+# Optional: enable lightweight homepage heuristics for DR discovery results
+ENABLE_JINA_DEEP_RESEARCH_HEURISTICS = os.getenv("ENABLE_JINA_DEEP_RESEARCH_HEURISTICS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    JINA_DEEP_RESEARCH_HEURISTIC_CHECK_MAX = int(os.getenv("JINA_DEEP_RESEARCH_HEURISTIC_CHECK_MAX", "3") or 3)
+except Exception:
+    JINA_DEEP_RESEARCH_HEURISTIC_CHECK_MAX = 3
+try:
+    JINA_DEEP_RESEARCH_HEURISTIC_TIMEOUT_S = float(os.getenv("JINA_DEEP_RESEARCH_HEURISTIC_TIMEOUT_S", "3.0") or 3.0)
+except Exception:
+    JINA_DEEP_RESEARCH_HEURISTIC_TIMEOUT_S = 3.0
+
 # Background-only discovery+enrichment after ICP confirmation
 BG_DISCOVERY_AND_ENRICH = os.getenv("BG_DISCOVERY_AND_ENRICH", "false").lower() in (
     "1",

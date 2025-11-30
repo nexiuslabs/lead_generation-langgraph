@@ -15,6 +15,9 @@ from src.settings import (
     JINA_DEEP_RESEARCH_BAD_HOSTNAMES,
     JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS,
     JINA_DEEP_RESEARCH_SUMMARY_MAX_URLS,
+    ENABLE_JINA_DEEP_RESEARCH_HEURISTICS,
+    JINA_DEEP_RESEARCH_HEURISTIC_CHECK_MAX,
+    JINA_DEEP_RESEARCH_HEURISTIC_TIMEOUT_S,
 )
 from src.obs import bump_vendor as _obs_bump, log_event as _obs_log
 
@@ -117,10 +120,18 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
         " DO NOT include any text or commentary outside of the JSON array."
         " Example: [{\"company_name\": \"Company A\", \"domain_url\": \"companya.com\"}]."
     )
-    # Prefer non-stream for simpler parsing; respect sample fields
+    # Prefer non-stream for simpler parsing; add explicit system guard for JSON-only output
     payload: Dict[str, Any] = {
         "model": JINA_DEEP_RESEARCH_MODEL,
         "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Return ONLY a JSON array of objects with keys 'company_name' (string) and 'domain_url' (string). "
+                    "The 'domain_url' MUST be an official corporate website. Exclude aggregators/directories (LinkedIn, ZoomInfo, Crunchbase). "
+                    "No prose or commentary outside of the JSON array."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         "stream": False,
@@ -161,8 +172,8 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
             )
         except Exception:
             pass
-        # Try to harvest domains from visitedURLs/readURLs first
-        urls = []
+        # Collect candidate URLs from telemetry and assistant content
+        urls: List[str] = []
         for key in ("visitedURLs", "readURLs"):
             try:
                 arr = data.get(key) or []
@@ -170,25 +181,102 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
                     urls.extend([str(x) for x in arr if isinstance(x, str)])
             except Exception:
                 pass
-        # Fallback to choices[].message.content when present
+        # Parse assistant content: prefer strict JSON; fallback to regex URL extraction
         try:
             content = None
             ch = (data.get("choices") or [{}])[0]
             msg = ch.get("message") or {}
             content = msg.get("content")
             if isinstance(content, str):
-                urls.extend(_extract_urls_from_text(content))
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict):
+                                du = item.get("domain_url") or item.get("domain") or item.get("url")
+                                if isinstance(du, str) and du.strip():
+                                    urls.append(du.strip())
+                    else:
+                        # Not a JSON array – regex fallback
+                        urls.extend(_extract_urls_from_text(content))
+                except Exception:
+                    # Non-JSON content – regex fallback
+                    urls.extend(_extract_urls_from_text(content))
         except Exception:
             pass
-        # Normalize to apex domains and dedupe
+        # Normalize → filter bad hostnames → dedupe → sort by rough "corporate-likeness"
+        def _is_bad(host: str) -> bool:
+            try:
+                host_l = (host or "").lower()
+                for pat in (JINA_DEEP_RESEARCH_BAD_HOSTNAMES or []):
+                    p = (pat or "").lower()
+                    if not p:
+                        continue
+                    if p.startswith("*."):
+                        suf = p[1:]
+                        if host_l.endswith(suf):
+                            return True
+                    elif host_l == p or host_l.endswith("." + p):
+                        return True
+                return False
+            except Exception:
+                return False
+
         hosts: List[str] = []
         seen = set()
         for u in urls:
             h = _norm_host(u)
             if not h or h in seen:
                 continue
+            if _is_bad(h):
+                continue
             seen.add(h)
             hosts.append(h)
+
+        def _score(h: str) -> int:
+            try:
+                parts = h.split(".")
+                tld = parts[-1] if len(parts) >= 2 else ""
+                score = 0
+                if len(parts) == 2:  # brand.tld
+                    score += 2
+                if tld in {"com", "co", "net", "sg", "io", "ai"}:
+                    score += 1
+                return score
+            except Exception:
+                return 0
+        hosts.sort(key=_score, reverse=True)
+
+        # Optional lightweight homepage heuristic check using Jina MCP
+        if ENABLE_JINA_DEEP_RESEARCH_HEURISTICS and hosts:
+            try:
+                from src.jina_reader import read_url as _jina_read  # lazy import to avoid circular deps
+                checked = []
+                limit = max(1, int(JINA_DEEP_RESEARCH_HEURISTIC_CHECK_MAX))
+                for h in hosts[:limit]:
+                    try:
+                        url = f"https://{h}"
+                        text = _jina_read(url, timeout=float(JINA_DEEP_RESEARCH_HEURISTIC_TIMEOUT_S)) or ""
+                        text_l = text.lower()
+                        brand = h.split(".")[0].lower()
+                        ok_brand = (brand in text_l)
+                        ok_about = ("/about" in text_l) or (" about " in text_l)
+                        ok_contact = ("/contact" in text_l) or (" contact " in text_l)
+                        score_bump = 0
+                        if ok_brand:
+                            score_bump += 2
+                        if ok_about:
+                            score_bump += 1
+                        if ok_contact:
+                            score_bump += 1
+                        checked.append((h, score_bump))
+                    except Exception:
+                        checked.append((h, 0))
+                # Reorder top candidates by heuristic bump
+                score_map = {h: bump for (h, bump) in checked}
+                hosts.sort(key=lambda hh: (_score(hh), score_map.get(hh, 0)), reverse=True)
+            except Exception:
+                pass
         _obs_bump(run_id=0, tenant_id=0, vendor="jina_deep_research", calls=1)  # run/tenant resolved by caller typically
         try:
             # Log discovered domains explicitly (as URLs for readability)
