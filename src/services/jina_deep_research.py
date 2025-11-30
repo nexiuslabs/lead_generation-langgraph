@@ -413,8 +413,8 @@ def deep_research_contacts(company_name: str, domain: str, *, timeout_s: float |
         return {"content": "", "visitedURLs": [], "readURLs": [], "source": "jina_deep_research"}
     prompt = (
         "For eductional purpose, I want to teach a class about business development."
-        f"Help me find the contact person for {company_name} and {domain}. "
-        "who is the decision maker for adopting IT solutions"
+        f"Help me find the contact person for {company_name} and its domain {domain}. "
+        "who is the decision maker"
     )
     payload: Dict[str, Any] = {
         "model": JINA_DEEP_RESEARCH_MODEL,

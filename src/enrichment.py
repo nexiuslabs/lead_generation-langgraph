@@ -858,8 +858,12 @@ def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
                 row: Dict[str, Any] = {"company_id": company_id}
                 if "full_name" in cols and c.get("full_name"):
                     row["full_name"] = c.get("full_name")
-                if "title" in cols and c.get("title"):
-                    row["title"] = c.get("title")
+                # Prefer schema's job_title; fallback to title when available
+                title_val = c.get("title") or c.get("job_title")
+                if "job_title" in cols and title_val:
+                    row["job_title"] = title_val
+                elif "title" in cols and title_val:
+                    row["title"] = title_val
                 if "linkedin_profile" in cols and c.get("linkedin_url"):
                     row["linkedin_profile"] = c.get("linkedin_url")
                 # Support either linkedin_url or linkedin_profile columns
@@ -869,6 +873,8 @@ def upsert_contacts_from_apify(company_id: int, contacts: List[Dict[str, Any]]):
                     row["linkedin_profile"] = c.get("linkedin_url")
                 if "location_city" in cols and c.get("location"):
                     row["location_city"] = c.get("location")
+                if "location_country" in cols and c.get("location_country"):
+                    row["location_country"] = c.get("location_country")
                 if "contact_source" in cols:
                     row["contact_source"] = "apify_linkedin"
                 email = c.get("email")
@@ -1155,6 +1161,14 @@ def update_company_core_fields(company_id: int, data: dict):
     conn = get_db_connection()
     try:
         with conn, conn.cursor() as cur:
+            # Coerce array-like fields to scalars for core columns
+            def _first_scalar(val):
+                if isinstance(val, list):
+                    return val[0] if val else None
+                return val
+            email_scalar = _first_scalar(data.get("email"))
+            phone_scalar = _first_scalar(data.get("phone_number"))
+
             sql = """
                 UPDATE companies SET
                   name = COALESCE(%s, name),
@@ -1167,6 +1181,7 @@ def update_company_core_fields(company_id: int, data: dict):
 
                   company_size = %s,
                   annual_revenue = %s,
+                  tech_stack = COALESCE(%s, tech_stack),
                   hq_city = %s,
                   hq_country = %s,
                   linkedin_url = %s,
@@ -1175,6 +1190,8 @@ def update_company_core_fields(company_id: int, data: dict):
                   funding_status = %s,
                   employee_turnover = %s,
                   web_traffic = %s,
+                  email = COALESCE(%s, email),
+                  phone_number = COALESCE(%s, phone_number),
                   location_city = %s,
                   location_country = %s,
                   last_seen = now()
@@ -1189,6 +1206,7 @@ def update_company_core_fields(company_id: int, data: dict):
                 data.get("website_domain"),
                 data.get("company_size"),
                 data.get("annual_revenue"),
+                (data.get("tech_stack") or []),
                 data.get("hq_city"),
                 data.get("hq_country"),
                 data.get("linkedin_url"),
@@ -1197,6 +1215,8 @@ def update_company_core_fields(company_id: int, data: dict):
                 data.get("funding_status"),
                 data.get("employee_turnover"),
                 data.get("web_traffic"),
+                email_scalar,
+                phone_scalar,
                 data.get("location_city"),
                 data.get("location_country"),
                 company_id,
@@ -1206,10 +1226,11 @@ def update_company_core_fields(company_id: int, data: dict):
                 # Log only fields that are not None; mask nothing sensitive here
                 keys = [
                     "name","employees_est","revenue_bucket","incorporation_year","website_domain",
-                    "company_size","annual_revenue","hq_city","hq_country","linkedin_url","founded_year",
-                    "ownership_type","funding_status","employee_turnover","web_traffic","location_city","location_country",
+                    "company_size","annual_revenue","tech_stack","hq_city","hq_country","linkedin_url","founded_year",
+                    "ownership_type","funding_status","employee_turnover","web_traffic","email","phone_number","location_city","location_country",
                 ]
-                snapshot = {k: data.get(k) for k in keys if k in data}
+                snap_raw = {k: (email_scalar if k=="email" else phone_scalar if k=="phone_number" else data.get(k)) for k in keys}
+                snapshot = {k: v for k, v in snap_raw.items() if v is not None}
                 logger.info("[db] UPDATE companies core company_id=%s fields=%s", company_id, snapshot)
             except Exception:
                 pass
@@ -1545,8 +1566,10 @@ class EnrichmentState(TypedDict, total=False):
 
 
 async def node_find_domain(state: EnrichmentState) -> EnrichmentState:
-    if state.get("completed"):
+    if state.get("completed") and state.get("error") != "no_domain":
         return state
+    if state.get("completed") and state.get("error") == "no_domain":
+        logger.info("[jina_dr_enrich] proceeding by company name (no domain)")
     name = state.get("company_name") or ""
     policy = (state.get("search_policy") or "auto").lower()
     # 0) DB fallback: use existing website_domain for this company if present
@@ -1985,6 +2008,389 @@ async def node_extract_pages(state: EnrichmentState) -> EnrichmentState:
     return state
 
 
+async def node_jina_dr_enrich(state: EnrichmentState) -> EnrichmentState:
+    """Primary enrichment via Jina Deep Research when company_name or domain is present.
+
+    - Calls deep_research_contacts with whichever of (company_name, domain) we have.
+    - Parses returned content for contacts and basic company fields (emails, phones, website, about, LinkedIn).
+    - Upserts contacts and mirrors emails into lead_emails with source 'jina_deep_research'.
+    - Merges salvaged company fields into state['data'] for persistence.
+    """
+    if state.get("completed"):
+        return state
+    company_id = state.get("company_id")
+    if not company_id:
+        return state
+    data = state.get("data") or {}
+    if (state.get("company_name") or "").strip() and not data.get("name"):
+        data["name"] = state.get("company_name")
+    company_name = state.get("company_name") or ""
+    dom = None
+    try:
+        home_url = state.get("home") or ""
+        if home_url:
+            from urllib.parse import urlparse
+            dom = (urlparse(home_url).netloc or "").lower()
+    except Exception:
+        dom = None
+    # single-shot guard
+    try:
+        attempts = int(state.get("jina_dr_attempts") or 0)
+    except Exception:
+        attempts = 0
+    if attempts >= 1:
+        return state
+    state["jina_dr_attempts"] = attempts + 1
+
+    try:
+        # Trace preconditions and key presence for DR visibility
+        try:
+            key_present = bool(os.getenv("JINA_API_KEY"))
+            logger.info(
+                "[jina_dr_enrich] start name=%s dom=%s key_present=%s",
+                company_name,
+                dom,
+                key_present,
+            )
+        except Exception:
+            pass
+        if _dr_contacts and (company_name or dom):
+            t0 = time.perf_counter()
+            try:
+                logger.info("[api] JinaDR.enrich name=%s domain=%s", company_name, dom)
+            except Exception:
+                pass
+            dr = _dr_contacts(company_name, dom or "")
+            _obs_vendor("jina_deep_research", calls=1)
+            _obs_log(
+                "jina_dr_enrich",
+                "primary",
+                "ok",
+                company_id=company_id,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                extra={"domain": dom or ""},
+            )
+            contacts: list[dict] = []
+            content = None
+            try:
+                content = dr.get("content") if isinstance(dr, dict) else None
+            except Exception:
+                content = None
+            try:
+                clen = len(content or "") if isinstance(content, str) else 0
+                logger.info("[jina_dr_enrich] dr_content_len=%s", clen)
+                if isinstance(content, str):
+                    logger.info("[jina_dr_enrich] content_full=\n%s", content)
+            except Exception:
+                pass
+            if isinstance(content, str) and content.strip():
+                # contacts
+                try:
+                    contacts.extend(_extract_contacts_from_text(content))
+                except Exception:
+                    pass
+                # basic company fields
+                try:
+                    salvaged = _fallback_extract_from_text(content)
+                    if salvaged:
+                        try:
+                            logger.info(
+                                "[jina_dr_enrich] salvaged_fields=%s",
+                                list(salvaged.keys()),
+                            )
+                        except Exception:
+                            pass
+                        for k in ["email", "phone_number", "tech_stack"]:
+                            if k in salvaged and not isinstance(salvaged[k], list):
+                                salvaged[k] = _ensure_list(salvaged[k]) or []
+                        data = _merge_extracted_records(data, salvaged)
+                    # SG cues (country/city/postcode/phone markers)
+                    cues = _extract_sg_cues(content)
+                    if cues:
+                        for k in ("sg_phone", "sg_postcode", "sg_markers"):
+                            v = cues.get(k)
+                            if v:
+                                data[k] = v
+                        # If SG cues present and HQ not set, assume Singapore HQ
+                        if (cues.get("sg_markers") or cues.get("sg_postcode") or cues.get("sg_phone")):
+                            if not data.get("hq_city"):
+                                data["hq_city"] = "Singapore"
+                            if not data.get("hq_country"):
+                                data["hq_country"] = "Singapore"
+                            if not data.get("location_city"):
+                                data["location_city"] = "Singapore"
+                            if not data.get("location_country"):
+                                data["location_country"] = "Singapore"
+                except Exception:
+                    pass
+            if contacts:
+                try:
+                    ins, upd = upsert_contacts_from_site(company_id, contacts)
+                    logger.info(
+                        f"[jina_dr_enrich] contacts upserted: inserted={ins}, updated={upd} company_id={company_id}"
+                    )
+                except Exception:
+                    pass
+                try:
+                    emails = [c.get("email") for c in contacts if c.get("email")]
+                    if emails:
+                        verification = verify_emails(emails)
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cur:
+                                for ver in verification:
+                                    try:
+                                        logger.info(
+                                            "[db] UPSERT lead_emails(email=%s, company_id=%s, src=%s) via JinaDR",
+                                            _mask_email(ver.get("email") or ""),
+                                            company_id,
+                                            "jina_deep_research",
+                                        )
+                                    except Exception:
+                                        pass
+                                    cur.execute(
+                                        """
+                                        INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                        VALUES (%s,%s,%s,%s,%s, now())
+                                        ON CONFLICT (email) DO UPDATE SET
+                                          company_id=EXCLUDED.company_id,
+                                          verification_status=EXCLUDED.verification_status,
+                                          smtp_confidence=EXCLUDED.smtp_confidence,
+                                          source=EXCLUDED.source,
+                                          last_verified_at=EXCLUDED.last_verified_at
+                                        """,
+                                        (
+                                            ver["email"],
+                                            company_id,
+                                            ver.get("status"),
+                                            ver.get("confidence"),
+                                            "jina_deep_research",
+                                        ),
+                                    )
+                                # Also reflect verification onto contacts table when schema supports it
+                                try:
+                                    cols = _get_table_columns(conn, "contacts")
+                                    if "email_verified" in cols or "verification_confidence" in cols:
+                                        for ver in verification:
+                                            ev = str(ver.get("status") or "").lower() in ("valid", "ok")
+                                            conf = ver.get("confidence")
+                                            sets = []
+                                            params = []
+                                            if "email_verified" in cols:
+                                                sets.append("email_verified=%s")
+                                                params.append(ev)
+                                            if "verification_confidence" in cols and conf is not None:
+                                                sets.append("verification_confidence=%s")
+                                                params.append(conf)
+                                            if sets:
+                                                params.extend([company_id, ver.get("email")])
+                                                cur.execute(
+                                                    f"UPDATE contacts SET {', '.join(sets)} WHERE company_id=%s AND email=%s",
+                                                    tuple(params),
+                                                )
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            # Decide DR sufficiency: require a named contact and at least one email from DR content
+            try:
+                total_contacts, has_named, _ = _get_contact_stats(company_id)
+                dr_has_email = any(bool(c.get("email")) for c in contacts)
+                state["dr_person_email_ok"] = bool(has_named and dr_has_email)
+                logger.info(
+                    "[jina_dr_enrich] contacts_extracted=%s emails_extracted=%s dr_ok=%s",
+                    len(contacts),
+                    sum(1 for c in contacts if c.get("email")),
+                    state["dr_person_email_ok"],
+                )
+            except Exception:
+                state["dr_person_email_ok"] = False
+        else:
+            logger.info("[jina_dr_enrich] skipped: _dr_contacts unavailable or missing name/domain")
+    except Exception:
+        logger.warning("[jina_dr_enrich] skipped due to error", exc_info=True)
+    state["data"] = data
+    return state
+
+
+async def node_apify_fallback(state: EnrichmentState) -> EnrichmentState:
+    """Apify-only fallback for contact discovery when DR is insufficient.
+
+    Runs once, best-effort, and mirrors emails to lead_emails with source 'apify_linkedin'.
+    """
+    if state.get("completed"):
+        return state
+    company_id = state.get("company_id")
+    if not company_id:
+        return state
+    # single-shot guard
+    try:
+        attempts = int(state.get("apify_fallback_attempts") or 0)
+    except Exception:
+        attempts = 0
+    if attempts >= 1:
+        return state
+    state["apify_fallback_attempts"] = attempts + 1
+
+    # Vendor enablement and caps
+    if not ENABLE_APIFY_LINKEDIN or not _dec_cap("contact_lookups", 1):
+        return state
+
+    data = state.get("data") or {}
+    tid = int(_RUN_CTX.get("tenant_id") or 0)
+    # Title preferences
+    titles_env = CONTACT_TITLES or []
+    titles_tenant = icp_preferred_titles_for_tenant(tid if tid else None)
+    titles = titles_tenant or titles_env
+    company_name = state.get("company_name") or ""
+    # Domain from state.home when present
+    dom = None
+    try:
+        from urllib.parse import urlparse
+        home = state.get("home") or ""
+        dom = urlparse(home).netloc if home else ""
+    except Exception:
+        dom = None
+
+    # Build queries for fallback runner
+    queries = apify_build_queries(company_name, titles)
+    try:
+        try:
+            logger.info(
+                "[apify_fallback] start reason=dr_person_email_ok_false name=%s dom=%s",
+                company_name,
+                dom,
+            )
+        except Exception:
+            pass
+        t0 = time.perf_counter()
+        # Resolve LinkedIn URL by domain when available
+        comp_url = None
+        if dom:
+            try:
+                comp_url = await apify_company_url_from_domain(dom, timeout_s=APIFY_SYNC_TIMEOUT_S, dataset_format=APIFY_DATASET_FORMAT)
+            except Exception:
+                comp_url = None
+            if comp_url:
+                (state.setdefault("data", {}))["linkedin_url"] = comp_url
+        # Fetch contacts
+        if dom:
+            contacts_raw = await apify_contacts_via_domain_chain(
+                dom,
+                titles=(titles if isinstance(titles, list) else None),
+                max_items=25,
+                timeout_s=APIFY_SYNC_TIMEOUT_S,
+            )
+            raw = contacts_raw
+            if not contacts_raw:
+                if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                    contacts_raw = await apify_contacts_via_chain(
+                        company_name,
+                        titles=(titles if isinstance(titles, list) else None),
+                        max_items=25,
+                        timeout_s=APIFY_SYNC_TIMEOUT_S,
+                    )
+                    raw = contacts_raw
+                else:
+                    raw = await apify_run(
+                        {"queries": queries},
+                        dataset_format=APIFY_DATASET_FORMAT,
+                        timeout_s=APIFY_SYNC_TIMEOUT_S,
+                    )
+                    contacts_raw = apify_normalize(raw)
+        else:
+            if os.getenv("APIFY_USE_COMPANY_EMPLOYEE_CHAIN", "").lower() in ("1", "true", "yes", "on") or APIFY_USE_COMPANY_EMPLOYEE_CHAIN:
+                contacts_raw = await apify_contacts_via_chain(
+                    company_name,
+                    titles=(titles if isinstance(titles, list) else None),
+                    max_items=25,
+                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                )
+                raw = contacts_raw
+            else:
+                raw = await apify_run(
+                    {"queries": queries},
+                    dataset_format=APIFY_DATASET_FORMAT,
+                    timeout_s=APIFY_SYNC_TIMEOUT_S,
+                )
+                contacts_raw = apify_normalize(raw)
+
+        logger.info(
+            f"[apify_fallback] fetched={len(raw) if isinstance(raw, list) else 0} normalized={len(contacts_raw)} company_id={company_id}"
+        )
+        # Upsert contacts
+        try:
+            ins, upd = upsert_contacts_from_apify(company_id, contacts_raw)
+            logger.info(
+                f"[apify_fallback] upserted: inserted={ins}, updated={upd} company_id={company_id}"
+            )
+        except Exception:
+            logger.warning("[apify_fallback] upsert error; continuing", exc_info=True)
+        # Mirror emails
+        try:
+            emails = [c.get("email") for c in contacts_raw if c.get("email")]
+            if emails:
+                verification = verify_emails(emails)
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        for ver in verification:
+                            try:
+                                logger.info(
+                                    "[db] UPSERT lead_emails(email=%s, company_id=%s, src=%s) via Apify",
+                                    _mask_email(ver.get("email") or ""),
+                                    company_id,
+                                    "apify_linkedin",
+                                )
+                            except Exception:
+                                pass
+                            cur.execute(
+                                """
+                                INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
+                                VALUES (%s,%s,%s,%s,%s, now())
+                                ON CONFLICT (email) DO UPDATE SET
+                                  company_id=EXCLUDED.company_id,
+                                  verification_status=EXCLUDED.verification_status,
+                                  smtp_confidence=EXCLUDED.smtp_confidence,
+                                  source=EXCLUDED.source,
+                                  last_verified_at=EXCLUDED.last_verified_at
+                                """,
+                                (
+                                    ver["email"],
+                                    company_id,
+                                    ver.get("status"),
+                                    ver.get("confidence"),
+                                    "apify_linkedin",
+                                ),
+                            )
+        except Exception:
+            logger.warning("[apify_fallback] email verify/upsert skipped", exc_info=True)
+        # vendor usage log
+        _VENDOR_COUNTERS["apify_linkedin_calls"] = _VENDOR_COUNTERS.get("apify_linkedin_calls", 0) + 1
+        _obs_vendor("apify_linkedin", calls=1)
+        _obs_log(
+            "contact_discovery",
+            "vendor_call",
+            "ok",
+            company_id=company_id,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
+            extra={"queries": queries},
+        )
+    except Exception as e:
+        _obs_vendor("apify_linkedin", calls=1, errors=1)
+        _obs_log(
+            "contact_discovery",
+            "vendor_call",
+            "error",
+            company_id=company_id,
+            error_code=type(e).__name__,
+        )
+        logger.warning("[apify_fallback] call failed", exc_info=True)
+        try:
+            (state.setdefault("degraded_reasons", [])) .append("APIFY_LINKEDIN_FAIL")
+        except Exception:
+            pass
+    state["data"] = data
+    return state
+
 async def node_deterministic_crawl(state: EnrichmentState) -> EnrichmentState:
     if state.get("completed") or not state.get("home") or not state.get("company_id"):
         return state
@@ -2268,7 +2674,7 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
         return state
     if state.get("completed") and state.get("error") == "no_domain":
         logger.info("[apify_contacts] No domain found; proceeding to Apify by company name")
-    # Single-shot guard per company/session: do not spam Apify within the same run
+    # Single-shot guard per company/session: run at most once
     try:
         attempts = int(state.get("apify_attempts") or 0)
     except Exception:
@@ -2318,7 +2724,6 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                         contacts_dr.extend(_extract_contacts_from_text(content))
                 except Exception:
                     pass
-                # Skip early MCP page reads here; reserved for final crawl fallback
                 # Upsert and verify if anything was found
                 if contacts_dr:
                     try:
@@ -2365,179 +2770,23 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                                         )
                     except Exception:
                         pass
-                    # Check sufficiency post-upsert (require named + at least one verified email)
+                    # Check DR presence: person (named) and email present
                     try:
-                        verified_any_dr = any(str(v.get("status")).lower() in {"valid", "ok"} for v in (verification or []))
+                        total_contacts, has_named, _ = _get_contact_stats(company_id)
+                        dr_has_email = bool(emails)
+                        state["dr_person_email_ok"] = bool(has_named and dr_has_email)
                     except Exception:
-                        verified_any_dr = False
-                    total_contacts, has_named, _ = _get_contact_stats(company_id)
-                    state["contacts_sufficient"] = bool((total_contacts > 0) and has_named and verified_any_dr)
-                    if state["contacts_sufficient"]:
-                        logger.info("[jina_dr_contacts] sufficient contacts found; will proceed to persist")
-                        state["data"] = data
+                        state["dr_person_email_ok"] = False
         except Exception:
             # Non-blocking: continue to MCP/site extraction then Apify
             pass
-
-        # First, attempt to extract contacts directly from deterministic site pages
-        try:
-            pages = state.get("extracted_pages") or []
-            site_contacts: list[dict] = []
-            home = (state.get("home") or "").lower()
-            # Consider About/Contact, and also homepage (footers often hold LinkedIn icons)
-            for p in pages:
-                u = (p.get("url") or "").lower()
-                is_about_contact = any(tok in u for tok in ("about", "contact"))
-                is_home = False
-                if home:
-                    try:
-                        from urllib.parse import urlparse
-                        up = urlparse(u)
-                        hp = urlparse(home)
-                        is_home = (up.netloc == hp.netloc) and ((up.path or "/").rstrip("/") in ("", "/"))
-                    except Exception:
-                        is_home = (u.rstrip("/") == home.rstrip("/"))
-                if is_about_contact or is_home:
-                    body = p.get("html") or p.get("raw_content") or p.get("content") or ""
-                    if isinstance(body, dict):
-                        body = body.get("text") or ""
-                    site_contacts.extend(_extract_contacts_from_text(str(body)))
-            if site_contacts:
-                ins, upd = upsert_contacts_from_site(company_id, site_contacts)
-                logger.info(f"[site_contacts] upserted from pages: inserted={ins}, updated={upd} company_id={company_id}")
-                # Verify any emails and mirror to lead_emails
-                emails = [c.get("email") for c in site_contacts if c.get("email")]
-                if emails:
-                    verification = verify_emails(emails)
-                    with get_db_connection() as conn:
-                        with conn.cursor() as cur:
-                            for ver in verification:
-                                email_verified = True if ver.get("status") == "valid" else False
-                                cur.execute(
-                                    """
-                                    INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
-                                    VALUES (%s,%s,%s,%s,%s, now())
-                                    ON CONFLICT (email) DO UPDATE SET
-                                      company_id=EXCLUDED.company_id,
-                                      verification_status=EXCLUDED.verification_status,
-                                      smtp_confidence=EXCLUDED.smtp_confidence,
-                                      source=EXCLUDED.source,
-                                      last_verified_at=EXCLUDED.last_verified_at
-                                    """,
-                                    (
-                                        ver["email"],
-                                        company_id,
-                                        ver.get("status"),
-                                        ver.get("confidence"),
-                                        "site_page",
-                                    ),
-                                )
-                # Recompute contact stats after site extraction; may skip vendor
-                total_contacts, has_named, founder_present = _get_contact_stats(company_id)
-                if total_contacts > 0 and has_named:
-                    logger.info("[site_contacts] sufficient contacts found; skipping Apify")
-                    state["data"] = data
-                    return state
-        except Exception:
-            pass
-
-        # Explicit MCP fallback: read common pages via Jina MCP if not already extracted
-        try:
-            root = None
-            home = state.get("home") or ""
-            if home:
-                try:
-                    from urllib.parse import urlparse
-                    p = urlparse(home)
-                    root = f"{p.scheme}://{p.netloc}"
-                except Exception:
-                    root = home
-            if root:
-                mcp_urls = [root, f"{root}/contact-us", f"{root}/contact", f"{root}/about", f"{root}/about-us"]
-                mcp_contacts: list[dict] = []
-                for u in mcp_urls:
-                    try:
-                        logger.info("[api] MCP.read_url url=%s", u)
-                        text = jina_read(u, timeout=6) or ""
-                        if text and len(text.strip()) > 120:
-                            mcp_contacts.extend(_extract_contacts_from_text(text))
-                            try:
-                                logger.info(
-                                    "[mcp_contacts] extracted_candidates=%s from url=%s",
-                                    len(mcp_contacts),
-                                    u,
-                                )
-                            except Exception:
-                                pass
-                    except Exception:
-                        continue
-                if mcp_contacts:
-                    ins, upd = upsert_contacts_from_site(company_id, mcp_contacts)
-                    logger.info(
-                        f"[mcp_contacts] upserted from Jina MCP: inserted={ins}, updated={upd} company_id={company_id}"
-                    )
-                    emails = [c.get("email") for c in mcp_contacts if c.get("email")]
-                    if emails:
-                        try:
-                            verification = verify_emails(emails)
-                            with get_db_connection() as conn:
-                                with conn.cursor() as cur:
-                                    for ver in verification:
-                                        try:
-                                            logger.info(
-                                                "[db] UPSERT lead_emails(email=%s, company_id=%s, src=%s) via MCP",
-                                                _mask_email(ver.get("email") or ""),
-                                                company_id,
-                                                "mcp_reader",
-                                            )
-                                        except Exception:
-                                            pass
-                                        cur.execute(
-                                            """
-                                            INSERT INTO lead_emails (email, company_id, verification_status, smtp_confidence, source, last_verified_at)
-                                            VALUES (%s,%s,%s,%s,%s, now())
-                                            ON CONFLICT (email) DO UPDATE SET
-                                              company_id=EXCLUDED.company_id,
-                                              verification_status=EXCLUDED.verification_status,
-                                              smtp_confidence=EXCLUDED.smtp_confidence,
-                                              source=EXCLUDED.source,
-                                              last_verified_at=EXCLUDED.last_verified_at
-                                            """,
-                                            (
-                                                ver["email"],
-                                                company_id,
-                                                ver.get("status"),
-                                                ver.get("confidence"),
-                                                "mcp_reader",
-                                            ),
-                                        )
-                        except Exception:
-                            pass
-                    total_contacts, has_named, founder_present = _get_contact_stats(company_id)
-                    if total_contacts > 0 and has_named:
-                        logger.info("[mcp_contacts] sufficient contacts found; skipping Apify")
-                        state["data"] = data
-                        return state
-        except Exception:
-            pass
-        need_emails = not (data.get("email") or [])
-        need_phones = not (data.get("phone_number") or [])
-        total_contacts, has_named, founder_present = _get_contact_stats(company_id)
-        needs_contacts = total_contacts == 0
-        missing_names = not has_named
-        missing_founder = not founder_present
-        trigger = (
-            need_emails
-            or need_phones
-            or needs_contacts
-            or missing_names
-            or missing_founder
-        )
+        # Decide Apify fallback strictly from DR outcome: require person AND email from DR
+        dr_ok = bool(state.get("dr_person_email_ok"))
         # Prefer Apify when enabled, or when Lusha fallback is disabled/missing
         tid = int(_RUN_CTX.get("tenant_id") or 0)
         rid = _RUN_CTX.get("run_id")
         prefer_apify = ENABLE_APIFY_LINKEDIN
-        if prefer_apify and trigger and _dec_cap("contact_lookups", 1):
+        if (not dr_ok) and prefer_apify and _dec_cap("contact_lookups", 1):
             # Use Apify LinkedIn Actor for contact discovery when trigger conditions met
             titles_env = CONTACT_TITLES or []
             titles_tenant = icp_preferred_titles_for_tenant(tid if tid else None)
@@ -2699,6 +2948,11 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
                             logger.warning(
                                 "[apify_contacts] upsert error; continuing", exc_info=True
                             )
+                        try:
+                            total_after, has_named_after, _ = _get_contact_stats(company_id)
+                            state["contacts_found_any"] = bool(total_after > 0)
+                        except Exception:
+                            pass
                         # Verify any provided emails and upsert into lead_emails
                         try:
                             emails = [c.get("email") for c in contacts_raw if c.get("email")]
@@ -2793,6 +3047,8 @@ async def node_apify_contacts(state: EnrichmentState) -> EnrichmentState:
     except Exception:
         # Keep state consistent on unexpected errors
         pass
+    # No deterministic crawl fallback wiring; proceed to persist regardless
+    state["fallback_needed"] = False
     state["data"] = data
     return state
 
@@ -2950,47 +3206,25 @@ async def node_persist_legacy(state: EnrichmentState) -> EnrichmentState:
 # Build the LangGraph for enrichment
 enrichment_graph = StateGraph(EnrichmentState)
 enrichment_graph.add_node("find_domain", node_find_domain)
- 
-enrichment_graph.add_node("deterministic_crawl", node_deterministic_crawl)
-enrichment_graph.add_node("discover_urls", node_discover_urls)
-enrichment_graph.add_node("expand_crawl", node_expand_crawl)
-enrichment_graph.add_node("extract_pages", node_extract_pages)
-enrichment_graph.add_node("build_chunks", node_build_chunks)
-enrichment_graph.add_node("llm_extract", node_llm_extract)
-enrichment_graph.add_node("apify_contacts", node_apify_contacts)
+enrichment_graph.add_node("jina_dr_enrich", node_jina_dr_enrich)
+enrichment_graph.add_node("apify_fallback", node_apify_fallback)
 enrichment_graph.add_node("persist_core", node_persist_core)
 enrichment_graph.add_node("persist_legacy", node_persist_legacy)
 
 enrichment_graph.set_entry_point("find_domain")
-enrichment_graph.add_edge("find_domain", "apify_contacts")
-
-def _after_contacts(state: EnrichmentState) -> str:
+enrichment_graph.add_edge("find_domain", "jina_dr_enrich")
+def _after_jina(state: EnrichmentState) -> str:
     try:
-        return "persist_core" if bool(state.get("contacts_sufficient")) else "deterministic_crawl"
+        return "persist_core" if bool(state.get("dr_person_email_ok")) else "apify_fallback"
     except Exception:
-        return "deterministic_crawl"
-
-
-def _after_deterministic(state: EnrichmentState) -> str:
-    return "build_chunks" if state.get("extracted_pages") else "discover_urls"
-
+        return "apify_fallback"
 
 enrichment_graph.add_conditional_edges(
-    "apify_contacts",
-    _after_contacts,
-    {"persist_core": "persist_core", "deterministic_crawl": "deterministic_crawl"},
+    "jina_dr_enrich",
+    _after_jina,
+    {"persist_core": "persist_core", "apify_fallback": "apify_fallback"},
 )
-
-enrichment_graph.add_conditional_edges(
-    "deterministic_crawl",
-    _after_deterministic,
-    {"build_chunks": "build_chunks", "discover_urls": "discover_urls"},
-)
-enrichment_graph.add_edge("discover_urls", "expand_crawl")
-enrichment_graph.add_edge("expand_crawl", "extract_pages")
-enrichment_graph.add_edge("extract_pages", "build_chunks")
-enrichment_graph.add_edge("build_chunks", "llm_extract")
-enrichment_graph.add_edge("llm_extract", "persist_core")
+enrichment_graph.add_edge("apify_fallback", "persist_core")
 enrichment_graph.add_edge("persist_core", "persist_legacy")
 
 enrichment_agent = enrichment_graph.compile()
@@ -3127,121 +3361,17 @@ def _agent_prompt(company_name: str, summary: str) -> str:
 
 
 async def run_enrichment_agentic(state: "EnrichmentState") -> "EnrichmentState":
-    steps = 0
-    # Reuse global llm with low temperature for determinism
-    while steps < int(ENRICH_AGENTIC_MAX_STEPS):
-        # Stop if pipeline marked completed
-        if state.get("completed"):
-            logger.info("[agentic] state.completed=true; stopping")
-            break
-        summary = _summarize_state_for_agent(state)
-        prompt = _agent_prompt(state.get("company_name") or "", summary)
-        try:
-            out = llm.invoke(prompt)
-            # Extract content from ChatMessage if present
-            content = None
-            try:
-                content = getattr(out, "content", None)
-            except Exception:
-                content = None
-            if not content:
-                content = str(out) if out is not None else ""
-            # Try strict JSON parse first
-            parsed = {}
-            try:
-                parsed = json.loads(content)
-            except Exception:
-                # Heuristic: find JSON substring
-                s = content
-                start = s.find("{")
-                end = s.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    try:
-                        parsed = json.loads(s[start : end + 1])
-                    except Exception:
-                        parsed = {}
-            action = (parsed or {}).get("action")
-            reason = (parsed or {}).get("reason") or ""
-        except Exception:
-            action = None
-            reason = "planner_exception"
-
-        # Choose safe default or override when parsing fails or action invalid/loops
-        have_domain = bool(state.get("home"))
-        have_pages = bool(state.get("extracted_pages") or [])
-        have_chunks = bool(state.get("chunks") or [])
-        have_data = bool(state.get("data") or {})
-        if not action or action not in AGENT_ACTIONS:
-            if not have_domain:
-                action = "search_domain"
-                reason = reason or "default_no_domain"
-            elif not have_pages:
-                action = "deterministic_crawl"
-                reason = reason or "default_need_pages"
-            elif not have_chunks:
-                action = "build_chunks"
-                reason = reason or "default_build_chunks"
-            elif not have_data:
-                action = "llm_extract"
-                reason = reason or "default_llm_extract"
-            else:
-                # Persist and finish by default once we have data
-                action = "persist_legacy"
-                reason = reason or "default_persist_finish"
-        else:
-            # Override repetitive crawl/expand suggestions to progress the pipeline
-            if have_pages and not have_chunks and action in ("expand_crawl", "deterministic_crawl"):
-                action = "build_chunks"
-                reason = "override_progress_build_chunks"
-            elif have_chunks and not have_data and action in ("expand_crawl", "deterministic_crawl"):
-                action = "llm_extract"
-                reason = "override_progress_llm_extract"
-            elif have_data and action in ("expand_crawl", "deterministic_crawl", "discover_urls"):
-                action = "persist_legacy"
-                reason = "override_progress_persist"
-
-        # keep routing overrides minimal
-
-        # If planner wants to persist/finish but we still need contacts, force Apify step first
-        try:
-            if action in ("persist_core", "persist_legacy", "finish"):
-                data = state.get("data") or {}
-                need_emails = not (data.get("email") or [])
-                need_phones = not (data.get("phone_number") or [])
-                company_id = state.get("company_id")
-                total_contacts, has_named, founder_present = _get_contact_stats(company_id) if company_id else (0, False, False)
-                needs_contacts = total_contacts == 0
-                missing_names = not has_named
-                missing_founder = not founder_present
-                prefer_apify = ENABLE_APIFY_LINKEDIN
-                tid = int(_RUN_CTX.get("tenant_id") or 0)
-                # Do not force repeatedly if an attempt has already occurred in this run
-                prior_attempts = 0
-                try:
-                    prior_attempts = int(state.get("apify_attempts") or 0)
-                except Exception:
-                    prior_attempts = 0
-                if (
-                    prefer_apify
-                    and (need_emails or need_phones or needs_contacts or missing_names or missing_founder)
-                    and (prior_attempts < 1)
-                    and _dec_cap("contact_lookups", 1)
-                    and _apify_cap_ok(tid, need=1)
-                ):
-                    action = "apify_contacts"
-                    reason = "force_contacts_before_persist"
-        except Exception:
-            pass
-
-        logger.info(f"[agentic] step={steps+1} action={action} reason={reason}")
-        if action == "finish":
-            break
-        try:
-            state = await _agent_execute(action, state)
-        except Exception:
-            logger.warning("[agentic] action execution failed; continuing", exc_info=True)
-        steps += 1
-    return state
+    """Enforce the productized flow in agentic mode as well:
+    find_domain -> apify_contacts (DR primary, Apify secondary) ->
+    if fallback_needed: deterministic_crawl -> ... -> llm_extract -> apify_contacts -> persist
+    else: persist
+    """
+    try:
+        # Reuse the compiled fixed graph to ensure correct sequencing
+        return await enrichment_agent.ainvoke(state)
+    except Exception:
+        logger.exception("[agentic] fallback to fixed graph failed")
+        return state
 
 
 def find_domain(company_name: str) -> list[str]:
@@ -3872,8 +4002,11 @@ def upsert_contacts_from_site(company_id: int, contacts: List[Dict[str, Any]]):
                 row: Dict[str, Any] = {"company_id": company_id}
                 if "full_name" in cols and c.get("full_name"):
                     row["full_name"] = c.get("full_name")
-                if "title" in cols and c.get("title"):
-                    row["title"] = c.get("title")
+                title_val = c.get("title") or c.get("job_title")
+                if "job_title" in cols and title_val:
+                    row["job_title"] = title_val
+                elif "title" in cols and title_val:
+                    row["title"] = title_val
                 # Support either linkedin_url or linkedin_profile columns
                 if "linkedin_url" in cols and c.get("linkedin_url"):
                     row["linkedin_url"] = c.get("linkedin_url")
@@ -3882,8 +4015,8 @@ def upsert_contacts_from_site(company_id: int, contacts: List[Dict[str, Any]]):
                 if has_email and email:
                     row["email"] = email
                 # Optional phone field if schema has it
-                if "phone" in cols and c.get("phone"):
-                    row["phone"] = c.get("phone")
+                if "phone_number" in cols and c.get("phone"):
+                    row["phone_number"] = c.get("phone")
                 if "contact_source" in cols:
                     row["contact_source"] = "site_page"
 
