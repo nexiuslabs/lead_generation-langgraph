@@ -233,6 +233,7 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
         # Candidate URLs come ONLY from assistant content (JSON or regex/table fallback).
         # We intentionally exclude visitedURLs/readURLs to avoid aggregator/reference links.
         urls: List[str] = []
+        name_by_host: Dict[str, str] = {}
         # Parse assistant content: prefer strict JSON (even when wrapped in ```json fences);
         # fallback to regex URL extraction only when JSON parse fails.
         parsed_content_urls: List[str] = []
@@ -262,8 +263,16 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
                             for item in parsed:
                                 if isinstance(item, dict):
                                     du = item.get("domain_url") or item.get("domain") or item.get("url")
+                                    nm = item.get("company_name") or item.get("name")
                                     if isinstance(du, str) and du.strip():
                                         parsed_content_urls.append(du.strip())
+                                        # Capture company_name mapping when available
+                                        try:
+                                            host = _norm_host(du) or _norm_host("https://" + du)
+                                            if host and isinstance(nm, str) and nm.strip():
+                                                name_by_host.setdefault(host, nm.strip())
+                                        except Exception:
+                                            pass
                     else:
                         # No JSON array found — try Markdown table and bare domains, then regex URLs
                         parsed_content_urls.extend(_extract_domains_from_markdown_table(text))
@@ -370,6 +379,7 @@ def deep_research_query(seed: str, icp_context: Dict[str, Any], *, timeout_s: fl
             pass
         return {
             "domains": hosts[:50],
+            "company_names_by_domain": {h: name_by_host.get(h) for h in hosts if name_by_host.get(h)},
             "snippets_by_domain": {},
             "fast_facts": {},
             "source": "jina_deep_research",

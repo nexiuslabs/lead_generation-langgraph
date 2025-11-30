@@ -603,6 +603,7 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
             pass
         domains: List[str] = []
         discovery_source = "jina_deep_research"
+        names_by_domain: dict[str, str] = {}
         with _stage_timer(run_id, tenant_id, "bg_discovery", total_inc=1):
             if ENABLE_JINA_DEEP_RESEARCH_DISCOVERY:
                 tdr = time.perf_counter()
@@ -619,6 +620,13 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     pass
                 pack = deep_research_query(str(seed), icp_context)
                 domains = list(pack.get("domains") or [])
+                # Optional: names mapped by discovered domain (when DR returned JSON with company_name)
+                try:
+                    cand = pack.get("company_names_by_domain") or {}
+                    if isinstance(cand, dict):
+                        names_by_domain = {str(k): str(v) for k, v in cand.items() if k and v}
+                except Exception:
+                    names_by_domain = {}
                 try:
                     _log_event(
                         run_id,
@@ -682,21 +690,35 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     )
                 except Exception:
                     pass
-            # persist into staging_global_companies
+            # persist into staging_global_companies (ensure company_name column exists)
             if domains:
                 with get_conn() as conn, conn.cursor() as cur:
+                    try:
+                        cur.execute("ALTER TABLE staging_global_companies ADD COLUMN IF NOT EXISTS company_name TEXT")
+                    except Exception:
+                        pass
                     for d in domains[:50]:
+                        cname = None
+                        try:
+                            # domains are typically apex hosts without scheme for DR results
+                            key = d
+                            if isinstance(key, str) and key.startswith("http"):
+                                from urllib.parse import urlparse as _urlparse
+                                key = _urlparse(key).netloc
+                            cname = names_by_domain.get(key)
+                        except Exception:
+                            cname = None
                         try:
                             log.info(
-                                "[db] INSERT staging_global_companies tenant_id=%s domain=%s source=%s",
-                                tenant_id, d, discovery_source,
+                                "[db] INSERT staging_global_companies tenant_id=%s domain=%s company_name=%s source=%s",
+                                tenant_id, d, cname, discovery_source,
                             )
                         except Exception:
                             pass
                         try:
                             cur.execute(
-                                "INSERT INTO staging_global_companies(tenant_id, domain, ai_metadata) VALUES (%s,%s,%s)",
-                                (tenant_id, d, Json({"provenance": {"source": discovery_source}})),
+                                "INSERT INTO staging_global_companies(tenant_id, domain, company_name, ai_metadata) VALUES (%s,%s,%s,%s)",
+                                (tenant_id, d, cname, Json({"provenance": {"source": discovery_source}})),
                             )
                         except Exception:
                             continue
@@ -735,13 +757,34 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     if r and r[0]:
                         company_ids.append(int(r[0]))
                     else:
+                        # Prefer DR-discovered company name when available
                         try:
-                            log.info("[db] INSERT companies(name=%s, website_domain=%s)", d.split(".")[0].title(), d)
+                            key = d
+                            if isinstance(key, str) and key.startswith("http"):
+                                from urllib.parse import urlparse as _urlparse
+                                key = _urlparse(key).netloc
+                            dr_name = names_by_domain.get(key) if 'names_by_domain' in locals() else None
+                        except Exception:
+                            dr_name = None
+                        # Fallback: derive a simple title-cased name from apex host
+                        fallback_name = None
+                        try:
+                            host = d
+                            if isinstance(host, str) and host.startswith("http"):
+                                from urllib.parse import urlparse as _urlparse
+                                host = _urlparse(host).netloc
+                            core = (host.split(".")[0] or "").replace("-", " ")
+                            fallback_name = core.title() if core else None
+                        except Exception:
+                            fallback_name = None
+                        cname = dr_name or fallback_name or None
+                        try:
+                            log.info("[db] INSERT companies(name=%s, website_domain=%s)", cname, d)
                         except Exception:
                             pass
                         cur.execute(
                             "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,now()) RETURNING company_id",
-                            (d.split(".")[0].title(), d),
+                            (cname, d),
                         )
                         rr = cur.fetchone()
                         if rr and rr[0]:
@@ -764,6 +807,33 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
         # Run enrichment for each
         if enrich_company_with_tavily is None:
             raise RuntimeError("enrich unavailable")
+        # Preload company names for enrichment (needed by Jina DR contacts)
+        names_by_id: dict[int, str] = {}
+        try:
+            if company_ids:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT company_id, name, website_domain FROM companies WHERE company_id = ANY(%s)",
+                        (company_ids,),
+                    )
+                    for row in cur.fetchall() or []:
+                        cid, nm, dom = int(row[0]), (row[1] or ""), (row[2] or "")
+                        # Fallback: derive name from domain when empty
+                        if not nm and isinstance(dom, str) and dom:
+                            try:
+                                host = dom
+                                if host.startswith("http"):
+                                    from urllib.parse import urlparse as _urlparse
+                                    host = _urlparse(host).netloc
+                                core = (host.split(".")[0] or "").replace("-", " ")
+                                nm = core.title() if core else ""
+                            except Exception:
+                                nm = ""
+                        if nm:
+                            names_by_id[cid] = nm
+        except Exception:
+            names_by_id = {}
+
         with _stage_timer(run_id, tenant_id, "bg_enrich_run", total_inc=len(company_ids)):
             try:
                 log.warning(
@@ -776,7 +846,9 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
             for cid in company_ids:
                 t1 = time.perf_counter()
                 try:
-                    await enrich_company_with_tavily(cid, search_policy="require_existing")
+                    # Pass company_name so enrichment can run Jina DR contacts primary
+                    cname = names_by_id.get(int(cid))
+                    await enrich_company_with_tavily(cid, company_name=cname, search_policy="require_existing")
                     processed += 1
                     _log_event(run_id, tenant_id, "bg_enrich_run", event="company", status="ok", company_id=cid, duration_ms=int((time.perf_counter()-t1)*1000))
                 except Exception as e:
