@@ -708,20 +708,50 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                             cname = names_by_domain.get(key)
                         except Exception:
                             cname = None
-                        try:
-                            log.info(
-                                "[db] INSERT staging_global_companies tenant_id=%s domain=%s company_name=%s source=%s",
-                                tenant_id, d, cname, discovery_source,
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            cur.execute(
-                                "INSERT INTO staging_global_companies(tenant_id, domain, company_name, ai_metadata) VALUES (%s,%s,%s,%s)",
-                                (tenant_id, d, cname, Json({"provenance": {"source": discovery_source}})),
-                            )
-                        except Exception:
-                            continue
+                        # Insert with conflict guard; log insert or reuse
+                        cur.execute(
+                            """
+                            INSERT INTO staging_global_companies(tenant_id, domain, company_name, ai_metadata)
+                            VALUES (%s,%s,%s,%s)
+                            ON CONFLICT (tenant_id, domain, source) DO NOTHING
+                            RETURNING id
+                            """,
+                            (tenant_id, d, cname, Json({"provenance": {"source": discovery_source}})),
+                        )
+                        sid_row = cur.fetchone()
+                        if sid_row and sid_row[0] is not None:
+                            try:
+                                log.info(
+                                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"staging_insert\",\"job_id\":%s,\"tenant_id\":%s,\"id\":%s,\"domain\":\"%s\",\"company_name\":%s}",
+                                    job_id,
+                                    tenant_id,
+                                    int(sid_row[0]),
+                                    d,
+                                    json.dumps(cname) if cname else 'null',
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            # Reuse existing row id for logging clarity
+                            try:
+                                cur.execute(
+                                    "SELECT id FROM staging_global_companies WHERE tenant_id=%s AND domain=%s AND source='web_discovery' LIMIT 1",
+                                    (tenant_id, d),
+                                )
+                                rrow = cur.fetchone()
+                                rid = int(rrow[0]) if rrow and rrow[0] is not None else None
+                            except Exception:
+                                rid = None
+                            try:
+                                log.info(
+                                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"staging_reuse\",\"job_id\":%s,\"tenant_id\":%s,\"id\":%s,\"domain\":\"%s\"}",
+                                    job_id,
+                                    tenant_id,
+                                    rid,
+                                    d,
+                                )
+                            except Exception:
+                                pass
                 try:
                     log.info(
                         "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_store\",\"job_id\":%s,\"domains\":%s,\"source\":\"%s\"}",
@@ -755,7 +785,17 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     cur.execute("SELECT company_id FROM companies WHERE website_domain=%s LIMIT 1", (d,))
                     r = cur.fetchone()
                     if r and r[0]:
-                        company_ids.append(int(r[0]))
+                        cid = int(r[0])
+                        company_ids.append(cid)
+                        try:
+                            log.info(
+                                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"companies_reuse\",\"job_id\":%s,\"company_id\":%s,\"domain\":\"%s\"}",
+                                job_id,
+                                cid,
+                                d,
+                            )
+                        except Exception:
+                            pass
                     else:
                         # Prefer DR-discovered company name when available
                         try:
@@ -778,17 +818,24 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                         except Exception:
                             fallback_name = None
                         cname = dr_name or fallback_name or None
-                        try:
-                            log.info("[db] INSERT companies(name=%s, website_domain=%s)", cname, d)
-                        except Exception:
-                            pass
                         cur.execute(
                             "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,now()) RETURNING company_id",
                             (cname, d),
                         )
                         rr = cur.fetchone()
                         if rr and rr[0]:
-                            company_ids.append(int(rr[0]))
+                            cid = int(rr[0])
+                            company_ids.append(cid)
+                            try:
+                                log.info(
+                                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"companies_insert\",\"job_id\":%s,\"company_id\":%s,\"name\":%s,\"domain\":\"%s\"}",
+                                    job_id,
+                                    cid,
+                                    json.dumps(cname) if cname else 'null',
+                                    d,
+                                )
+                            except Exception:
+                                pass
                 except Exception:
                     continue
         try:
