@@ -16,6 +16,7 @@ import re
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime
+import time
 from typing import Any, Dict, Iterable, List, Mapping, NotRequired, Optional, Tuple, TypedDict, Literal
 try:  # Python 3.9/3.10 fallback
     from typing import Annotated  # type: ignore
@@ -114,6 +115,7 @@ except Exception:  # pragma: no cover
     _qa_answer = None  # type: ignore
     _phrase_update = None  # type: ignore
 from src.jina_reader import read_url as jina_read
+from src.troubleshoot_log import log_json
 
 # ---------- logging ----------
 logger = logging.getLogger("presdr")
@@ -6741,7 +6743,7 @@ async def enrich_node(state: GraphState) -> GraphState:
         except Exception:
             pass
 
-    if all_done:
+        if all_done:
         # Compose completion message; include ACRA/ICP totals and nightly remainder
         icp_total = 0
         acra_total_state = 0
@@ -6793,7 +6795,32 @@ async def enrich_node(state: GraphState) -> GraphState:
                         },
                     },
                 }
+                try:
+                    t_sc = time.perf_counter()
+                except Exception:
+                    t_sc = None
+                try:
+                    log_json(
+                        "orchestrator",
+                        "info",
+                        "scoring_start",
+                        {"candidates": len(ids)},
+                    )
+                except Exception:
+                    pass
                 await lead_scoring_agent.ainvoke(scoring_initial_state)
+                try:
+                    log_json(
+                        "orchestrator",
+                        "info",
+                        "scoring_done",
+                        {
+                            "candidates": len(ids),
+                            "duration_ms": int((time.perf_counter() - t_sc) * 1000) if t_sc else None,
+                        },
+                    )
+                except Exception:
+                    pass
                 # Immediately render scores into chat for better UX
                 state = await score_node(state)
 
@@ -7025,6 +7052,22 @@ async def enrich_node(state: GraphState) -> GraphState:
                         store = None
 
                     if store:
+                        # Export summary counters
+                        _odoo_upserts = 0
+                        _odoo_contacts = 0
+                        _odoo_leads = 0
+                        try:
+                            log_json(
+                                "orchestrator",
+                                "info",
+                                "odoo_export_start",
+                                {
+                                    "ids_export": len(ids_export),
+                                    "scores_available": len(scores or {}),
+                                },
+                            )
+                        except Exception:
+                            pass
                         for cid in ids_export:
                             comp = comps.get(cid, {})
                             if not comp:
@@ -7049,6 +7092,10 @@ async def enrich_node(state: GraphState) -> GraphState:
                                     )
                                 except Exception:
                                     pass
+                                try:
+                                    _odoo_upserts += 1
+                                except Exception:
+                                    pass
                                 if email:
                                     try:
                                         await store.add_contact(odoo_id, email)
@@ -7057,6 +7104,10 @@ async def enrich_node(state: GraphState) -> GraphState:
                                             email,
                                             odoo_id,
                                         )
+                                        try:
+                                            _odoo_contacts += 1
+                                        except Exception:
+                                            pass
                                     except OdooUnavailable as _c_unavail:
                                         logger.info(
                                             "odoo export: contact skipped partner_id=%s reason=%s",
@@ -7083,6 +7134,10 @@ async def enrich_node(state: GraphState) -> GraphState:
                                             str(score.get("rationale") or ""),
                                             email,
                                         )
+                                        try:
+                                            _odoo_leads += 1
+                                        except Exception:
+                                            pass
                                     except OdooUnavailable as _lead_unavail:
                                         logger.info(
                                             "odoo export: lead create skipped partner_id=%s reason=%s",
@@ -7103,6 +7158,20 @@ async def enrich_node(state: GraphState) -> GraphState:
                                 logger.exception(
                                     "odoo sync failed for company_id=%s", cid
                                 )
+                        try:
+                            log_json(
+                                "orchestrator",
+                                "info",
+                                "odoo_export_done",
+                                {
+                                    "ids_export": len(ids_export),
+                                    "upserts": _odoo_upserts,
+                                    "contacts": _odoo_contacts,
+                                    "leads": _odoo_leads,
+                                },
+                            )
+                        except Exception:
+                            pass
                 except StopIteration:
                     pass
                 except Exception as _odoo_exc:
@@ -7135,7 +7204,33 @@ async def enrich_node(state: GraphState) -> GraphState:
                         },
                     },
                 }
+                try:
+                    t_sc2 = time.perf_counter()
+                except Exception:
+                    t_sc2 = None
+                try:
+                    log_json(
+                        "orchestrator",
+                        "info",
+                        "scoring_start",
+                        {"candidates": len(done_ids), "mode": "partial"},
+                    )
+                except Exception:
+                    pass
                 await lead_scoring_agent.ainvoke(scoring_initial_state)
+                try:
+                    log_json(
+                        "orchestrator",
+                        "info",
+                        "scoring_done",
+                        {
+                            "candidates": len(done_ids),
+                            "mode": "partial",
+                            "duration_ms": int((time.perf_counter() - t_sc2) * 1000) if t_sc2 else None,
+                        },
+                    )
+                except Exception:
+                    pass
                 # Filter candidates to the completed subset for display
                 try:
                     cands = state.get("candidates") or []
@@ -7167,6 +7262,15 @@ async def enrich_node(state: GraphState) -> GraphState:
                 except Exception as _partial_store_exc:
                     logger.info("odoo export skipped in partial path: %s", _partial_store_exc)
                 if store is not None:
+                    try:
+                        log_json(
+                            "orchestrator",
+                            "info",
+                            "odoo_export_start",
+                            {"ids_export": len(done_ids), "mode": "partial"},
+                        )
+                    except Exception:
+                        pass
                     async with pool.acquire() as conn:
                         comp_rows = await conn.fetch(
                             """
@@ -7189,6 +7293,9 @@ async def enrich_node(state: GraphState) -> GraphState:
                             done_ids,
                         )
                         scores = {r["company_id"]: dict(r) for r in score_rows}
+                    _odoo_upserts_p = 0
+                    _odoo_contacts_p = 0
+                    _odoo_leads_p = 0
                     for cid in done_ids:
                         comp = comps.get(cid) or {}
                         email = emails.get(cid)
@@ -7202,9 +7309,11 @@ async def enrich_node(state: GraphState) -> GraphState:
                                 incorporation_year=comp.get("incorporation_year"),
                                 website_domain=comp.get("website_domain"),
                             )
+                            _odoo_upserts_p += 1
                             if email:
                                 try:
                                     await store.add_contact(odoo_id, email)
+                                    _odoo_contacts_p += 1
                                 except OdooUnavailable as _c_unavail:
                                     logger.info(
                                         "odoo export: contact skipped partner_id=%s reason=%s",
@@ -7224,6 +7333,7 @@ async def enrich_node(state: GraphState) -> GraphState:
                                         str(sc.get("rationale") or ""),
                                         email,
                                     )
+                                    _odoo_leads_p += 1
                                 except OdooUnavailable as _lead_unavail:
                                     logger.info(
                                         "odoo export: lead create skipped partner_id=%s reason=%s",
@@ -7236,6 +7346,21 @@ async def enrich_node(state: GraphState) -> GraphState:
                             logger.info("odoo sync skipped for company_id=%s: %s", cid, exc)
                         except Exception:
                             logger.exception("odoo sync failed for company_id=%s", cid)
+                    try:
+                        log_json(
+                            "orchestrator",
+                            "info",
+                            "odoo_export_done",
+                            {
+                                "ids_export": len(done_ids),
+                                "mode": "partial",
+                                "upserts": _odoo_upserts_p,
+                                "contacts": _odoo_contacts_p,
+                                "leads": _odoo_leads_p,
+                            },
+                        )
+                    except Exception:
+                        pass
         except Exception:
             logger.exception("partial odoo export failed")
 

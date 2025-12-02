@@ -71,6 +71,10 @@ async def agentic_send_results(to: Optional[str], tenant_id: Optional[int], *, l
         return {"status": "skipped_no_config"}
 
     # Prepare context summary for the model (counts + a few top names)
+    try:
+        log.info("agentic_email:start to=%s tenant_id=%s limit=%s", to, tenant_id, limit)
+    except Exception:
+        pass
     subj_auto, table_html, csv_link = render_summary_html(int(tenant_id), int(limit))
     # Derive a tiny, safe preview list (no PII) to guide tone
     preview_names: list[str] = []
@@ -146,4 +150,15 @@ async def agentic_send_results(to: Optional[str], tenant_id: Optional[int], *, l
     for k in ("request_id", "http_status", "error", "csv_link"):
         if sent.get(k) is not None:
             out[k] = sent.get(k)
+    try:
+        log.info(
+            "agentic_email:done to=%s tenant_id=%s status=%s http_status=%s request_id=%s",
+            to,
+            tenant_id,
+            out.get("status"),
+            out.get("http_status"),
+            out.get("request_id"),
+        )
+    except Exception:
+        pass
     return out

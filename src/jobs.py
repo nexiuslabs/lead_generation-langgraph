@@ -11,6 +11,7 @@ from psycopg2.extras import Json
 import json
 import threading
 from src.settings import ICP_RULE_NAME
+from src.troubleshoot_log import log_json
 
 # Reuse the batched/streaming implementation from lg_entry
 try:
@@ -766,136 +767,106 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery\",\"job_id\":%s,\"event\":\"no_domains\"}",
                     job_id,
                 )
-        # 2) Enrichment per company_id resolved by domain (best-effort)
+        # 2) Sequential enrichment per discovered domain (preserve order)
         processed = 0
-        # Use only the domains discovered in this run (do not always take 50 from staging)
         stage_domains = list(domains or [])
+        total_seq = len(stage_domains)
         try:
             log.info(
                 "{\"job\":\"icp_discovery_enrich\",\"phase\":\"discovery_stage\",\"job_id\":%s,\"domains\":%s}",
                 job_id,
-                len(stage_domains),
+                total_seq,
             )
         except Exception:
             pass
         company_ids: List[int] = []
-        with get_conn() as conn, conn.cursor() as cur:
-            for d in stage_domains:
-                try:
-                    cur.execute("SELECT company_id FROM companies WHERE website_domain=%s LIMIT 1", (d,))
-                    r = cur.fetchone()
-                    if r and r[0]:
-                        cid = int(r[0])
-                        company_ids.append(cid)
-                        try:
-                            log.info(
-                                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"companies_reuse\",\"job_id\":%s,\"company_id\":%s,\"domain\":\"%s\"}",
-                                job_id,
-                                cid,
-                                d,
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        # Prefer DR-discovered company name when available
-                        try:
-                            key = d
-                            if isinstance(key, str) and key.startswith("http"):
-                                from urllib.parse import urlparse as _urlparse
-                                key = _urlparse(key).netloc
-                            dr_name = names_by_domain.get(key) if 'names_by_domain' in locals() else None
-                        except Exception:
-                            dr_name = None
-                        # Fallback: derive a simple title-cased name from apex host
-                        fallback_name = None
-                        try:
-                            host = d
-                            if isinstance(host, str) and host.startswith("http"):
-                                from urllib.parse import urlparse as _urlparse
-                                host = _urlparse(host).netloc
-                            core = (host.split(".")[0] or "").replace("-", " ")
-                            fallback_name = core.title() if core else None
-                        except Exception:
-                            fallback_name = None
-                        cname = dr_name or fallback_name or None
-                        cur.execute(
-                            "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,now()) RETURNING company_id",
-                            (cname, d),
-                        )
-                        rr = cur.fetchone()
-                        if rr and rr[0]:
-                            cid = int(rr[0])
-                            company_ids.append(cid)
-                            try:
-                                log.info(
-                                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"companies_insert\",\"job_id\":%s,\"company_id\":%s,\"name\":%s,\"domain\":\"%s\"}",
-                                    job_id,
-                                    cid,
-                                    json.dumps(cname) if cname else 'null',
-                                    d,
-                                )
-                            except Exception:
-                                pass
-                except Exception:
-                    continue
-        try:
-            log.info(
-                "{\"job\":\"icp_discovery_enrich\",\"phase\":\"manifest\",\"job_id\":%s,\"company_ids\":%s}",
-                job_id,
-                len(company_ids),
-            )
-        except Exception:
-            pass
-        # Persist manifest early for traceability
-        try:
-            _persist_manifest(run_id, tenant_id, company_ids)
-        except Exception:
-            pass
-        # Run enrichment for each
         if enrich_company_with_tavily is None:
             raise RuntimeError("enrich unavailable")
-        # Preload company names for enrichment (needed by Jina DR contacts)
-        names_by_id: dict[int, str] = {}
-        try:
-            if company_ids:
-                with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT company_id, name, website_domain FROM companies WHERE company_id = ANY(%s)",
-                        (company_ids,),
-                    )
-                    for row in cur.fetchall() or []:
-                        cid, nm, dom = int(row[0]), (row[1] or ""), (row[2] or "")
-                        # Fallback: derive name from domain when empty
-                        if not nm and isinstance(dom, str) and dom:
-                            try:
-                                host = dom
-                                if host.startswith("http"):
-                                    from urllib.parse import urlparse as _urlparse
-                                    host = _urlparse(host).netloc
-                                core = (host.split(".")[0] or "").replace("-", " ")
-                                nm = core.title() if core else ""
-                            except Exception:
-                                nm = ""
-                        if nm:
-                            names_by_id[cid] = nm
-        except Exception:
-            names_by_id = {}
-
-        with _stage_timer(run_id, tenant_id, "bg_enrich_run", total_inc=len(company_ids)):
+        with _stage_timer(run_id, tenant_id, "bg_enrich_run", total_inc=total_seq):
             try:
                 log.warning(
                     "{\"job\":\"icp_discovery_enrich\",\"phase\":\"enrich_start\",\"job_id\":%s,\"companies\":%s}",
                     job_id,
-                    len(company_ids),
+                    total_seq,
                 )
             except Exception:
                 pass
-            for cid in company_ids:
+            for idx, d in enumerate(stage_domains, start=1):
+                # Prepare or reuse company row for this domain
+                cid = None
+                cname_hint = None
+                try:
+                    key = d
+                    if isinstance(key, str) and key.startswith("http"):
+                        from urllib.parse import urlparse as _urlparse
+                        key = _urlparse(key).netloc
+                    cname_hint = names_by_domain.get(key) if 'names_by_domain' in locals() else None
+                except Exception:
+                    cname_hint = None
+                try:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT company_id FROM companies WHERE website_domain=%s LIMIT 1", (d,))
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            cid = int(r[0])
+                            try:
+                                log.info(
+                                    "{\"job\":\"icp_discovery_enrich\",\"phase\":\"companies_reuse\",\"job_id\":%s,\"seq\":%s,\"company_id\":%s,\"domain\":\"%s\"}",
+                                    job_id,
+                                    idx,
+                                    cid,
+                                    d,
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            # Fallback: derive a simple title-cased name from apex host
+                            try:
+                                host = d
+                                if isinstance(host, str) and host.startswith("http"):
+                                    from urllib.parse import urlparse as _urlparse
+                                    host = _urlparse(host).netloc
+                                core = (host.split(".")[0] or "").replace("-", " ")
+                                fallback_name = core.title() if core else None
+                            except Exception:
+                                fallback_name = None
+                            cname = cname_hint or fallback_name or None
+                            cur.execute(
+                                "INSERT INTO companies(name, website_domain, last_seen) VALUES (%s,%s,now()) RETURNING company_id",
+                                (cname, d),
+                            )
+                            rr = cur.fetchone()
+                            if rr and rr[0]:
+                                cid = int(rr[0])
+                                try:
+                                    log.info(
+                                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"companies_insert\",\"job_id\":%s,\"seq\":%s,\"company_id\":%s,\"name\":%s,\"domain\":\"%s\"}",
+                                        job_id,
+                                        idx,
+                                        cid,
+                                        json.dumps(cname) if cname else 'null',
+                                        d,
+                                    )
+                                except Exception:
+                                    pass
+                except Exception as prep_exc:
+                    _log_event(run_id, tenant_id, "bg_enrich_run", event="company", status="error", error_code=type(prep_exc).__name__, extra={"step":"prepare","domain":d})
+                    continue
+
+                if not cid:
+                    continue
+                company_ids.append(cid)
+                # Enrich sequentially for this company
                 t1 = time.perf_counter()
                 try:
-                    # Pass company_name so enrichment can run Jina DR contacts primary
-                    cname = names_by_id.get(int(cid))
-                    await enrich_company_with_tavily(cid, company_name=cname, search_policy="require_existing")
+                    try:
+                        log.info(
+                            "{\"job\":\"icp_discovery_enrich\",\"phase\":\"enrich_company_start\",\"job_id\":%s,\"seq\":%s,\"total\":%s,\"company_id\":%s,\"domain\":\"%s\"}",
+                            job_id, idx, total_seq, cid, d,
+                        )
+                    except Exception:
+                        pass
+                    await enrich_company_with_tavily(cid, company_name=cname_hint, search_policy="require_existing")
                     processed += 1
                     _log_event(run_id, tenant_id, "bg_enrich_run", event="company", status="ok", company_id=cid, duration_ms=int((time.perf_counter()-t1)*1000))
                 except Exception as e:
@@ -906,7 +877,7 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 "{\"job\":\"icp_discovery_enrich\",\"phase\":\"enrich\",\"job_id\":%s,\"processed\":%s,\"total\":%s}",
                 job_id,
                 processed,
-                len(company_ids),
+                total_seq,
             )
         except Exception:
             pass
@@ -919,6 +890,7 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     "lead_features": [],
                     "lead_scores": [],
                     "icp_payload": {},
+                    "tenant_id": int(tenant_id) if tenant_id is not None else None,
                 }
                 await lead_scoring_agent.ainvoke(scoring_state)
                 try:
@@ -943,7 +915,111 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     pass
         except Exception:
             pass
-        # Export to Odoo (best-effort)
+        
+        # Email notification (best-effort)
+        try:
+            to_email = notify_email
+            # If not provided on enqueue, try to resolve from job params, tenant_users, or DEFAULT_NOTIFY_EMAIL
+            if not to_email:
+                try:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT params FROM background_jobs WHERE job_id=%s", (job_id,))
+                        row = cur.fetchone()
+                        current_params = row[0] if row and row[0] else {}
+                        if isinstance(current_params, dict):
+                            to_email = current_params.get("notify_email")
+                except Exception:
+                    to_email = None
+            if not to_email:
+                try:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT user_id FROM tenant_users WHERE tenant_id=%s ORDER BY user_id LIMIT 1",
+                            (int(tenant_id),),
+                        )
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            candidate = str(row[0])
+                            from src.settings import EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL as _ACCEPT_TU_EMAIL  # type: ignore
+                            if _ACCEPT_TU_EMAIL and ("@" in candidate):
+                                to_email = candidate
+                                cur.execute(
+                                    "UPDATE background_jobs SET params=COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source','tenant_users') WHERE job_id=%s",
+                                    (to_email, job_id),
+                                )
+                except Exception:
+                    pass
+            if not to_email:
+                try:
+                    from src.settings import DEFAULT_NOTIFY_EMAIL as _DEF_TO  # type: ignore
+                    if _DEF_TO and ("@" in str(_DEF_TO)):
+                        to_email = str(_DEF_TO)
+                        with get_conn() as conn, conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE background_jobs SET params=COALESCE(params,'{}'::jsonb) || jsonb_build_object('notify_email', %s, 'notify_email_source','default_env') WHERE job_id=%s",
+                                (to_email, job_id),
+                            )
+                except Exception:
+                    pass
+            if to_email and processed > 0:
+                t2 = time.perf_counter()
+                try:
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"email_start\",\"job_id\":%s,\"to\":\"%s\"}",
+                        job_id,
+                        (to_email or "").replace("\"", "'")[:200],
+                    )
+                except Exception:
+                    pass
+                res = await agentic_send_results(to_email, tenant_id, limit=500)
+                elapsed_ms = int((time.perf_counter() - t2) * 1000)
+                _log_event(
+                    run_id,
+                    tenant_id,
+                    "email_notify",
+                    event="send",
+                    status=str(res.get("status") or "ok"),
+                    duration_ms=elapsed_ms,
+                    extra={"to": to_email, "http_status": res.get("http_status"), "request_id": res.get("request_id")},
+                )
+                try:
+                    log_json(
+                        "background_worker",
+                        "info",
+                        "email",
+                        {
+                            "job_id": int(job_id),
+                            "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                            "to": to_email,
+                            "status": res.get("status"),
+                            "http_status": res.get("http_status"),
+                            "request_id": res.get("request_id"),
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    log.info(
+                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"email\",\"job_id\":%s,\"to\":\"%s\",\"status\":\"%s\",\"http_status\":%s,\"request_id\":%s,\"duration_ms\":%s}",
+                        job_id,
+                        (to_email or "").replace("\"","'")[:200],
+                        str(res.get("status") or "ok"),
+                        json.dumps(res.get("http_status")) if isinstance(res.get("http_status"), int) else json.dumps(res.get("http_status")),
+                        json.dumps(res.get("request_id")),
+                        elapsed_ms,
+                    )
+                except Exception:
+                    pass
+                if (res or {}).get("status") == "sent":
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE background_jobs SET params=COALESCE(params,'{}'::jsonb) || jsonb_build_object('email_sent_at', now(), 'email_to', %s) WHERE job_id=%s",
+                            (to_email, job_id),
+                        )
+        except Exception:
+            pass
+        # Export to Odoo (best-effort) — after email
         try:
             rows: list[tuple] = []
             with get_conn() as conn, conn.cursor() as cur:
@@ -954,7 +1030,7 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                 rows = cur.fetchall() or []
             if rows:
                 texp = time.perf_counter()
-                await _odoo_export_for_ids(tenant_id, rows)
+                odoo_counts = await _odoo_export_for_ids(tenant_id, rows)
                 try:
                     _log_event(
                         run_id,
@@ -967,23 +1043,49 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     )
                 except Exception:
                     pass
-        except Exception:
-            pass
-        # Email notification (best-effort)
-        try:
-            if notify_email:
-                t2 = time.perf_counter()
-                res = await agentic_send_results(notify_email, tenant_id, limit=500)
-                _log_event(run_id, tenant_id, "email_notify", event="send", status=str(res.get("status") or "ok"), duration_ms=int((time.perf_counter()-t2)*1000), extra={"to": notify_email})
                 try:
-                    log.info(
-                        "{\"job\":\"icp_discovery_enrich\",\"phase\":\"email\",\"job_id\":%s,\"to\":\"%s\",\"status\":\"%s\"}",
-                        job_id,
-                        notify_email,
-                        str(res.get("status") or "ok"),
+                    log_json(
+                        "background_worker",
+                        "info",
+                        "odoo_export",
+                        {
+                            "job_id": int(job_id),
+                            "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                            "companies": len(rows),
+                            "upserts": int(odoo_counts.get("upserts", 0)),
+                            "contacts": int(odoo_counts.get("contacts", 0)),
+                            "leads": int(odoo_counts.get("leads", 0)),
+                        },
                     )
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # Job end summary (scoring/email/Odoo export)
+        try:
+            summary_email_status = None
+            summary_email_http = None
+            try:
+                # best effort: check last email event emitted above
+                # we can't read it back; instead, reuse local variable if present
+                summary_email_status = locals().get("res", {}).get("status")  # type: ignore[arg-type]
+                summary_email_http = locals().get("res", {}).get("http_status")  # type: ignore[arg-type]
+            except Exception:
+                pass
+            log_json(
+                "background_worker",
+                "info",
+                "job_end",
+                {
+                    "job_id": int(job_id),
+                    "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                    "companies": len(company_ids or []),
+                    "processed": int(processed),
+                    "scored": len(company_ids or []),
+                    "email_status": summary_email_status,
+                    "email_http_status": summary_email_http,
+                },
+            )
         except Exception:
             pass
         # Run summary
@@ -1192,12 +1294,7 @@ async def run_enrich_candidates(job_id: int) -> None:
             await _run()
             processed = len(rows)
             scored_ids = [int(r[0]) for r in rows if r and r[0] is not None]
-            # Best-effort Odoo export for enriched companies
-            try:
-                await _odoo_export_for_ids(tenant_id, rows)
-            except Exception:
-                pass
-            # Run lead scoring on the enriched batch so nightly runs update lead_scores immediately
+            # Run lead scoring first so email can reflect latest shortlist
             try:
                 if scored_ids:
                     from src.lead_scoring import lead_scoring_agent
@@ -1206,6 +1303,7 @@ async def run_enrich_candidates(job_id: int) -> None:
                         "lead_features": [],
                         "lead_scores": [],
                         "icp_payload": {},
+                        "tenant_id": int(tenant_id) if tenant_id is not None else None,
                     }
                     await lead_scoring_agent.ainvoke(scoring_state)
             except Exception as e:
@@ -1254,7 +1352,8 @@ async def run_enrich_candidates(job_id: int) -> None:
             processed,
             dur_ms,
         )
-        # If the nightly batch fully completed, send the shortlist email once scoring is done
+        # If the nightly batch fully completed, send the shortlist email once scoring is done,
+        # then perform Odoo export (scoring -> email -> Odoo export).
         if job_completed and tenant_id is not None and processed > 0:
             try:
                 current_params = params
@@ -1334,6 +1433,25 @@ async def run_enrich_candidates(job_id: int) -> None:
                         )
                     except Exception:
                         pass
+                # After email attempt, perform Odoo export for the selected rows
+                try:
+                    if rows:
+                        texp = time.perf_counter()
+                        await _odoo_export_for_ids(tenant_id, rows)
+                        try:
+                            _log_event(
+                                run_id,
+                                tenant_id,
+                                "odoo_export",
+                                event="export_batch",
+                                status="ok",
+                                duration_ms=int((time.perf_counter() - texp) * 1000),
+                                extra={"companies": len(rows)},
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             except Exception:
                 pass
     except Exception as e:  # pragma: no cover
@@ -1350,7 +1468,7 @@ async def run_enrich_candidates(job_id: int) -> None:
         log.info("{\"job\":\"enrich_candidates\",\"phase\":\"error\",\"job_id\":%s,\"duration_ms\":%s,\"error\":%s}", job_id, dur_ms, str(e))
 
 
-async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tuple]) -> None:
+async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tuple]) -> dict:
     """Best-effort Odoo sync for a batch of companies after nightly enrichment.
 
     For each (company_id, name, uen) in company_rows, upsert to Odoo partner,
@@ -1358,7 +1476,7 @@ async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tupl
     Non-fatal: all exceptions are swallowed per item; logs in OdooStore cover details.
     """
     if not company_rows:
-        return
+        return {"total": 0, "upserts": 0, "contacts": 0, "leads": 0}
     try:
         from app.odoo_store import OdooStore  # async methods
     except Exception:
@@ -1370,7 +1488,7 @@ async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tupl
     # Fetch company core fields, scores and a primary email
     ids = [int(r[0]) for r in company_rows if r and r[0] is not None]
     if not ids:
-        return
+        return {"total": 0, "upserts": 0, "contacts": 0, "leads": 0}
     comps: dict[int, dict] = {}
     emails: dict[int, str | None] = {}
     scores: dict[int, float] = {}
@@ -1422,6 +1540,9 @@ async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tupl
         # proceed with what we have
         pass
     # Export sequentially to avoid hammering Odoo
+    upserts = 0
+    contacts_added = 0
+    leads_created = 0
     for cid in ids:
         comp = comps.get(cid) or {}
         try:
@@ -1434,18 +1555,81 @@ async def _odoo_export_for_ids(tenant_id: Optional[int], company_rows: list[tupl
                 incorporation_year=comp.get("incorporation_year"),
                 website_domain=comp.get("website_domain"),
             )
+            try:
+                upserts += 1
+                log_json(
+                    "odoo_export",
+                    "info",
+                    "upsert_company",
+                    {
+                        "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                        "company_id": int(cid),
+                        "partner_id": int(partner_id) if isinstance(partner_id, int) else partner_id,
+                        "name": comp.get("name"),
+                        "domain": comp.get("website_domain"),
+                    },
+                )
+            except Exception:
+                pass
             email = emails.get(cid)
             if email:
                 try:
                     await store.add_contact(partner_id, email)
+                    contacts_added += 1
+                    try:
+                        log_json(
+                            "odoo_export",
+                            "info",
+                            "add_contact",
+                            {
+                                "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                                "company_id": int(cid),
+                                "partner_id": int(partner_id) if isinstance(partner_id, int) else partner_id,
+                                "email": email,
+                            },
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             score = scores.get(cid, 0.0)
             rationale = rationales.get(cid, "")
             try:
                 await store.create_lead_if_high(partner_id, comp.get("name"), score, {}, rationale, email)
+                leads_created += 1
+                try:
+                    log_json(
+                        "odoo_export",
+                        "info",
+                        "create_lead",
+                        {
+                            "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                            "company_id": int(cid),
+                            "partner_id": int(partner_id) if isinstance(partner_id, int) else partner_id,
+                            "score": float(score),
+                            "email": email,
+                        },
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception:
             # continue best-effort for the rest
             continue
+    try:
+        log_json(
+            "odoo_export",
+            "info",
+            "batch_summary",
+            {
+                "tenant_id": int(tenant_id) if tenant_id is not None else None,
+                "total": len(ids),
+                "upserts": upserts,
+                "contacts": contacts_added,
+                "leads": leads_created,
+            },
+        )
+    except Exception:
+        pass
+    return {"total": len(ids), "upserts": upserts, "contacts": contacts_added, "leads": leads_created}

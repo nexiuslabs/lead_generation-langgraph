@@ -8,6 +8,12 @@ from src.settings import MISSING_FIRMO_PENALTY, FIRMO_MIN_COMPLETENESS_FOR_BONUS
 from langchain_openai import ChatOpenAI
 from sklearn.linear_model import LogisticRegression
 from src.openai_client import generate_rationale
+import os as _os
+import time
+import logging
+from src.troubleshoot_log import log_json
+
+_logger = logging.getLogger("lead_scoring")
 
 # Define state for lead scoring
 class LeadScoringState(TypedDict):
@@ -20,6 +26,7 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
     """
     Fetch core features from companies table for given candidate IDs.
     """
+    t0 = time.perf_counter()
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -49,6 +56,19 @@ async def fetch_features(state: LeadScoringState) -> LeadScoringState:
             'industry_code': row['industry_code'],
         })
     state['lead_features'] = features
+    try:
+        log_json(
+            "lead_scoring",
+            "info",
+            "fetch_features",
+            {
+                "candidates": len(state.get("candidate_ids") or []),
+                "features": len(features),
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
+    except Exception:
+        pass
     return state
 
 async def train_and_score(state: LeadScoringState) -> LeadScoringState:
@@ -56,6 +76,7 @@ async def train_and_score(state: LeadScoringState) -> LeadScoringState:
     Train a logistic regression model on ICP data (balanced) and score candidates.
     """
     # Prepare feature matrix
+    t0 = time.perf_counter()
     X: List[List[float]] = []
     for feat in state['lead_features']:
         # One-hot encode revenue_bucket: small, medium, large
@@ -174,6 +195,19 @@ async def train_and_score(state: LeadScoringState) -> LeadScoringState:
             'firmo_missing': bool(firmo_missing),
         })
     state['lead_scores'] = lead_scores
+    try:
+        log_json(
+            "lead_scoring",
+            "info",
+            "train_and_score",
+            {
+                "features": len(state.get("lead_features") or []),
+                "scored": len(lead_scores),
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
+    except Exception:
+        pass
     return state
 
 def assign_buckets(state: LeadScoringState) -> LeadScoringState:
@@ -195,6 +229,15 @@ def assign_buckets(state: LeadScoringState) -> LeadScoringState:
         except Exception:
             pass
         s['bucket'] = bucket
+    try:
+        counts = {"high": 0, "medium": 0, "low": 0}
+        for s in state.get("lead_scores") or []:
+            b = s.get("bucket")
+            if b in counts:
+                counts[b] += 1
+        log_json("lead_scoring", "info", "assign_buckets", counts)
+    except Exception:
+        pass
     return state
 
 async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
@@ -241,6 +284,9 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
         # Cache lookup is best-effort; continue without it on any error
         cached_rationales = {}
 
+    t0 = time.perf_counter()
+    used_cache = 0
+    made_llm = 0
     for feat, score in zip(state['lead_features'], state['lead_scores']):
         try:
             cid = int(feat.get('company_id'))
@@ -251,6 +297,7 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
         rationale = None
         if cid is not None and cache_key and cid in cached_rationales:
             rationale = cached_rationales[cid]
+            used_cache += 1
         else:
             # Create prompt and call LLM best-effort
             prompt = (
@@ -259,6 +306,7 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
             )
             try:
                 rationale = await generate_rationale(prompt)
+                made_llm += 1
             except Exception:
                 rationale = "Rationale unavailable."
 
@@ -282,21 +330,46 @@ async def generate_rationales(state: LeadScoringState) -> LeadScoringState:
                 score['cache_key'] = hashlib.sha1(key_str.encode('utf-8')).hexdigest()
             except Exception:
                 pass
+    try:
+        log_json(
+            "lead_scoring",
+            "info",
+            "generate_rationales",
+            {
+                "cached": int(used_cache),
+                "generated": int(made_llm),
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+            },
+        )
+    except Exception:
+        pass
     return state
 
 async def persist_results(state: LeadScoringState) -> LeadScoringState:
     """
     Persist lead_features and lead_scores into database tables.
     """
+    t0 = time.perf_counter()
     pool = await get_pg_pool()
     async with pool.acquire() as conn:
-        # Try set tenant GUC for RLS from env (supports non-HTTP runs),
-        # and also detect an existing tenant from the current session if present.
+        # Try set tenant GUC for RLS using, in order:
+        # 1) state.tenant_id (if present)
+        # 2) DEFAULT_TENANT_ID env (for non-HTTP runs)
+        # 3) existing session setting
         try:
-            import os as _os
-            _tenant_env = _os.getenv('DEFAULT_TENANT_ID')
-            if _tenant_env:
-                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", _tenant_env)
+            _tid_from_state = None
+            try:
+                _tid_from_state_raw = (state.get('tenant_id') if isinstance(state, dict) else None)
+                if _tid_from_state_raw is not None:
+                    _tid_from_state = int(str(_tid_from_state_raw).strip())
+            except Exception:
+                _tid_from_state = None
+            if _tid_from_state is not None:
+                await conn.execute("SELECT set_config('request.tenant_id', $1, true)", str(_tid_from_state))
+            else:
+                _tenant_env = _os.getenv('DEFAULT_TENANT_ID')
+                if _tenant_env:
+                    await conn.execute("SELECT set_config('request.tenant_id', $1, true)", _tenant_env)
         except Exception:
             pass
         # Ensure tables exist
@@ -335,10 +408,17 @@ async def persist_results(state: LeadScoringState) -> LeadScoringState:
             tenant_val = None
         if tenant_val is None:
             try:
-                import os as _os
                 tenant_val = _os.getenv('DEFAULT_TENANT_ID')
             except Exception:
                 tenant_val = None
+        # If still none, trust state.tenant_id for writing
+        if tenant_val is None:
+            try:
+                _tid_from_state = (state.get('tenant_id') if isinstance(state, dict) else None)
+                if _tid_from_state is not None and str(_tid_from_state).strip().isdigit():
+                    tenant_val = str(_tid_from_state).strip()
+            except Exception:
+                tenant_val = tenant_val
         for feat, score in zip(state['lead_features'], state['lead_scores']):
             # Upsert features
             if has_tenant and tenant_val is not None:
@@ -387,6 +467,25 @@ async def persist_results(state: LeadScoringState) -> LeadScoringState:
                     """,
                     score['company_id'], score['score'], score['bucket'], score['rationale'], score['cache_key']
                 )
+        try:
+            current_tenant = None
+            try:
+                current_tenant = await conn.fetchval("SELECT current_setting('request.tenant_id', true)")
+            except Exception:
+                current_tenant = None
+            log_json(
+                "lead_scoring",
+                "info",
+                "persist_results",
+                {
+                    "features": len(state.get("lead_features") or []),
+                    "scores": len(state.get("lead_scores") or []),
+                    "tenant_id": int(current_tenant) if (current_tenant and str(current_tenant).isdigit()) else None,
+                    "duration_ms": int((time.perf_counter() - t0) * 1000),
+                },
+            )
+        except Exception:
+            pass
     return state
 
 # Build and compile LangGraph pipeline
