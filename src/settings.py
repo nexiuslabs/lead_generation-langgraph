@@ -555,3 +555,52 @@ CHAT_ENRICHMENT_ENABLED = os.getenv("CHAT_ENRICHMENT_ENABLED", "false").lower() 
     "yes",
     "on",
 )
+
+# Return-user / thread policy and staleness thresholds
+try:
+    PROFILE_STALENESS_DAYS = int(os.getenv("PROFILE_STALENESS_DAYS", "14") or 14)
+except Exception:
+    PROFILE_STALENESS_DAYS = 14
+try:
+    DISCOVERY_STALENESS_DAYS = int(os.getenv("DISCOVERY_STALENESS_DAYS", "14") or 14)
+except Exception:
+    DISCOVERY_STALENESS_DAYS = 14
+
+# Embedded LangGraph server toggle (optional; not required for API paths)
+ENABLE_EMBEDDED_LG_SERVER = os.getenv("ENABLE_EMBEDDED_LG_SERVER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Single active thread per context (policy hints for embedding/proxy servers)
+SINGLE_THREAD_PER_CONTEXT = os.getenv("SINGLE_THREAD_PER_CONTEXT", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    THREAD_RESUME_WINDOW_DAYS = int(os.getenv("THREAD_RESUME_WINDOW_DAYS", "7") or 7)
+except Exception:
+    THREAD_RESUME_WINDOW_DAYS = 7
+try:
+    THREAD_STALE_DAYS = int(os.getenv("THREAD_STALE_DAYS", "30") or 30)
+except Exception:
+    THREAD_STALE_DAYS = 30
+AUTO_ARCHIVE_STALE_LOCKED = os.getenv("AUTO_ARCHIVE_STALE_LOCKED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Control whether nodes can pick a tenant_id by reading the first active row
+# from odoo_connections when no tenant metadata is present (dev-only convenience).
+ALLOW_DB_TENANT_FALLBACK = os.getenv("ALLOW_DB_TENANT_FALLBACK", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)

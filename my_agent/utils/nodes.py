@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 import requests
@@ -35,6 +35,9 @@ from app.pre_sdr_graph import (
     _persist_company_profile_sync,
     _persist_icp_profile_sync,
     _persist_web_candidates_to_staging,
+    _fetch_company_profile_record,
+    _fetch_icp_profile_record,
+    _load_persisted_top10,
 )  # type: ignore
 
 try:
@@ -272,6 +275,24 @@ def _get_tenant_id(state: OrchestrationState) -> Optional[int]:
             except Exception:
                 return None
     return None
+
+
+def _get_config_int(name: str, default: int) -> int:
+    try:
+        v = int(os.getenv(name, str(default)) or default)
+        return v
+    except Exception:
+        return default
+
+
+def _get_config_bool(name: str, default: bool) -> bool:
+    try:
+        raw = (os.getenv(name) or "").strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "yes", "on"}
+    except Exception:
+        return default
 
 
 def _ensure_profile_state(state: OrchestrationState) -> ProfileState:
@@ -999,6 +1020,8 @@ Each list should contain up to 4 concise items.
 
 def _heuristic_intent(text: str) -> str:
     lowered = text.lower()
+    if any(keyword in lowered for keyword in ("status", "progress", "job status", "queue", "queued", "running", "done")):
+        return "status"
     if any(keyword in lowered for keyword in ("http://", "https://")):
         return "confirm_company"
     if "confirm" in lowered and "company" in lowered:
@@ -1021,7 +1044,7 @@ def _simple_intent(text: str) -> str:
     heuristic = _heuristic_intent(raw)
     prompt = f"""
 Classify the user's intention for the lead-generation orchestrator.
-Return JSON {{"intent": one of [run_enrichment, confirm_icp, confirm_company, confirm_discovery, accept_micro_icp, question, chat]}}.
+Return JSON {{"intent": one of [status, run_enrichment, confirm_icp, confirm_company, confirm_discovery, accept_micro_icp, question, chat]}}.
 Text: {raw!r}
 """
     fallback = {"intent": heuristic}
@@ -1212,6 +1235,277 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
     return state
 
 
+async def return_user_probe(state: OrchestrationState) -> OrchestrationState:
+    """Probe for prior tenant context and cached discovery to minimize re-asks.
+
+    Loads persisted company/ICP profiles and Top-10 preview (if any) and
+    computes a minimal decision: reuse cached vs request re-run. Designed to be
+    idempotent and fast; falls back to heuristics when DB helpers are missing.
+    """
+    profile = _ensure_profile_state(state)
+    # Resolve tenant context early so persisted snapshots can be loaded
+    tenant_id = _get_tenant_id(state)
+    if tenant_id is None:
+        try:
+            # Attempt to read from state.context / configurable metadata
+            ctx_in = state.get("context") or {}
+            if isinstance(ctx_in, dict):
+                tid0 = ctx_in.get("tenant_id") or ctx_in.get("tenantId")
+                if tid0 is not None:
+                    tid_int = int(str(tid0).strip())
+                    ctx0 = state.get("entry_context") or {}
+                    ctx0["tenant_id"] = tid_int
+                    state["entry_context"] = ctx0
+                    state["tenant_id"] = tid_int
+                    tenant_id = tid_int
+                    _log_step("tenant_context", source="probe/state.context", tenant_id=tid_int)
+        except Exception:
+            pass
+        try:
+            cfg = var_child_runnable_config.get() or {}
+            conf = cfg.get("configurable", {}) if isinstance(cfg, dict) else {}
+            meta = {}
+            if isinstance(conf.get("metadata"), dict):
+                meta.update(conf.get("metadata"))
+            if isinstance(conf.get("context"), dict):
+                meta.update(conf.get("context"))
+            for key in ("tenant_id", "tenantId"):
+                if key in conf and conf.get(key) is not None:
+                    meta.setdefault("tenant_id", conf.get(key))
+            tid = meta.get("tenant_id")
+            if tid is not None:
+                tid_int = int(str(tid).strip())
+                ctx0 = state.get("entry_context") or {}
+                ctx0["tenant_id"] = tid_int
+                state["entry_context"] = ctx0
+                state["tenant_id"] = tid_int
+                tenant_id = tid_int
+                _log_step("tenant_context", source="probe/configurable/context/metadata", tenant_id=tid_int)
+        except Exception:
+            pass
+        if tenant_id is None and _lg_get_current_metadata is not None:
+            try:
+                md = _lg_get_current_metadata() or {}
+                headers = {}
+                if isinstance(md.get("headers"), dict):
+                    headers = md.get("headers")
+                elif isinstance(md.get("request"), dict) and isinstance(md["request"].get("headers"), dict):
+                    headers = md["request"]["headers"]  # type: ignore[index]
+                tid_hdr = headers.get("x-tenant-id") or headers.get("X-Tenant-ID") if headers else None
+                if tid_hdr is None:
+                    tmeta = None
+                    if isinstance(md.get("thread"), dict):
+                        tmeta = md.get("thread").get("metadata") if isinstance(md.get("thread").get("metadata"), dict) else None  # type: ignore[index]
+                    elif isinstance(md.get("metadata"), dict):
+                        tmeta = md.get("metadata")
+                    if tmeta and isinstance(tmeta.get("tenant_id"), (str, int)):
+                        tid_hdr = tmeta.get("tenant_id")
+                if tid_hdr is not None:
+                    tid_int = int(str(tid_hdr).strip())
+                    ctx0 = state.get("entry_context") or {}
+                    ctx0["tenant_id"] = tid_int
+                    state["entry_context"] = ctx0
+                    state["tenant_id"] = tid_int
+                    tenant_id = tid_int
+                    _log_step("tenant_context", source="probe/lg_metadata", tenant_id=tid_int)
+            except Exception:
+                pass
+        # Final DB fallback in dev: pick first active Odoo tenant
+        if tenant_id is None:
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    from src.settings import ALLOW_DB_TENANT_FALLBACK as _ALLOW
+                    if _ALLOW:
+                        cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                        row = cur.fetchone()
+                        if row and row[0] is not None:
+                            tid_int = int(row[0])
+                            ctx0 = state.get("entry_context") or {}
+                            ctx0["tenant_id"] = tid_int
+                            state["entry_context"] = ctx0
+                            state["tenant_id"] = tid_int
+                            tenant_id = tid_int
+                            _log_step("tenant_context", source="probe/db_fallback", tenant_id=tid_int)
+            except Exception:
+                pass
+    decisions: Dict[str, Any] = {
+        "is_return_user": False,
+        "use_cached": False,
+        "rerun_icp": False,
+        "reason": "no_prior_context",
+        "stale_signals": {},
+        "diffs": {},
+    }
+    candidate_details: List[Dict[str, Any]] = []
+    last_preview_ts: Optional[str] = None
+    loaded_any = False
+
+    # Attempt to load persisted profiles for the tenant
+    if isinstance(tenant_id, int) and tenant_id > 0:
+        try:
+            comp = _fetch_company_profile_record(int(tenant_id))
+        except Exception:
+            comp = None
+        try:
+            icp = _fetch_icp_profile_record(int(tenant_id))
+        except Exception:
+            icp = None
+        if comp and isinstance(comp.get("profile"), dict):
+            company = dict(comp.get("profile") or {})
+            if company:
+                profile["company_profile"] = company
+                profile["company_profile_confirmed"] = bool(comp.get("confirmed")) or bool(company.get("website"))
+                loaded_any = True
+        if icp and isinstance(icp.get("profile"), dict):
+            profile["icp_profile"] = dict(icp.get("profile") or {})
+            profile["icp_profile_confirmed"] = bool(icp.get("confirmed")) or bool(profile.get("icp_profile"))
+            loaded_any = True
+        # Load any recently persisted Top‑10 preview for reuse
+        try:
+            top = _load_persisted_top10(int(tenant_id)) or []
+        except Exception:
+            top = []
+        if top:
+            candidate_details = top[:10]
+            # Read latest preview timestamp for staleness evaluation
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT created_at
+                          FROM staging_global_companies
+                         WHERE (tenant_id = %s OR %s IS NULL)
+                           AND COALESCE((ai_metadata->>'preview')::boolean,false) = true
+                         ORDER BY created_at DESC
+                         LIMIT 1
+                        """,
+                        (int(tenant_id), int(tenant_id)),
+                    )
+                    r = cur.fetchone()
+                    if r and r[0] is not None:
+                        last_preview_ts = str(r[0])
+            except Exception:
+                last_preview_ts = None
+
+    # Decide reuse vs rerun (heuristic + optional LLM policy)
+    candidate_count = len(candidate_details)
+    stale_days = None
+    is_stale = False
+    try:
+        from src.settings import DISCOVERY_STALENESS_DAYS as _STALE
+    except Exception:
+        _STALE = 14
+    if candidate_count:
+        if last_preview_ts:
+            try:
+                t = datetime.fromisoformat(last_preview_ts.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - t).days
+                stale_days = age
+                is_stale = age > int(_STALE)
+            except Exception:
+                is_stale = False
+        if not is_stale:
+            decisions.update({
+                "is_return_user": True,
+                "use_cached": True,
+                "rerun_icp": False,
+                "reason": "cached_top10_preview",
+            })
+        else:
+            decisions.update({
+                "is_return_user": True,
+                "use_cached": False,
+                "rerun_icp": True,
+                "reason": f"stale_preview_over_{_STALE}d",
+                "stale_signals": {"last_preview_at": last_preview_ts, "window_days": _STALE},
+            })
+    elif loaded_any:
+        decisions.update({
+            "is_return_user": True,
+            "use_cached": False,
+            "rerun_icp": False,
+            "reason": "profiles_loaded_no_candidates",
+        })
+
+    # Optional LLM policy to refine the decision (fallback to heuristics)
+    try:
+        company = (profile.get("company_profile") or {})
+        icp_prof = (profile.get("icp_profile") or {})
+        intent = (state.get("entry_context") or {}).get("intent")
+        text = (state.get("entry_context") or {}).get("last_user_command")
+        prompt = f"""
+You are a cautious orchestrator policy assistant. Decide whether to reuse cached ICP discovery results or re-run discovery.
+Return ONLY JSON with keys: is_return_user, use_cached, rerun_icp, reason, stale_signals, diffs.
+
+company_profile: {company!r}
+icp_profile: {icp_prof!r}
+cached_discovery: {{"count": {candidate_count}, "top10_age_days": {stale_days}, "last_run_at": {last_preview_ts!r}}}
+rules: {{"icp_rule_name": "default", "profile_staleness_days": 14, "discovery_staleness_days": {_STALE}}}
+incoming_intent: {intent!r}
+incoming_text: {text!r}
+
+Heuristics:
+- use_cached when: candidates exist, fresh (<= discovery_staleness_days), and no breaking diffs.
+- rerun_icp when: website/industries changed, rule drift, or stale (> discovery_staleness_days).
+Respond with JSON only.
+"""
+        fallback = {
+            "is_return_user": bool(decisions.get("is_return_user")),
+            "use_cached": bool(decisions.get("use_cached")),
+            "rerun_icp": bool(decisions.get("rerun_icp")),
+            "reason": str(decisions.get("reason") or "heuristic"),
+            "stale_signals": decisions.get("stale_signals") or {},
+            "diffs": decisions.get("diffs") or {},
+        }
+        llm_dec = call_llm_json(prompt, fallback) or fallback
+        # Normalize
+        decisions["is_return_user"] = bool(llm_dec.get("is_return_user", fallback["is_return_user"]))
+        decisions["use_cached"] = bool(llm_dec.get("use_cached", fallback["use_cached"]))
+        decisions["rerun_icp"] = bool(llm_dec.get("rerun_icp", fallback["rerun_icp"]))
+        if decisions["use_cached"] and decisions["rerun_icp"]:
+            # prefer rerun if conflict
+            decisions["use_cached"] = False
+        reason = llm_dec.get("reason") or decisions.get("reason") or "policy"
+        decisions["reason"] = str(reason)
+        if isinstance(llm_dec.get("stale_signals"), dict):
+            decisions["stale_signals"] = llm_dec.get("stale_signals")
+        if isinstance(llm_dec.get("diffs"), dict):
+            decisions["diffs"] = llm_dec.get("diffs")
+    except Exception:
+        pass
+
+    # Write discovery cache for downstream nodes to optionally reuse
+    if candidate_details:
+        disc = state.get("discovery") or {}
+        disc["web_candidate_details"] = candidate_details
+        disc["top10_details"] = candidate_details[:10]
+        # Derive domains + ids if possible (ids may be absent in preview; leave empty)
+        doms = [_domain_from_value(d.get("domain") or "") for d in candidate_details if isinstance(d, dict)]
+        disc["top10_domains"] = [d for d in doms if d]
+        state["discovery"] = disc
+
+    # Persist updated profile_state back
+    state["profile_state"] = profile
+    state["decisions"] = decisions
+    state["is_return_user"] = bool(decisions.get("is_return_user"))
+
+    # Status/logs
+    if decisions.get("is_return_user"):
+        msg = "Found prior context; will reuse cached candidates" if decisions.get("use_cached") else "Found prior context; no cached candidates to reuse"
+    else:
+        msg = "No prior context found"
+    _log_step(
+        "return_user_probe",
+        tenant_id=_get_tenant_id(state),
+        is_return=bool(decisions.get("is_return_user")),
+        use_cached=bool(decisions.get("use_cached")),
+        reason=decisions.get("reason"),
+        cached=len(candidate_details),
+    )
+    _set_status(state, "return_user_probe", msg)
+    return state
+
+
 async def profile_builder(state: OrchestrationState) -> OrchestrationState:
     """Update profile flags using the latest conversation snippet."""
     profile = _ensure_profile_state(state)
@@ -1378,6 +1672,38 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     last_intent = (ctx.get("intent") or (_heuristic_intent(question) if question else "")).strip().lower()
     last_command = (ctx.get("last_user_command") or "").strip().lower()
     normalized_command = last_command.translate(str.maketrans("", "", ".!?")).strip()
+
+    # Honor return-user decisions: reuse cached vs ask to re-run
+    try:
+        decisions = state.get("decisions") or {}
+        if isinstance(decisions, dict) and decisions:
+            if decisions.get("use_cached") and (company_ready and icp_ready):
+                profile["icp_discovery_confirmed"] = True
+                profile["awaiting_discovery_confirmation"] = False
+                discovery_ready = True
+            elif decisions.get("rerun_icp") and (company_ready and icp_ready):
+                # Require a positive confirmation before proceeding
+                ask = f"Re-run discovery now due to {decisions.get('reason') or 'policy'}? (yes/no)"
+                # Look for a yes-like response in the last turn
+                positive_intents = {"confirm_discovery", "confirm", "run_enrichment"}
+                positive_phrases = {"yes", "yep", "ok", "okay", "start discovery", "run discovery", "begin discovery", "proceed"}
+                normalized = normalized_command
+                wants = False
+                if last_intent in positive_intents or any(p in normalized for p in positive_phrases) or _looks_like_discovery_confirmation(normalized):
+                    wants = True
+                if wants:
+                    profile["icp_discovery_confirmed"] = True
+                    profile["awaiting_discovery_confirmation"] = False
+                    discovery_ready = True
+                else:
+                    profile["awaiting_discovery_confirmation"] = True
+                    prompts = profile.get("outstanding_prompts") or []
+                    if ask not in prompts:
+                        prompts.append(ask)
+                        profile["outstanding_prompts"] = prompts
+                        _append_message(state, "assistant", ask)
+    except Exception:
+        pass
     if discovery_ready and not enrichment_ready and _wants_enrichment(last_intent, normalized_command):
         profile["enrichment_confirmed"] = True
         enrichment_ready = True
@@ -1447,16 +1773,18 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
         if not tenant_id:
             try:
                 with get_conn() as conn, conn.cursor() as cur:
-                    cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
-                    row = cur.fetchone()
-                    if row and row[0] is not None:
-                        tid_int = int(row[0])
-                        ctx2 = state.get("entry_context") or {}
-                        ctx2["tenant_id"] = tid_int
-                        state["entry_context"] = ctx2
-                        state["tenant_id"] = tid_int
-                        tenant_id = tid_int
-                        _log_step("tenant_context", source="journey_guard/db_fallback", tenant_id=tid_int)
+                    from src.settings import ALLOW_DB_TENANT_FALLBACK as _ALLOW
+                    if _ALLOW:
+                        cur.execute("SELECT tenant_id FROM odoo_connections WHERE active=TRUE LIMIT 1")
+                        row = cur.fetchone()
+                        if row and row[0] is not None:
+                            tid_int = int(row[0])
+                            ctx2 = state.get("entry_context") or {}
+                            ctx2["tenant_id"] = tid_int
+                            state["entry_context"] = ctx2
+                            state["tenant_id"] = tid_int
+                            tenant_id = tid_int
+                            _log_step("tenant_context", source="journey_guard/db_fallback", tenant_id=tid_int)
             except Exception:
                 pass
         # Short-term UI auto-enqueue path: emit custom event for the UI to call FastAPI with user cookies
@@ -1506,8 +1834,11 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             if _enqueue_unified is not None and tenant_id:
                 res = _enqueue_unified(int(tenant_id), notify_email=notify_email)
                 job_id = (res or {}).get("job_id")
+                if not job_id:
+                    _log_step("enqueue_bg", ok=False, reason="no_job_id", tenant_id=tenant_id, response=res)
         except Exception:
             job_id = None
+            _log_step("enqueue_bg", ok=False, reason="exception", tenant_id=tenant_id)
         if tenant_id and job_id:
             msg = (
                 f"Thanks — I’ve queued background discovery and enrichment for your ICP. "
@@ -1958,6 +2289,39 @@ async def progress_report(state: OrchestrationState) -> OrchestrationState:
         "confirmed_icp": bool(state.get("profile_state", {}).get("icp_profile_confirmed")),
         "web_candidates": len(state.get("discovery", {}).get("web_candidates") or []),
     }
+    # Optional: if user asked for status, include latest background job info
+    try:
+        ctx = state.get("entry_context") or {}
+        if (ctx.get("intent") or "").strip().lower() == "status":
+            tid = _get_tenant_id(state)
+            if tid:
+                try:
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT job_id, status, processed, total, created_at, started_at, ended_at
+                              FROM background_jobs
+                             WHERE tenant_id=%s AND job_type='icp_discovery_enrich'
+                             ORDER BY created_at DESC
+                             LIMIT 1
+                            """,
+                            (int(tid),),
+                        )
+                        row = cur.fetchone()
+                    if row:
+                        summary["latest_job"] = {
+                            "job_id": row[0],
+                            "status": row[1],
+                            "processed": row[2],
+                            "total": row[3],
+                            "created_at": str(row[4]) if row[4] else None,
+                            "started_at": str(row[5]) if row[5] else None,
+                            "ended_at": str(row[6]) if row[6] else None,
+                        }
+                except Exception:
+                    pass
+    except Exception:
+        pass
     outstanding = (state.get("profile_state") or {}).get("outstanding_prompts") or []
     if outstanding:
         message = outstanding[0]
@@ -2062,8 +2426,34 @@ def _message_text(message: Any) -> str:
                 parts.append(str(chunk))
         return " ".join(p for p in parts if p)
     return str(content)
-def _normalize_url(url: str) -> str:
+def _coerce_url_str(value: Any) -> str:
     try:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            for v in value:
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+        if isinstance(value, dict):
+            for key in ("url", "website", "href"):
+                v = value.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        s = str(value)
+        return s.strip()
+    except Exception:
+        return ""
+
+
+def _normalize_url(url: Any) -> str:
+    url = _coerce_url_str(url)
+    try:
+        if not url:
+            return ""
         parsed = urlparse(url if url.startswith("http") else ("https://" + url))
         scheme = parsed.scheme or "https"
         netloc = (parsed.netloc or parsed.path).lower()
@@ -2071,7 +2461,10 @@ def _normalize_url(url: str) -> str:
         base = f"{scheme}://{netloc}{path}"
         return base.rstrip("/")
     except Exception:
-        return url.rstrip("/")
+        try:
+            return url.rstrip("/") if isinstance(url, str) else ""
+        except Exception:
+            return ""
 
 try:
     from src.settings import (
@@ -2099,7 +2492,7 @@ def _extract_urls(text: str) -> List[str]:
 
 
 def _collect_customer_sites(messages: List[Dict[str, Any]], company_url: Optional[str]) -> List[str]:
-    normalized_company = _normalize_url(company_url) if company_url else None
+    normalized_company = _normalize_url(company_url)
     seen = set()
     urls: List[str] = []
     for message in messages:

@@ -6743,7 +6743,7 @@ async def enrich_node(state: GraphState) -> GraphState:
         except Exception:
             pass
 
-        if all_done:
+    if all_done:
         # Compose completion message; include ACRA/ICP totals and nightly remainder
         icp_total = 0
         acra_total_state = 0

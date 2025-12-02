@@ -31,6 +31,8 @@ import asyncio
 import math
 import uuid
 from typing import Any, Dict, List, Optional
+import re
+from datetime import datetime, timezone, timedelta
 
 fmt = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s :: %(message)s", "%H:%M:%S")
 
@@ -271,6 +273,156 @@ except Exception as _e:
 # Orchestrator API
 # ---------------------------------------------------------------
 
+# In-memory thread registry to enforce simple policy hooks when embedded server
+# is not mounted. This provides minimal behavior: single active thread per
+# context, auto-resume when exactly one match exists, and 409 on locked.
+_THREADS: dict[str, dict] = {}
+_PENDING_DISAMBIG: dict[str, list[dict]] = {}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _first_url_from_messages(messages: List[Dict[str, str]] | None, text: str | None) -> Optional[str]:
+    url_re = re.compile(r"https?://[^\s)]+|\b([a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
+    scan: List[str] = []
+    if isinstance(text, str) and text.strip():
+        scan.append(text)
+    for m in (messages or [])[:8]:
+        try:
+            c = (m.get("content") or "").strip()
+            if c:
+                scan.append(c)
+        except Exception:
+            continue
+    for chunk in scan:
+        m = url_re.search(chunk or "")
+        if not m:
+            continue
+        raw = m.group(0)
+        # strip trailing punctuation
+        raw = raw.rstrip(".,);]")
+        return raw
+    return None
+
+
+def _domain_from_value(url: str) -> str:
+    try:
+        from urllib.parse import urlparse as _parse
+
+        u = url if url.startswith("http") else ("https://" + url)
+        p = _parse(u)
+        host = (p.netloc or p.path or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if ":" in host:
+            host = host.split(":", 1)[0]
+        if "/" in host:
+            host = host.split("/", 1)[0]
+        return host
+    except Exception:
+        return ""
+
+
+def _icp_fp(icp_payload: dict) -> str:
+    try:
+        import json as _json, hashlib
+
+        blob = _json.dumps(
+            {k: icp_payload.get(k) for k in (
+                "industries",
+                "buyer_titles",
+                "company_sizes",
+                "size_bands",
+                "geos",
+                "signals",
+                "triggers",
+                "integrations",
+                "seed_urls",
+                "summary",
+            ) if icp_payload.get(k) is not None},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _context_key(payload: Dict[str, Any], tenant_id: Optional[int]) -> str:
+    # Prefer domain context
+    url = _first_url_from_messages(
+        _normalize_message_payload(payload.get("messages")),
+        str(payload.get("input") or ""),
+    )
+    dom = _domain_from_value(url or "") if url else ""
+    if dom:
+        return f"domain:{dom}"
+    # Else hash ICP payload for icp:* key
+    icp = payload.get("icp_payload") or {}
+    fp = _icp_fp(icp) if isinstance(icp, dict) else ""
+    rule = None
+    try:
+        from src.settings import ICP_RULE_NAME as _RN
+
+        rule = _RN
+    except Exception:
+        rule = None
+    rn = rule or icp.get("rule_name") or "default"
+    return f"icp:{rn}#{fp or 'none'}"
+
+
+def _thread_find_candidates(tenant_id: Optional[int], user_id: Optional[str], agent: str, context_key: str) -> list[dict]:
+    out: list[dict] = []
+    for tid, meta in _THREADS.items():
+        try:
+            if meta.get("agent") != agent:
+                continue
+            if tenant_id is not None and meta.get("tenant_id") != tenant_id:
+                continue
+            if user_id is not None and meta.get("user_id") != user_id:
+                continue
+            if meta.get("context_key") != context_key:
+                continue
+            out.append({"id": tid, **meta})
+        except Exception:
+            continue
+    return out
+
+
+def _thread_store_path() -> str:
+    try:
+        base = os.getenv("LANGGRAPH_CHECKPOINT_DIR", ".langgraph_api").rstrip("/")
+    except Exception:
+        base = ".langgraph_api"
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base, "threads.json")
+
+
+def _load_threads() -> None:
+    path = _thread_store_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _THREADS.update(data)
+    except Exception:
+        pass
+
+
+def _save_threads() -> None:
+    path = _thread_store_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_THREADS, f)
+    except Exception:
+        pass
+
 
 def _normalize_message_payload(messages: Any) -> List[Dict[str, str]]:
     normalized: List[Dict[str, str]] = []
@@ -293,8 +445,148 @@ async def start_orchestration(
     payload: Dict[str, Any] = Body(default_factory=dict),
     identity: Dict[str, Any] = Depends(require_auth),
 ):
-    thread_id = str(payload.get("thread_id") or uuid.uuid4())
     tenant_id = getattr(request.state, "tenant_id", None)
+    # Compute context key to enforce single-active-thread policy per context
+    ctx_key = _context_key(payload, tenant_id)
+
+    # If no thread_id provided, try auto-resume an existing open thread for this context
+    provided_tid = str(payload.get("thread_id") or "").strip()
+    auto_resume_tid: Optional[str] = None
+    # Check if user responded with a numeric selection for pending disambiguation
+    user_input = str(payload.get("input") or "").strip()
+    key = f"{tenant_id}|{identity.get('sub')}|{ctx_key}"
+    if not provided_tid and user_input:
+        try:
+            import re as _re
+
+            m = _re.search(r"\b(\d{1,2})\b", user_input)
+            if m and key in _PENDING_DISAMBIG:
+                idx = int(m.group(1)) - 1
+                cand_list = _PENDING_DISAMBIG.get(key) or []
+                if 0 <= idx < len(cand_list):
+                    sel = cand_list[idx]
+                    sel_id = str(sel.get("id") or "").strip()
+                    if sel_id and sel_id in _THREADS:
+                        provided_tid = sel_id
+                        _PENDING_DISAMBIG.pop(key, None)
+        except Exception:
+            pass
+    if not provided_tid:
+        candidates = _thread_find_candidates(tenant_id, identity.get("sub"), "icp_finder", ctx_key)
+        open_candidates = [c for c in candidates if (c.get("status") or "open") == "open"]
+        # Enforce resume window
+        try:
+            from src.settings import THREAD_RESUME_WINDOW_DAYS as _WIN
+        except Exception:
+            _WIN = 7
+        if open_candidates:
+            eligible: list[dict] = []
+            for c in open_candidates:
+                try:
+                    ts = c.get("updated_at") or c.get("created_at")
+                    if not ts:
+                        eligible.append(c)
+                        continue
+                    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    if dt >= datetime.now(timezone.utc) - timedelta(days=int(_WIN)):
+                        eligible.append(c)
+                except Exception:
+                    eligible.append(c)
+            open_candidates = eligible
+        if len(open_candidates) == 1:
+            auto_resume_tid = open_candidates[0]["id"]
+        elif len(open_candidates) > 1 and not provided_tid:
+            # Prepare disambiguation message; do not mutate existing threads
+            open_candidates.sort(key=lambda c: (c.get("updated_at") or c.get("created_at") or ""), reverse=True)
+            top = open_candidates[:3]
+            _PENDING_DISAMBIG[key] = top
+            def _label(meta: dict) -> str:
+                ck = str(meta.get("context_key") or "")
+                if ck.startswith("domain:"):
+                    return ck.split(":", 1)[1]
+                return ck or "ICP session"
+            lines = []
+            for i, c in enumerate(top, start=1):
+                label = _label(c)
+                ts = c.get("updated_at") or c.get("created_at") or "recently"
+                lines.append(f"{i}) {label} — last updated {ts}")
+            msg = "You have multiple ongoing sessions for this ICP. Which should we continue?\n" + "\n".join(lines) + "\nReply with 1, 2, or 3."
+            # Create a placeholder locked thread id so the client can poll status safely
+            placeholder_id = str(uuid.uuid4())
+            _THREADS[placeholder_id] = {
+                "tenant_id": tenant_id,
+                "user_id": identity.get("sub"),
+                "agent": "icp_finder",
+                "context_key": ctx_key,
+                "status": "locked",
+                "locked_at": _now_iso(),
+                "reason": "awaiting_disambiguation",
+                "created_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+            _save_threads()
+            return {
+                "thread_id": placeholder_id,
+                "status": {"phase": "disambiguation", "message": msg},
+                "status_history": [{"phase": "disambiguation", "message": msg, "timestamp": _now_iso()}],
+                "output": msg,
+                "disambiguation_required": True,
+                "candidates": [{"id": c["id"], "label": _label(c), "updated_at": c.get("updated_at") or c.get("created_at")} for c in top],
+            }
+    thread_id = provided_tid or auto_resume_tid or str(uuid.uuid4())
+
+    # Reject requests to a locked thread (policy)
+    meta = _THREADS.get(thread_id)
+    if meta and meta.get("status") == "locked":
+        raise HTTPException(status_code=409, detail={"error": "thread_locked", "hint": "create_new"})
+
+    # If this is a new thread, register it and lock prior open threads for the same context
+    if not meta:
+        _THREADS[thread_id] = {
+            "tenant_id": tenant_id,
+            "user_id": identity.get("sub"),
+            "agent": "icp_finder",
+            "context_key": ctx_key,
+            "status": "open",
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        try:
+            from src.settings import SINGLE_THREAD_PER_CONTEXT as _STPC, AUTO_ARCHIVE_STALE_LOCKED as _AUTO_ARCH, THREAD_STALE_DAYS as _STALE
+
+            if _STPC:
+                for tid, meta2 in list(_THREADS.items()):
+                    if tid == thread_id:
+                        continue
+                    if meta2.get("tenant_id") != tenant_id or meta2.get("user_id") != identity.get("sub"):
+                        continue
+                    if meta2.get("agent") != "icp_finder" or meta2.get("context_key") != ctx_key:
+                        continue
+                        if meta2.get("status") == "open":
+                            meta2["status"] = "locked"
+                            meta2["locked_at"] = _now_iso()
+                            meta2["reason"] = "new_thread_same_context"
+                    # option: auto-archive stale locked
+                    if meta2.get("status") == "locked" and _AUTO_ARCH:
+                        try:
+                            ts = meta2.get("updated_at") or meta2.get("locked_at")
+                            if ts:
+                                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                                if dt < datetime.now(timezone.utc) - timedelta(days=int(_STALE)):
+                                    meta2["status"] = "archived"
+                                    meta2["archived_at"] = _now_iso()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        _save_threads()
+    else:
+        # Update last-used timestamp for existing threads
+        try:
+            meta["updated_at"] = _now_iso()
+        except Exception:
+            pass
+        _save_threads()
     state: OrchestrationState = {
         "messages": _normalize_message_payload(payload.get("messages")),
         "input": str(payload.get("input") or ""),
@@ -2215,6 +2507,47 @@ async def admin_run_nightly(background: BackgroundTasks, request: Request, claim
         raise HTTPException(status_code=500, detail=f"schedule failed: {e}")
 # Build orchestrator graph once for API + chat entry
 ORCHESTRATOR = build_orchestrator_graph()
+
+
+def _maybe_mount_embedded_lg_server() -> None:
+    """Optionally mount an embedded LangGraph server if available.
+
+    This is best-effort only and safely no-ops when the library is absent. The
+    existing /api/orchestrations route remains the primary entry in this app.
+    """
+    try:
+        from src.settings import ENABLE_EMBEDDED_LG_SERVER as _ENABLE
+    except Exception:
+        _ENABLE = False
+    if not _ENABLE:
+        return
+    try:
+        # Attempt a few known mounting patterns; ignore failures
+        try:
+            # Newer server interface providing a FastAPI router
+            from langgraph_api.fastapi import mount as _lg_mount  # type: ignore
+
+            _lg_mount(app)  # mounts /threads and /runs/stream if configured
+            logging.getLogger("startup").info("Embedded LangGraph server mounted via fastapi.mount")
+            return
+        except Exception:
+            pass
+        try:
+            # Alternate pattern: module exposes a mount_app helper
+            from langgraph_api.server import mount_app as _mount_app  # type: ignore
+
+            _mount_app(app)
+            logging.getLogger("startup").info("Embedded LangGraph server mounted via server.mount_app")
+            return
+        except Exception:
+            pass
+        logging.getLogger("startup").info("Embedded LangGraph server not available; skipping mount")
+    except Exception as exc:
+        logging.getLogger("startup").warning("Embedded LangGraph server mount failed: %s", exc)
+
+
+_maybe_mount_embedded_lg_server()
+_load_threads()
 
 
 def _orchestrator_callbacks(context: Dict[str, Any] | None = None):

@@ -68,6 +68,10 @@ class StatusState(TypedDict, total=False):
 
 
 class OrchestrationState(MessagesState, total=False):
+    tenant_id: Optional[int]
+    thread_id: Optional[str]
+    is_return_user: bool
+    decisions: Dict[str, Any]
     entry_context: Dict[str, Any]
     profile_state: ProfileState
     icp_payload: Dict[str, Any]

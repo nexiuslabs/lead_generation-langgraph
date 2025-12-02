@@ -3,6 +3,8 @@ import logging
 import os
 from typing import List, Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
+import hashlib
+import zlib
 
 from src.database import get_conn
 import psycopg2
@@ -154,6 +156,57 @@ def _fallback_discovery_domains(
         except Exception:
             pass
     return (domains[:limit], source)
+
+
+def _canonical_icp_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Project ICP payload to a stable subset for hashing.
+
+    We keep only fields that influence discovery/targeting and sort list values implicitly via JSON dumps.
+    """
+    keys = (
+        "industries",
+        "buyer_titles",
+        "size_bands",
+        "company_sizes",
+        "geos",
+        "signals",
+        "integrations",
+        "triggers",
+        "summary",
+        "seed_urls",
+    )
+    out: Dict[str, Any] = {}
+    try:
+        for k in keys:
+            v = payload.get(k)
+            if v is None:
+                continue
+            out[k] = v
+    except Exception:
+        return {}
+    return out
+
+
+def _icp_fingerprint(payload: Dict[str, Any], rule_name: Optional[str]) -> str:
+    try:
+        subset = _canonical_icp_profile(payload or {})
+        blob = json.dumps(subset, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        rn = (rule_name or payload.get("rule_name") or "Default ICP").strip()
+        text = f"{blob}|{rn}"
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _fp_to_key(fp: str) -> int:
+    """Map a hex fingerprint to a 32-bit int for advisory locks."""
+    if not fp:
+        return 0
+    try:
+        # Fast 32bit key
+        return zlib.crc32(fp.encode("utf-8")) & 0xFFFFFFFF
+    except Exception:
+        return 0
 
 
 def _load_icp_profile(tenant_id: int) -> Dict[str, Any]:
@@ -510,28 +563,67 @@ async def run_manual_research_enrich(job_id: int) -> None:
 def enqueue_icp_discovery_enrich(tenant_id: int, notify_email: Optional[str] = None) -> dict:
     """Queue a unified background job that performs ICP discovery (50) and enrichment end-to-end.
 
-    Params are stored in background_jobs.params with optional notify_email.
+    Idempotency: compute an ICP fingerprint from the latest `icp_rules` payload combined with rule name.
+    If an identical fingerprint is already queued/running for the same tenant, return the existing job_id.
     """
+    icp_payload = _load_icp_profile(int(tenant_id)) or {}
+    fp = _icp_fingerprint(icp_payload, ICP_RULE_NAME)
+    fp_key = _fp_to_key(fp)
+    params = {"notify_email": notify_email} if notify_email else {}
+    if fp:
+        params["fp"] = fp
     with get_conn() as conn, conn.cursor() as cur:
+        # Acquire a short-lived advisory lock on (tenant_id, fp_key) to prevent races
+        try:
+            if fp_key:
+                cur.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (int(tenant_id), int(fp_key)))
+        except Exception:
+            pass
+        # Check for an existing queued/running job with the same fingerprint
+        if fp:
+            try:
+                cur.execute(
+                    """
+                    SELECT job_id
+                      FROM background_jobs
+                     WHERE tenant_id = %s
+                       AND job_type = 'icp_discovery_enrich'
+                       AND status IN ('queued','running')
+                       AND COALESCE(params->>'fp','') = %s
+                     ORDER BY job_id DESC
+                     LIMIT 1
+                    """,
+                    (int(tenant_id), fp),
+                )
+                r = cur.fetchone()
+                if r and r[0] is not None:
+                    jid = int(r[0])
+                    try:
+                        log.info(
+                            '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"dedup":"existing","fp":"%s"}',
+                            int(tenant_id),
+                            jid,
+                            fp,
+                        )
+                    except Exception:
+                        pass
+                    return {"job_id": jid, "dedup": True}
+            except Exception:
+                pass
+        # Insert new job
         cur.execute(
             "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'icp_discovery_enrich','queued', %s) RETURNING job_id",
-            (tenant_id, Json({**({"notify_email": notify_email} if notify_email else {})})),
+            (int(tenant_id), Json(params)),
         )
         row = cur.fetchone()
         jid = int(row[0]) if row and row[0] is not None else 0
         try:
             log.info(
-                "[db] INSERT background_jobs(job_type=%s, tenant_id=%s) -> job_id=%s",
-                'icp_discovery_enrich', int(tenant_id), int(jid)
-            )
-        except Exception:
-            pass
-        try:
-            log.info(
-                '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"notify_email":%s}',
+                '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"notify_email":%s,"fp":"%s"}',
                 int(tenant_id),
                 int(jid),
-                json.dumps(notify_email) if notify_email else 'null'
+                json.dumps(notify_email) if notify_email else 'null',
+                fp or ''
             )
         except Exception:
             pass
