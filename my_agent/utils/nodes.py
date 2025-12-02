@@ -1130,6 +1130,17 @@ Each list should contain up to 4 concise items.
 
 def _heuristic_intent(text: str) -> str:
     lowered = text.lower()
+    # Treat punctuation-agnostic direct questions as questions (even without '?')
+    _q_norm = lowered.strip().replace("’", "'")
+    if any(_q_norm.startswith(p) for p in (
+        "what is my ", "what's my ", "whats my ", "what is our ", "what's our ", "whats our ",
+        "what is the ", "what's the ", "whats the ",
+    )):
+        return "question"
+    if any(_q_norm.startswith(p) for p in (
+        "show me ", "show ", "give me ", "tell me ", "where is ", "list ",
+    )):
+        return "question"
     if any(keyword in lowered for keyword in ("status", "progress", "job status", "queue", "queued", "running", "done")):
         return "status"
     if any(keyword in lowered for keyword in ("http://", "https://")):
@@ -1333,6 +1344,14 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
         state["entry_context"] = ctx
         if ctx.get("tenant_id"):
             state["tenant_id"] = ctx["tenant_id"]
+        # If the latest input is a question, clear/downgrade outstanding prompts to avoid overshadowing the Q&A
+        try:
+            if ctx.get("intent") == "question" or _heuristic_intent(ctx.get("last_user_command") or "") == "question":
+                profile = _ensure_profile_state(state)
+                profile["outstanding_prompts"] = []
+                state["profile_state"] = profile
+        except Exception:
+            pass
         _log_step(
             "ingest",
             role=role,
@@ -1462,9 +1481,15 @@ async def return_user_probe(state: OrchestrationState) -> OrchestrationState:
             icp = None
         if comp and isinstance(comp.get("profile"), dict):
             company = dict(comp.get("profile") or {})
+            # Ensure website is set from source_url if missing
+            src_url = comp.get("source_url")
+            if (not company.get("website")) and isinstance(src_url, str) and src_url.strip():
+                company["website"] = src_url.strip()
             if company:
                 profile["company_profile"] = company
                 profile["company_profile_confirmed"] = bool(comp.get("confirmed")) or bool(company.get("website"))
+                # Hydration implies we seeded from persistence; prevent re-ask wording
+                profile["seeded_company_profile"] = False
                 loaded_any = True
         if icp and isinstance(icp.get("profile"), dict):
             profile["icp_profile"] = dict(icp.get("profile") or {})
@@ -2027,15 +2052,24 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
         _set_status(state, "journey_guard", msg)
         return state
 
+    # If the last input is a question, defer to progress_report Q&A and do not append prompts here.
+    is_question_turn = (last_intent == "question") or (_heuristic_intent(question or "") == "question")
+
+    if is_question_turn:
+        # Do not mutate outstanding_prompts here; progress_report will answer.
+        state["journey_ready"] = False
+        _set_status(state, "journey_guard", "question_turn")
+        _log_step("journey_guard", company_ready=company_ready, icp_ready=icp_ready, discovery_ready=discovery_ready, enrichment_ready=enrichment_ready, intent=last_intent, explanation_provided=False, needs_website=needs_website, question_turn=True)
+        return state
+
     if journey_ready:
         profile["outstanding_prompts"] = []
         profile["awaiting_discovery_confirmation"] = False
         msg = "Prerequisites satisfied. Proceeding to normalization."
     else:
-        explanation = _maybe_explain_question(question, last_intent)
+        explanation = None  # generic explanations disabled; use unified Q&A in progress_report
         prompt_parts: List[str] = []
-        if explanation:
-            prompt_parts.append(explanation)
+        # never inject generic explanations here; prompts only for gating needs
 
         if needs_website:
             profile["awaiting_discovery_confirmation"] = False
@@ -2128,7 +2162,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
         discovery_ready=discovery_ready,
         enrichment_ready=enrichment_ready,
         intent=last_intent,
-        explanation_provided=bool(explanation),
+        explanation_provided=False,
         needs_website=needs_website,
     )
     _set_status(state, "journey_guard", msg)
@@ -2448,6 +2482,28 @@ async def export_results(state: OrchestrationState) -> OrchestrationState:
 
 
 async def progress_report(state: OrchestrationState) -> OrchestrationState:
+    # Q&A precedence: if the last message looks like a direct question (even without '?'),
+    # attempt to answer before replaying outstanding prompts.
+    last_text = _latest_user_text(state)
+    ctx = state.get("entry_context") or {}
+    is_question = (ctx.get("intent") == "question") or (_heuristic_intent(last_text) == "question")
+    if is_question:
+        # Answer from thread/persistence; fall back to LLM using a compact context snapshot
+        answer = _smart_answer(state, last_text)
+        if answer:
+            _log_step("qa_answer", message=answer[:140])
+            _set_status(state, "progress_report", answer)
+            # Clear outstanding prompts since user's question took precedence
+            try:
+                profile = _ensure_profile_state(state)
+                profile["outstanding_prompts"] = []
+                state["profile_state"] = profile
+            except Exception:
+                pass
+            if not state.get("suppress_output"):
+                _append_message(state, "assistant", answer)
+            return state
+
     summary = {
         "phase": state.get("status", {}).get("phase"),
         "candidates": len(state.get("discovery", {}).get("candidate_ids") or []),
@@ -2515,6 +2571,329 @@ Return JSON {{"message": "..."}}
     if not state.get("suppress_output"):
         _append_message(state, "assistant", message)
     return state
+
+
+def _answer_direct_question(state: OrchestrationState, text: str | None) -> str | None:
+    """Answer simple, direct facts from thread or persistence.
+
+    Currently supports company website/url queries even without a trailing question mark.
+    """
+    if not text:
+        return None
+    msg = text.strip().lower().replace("’", "'")
+    # Normalize stray trailing punctuation/symbols
+    while msg and msg[-1] in ">:;,. ":
+        msg = msg[:-1]
+    # Detect company url/website questions
+    url_tokens = {"url", "website", "site", "domain"}
+    trig = (msg.startswith("what is my ") or msg.startswith("what's my ") or msg.startswith("whats my ") or
+            msg.startswith("what is our ") or msg.startswith("what's our ") or msg.startswith("whats our ") or
+            "what is the" in msg or "what's the" in msg or "whats the" in msg)
+    mentions_url = any(tok in msg for tok in url_tokens) and ("company" in msg or True)
+    if trig and mentions_url:
+        # Try thread state first
+        profile = _ensure_profile_state(state)
+        company = profile.get("company_profile") or {}
+        website = (company.get("website") or "").strip()
+        if website:
+            return f"Your company website is {website}."
+        # Fallback: read from persisted tenant_company_profiles (source_url)
+        tid = _get_tenant_id(state)
+        if tid is not None:
+            try:
+                rec = _fetch_company_profile_record(int(tid))
+            except Exception:
+                rec = None
+            if rec:
+                src = (rec.get("source_url") or "").strip() if isinstance(rec.get("source_url"), str) else ""
+                if src:
+                    return f"Your company website is {src}."
+        return "I don’t have your website on file yet. Please share it (e.g., https://example.com)."
+    return None
+
+
+def _qa_context_snapshot(state: OrchestrationState) -> Dict[str, Any]:
+    """Collect a compact snapshot for Q&A answers (thread + persistence + latest job)."""
+    snap: Dict[str, Any] = {}
+    profile = _ensure_profile_state(state)
+    snap["company_profile"] = dict(profile.get("company_profile") or {})
+    snap["icp_profile"] = dict(profile.get("icp_profile") or {})
+    snap["customer_websites"] = list(profile.get("customer_websites") or [])
+    snap["flags"] = {
+        "company_confirmed": bool(profile.get("company_profile_confirmed")),
+        "icp_confirmed": bool(profile.get("icp_profile_confirmed")),
+        "icp_generated": bool(profile.get("icp_profile_generated")),
+    }
+    # Discovery snapshot (counts + preview)
+    disc = state.get("discovery") or {}
+    try:
+        web_cands = list(disc.get("web_candidates") or [])
+    except Exception:
+        web_cands = []
+    try:
+        top10 = list(disc.get("top10_domains") or [])
+    except Exception:
+        top10 = []
+    try:
+        next40 = list(disc.get("next40_domains") or [])
+    except Exception:
+        next40 = []
+    try:
+        cand_ids = list(disc.get("candidate_ids") or [])
+    except Exception:
+        cand_ids = []
+    snap["discovery"] = {
+        "web_candidate_count": len(web_cands),
+        "top10_count": len(top10),
+        "next40_count": len(next40),
+        "candidate_ids_count": len(cand_ids),
+        "web_candidates_preview": web_cands[:10],
+        "top10_preview": top10[:10],
+        "next40_preview": next40[:10],
+    }
+
+    # Scoring snapshot (bucket counts + preview)
+    scoring = state.get("scoring") or {}
+    scores = scoring.get("scores") or []
+    buckets = {"A": 0, "B": 0, "C": 0}
+    try:
+        for row in scores:
+            b = str(row.get("bucket") or "C").upper()
+            if b in buckets:
+                buckets[b] += 1
+    except Exception:
+        pass
+    try:
+        preview_scores = [
+            {"company_id": r.get("company_id"), "score": r.get("score"), "bucket": r.get("bucket")}
+            for r in (scores or [])[:5]
+            if isinstance(r, dict)
+        ]
+    except Exception:
+        preview_scores = []
+    snap["scoring"] = {
+        "total": len(scores or []),
+        "buckets": buckets,
+        "preview": preview_scores,
+    }
+
+    # Include latest background job (if any)
+    tid = _get_tenant_id(state)
+    if tid is not None:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT job_id, status, processed, total
+                      FROM background_jobs
+                     WHERE tenant_id=%s AND job_type='icp_discovery_enrich'
+                     ORDER BY created_at DESC
+                     LIMIT 1
+                    """,
+                    (int(tid),),
+                )
+                row = cur.fetchone()
+                if row:
+                    snap["latest_job"] = {
+                        "job_id": row[0],
+                        "status": row[1],
+                        "processed": row[2],
+                        "total": row[3],
+                    }
+        except Exception:
+            pass
+        # Also include persisted website as a fallback
+        try:
+            rec = _fetch_company_profile_record(int(tid))
+        except Exception:
+            rec = None
+        if rec and isinstance(rec.get("source_url"), str) and rec.get("source_url").strip():
+            snap.setdefault("company_profile", {}).setdefault("website", rec.get("source_url").strip())
+    return snap
+
+
+def _smart_answer(state: OrchestrationState, text: str | None) -> str | None:
+    """Answer general user questions using thread + persisted context (and LLM fallback).
+
+    - Tries direct fact lookups for known fields (site, name, summaries, lists).
+    - Falls back to a concise LLM answer grounded in a compact context snapshot.
+    """
+    if not text:
+        return None
+    raw = text.strip()
+    msg = raw.lower().replace("’", "'")
+
+    # 1) Deterministic facts
+    prof = _ensure_profile_state(state)
+    company = dict(prof.get("company_profile") or {})
+    icp = dict(prof.get("icp_profile") or {})
+    customers = list(prof.get("customer_websites") or [])
+
+    def has_any(words: Iterable[str]) -> bool:
+        return any(w in msg for w in words)
+
+    # Company website / URL / domain
+    if has_any([" company url", " company website", " company site", " company domain"]) or (
+        msg.startswith("what is my ") and has_any(["url", "website", "site", "domain"])):
+        ans = _answer_direct_question(state, raw)
+        if ans:
+            return ans
+
+    # Company name
+    if has_any(["company name", "what is my company name", "what's my company name"]):
+        name = (company.get("name") or "").strip()
+        if name:
+            return f"Your company name is {name}."
+
+    # Company summary / what we do
+    if has_any(["company summary", "what do we do", "what does my company do", "what's our summary"]):
+        s = (company.get("summary") or "").strip()
+        if s:
+            return s
+
+    # Company fields
+    def _fmt_list(key: str, label: str, limit: int = 6) -> Optional[str]:
+        vals = company.get(key) if isinstance(company, dict) else None
+        if isinstance(vals, list) and vals:
+            items = ", ".join([str(v) for v in vals[:limit]])
+            return f"{label}: {items}."
+        return None
+
+    if has_any(["industries"]):
+        t = _fmt_list("industries", "Industries")
+        if t:
+            return t
+    if has_any(["offerings", "products", "services"]):
+        t = _fmt_list("offerings", "Offerings")
+        if t:
+            return t
+    if has_any(["ideal customers", "ideal buyer", "buyers"]):
+        t = _fmt_list("ideal_customers", "Ideal customers")
+        if t:
+            return t
+    if has_any(["proof points", "proof", "evidence"]):
+        t = _fmt_list("proof_points", "Proof points")
+        if t:
+            return t
+
+    # ICP questions
+    def _icp_list(key: str, label: str, limit: int = 6) -> Optional[str]:
+        vals = icp.get(key) if isinstance(icp, dict) else None
+        if isinstance(vals, list) and vals:
+            items = ", ".join([str(v) for v in vals[:limit]])
+            return f"{label}: {items}."
+        return None
+
+    if has_any(["icp summary", "what is my icp", "what's my icp", "ideal customer profile"]):
+        s = (icp.get("summary") or "").strip()
+        if s:
+            return s
+    if has_any(["icp industries", "target industries"]):
+        t = _icp_list("industries", "ICP industries")
+        if t:
+            return t
+    if has_any(["company sizes", "size bands", "target sizes"]):
+        t = _icp_list("company_sizes", "Company sizes") or _icp_list("size_bands", "Company sizes")
+        if t:
+            return t
+    if has_any(["regions", "geos", "target regions", "target geos"]):
+        t = _icp_list("regions", "Regions") or _icp_list("geos", "Regions")
+        if t:
+            return t
+    if has_any(["pains", "pain points", "key pains"]):
+        t = _icp_list("pains", "Key pains")
+        if t:
+            return t
+    if has_any(["triggers", "buying triggers"]):
+        t = _icp_list("buying_triggers", "Buying triggers") or _icp_list("triggers", "Buying triggers")
+        if t:
+            return t
+    if has_any(["personas", "titles", "roles"]):
+        t = _icp_list("persona_titles", "Personas") or _icp_list("buyer_titles", "Personas")
+        if t:
+            return t
+
+    # Customer sites
+    if has_any(["customer websites", "customer urls", "seed urls", "seeds"]):
+        if customers:
+            preview = ", ".join(customers[:5])
+            return f"You’ve shared {len(customers)} customer websites. Example: {preview}."
+
+    # Candidates / Top‑10 / Next‑40
+    if has_any(["candidates", "domains", "top 10", "top-10", "next 40", "next-40", "web candidates", "lookalikes"]):
+        snap = _qa_context_snapshot(state)
+        disc = snap.get("discovery") or {}
+        top10 = disc.get("top10_preview") or []
+        web = disc.get("web_candidates_preview") or []
+        next40 = disc.get("next40_preview") or []
+        total = int(disc.get("web_candidate_count") or 0) or int(disc.get("candidate_ids_count") or 0)
+        if top10:
+            sample = ", ".join(top10[:5])
+            return f"Top‑10 planned; sample: {sample}. Total planned candidates: {total or len(top10)}."
+        if web:
+            sample = ", ".join(web[:5])
+            return f"Planned candidates: {len(web)} (preview). Sample: {sample}."
+        if next40:
+            sample = ", ".join(next40[:5])
+            return f"Next‑40 queued; sample: {sample}."
+        return "I don’t have candidate domains yet. Once discovery runs, I’ll share a preview."
+
+    # Lead scores / buckets
+    if has_any(["scores", "lead scores", "buckets", "grade", "how many a", "how many b", "how many c"]):
+        snap = _qa_context_snapshot(state)
+        sc = snap.get("scoring") or {}
+        total = int(sc.get("total") or 0)
+        buckets = sc.get("buckets") or {}
+        if total:
+            a = buckets.get("A", 0)
+            b = buckets.get("B", 0)
+            c = buckets.get("C", 0)
+            return f"Scored {total} companies. Buckets: A={a}, B={b}, C={c}."
+        return "I don’t have scores yet — they’ll appear after enrichment runs."
+
+    # Job status / what did you queue
+    if has_any(["job", "status", "queue", "queued", "running", "progress", "what did you queue", "what did you enqueue", "what was queued"]):
+        snap = _qa_context_snapshot(state)
+        job = snap.get("latest_job") or {}
+        if job:
+            jid = job.get("job_id")
+            st = job.get("status")
+            p = job.get("processed")
+            t = job.get("total")
+            return f"Latest job {jid} is {st}. Progress: {p}/{t}."
+
+    # General lead‑generation guidance / how-to use the system
+    if has_any(["lead generation", "generate leads", "prospecting", "mql", "sql", "pipeline", "enrichment", "discovery", "icp best", "how to find leads"]):
+        return (
+            "Lead generation basics: 1) Define ICP (industries, size, regions, pains, triggers), "
+            "2) Build lookalike list (discovery) from ICP, 3) Enrich companies (web + signals) and score (A/B/C), "
+            "4) Prioritize outreach with clear offers and fast feedback loops. In this system: share your website, "
+            "confirm the profile, add 5 customer sites → I synthesize ICP → I plan candidates (Top‑10/Next‑40) → "
+            "enrichment + scoring runs in the background → export via /export/latest_scores.csv."
+        )
+
+    if has_any(["help", "how to use", "how this works", "guide", "instructions", "what can you do", "what does this do"]):
+        return (
+            "How to use: 1) Share your business website; confirm your company profile. "
+            "2) Share 5 customer websites; I’ll generate your ICP. 3) Confirm ICP; I queue discovery + enrichment in the background. "
+            "4) Check progress by asking ‘job status’, and download scores at /export/latest_scores.csv. "
+            "Tip: You can ask me anything (e.g., ‘what’s our ICP industries?’ or ‘show Top‑10 candidates’)."
+        )
+
+    # 2) LLM fallback using compact context snapshot
+    snapshot = _qa_context_snapshot(state)
+    prompt = f"""
+You are a precise assistant. Answer the user's question using ONLY this context.
+If unknown, say you don't know and ask for the missing info.
+
+Question: {raw!r}
+Context: {snapshot!r}
+Return JSON {{"answer": "<one or two sentences>"}}.
+"""
+    fallback = {"answer": "I don't have enough info to answer that yet."}
+    result = call_llm_json(prompt, fallback)
+    ans = (result or fallback).get("answer") or fallback["answer"]
+    return ans.strip() if isinstance(ans, str) else None
 
 
 async def finalize(state: OrchestrationState) -> OrchestrationState:
