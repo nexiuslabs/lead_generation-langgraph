@@ -1141,6 +1141,11 @@ def _heuristic_intent(text: str) -> str:
         "show me ", "show ", "give me ", "tell me ", "where is ", "list ",
     )):
         return "question"
+    # Update/edit intents
+    if any(_q_norm.startswith(p) for p in (
+        "update ", "change ", "set ", "remove ", "add ", "edit ", "delete ",
+    )):
+        return "update"
     if any(keyword in lowered for keyword in ("status", "progress", "job status", "queue", "queued", "running", "done")):
         return "status"
     if any(keyword in lowered for keyword in ("http://", "https://")):
@@ -1344,9 +1349,11 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
         state["entry_context"] = ctx
         if ctx.get("tenant_id"):
             state["tenant_id"] = ctx["tenant_id"]
-        # If the latest input is a question, clear/downgrade outstanding prompts to avoid overshadowing the Q&A
+        # If the latest input is a question/update, clear/downgrade outstanding prompts to avoid overshadowing the action
         try:
-            if ctx.get("intent") == "question" or _heuristic_intent(ctx.get("last_user_command") or "") == "question":
+            _last = ctx.get("last_user_command") or ""
+            _int = ctx.get("intent") or _heuristic_intent(_last)
+            if _int in {"question", "update"}:
                 profile = _ensure_profile_state(state)
                 profile["outstanding_prompts"] = []
                 state["profile_state"] = profile
@@ -2054,12 +2061,13 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
 
     # If the last input is a question, defer to progress_report Q&A and do not append prompts here.
     is_question_turn = (last_intent == "question") or (_heuristic_intent(question or "") == "question")
+    is_update_turn = (last_intent == "update") or (_heuristic_intent(question or "") == "update")
 
-    if is_question_turn:
+    if is_question_turn or is_update_turn:
         # Do not mutate outstanding_prompts here; progress_report will answer.
         state["journey_ready"] = False
-        _set_status(state, "journey_guard", "question_turn")
-        _log_step("journey_guard", company_ready=company_ready, icp_ready=icp_ready, discovery_ready=discovery_ready, enrichment_ready=enrichment_ready, intent=last_intent, explanation_provided=False, needs_website=needs_website, question_turn=True)
+        _set_status(state, "journey_guard", "question_or_update_turn")
+        _log_step("journey_guard", company_ready=company_ready, icp_ready=icp_ready, discovery_ready=discovery_ready, enrichment_ready=enrichment_ready, intent=last_intent, explanation_provided=False, needs_website=needs_website, question_turn=is_question_turn, update_turn=is_update_turn)
         return state
 
     if journey_ready:
@@ -2482,11 +2490,28 @@ async def export_results(state: OrchestrationState) -> OrchestrationState:
 
 
 async def progress_report(state: OrchestrationState) -> OrchestrationState:
-    # Q&A precedence: if the last message looks like a direct question (even without '?'),
-    # attempt to answer before replaying outstanding prompts.
+    # Update/Q&A precedence: if the last message is an update or looks like a direct question (even without '?'),
+    # attempt to perform the update or answer before replaying outstanding prompts.
     last_text = _latest_user_text(state)
     ctx = state.get("entry_context") or {}
-    is_question = (ctx.get("intent") == "question") or (_heuristic_intent(last_text) == "question")
+    intent_norm = (ctx.get("intent") or _heuristic_intent(last_text)).strip().lower()
+    is_question = intent_norm == "question"
+    is_update = intent_norm == "update"
+    if is_update:
+        updated, message = _try_apply_update_command(state, last_text)
+        if updated:
+            _log_step("icp_update", message=message[:140])
+            _set_status(state, "progress_report", message)
+            # Clear prompts and acknowledge update
+            try:
+                profile = _ensure_profile_state(state)
+                profile["outstanding_prompts"] = []
+                state["profile_state"] = profile
+            except Exception:
+                pass
+            if not state.get("suppress_output"):
+                _append_message(state, "assistant", message)
+            return state
     if is_question:
         # Answer from thread/persistence; fall back to LLM using a compact context snapshot
         answer = _smart_answer(state, last_text)
@@ -2894,6 +2919,277 @@ Return JSON {{"answer": "<one or two sentences>"}}.
     result = call_llm_json(prompt, fallback)
     ans = (result or fallback).get("answer") or fallback["answer"]
     return ans.strip() if isinstance(ans, str) else None
+
+
+# -----------------------------
+# Update command parser & applier
+# -----------------------------
+
+def _canonical_icp_key(section: str) -> Optional[str]:
+    key = (section or "").strip().lower()
+    mapping = {
+        "industries": "industries",
+        "industry": "industries",
+        "regions": "regions",
+        "geos": "regions",
+        "region": "regions",
+        "company sizes": "company_sizes",
+        "company size": "company_sizes",
+        "sizes": "company_sizes",
+        "size bands": "company_sizes",
+        "pains": "pains",
+        "pain points": "pains",
+        "triggers": "buying_triggers",
+        "buying triggers": "buying_triggers",
+        "personas": "persona_titles",
+        "titles": "persona_titles",
+        "buyer titles": "persona_titles",
+        "proof points": "proof_points",
+        "proofs": "proof_points",
+        "seed urls": "seed_urls",
+        "seeds": "seed_urls",
+    }
+    return mapping.get(key)
+
+
+def _parse_update_command(text: str | None) -> Optional[Dict[str, Any]]:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    s = text.strip()
+    low = s.lower()
+    # Patterns: remove X, Y in <section>; remove X from <section>
+    import re
+    m = re.match(r"^(remove|add|set|change|edit|delete)\s+(.*)$", low)
+    if not m:
+        return None
+    op = m.group(1)
+    rest = s[len(op):].strip()
+    # Try 'in <section>' or 'from <section>' or 'to <section>' or 'set <section> to ...'
+    # Normalize separators
+    candidates: list[str] = []
+    section = None
+    if op == "set" or low.startswith("set "):
+        # set <section> to ITEMS
+        sm = re.match(r"^\s*([a-zA-Z /&_-]+?)\s+to\s+(.+)$", rest, re.IGNORECASE)
+        if sm:
+            section_raw = sm.group(1)
+            # Decide target by section name and presence of 'company'
+            prefer_company = ("company" in low) or ("company profile" in low)
+            c_key = _canonical_company_key(section_raw)
+            i_key = _canonical_icp_key(section_raw)
+            if prefer_company and c_key:
+                section = c_key
+                target = "company"
+            elif i_key and not c_key:
+                section = i_key
+                target = "icp"
+            elif c_key:
+                section = c_key
+                target = "company"
+            else:
+                section = i_key
+                target = "icp"
+            raw_items = sm.group(2).strip()
+            candidates = [i.strip() for i in re.split(r",|/|;|\n", raw_items) if i.strip()]
+            return {"op": "set", "section": section, "items": candidates, "target": target}
+    # remove/add/edit/delete/change patterns with 'in/from/to'
+    pm = re.match(r"^(.+?)\s+(in|from|to)\s+([a-zA-Z /&_-]+)$", rest, re.IGNORECASE)
+    if pm:
+        item_part = pm.group(1)
+        preposition = pm.group(2).lower()
+        section_raw = pm.group(3)
+        prefer_company = ("company" in low) or ("company profile" in low)
+        c_key = _canonical_company_key(section_raw)
+        i_key = _canonical_icp_key(section_raw)
+        if prefer_company and c_key:
+            section = c_key
+            target = "company"
+        elif i_key and not c_key:
+            section = i_key
+            target = "icp"
+        elif c_key:
+            section = c_key
+            target = "company"
+        else:
+            section = i_key
+            target = "icp"
+        raw_items = item_part
+        # Strip parentheses and extra spaces
+        raw_items = re.sub(r"[()]+", " ", raw_items)
+        candidates = [i.strip() for i in re.split(r",|/|;|\n", raw_items) if i.strip()]
+        normalized_op = "remove" if op in {"remove", "delete"} else ("add" if op == "add" or preposition == "to" else "change")
+        return {"op": normalized_op, "section": section, "items": candidates, "target": target}
+    # Fallback: single-section direct (e.g., remove Malaysia in Regions without clear tokens)
+    # Not matched → ignore
+    return None
+
+
+def _apply_icp_update(state: OrchestrationState, spec: Dict[str, Any]) -> Tuple[bool, str]:
+    section = spec.get("section")
+    op = spec.get("op")
+    items = spec.get("items") or []
+    if not section or not isinstance(items, list):
+        return False, "I couldn’t parse which section to update."
+    profile = _ensure_profile_state(state)
+    icp = dict(profile.get("icp_profile") or {})
+    # Map canonical section to both icp keys we keep
+    def _get_lists_for_section(sec: str) -> list[Tuple[dict, str]]:
+        # Return (dict, key) pairs to update in place
+        if sec == "company_sizes":
+            return [(icp, "company_sizes"), (icp, "size_bands")]
+        if sec == "regions":
+            return [(icp, "regions"), (icp, "geos")]
+        if sec == "buying_triggers":
+            return [(icp, "buying_triggers"), (icp, "triggers")]
+        if sec == "persona_titles":
+            return [(icp, "persona_titles"), (icp, "buyer_titles")]
+        return [(icp, sec)]
+
+    targets = _get_lists_for_section(section)
+    # Normalize helpers
+    def _norm_list(v):
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return []
+    def _ci_match(a: str, b: str) -> bool:
+        return a.strip().lower() == b.strip().lower()
+    def _ci_contains(longer: str, shorter: str) -> bool:
+        return shorter.strip().lower() in longer.strip().lower()
+
+    summary_changes: list[str] = []
+    for obj, key in targets:
+        cur = _norm_list(obj.get(key) or [])
+        if op == "set":
+            obj[key] = items
+            summary_changes.append(f"set {key} to {', '.join(items) if items else 'empty'}")
+        elif op == "add":
+            for it in items:
+                if not any(_ci_match(x, it) for x in cur):
+                    cur.append(it)
+            obj[key] = cur
+            summary_changes.append(f"added {', '.join(items)} to {key}")
+        elif op in {"remove", "delete"}:
+            newlist = []
+            removed_local: list[str] = []
+            for x in cur:
+                if any(_ci_match(x, it) or _ci_contains(x, it) for it in items):
+                    removed_local.append(x)
+                else:
+                    newlist.append(x)
+            obj[key] = newlist
+            if removed_local:
+                summary_changes.append(f"removed {', '.join(removed_local)} from {key}")
+        else:
+            # change/edit → treat like set
+            obj[key] = items
+            summary_changes.append(f"set {key} to {', '.join(items)}")
+
+    profile["icp_profile"] = icp
+    # Keep ICP confirmed and persist
+    profile["icp_profile_confirmed"] = True
+    state["profile_state"] = profile
+    try:
+        seeds = list(profile.get("customer_websites") or [])
+        _persist_icp_profile_state(state, icp, seeds[:5])
+    except Exception:
+        pass
+    msg = "; ".join(summary_changes) if summary_changes else f"updated {section}"
+    return True, f"Updated ICP: {msg}."
+
+
+def _try_apply_update_command(state: OrchestrationState, text: str | None) -> Tuple[bool, str]:
+    spec = _parse_update_command(text)
+    if not spec:
+        return False, ""
+    if spec.get("target") == "company" or not spec.get("target") and spec.get("section") in {"industries", "offerings", "ideal_customers", "proof_points", "summary", "name", "website"}:
+        ok, msg = _apply_company_update(state, spec)
+        return ok, msg
+    ok, msg = _apply_icp_update(state, spec)
+    return ok, msg
+
+
+def _canonical_company_key(section: str) -> Optional[str]:
+    key = (section or "").strip().lower()
+    mapping = {
+        "industries": "industries",
+        "industry": "industries",
+        "offerings": "offerings",
+        "products": "offerings",
+        "services": "offerings",
+        "ideal customers": "ideal_customers",
+        "ideal customer": "ideal_customers",
+        "customers": "ideal_customers",
+        "proof points": "proof_points",
+        "proof": "proof_points",
+        "summary": "summary",
+        "name": "name",
+        "website": "website",
+        "url": "website",
+        "site": "website",
+        "domain": "website",
+    }
+    return mapping.get(key)
+
+
+def _apply_company_update(state: OrchestrationState, spec: Dict[str, Any]) -> Tuple[bool, str]:
+    section = spec.get("section")
+    op = spec.get("op")
+    items = spec.get("items") or []
+    if not section:
+        return False, "I couldn’t parse which company section to update."
+    profile = _ensure_profile_state(state)
+    company = dict(profile.get("company_profile") or {})
+
+    list_fields = {"industries", "offerings", "ideal_customers", "proof_points"}
+    string_fields = {"summary", "name", "website"}
+
+    def _norm_list(v):
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return []
+
+    changes: list[str] = []
+    if section in list_fields:
+        cur = _norm_list(company.get(section) or [])
+        if op == "set" or op == "change":
+            company[section] = items
+            changes.append(f"set {section} to {', '.join(items) if items else 'empty'}")
+        elif op == "add":
+            for it in items:
+                if it and it.lower() not in [x.lower() for x in cur]:
+                    cur.append(it)
+            company[section] = cur
+            changes.append(f"added {', '.join(items)} to {section}")
+        elif op in {"remove", "delete"}:
+            lowered = [x.lower() for x in items]
+            newlist = [x for x in cur if all(li not in x.lower() for li in lowered)]
+            removed = [x for x in cur if x not in newlist]
+            company[section] = newlist
+            if removed:
+                changes.append(f"removed {', '.join(removed)} from {section}")
+        else:
+            company[section] = items
+            changes.append(f"set {section} to {', '.join(items)}")
+    elif section in string_fields:
+        # For string fields, use first item or join items
+        value = ", ".join(items) if items else ""
+        company[section] = value
+        if section == "website" and value:
+            state["site_profile_bootstrap_url"] = value
+        changes.append(f"set {section} to {value if value else 'empty'}")
+    else:
+        return False, "I couldn’t map that company section."
+
+    # Persist and confirm
+    profile["company_profile"] = company
+    profile["company_profile_confirmed"] = True
+    state["profile_state"] = profile
+    try:
+        _persist_company_profile_sync(state, company, confirmed=True)
+    except Exception:
+        pass
+    msg = "; ".join(changes) if changes else f"updated {section}"
+    return True, f"Updated company profile: {msg}."
 
 
 async def finalize(state: OrchestrationState) -> OrchestrationState:
