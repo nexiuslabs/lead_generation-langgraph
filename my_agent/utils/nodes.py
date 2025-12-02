@@ -515,6 +515,116 @@ def _ensure_company_summary(state: OrchestrationState, profile: ProfileState, hi
     return True
 
 
+def _parse_structured_company_profile(text: str) -> Dict[str, Any]:
+    """Parse a plain-text snippet into a structured company profile.
+
+    Supports simple section headers like:
+      Summary\n...
+      Industries\nitem\nitem
+      Offerings\nitem\n...
+      Ideal Customers\n...
+      Proof Points\n...
+
+    Returns an empty dict when nothing is confidently extracted.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return {}
+    lines = [ln.strip() for ln in text.splitlines()]
+    # Normalize: collapse multiple blank lines, keep order
+    norm: list[str] = []
+    for ln in lines:
+        if not ln and (not norm or not norm[-1]):
+            continue
+        norm.append(ln)
+    # Section names we recognize (case-insensitive)
+    sections = {
+        "summary": {"summary"},
+        "industries": {"industry", "industries"},
+        "offerings": {"offering", "offerings", "products", "services"},
+        "ideal_customers": {"ideal customers", "ideal customer", "customers", "buyers", "personas"},
+        "proof_points": {"proof points", "proofs", "evidence", "social proof", "results"},
+    }
+    # Build reverse lookup mapping of header label -> canonical key
+    lookup: dict[str, str] = {}
+    for key, labels in sections.items():
+        for lab in labels:
+            lookup[lab] = key
+    # Scan for header indices
+    header_idx: list[tuple[int, str]] = []
+    for i, ln in enumerate(norm):
+        hdr = ln.strip().lower().rstrip(":")
+        if hdr in lookup:
+            header_idx.append((i, lookup[hdr]))
+    if not header_idx:
+        return {}
+    header_idx.sort(key=lambda x: x[0])
+    # Add sentinel end
+    header_idx.append((len(norm), "__end"))
+    result: Dict[str, Any] = {}
+    for (start, key), (end, _next) in zip(header_idx, header_idx[1:]):
+        if key == "__end":
+            continue
+        # Capture the block following the header until the next header or blank break
+        block = [ln for ln in norm[start + 1 : end] if ln]
+        if not block:
+            continue
+        if key == "summary":
+            summary = " ".join(block).strip()
+            # Trim extremely long text to keep UI concise
+            result["summary"] = summary[:600]
+        else:
+            # Split list-like lines into items; also split on bullets or commas or slashes
+            items: list[str] = []
+            for ln in block:
+                raw = ln.lstrip("-•\u2022 ")  # remove common bullet prefixes
+                parts = [p.strip() for p in re.split(r"[,/]|\s{2,}", raw) if p.strip()]
+                # When the line is meant as a single item (e.g., a short phrase), avoid over-splitting
+                if len(parts) == 1:
+                    items.append(parts[0])
+                else:
+                    items.extend(parts)
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            cleaned: list[str] = []
+            for it in items:
+                v = it.strip()
+                if not v:
+                    continue
+                low = v.lower()
+                if low in seen:
+                    continue
+                seen.add(low)
+                cleaned.append(v)
+            result[key] = cleaned
+    return result
+
+
+def _apply_user_company_profile_text(state: OrchestrationState, profile: ProfileState, last_user_text: Optional[str]) -> bool:
+    """Best-effort parse of the latest user message into company_profile fields.
+
+    When a user provides a structured snippet with headers like "Summary", "Industries",
+    etc., extract fields and persist to `tenant_company_profiles` immediately so the
+    orchestrator can continue without requiring LLM parsing.
+    """
+    if not last_user_text:
+        return False
+    extracted = _parse_structured_company_profile(last_user_text)
+    if not extracted:
+        return False
+    company = dict(profile.get("company_profile") or {})
+    company.update(extracted)
+    # Prefer any existing website/name already known; do not overwrite here
+    if company.get("summary"):
+        company["summary_source"] = company.get("summary_source") or "user"
+    profile["company_profile"] = company
+    # Draft persist (not confirmed yet); confirmation handled downstream by phrase detection
+    try:
+        _persist_company_profile_state(state, company, confirmed=False)
+    except Exception:
+        logger.debug("rule-based company profile persist failed", exc_info=True)
+    return True
+
+
 def _format_company_profile(company: Dict[str, Any]) -> str:
     summary = (company.get("summary") or "").strip()
     industries = company.get("industries") or []
@@ -1474,6 +1584,11 @@ Respond with JSON only.
     except Exception:
         pass
 
+    # Guard: On first-run with no cached candidates, do NOT suggest rerun.
+    # This prevents the confusing "Re-run discovery" prompt when there is nothing to rerun.
+    if not candidate_details:
+        decisions["rerun_icp"] = False
+
     # Write discovery cache for downstream nodes to optionally reuse
     if candidate_details:
         disc = state.get("discovery") or {}
@@ -1510,6 +1625,15 @@ async def profile_builder(state: OrchestrationState) -> OrchestrationState:
     """Update profile flags using the latest conversation snippet."""
     profile = _ensure_profile_state(state)
     history = state.get("messages", [])[-5:]
+    # First try a deterministic parse of a user‑provided structured snippet
+    try:
+        last_user = next((m for m in reversed(history) if _message_role(m) == "user"), None)
+        last_user_text = _message_text(last_user) if last_user else None
+        if _apply_user_company_profile_text(state, profile, last_user_text):
+            # If we captured new fields from user text, treat as not yet confirmed
+            profile["company_profile_confirmed"] = False
+    except Exception:
+        pass
     prompt = f"""
 You maintain company + ICP profile confirmations and draft summaries from chat snippets.
 Return JSON with keys:
@@ -1595,7 +1719,12 @@ Current profile: {profile!r}
             or _includes_phrase(normalized_command, icp_confirm_phrases)
             or _looks_like_discovery_confirmation(normalized_command)
         ):
-            profile["icp_profile_confirmed"] = True
+            # Only confirm ICP if it was generated from customer sites and we have at least 5
+            sites = profile.get("customer_websites") or []
+            have5 = isinstance(sites, list) and len([u for u in sites if isinstance(u, str) and u.strip()]) >= 5
+            generated = bool(profile.get("icp_profile_generated")) and bool(profile.get("icp_profile"))
+            if generated and have5:
+                profile["icp_profile_confirmed"] = True
 
     enrichment_requested = _wants_enrichment(last_intent, normalized_command)
     if profile.get("icp_discovery_confirmed") and enrichment_requested:
@@ -1649,6 +1778,14 @@ Current profile: {profile!r}
     if profile.get("seeded_company_profile"):
         profile["company_profile_confirmed"] = False
 
+    # Final guardrail: never allow ICP to be marked confirmed unless we have a generated ICP
+    # AND at least 5 customer websites. This overrides any premature LLM booleans.
+    sites = profile.get("customer_websites") or []
+    have5 = isinstance(sites, list) and len([u for u in sites if isinstance(u, str) and u.strip()]) >= 5
+    generated_icp = bool(profile.get("icp_profile_generated")) and bool(profile.get("icp_profile"))
+    if profile.get("icp_profile_confirmed") and not (generated_icp and have5):
+        profile["icp_profile_confirmed"] = False
+
     profile["last_updated_at"] = datetime.now(timezone.utc).isoformat()
     _log_step(
         "profile_builder",
@@ -1697,11 +1834,9 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                     discovery_ready = True
                 else:
                     profile["awaiting_discovery_confirmation"] = True
-                    prompts = profile.get("outstanding_prompts") or []
-                    if ask not in prompts:
-                        prompts.append(ask)
-                        profile["outstanding_prompts"] = prompts
-                        _append_message(state, "assistant", ask)
+                    # Make this the primary prompt so it isn't overshadowed by older asks
+                    profile["outstanding_prompts"] = [ask]
+                    _append_message(state, "assistant", ask)
     except Exception:
         pass
     if discovery_ready and not enrichment_ready and _wants_enrichment(last_intent, normalized_command):
@@ -1716,11 +1851,42 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     discovery_state = state.get("discovery") or {}
     if company_ready and company_profile:
         _persist_company_profile_state(state, company_profile, confirmed=True)
+    # Persist ICP profile as confirmed when user has confirmed it in chat
+    if icp_ready and icp_profile:
+        try:
+            normalized = _normalized_icp_for_persistence(icp_profile)
+            _persist_icp_profile_sync(
+                {"tenant_id": _get_tenant_id(state)},
+                normalized,
+                confirmed=True,
+                seed_urls=(customer_sites or [])[:5],
+                user_confirmed=True,
+            )
+        except Exception:
+            logger.debug("icp confirmed persist failed", exc_info=True)
     if not needs_website:
         if _ensure_company_summary(state, profile, state.get("messages", [])[-8:]):
             company_profile = profile.get("company_profile") or {}
     explanation = None
+    # Background job creation should happen only after both profiles are confirmed
+    # and (optionally) after collecting a minimum number of customer websites.
     if BG_DISCOVERY_AND_ENRICH and company_ready and icp_ready:
+        # Require customer websites before enqueueing (configurable, default 5)
+        min_customers = _get_config_int("CUSTOMER_SITES_REQUIRED", 5)
+        have_customers = isinstance(customer_sites, list) and len([u for u in customer_sites if str(u).strip()]) >= max(0, min_customers)
+        if not have_customers and min_customers > 0:
+            ask = (
+                f"Great — company and ICP are confirmed. Please share {min_customers} customer website URLs "
+                f"(e.g., your best-fit customers) so I can tune discovery before I queue the background job."
+            )
+            # Always surface the latest gating prompt as primary
+            profile["outstanding_prompts"] = [ask]
+            _append_message(state, "assistant", ask)
+            _set_status(state, "journey_guard", "Awaiting customer websites")
+            _log_step("journey_guard", company_ready=company_ready, icp_ready=icp_ready, need_customer_urls=True, required=min_customers)
+            state["profile_state"] = profile
+            return state
+
         # Ensure tenant_id is set; if missing, attempt to read from client-provided context and LG server metadata
         tenant_id = _get_tenant_id(state) or 0
         if not tenant_id:

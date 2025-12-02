@@ -36,6 +36,7 @@ scikit-learn
 grandalf
 python-dotenv
 PyJWT
+cryptography
 passlib
 apscheduler
 langchain-mcp-adapters

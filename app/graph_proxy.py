@@ -65,7 +65,7 @@ async def _forward(request: Request, method: str, path: str) -> Response:
                 # Target path shapes:
                 #   /threads/{id}/runs
                 #   /threads/{id}/runs/stream
-                # We inject { context: { tenant_id: <X-Tenant-ID> } } using the incoming header if present.
+                # We inject { config: { configurable: { tenant_id } } } using the most reliable source available.
                 if "/threads/" in path and "/runs" in path:
                     raw = body.decode("utf-8")
                     payload = {}
@@ -74,14 +74,24 @@ async def _forward(request: Request, method: str, path: str) -> Response:
                         payload = _json.loads(raw or "{}")
                     except Exception:
                         payload = {}
+                    # Resolve tenant from header or request.state (set by require_auth/identity)
                     tenant_hdr = request.headers.get("x-tenant-id") or request.headers.get("X-Tenant-ID")
-                    if tenant_hdr:
-                        ctx = payload.get("context") or {}
-                        if not isinstance(ctx, dict):
-                            ctx = {}
-                        # Only set if not already provided by the client
-                        ctx.setdefault("tenant_id", tenant_hdr)
-                        payload["context"] = ctx
+                    tenant_fallback = getattr(getattr(request, "state", object()), "tenant_id", None)
+                    tenant_val = tenant_hdr or tenant_fallback
+                    if tenant_val:
+                        # Prefer the configurable channel which nodes read via var_child_runnable_config
+                        cfg = payload.get("config") or {}
+                        conf = cfg.get("configurable") or {}
+                        if not isinstance(conf, dict):
+                            conf = {}
+                        conf.setdefault("tenant_id", str(tenant_val))
+                        # Mirror into metadata/context for older readers (best-effort)
+                        if not conf.get("metadata"):
+                            conf["metadata"] = {"tenant_id": str(tenant_val)}
+                        if not conf.get("context"):
+                            conf["context"] = {"tenant_id": str(tenant_val)}
+                        cfg["configurable"] = conf
+                        payload["config"] = cfg
                         body = _json.dumps(payload).encode("utf-8")
                         headers["content-type"] = "application/json"
         except Exception:

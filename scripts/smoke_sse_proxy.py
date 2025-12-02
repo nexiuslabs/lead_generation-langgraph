@@ -49,10 +49,19 @@ async def main():
         # Stream a run
         run_url = f"{args.base.rstrip('/')}/threads/{thread_id}/runs/stream"
         payload = {
-            "messages": {
-                "type": "human",
-                "content": [{"type": "text", "text": args.text}],
-            }
+            # Required by the run endpoint
+            "assistant_id": args.graph,
+            # Newer servers may also accept graph_id; harmless if ignored
+            "graph_id": args.graph,
+            # LangGraph REST expects an `input` object for runs
+            "input": {
+                "messages": {
+                    "type": "human",
+                    "content": [{"type": "text", "text": args.text}],
+                }
+            },
+            # Provide tenant in configurable in case proxy/header injection is bypassed
+            "config": {"configurable": {"tenant_id": str(args.tenant)}}
         }
         async with client.stream(
             "POST",
@@ -65,7 +74,16 @@ async def main():
             json=payload,
         ) as resp:
             print("Status:", resp.status_code, resp.headers.get("content-type"))
-            resp.raise_for_status()
+            if resp.status_code >= 400 and resp.headers.get("content-type", "").startswith("application/json"):
+                # Print validation errors for quick diagnosis
+                err = await resp.aread()
+                try:
+                    print("Body:", err.decode("utf-8"))
+                except Exception:
+                    print("Body:", err)
+                resp.raise_for_status()
+            else:
+                resp.raise_for_status()
             n = 0
             async for chunk in resp.aiter_lines():
                 if chunk:
@@ -77,4 +95,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

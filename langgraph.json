@@ -1,10 +1,12 @@
  {
-    "dependencies": [
-      "my_agent",
-      "app",
-      "src"
-    ],
-    "graphs": {
-      "orchestrator": "my_agent.agent:build_orchestrator_graph"
-    }
-  }
+  "dependencies": [
+    "my_agent",
+    "app",
+    "src"
+  ],
+  "graphs": {
+    "orchestrator": "my_agent.agent:build_orchestrator_graph"
+  },
+  
+  "env": ".env"
+}

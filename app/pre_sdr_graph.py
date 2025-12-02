@@ -629,35 +629,70 @@ def _icp_payload_from_state_icp(icp: dict) -> dict:
 
 
 def _merge_icp_profile_into_payload(payload: dict, icp_profile: dict) -> dict:
-    """Merge LLM-derived icp_profile keys into icp_rules payload structure.
+    """Merge/synthesize ICP fields into icp_rules payload.
 
-    Adds: industries, integrations, buyer_titles, triggers, size_bands (if present).
+    Recognizes canonical keys and common synonyms to ensure the entire profile is persisted:
+      - industries
+      - buyer_titles (synonym: persona_titles)
+      - triggers (synonym: buying_triggers)
+      - size_bands (synonym: company_sizes)
+      - geos (synonym: regions)
+      - integrations (if present)
+      - signals (if present)
+      - pains, proof_points (if present)
+      - seed_urls (or seeds_list)
+      - summary (short text)
     """
     out = dict(payload or {})
     prof = dict(icp_profile or {})
-    def _arr(key: str) -> list[str]:
-        vals = prof.get(key) or []
+
+    def _arr_from(obj: dict, key: str) -> list[str]:
+        vals = obj.get(key) or []
         if not isinstance(vals, list):
             return []
         return [str(v).strip() for v in vals if isinstance(v, str) and v.strip()]
-    for k in ("industries", "integrations", "buyer_titles", "triggers", "size_bands"):
-        arr = _arr(k)
+
+    # Copy canonical arrays if present
+    for key in ("industries", "integrations", "buyer_titles", "triggers", "size_bands", "geos", "signals"):
+        arr = _arr_from(prof, key)
         if arr:
-            out[k] = sorted(set(arr))
+            out[key] = sorted(set(arr))
+
+    # Map common synonyms → canonical keys
+    synonyms = {
+        "persona_titles": "buyer_titles",
+        "buying_triggers": "triggers",
+        "company_sizes": "size_bands",
+        "regions": "geos",
+    }
+    for src, dest in synonyms.items():
+        if not out.get(dest):
+            arr = _arr_from(prof, src)
+            if arr:
+                out[dest] = sorted(set(arr))
+
+    # Add optional sections frequently requested in UI/PRD
+    for extra in ("pains", "proof_points"):
+        arr = _arr_from(prof, extra)
+        if arr:
+            out[extra] = arr  # keep original order for readability
+
+    # Seed URLs (primary for downstream discovery context)
     seed_urls = prof.get("seed_urls") or prof.get("seeds_list")
     if isinstance(seed_urls, list) and seed_urls:
-        norm = []
-        for v in seed_urls:
-            if isinstance(v, str) and v.strip():
-                norm.append(v.strip())
+        norm = [str(v).strip() for v in seed_urls if isinstance(v, str) and v.strip()]
         if norm:
             out["seed_urls"] = sorted(set(norm))
+
+    # Confirmation flags
     if "icp_profile_confirmed" in prof:
         out["icp_profile_confirmed"] = bool(prof.get("icp_profile_confirmed"))
     if "icp_profile_user_confirmed" in prof:
         out["icp_profile_user_confirmed"] = bool(prof.get("icp_profile_user_confirmed"))
-    if prof.get("summary"):
-        out["summary"] = prof.get("summary")
+
+    # Summary (short text)
+    if isinstance(prof.get("summary"), str) and prof.get("summary").strip():
+        out["summary"] = prof.get("summary").strip()
     return out
 
 
@@ -1089,6 +1124,26 @@ def _persist_icp_profile_sync(
             logger.info(
                 "[db] UPSERT icp_rules OK tenant_id=%s name=%s", tid, "Default ICP"
             )
+            # Additional verification log with field counts to assert full profile persistence
+            try:
+                def _count_list(name: str) -> int:
+                    v = payload.get(name)
+                    return len(v) if isinstance(v, list) else 0
+                logger.info(
+                    "[icp_profile] field_counts tenant_id=%s summary=%s industries=%s buyer_titles=%s size_bands=%s geos=%s pains=%s triggers=%s proof_points=%s seed_urls=%s",
+                    tid,
+                    bool(payload.get("summary")),
+                    _count_list("industries"),
+                    _count_list("buyer_titles"),
+                    _count_list("size_bands"),
+                    _count_list("geos"),
+                    _count_list("pains"),
+                    _count_list("triggers"),
+                    _count_list("proof_points"),
+                    _count_list("seed_urls"),
+                )
+            except Exception:
+                pass
         except Exception:
             pass
     except Exception:
