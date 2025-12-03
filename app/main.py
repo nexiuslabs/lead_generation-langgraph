@@ -588,9 +588,22 @@ async def start_orchestration(
         except Exception:
             pass
         _save_threads()
+    # Normalize incoming messages and derive a sensible fallback for `input` if FE omitted it
+    _msgs = _normalize_message_payload(payload.get("messages"))
+    _input_raw = str(payload.get("input") or "")
+    if not _input_raw and _msgs:
+        try:
+            # Use last user message as input when present
+            for _m in reversed(_msgs):
+                if (_m.get("role") or "").lower() == "user":
+                    _input_raw = str(_m.get("content") or "")
+                    break
+        except Exception:
+            _input_raw = ""
+
     state: OrchestrationState = {
-        "messages": _normalize_message_payload(payload.get("messages")),
-        "input": str(payload.get("input") or ""),
+        "messages": _msgs,
+        "input": _input_raw,
         "input_role": str(payload.get("role") or "user"),
         "entry_context": {
             "thread_id": thread_id,

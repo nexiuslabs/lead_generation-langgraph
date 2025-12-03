@@ -1384,7 +1384,53 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
             tags=ctx.get("tags", []),
             normalized_text=ctx["last_user_command"],
         )
-    msg = "Processed user input" if incoming else "Waiting for user input"
+    # Always try to capture a yes/no confirmation from latest user message, even if 'input' was empty
+    try:
+        ctx2 = state.get("entry_context") or {}
+        profile = _ensure_profile_state(state)
+        awaiting_job = bool(profile.get("awaiting_enrichment_confirmation"))
+        # Check most recent assistant/user exchange
+        messages = state.get("messages") or []
+        last_msg = messages[-1] if messages else None
+        last_role = _message_role(last_msg) if last_msg else None
+        # Only act if the latest message is from the user and either we were awaiting confirmation
+        # or the last assistant message asked to queue the job
+        last_ai = None
+        for m in reversed(messages[:-1] if messages else []):
+            if _message_role(m) == "assistant":
+                last_ai = m
+                break
+        last_ai_text = (_message_text(last_ai) if last_ai else "").lower()
+        asked_to_queue = "shall i queue a background discovery + enrichment job" in last_ai_text
+        if last_role == "user" and (awaiting_job or asked_to_queue):
+            user_text = (_message_text(last_msg) or "").strip().lower()
+            yes_phrases = {
+                "yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay", "kk", "alright",
+                "proceed", "start", "begin", "go ahead", "do it", "run it", "run discovery",
+                "run enrichment", "please proceed", "go for it", "sounds good"
+            }
+            no_phrases = {
+                "no", "n", "nope", "not now", "later", "don't", "dont", "stop", "hold on",
+                "wait", "cancel", "skip"
+            }
+            if any(p == user_text or p in user_text for p in yes_phrases):
+                ctx2["intent"] = "confirm_discovery"
+                state["entry_context"] = ctx2
+                if not awaiting_job:
+                    profile["awaiting_enrichment_confirmation"] = True
+                    state["profile_state"] = profile
+                _log_step("job_confirmation_intent", captured=True, kind="yes")
+            elif any(p == user_text or p in user_text for p in no_phrases):
+                ctx2["intent"] = "decline_bg_job"
+                state["entry_context"] = ctx2
+                if not awaiting_job and asked_to_queue:
+                    profile["awaiting_enrichment_confirmation"] = True
+                    state["profile_state"] = profile
+                _log_step("job_confirmation_intent", captured=True, kind="no")
+    except Exception:
+        pass
+
+    msg = "Processed user input" if (incoming or (_latest_user_text(state) or "")) else "Waiting for user input"
     _set_status(state, "ingest", msg)
     return state
 
@@ -2119,9 +2165,12 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             wants = _wants_enrichment(last_intent, normalized_command)
             awaiting = bool(profile.get("awaiting_enrichment_confirmation"))
             positive_intents = {"confirm_discovery", "confirm", "run_enrichment"}
-            positive_phrases = {"yes", "yep", "yeah", "ok", "okay", "proceed", "start", "go ahead", "do it", "run discovery", "run enrichment", "begin discovery"}
+            positive_phrases = {"yes", "yep", "yeah", "ok", "okay", "proceed", "start", "go ahead", "do it", "run discovery", "run enrichment", "begin discovery", "please proceed", "go for it", "sounds good"}
+            negative_intents = {"decline_bg_job"}
+            negative_phrases = {"no", "nope", "not now", "later", "don't", "dont", "stop", "hold on", "wait", "cancel", "skip"}
             normalized = normalized_command
             user_said_yes = (last_intent in positive_intents) or any(p in normalized for p in positive_phrases) or _looks_like_discovery_confirmation(normalized)
+            user_said_no = (last_intent in negative_intents) or any(p in normalized for p in negative_phrases)
             if not wants and not awaiting and tenant_id:
                 ask = (
                     f"You're all set — company and ICP are confirmed and {len(customer_sites)} customer sites are on file. "
@@ -2131,6 +2180,16 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 profile["outstanding_prompts"] = [ask]
                 _append_message(state, "assistant", ask)
                 _set_status(state, "journey_guard", "Awaiting enrichment confirmation")
+                _log_step("job_prompt_pending", pending=True, reason="company+icp+seeds_ready", customers=len(customer_sites))
+                state["profile_state"] = profile
+                return state
+            if awaiting and user_said_no:
+                profile["awaiting_enrichment_confirmation"] = False
+                msg = "Okay, not queuing now. Say ‘run discovery’ anytime."
+                profile["outstanding_prompts"] = [msg]
+                _append_message(state, "assistant", msg)
+                _set_status(state, "journey_guard", msg)
+                _log_step("job_prompt_cleared", declined=True)
                 state["profile_state"] = profile
                 return state
             if awaiting and (not user_said_yes) and (not wants):
@@ -2202,6 +2261,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 f"Job ID: {job_id}."
             )
             profile["enrichment_confirmed"] = True
+            _log_step("enqueue_bg", ok=True, job_id=job_id, tenant_id=int(tenant_id))
         elif not tenant_id:
             msg = (
                 "I couldn’t resolve your tenant session, so I can’t queue the background job yet. "
