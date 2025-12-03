@@ -1170,12 +1170,16 @@ def _simple_intent(text: str) -> str:
     heuristic = _heuristic_intent(raw)
     prompt = f"""
 Classify the user's intention for the lead-generation orchestrator.
-Return JSON {{"intent": one of [status, run_enrichment, confirm_icp, confirm_company, confirm_discovery, accept_micro_icp, question, chat]}}.
+Return JSON {{"intent": one of [status, run_enrichment, confirm_icp, confirm_company, confirm_discovery, accept_micro_icp, update, question, chat]}}.
 Text: {raw!r}
 """
     fallback = {"intent": heuristic}
     result = call_llm_json(prompt, fallback)
-    return (result or fallback)["intent"]
+    # Prefer heuristic when it detects update/question but the LLM disagrees
+    final_intent = (result or fallback)["intent"]
+    if heuristic in {"update", "question"} and final_intent not in {"update", "question"}:
+        final_intent = heuristic
+    return final_intent
 
 
 def _wants_enrichment(intent: str | None, normalized_command: str) -> bool:
@@ -1501,6 +1505,31 @@ async def return_user_probe(state: OrchestrationState) -> OrchestrationState:
         if icp and isinstance(icp.get("profile"), dict):
             profile["icp_profile"] = dict(icp.get("profile") or {})
             profile["icp_profile_confirmed"] = bool(icp.get("confirmed")) or bool(profile.get("icp_profile"))
+            # Hydrate customer websites from persisted seed_urls so the agent
+            # does not re-ask for the 5 best customer sites on return visits.
+            try:
+                seeds = icp.get("seed_urls") or []
+                if isinstance(seeds, list):
+                    cleaned_seeds = [str(u).strip() for u in seeds if isinstance(u, str) and str(u).strip()]
+                else:
+                    cleaned_seeds = []
+                if cleaned_seeds:
+                    existing_sites = profile.get("customer_websites") or []
+                    if not existing_sites:
+                        profile["customer_websites"] = cleaned_seeds[:5]
+                    # Mark that an ICP profile was generated so gating honors it
+                    if profile.get("icp_profile"):
+                        profile["icp_profile_generated"] = True
+                    try:
+                        _log_step(
+                            "seed_hydration",
+                            seeds=len(cleaned_seeds),
+                            hydrated=len(profile.get("customer_websites") or []),
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             loaded_any = True
         # Load any recently persisted Top‑10 preview for reuse
         try:
@@ -1528,6 +1557,19 @@ async def return_user_probe(state: OrchestrationState) -> OrchestrationState:
                         last_preview_ts = str(r[0])
             except Exception:
                 last_preview_ts = None
+
+    # Summarize hydration so operators can verify return-user state quickly
+    try:
+        _log_step(
+            "probe_hydration",
+            company_loaded=bool(profile.get("company_profile")),
+            company_confirmed=bool(profile.get("company_profile_confirmed")),
+            icp_loaded=bool(profile.get("icp_profile")),
+            icp_confirmed=bool(profile.get("icp_profile_confirmed")),
+            customers=len(profile.get("customer_websites") or []),
+        )
+    except Exception:
+        pass
 
     # Decide reuse vs rerun (heuristic + optional LLM policy)
     candidate_count = len(candidate_details)
@@ -1699,6 +1741,12 @@ Current profile: {profile!r}
     messages = state.get("messages", [])
     company_url = (profile.get("company_profile") or {}).get("website")
     profile["customer_websites"] = _collect_customer_sites(messages, company_url)
+    # Persist captured customer websites to customer_seeds for later intake usage
+    try:
+        if profile.get("customer_websites"):
+            _persist_customer_websites_to_seeds(state, profile["customer_websites"])
+    except Exception:
+        pass
     customer_sites = profile.get("customer_websites") or []
     if len(customer_sites) >= 5 and not profile.get("icp_profile_generated"):
         _generate_icp_from_customers(state, profile)
@@ -2784,7 +2832,7 @@ def _smart_answer(state: OrchestrationState, text: str | None) -> str | None:
             return f"{label}: {items}."
         return None
 
-    if has_any(["industries"]):
+    if has_any(["industries", "targeted industry", "targeted industries", "industry focus", "target industry", "target industries"]):
         t = _fmt_list("industries", "Industries")
         if t:
             return t
@@ -2972,7 +3020,7 @@ def _parse_update_command(text: str | None) -> Optional[Dict[str, Any]]:
         # set <section> to ITEMS
         sm = re.match(r"^\s*([a-zA-Z /&_-]+?)\s+to\s+(.+)$", rest, re.IGNORECASE)
         if sm:
-            section_raw = sm.group(1)
+            section_raw = _clean_section_name(sm.group(1))
             # Decide target by section name and presence of 'company'
             prefer_company = ("company" in low) or ("company profile" in low)
             c_key = _canonical_company_key(section_raw)
@@ -2997,7 +3045,7 @@ def _parse_update_command(text: str | None) -> Optional[Dict[str, Any]]:
     if pm:
         item_part = pm.group(1)
         preposition = pm.group(2).lower()
-        section_raw = pm.group(3)
+        section_raw = _clean_section_name(pm.group(3))
         prefer_company = ("company" in low) or ("company profile" in low)
         c_key = _canonical_company_key(section_raw)
         i_key = _canonical_icp_key(section_raw)
@@ -3022,6 +3070,26 @@ def _parse_update_command(text: str | None) -> Optional[Dict[str, Any]]:
     # Fallback: single-section direct (e.g., remove Malaysia in Regions without clear tokens)
     # Not matched → ignore
     return None
+
+
+def _clean_section_name(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    # Strip trailing qualifiers like 'of icp profile', 'of company profile', 'of profile'
+    for token in [
+        " of icp profile", " of company profile", " of profile", " of the icp", " of the company", " profile", " icp"
+    ]:
+        if s.endswith(token):
+            s = s[: -len(token)].strip()
+    # Normalize singular/plural and synonyms
+    replacements = {
+        "region": "regions",
+        "industry": "industries",
+        "size band": "company sizes",
+    }
+    for k, v in replacements.items():
+        if s == k:
+            s = v
+    return s
 
 
 def _apply_icp_update(state: OrchestrationState, spec: Dict[str, Any]) -> Tuple[bool, str]:
@@ -3091,6 +3159,12 @@ def _apply_icp_update(state: OrchestrationState, spec: Dict[str, Any]) -> Tuple[
     try:
         seeds = list(profile.get("customer_websites") or [])
         _persist_icp_profile_state(state, icp, seeds[:5])
+    except Exception:
+        pass
+    # Persist customer websites into customer_seeds table as well
+    try:
+        if profile.get("customer_websites"):
+            _persist_customer_websites_to_seeds(state, profile.get("customer_websites") or [])
     except Exception:
         pass
     msg = "; ".join(summary_changes) if summary_changes else f"updated {section}"
@@ -3350,3 +3424,39 @@ def _collect_customer_sites(messages: List[Dict[str, Any]], company_url: Optiona
             if len(urls) >= 5:
                 return urls
     return urls
+
+
+def _persist_customer_websites_to_seeds(state: OrchestrationState, urls: List[str]) -> int:
+    # Persist customer websites into customer_seeds for the tenant (dev-safe, idempotent per (tenant,domain))
+    tid = _get_tenant_id(state)
+    if tid is None:
+        return 0
+    domains: List[str] = []
+    seen: set[str] = set()
+    for u in urls or []:
+        d = _domain_from_value(u)
+        if not d:
+            continue
+        if d not in seen:
+            seen.add(d)
+            domains.append(d)
+    if not domains:
+        return 0
+    inserted = 0
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            for d in domains:
+                try:
+                    cur.execute("SELECT 1 FROM customer_seeds WHERE tenant_id=%s AND domain=%s LIMIT 1", (int(tid), d))
+                    if cur.fetchone():
+                        continue
+                    cur.execute(
+                        "INSERT INTO customer_seeds(tenant_id, seed_name, domain) VALUES (%s,%s,%s)",
+                        (int(tid), d, d),
+                    )
+                    inserted += 1
+                except Exception:
+                    continue
+    except Exception:
+        return 0
+    return inserted

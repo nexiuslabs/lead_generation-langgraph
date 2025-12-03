@@ -562,10 +562,11 @@ async def start_orchestration(
                         continue
                     if meta2.get("agent") != "icp_finder" or meta2.get("context_key") != ctx_key:
                         continue
-                        if meta2.get("status") == "open":
-                            meta2["status"] = "locked"
-                            meta2["locked_at"] = _now_iso()
-                            meta2["reason"] = "new_thread_same_context"
+                    # Lock prior open threads for the same context
+                    if meta2.get("status") == "open":
+                        meta2["status"] = "locked"
+                        meta2["locked_at"] = _now_iso()
+                        meta2["reason"] = "new_thread_same_context"
                     # option: auto-archive stale locked
                     if meta2.get("status") == "locked" and _AUTO_ARCH:
                         try:
