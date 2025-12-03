@@ -1130,6 +1130,11 @@ Each list should contain up to 4 concise items.
 
 def _heuristic_intent(text: str) -> str:
     lowered = text.lower()
+    # Greetings: keep overall intent as chat but allow a greeting tag
+    simple = lowered.strip()
+    if simple in {"hi", "hello", "hey", "hey there", "hi there"} or \
+       simple.startswith("good morning") or simple.startswith("good afternoon") or simple.startswith("good evening"):
+        return "chat"
     # Treat punctuation-agnostic direct questions as questions (even without '?')
     _q_norm = lowered.strip().replace("’", "'")
     if any(_q_norm.startswith(p) for p in (
@@ -1342,12 +1347,21 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
         }
         analysis = call_llm_json(prompt, fallback)
         ctx = state.get("entry_context") or {}
+        # Lightweight greeting detection to shape reply tone
+        def _is_greeting(text: str) -> bool:
+            t = (text or "").strip().lower()
+            if not t:
+                return False
+            if t in {"hi", "hello", "hey", "hey there", "hi there"}:
+                return True
+            return t.startswith("good morning") or t.startswith("good afternoon") or t.startswith("good evening")
         ctx.update(
             {
                 "last_user_command": analysis.get("normalized_text", incoming),
                 "intent": analysis.get("intent", fallback["intent"]),
                 "tags": analysis.get("tags", []),
                 "last_received_at": datetime.now(timezone.utc).isoformat(),
+                "is_greeting": _is_greeting(incoming),
             }
         )
         state["entry_context"] = ctx
@@ -1740,7 +1754,20 @@ Current profile: {profile!r}
         profile["company_profile_confirmed"] = False
     messages = state.get("messages", [])
     company_url = (profile.get("company_profile") or {}).get("website")
-    profile["customer_websites"] = _collect_customer_sites(messages, company_url)
+    # Do not clobber previously hydrated customer sites with an empty parse
+    # from the current turn; only merge when we detect new sites.
+    newly_collected = _collect_customer_sites(messages, company_url)
+    if newly_collected:
+        existing_sites = profile.get("customer_websites") or []
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for u in list(existing_sites) + list(newly_collected):
+            s = str(u).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            dedup.append(s)
+        profile["customer_websites"] = dedup
     # Persist captured customer websites to customer_seeds for later intake usage
     try:
         if profile.get("customer_websites"):
@@ -1890,6 +1917,28 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     last_command = (ctx.get("last_user_command") or "").strip().lower()
     normalized_command = last_command.translate(str.maketrans("", "", ".!?")).strip()
 
+    # Early deferral: if the user asked a question/issued an update/status, do not append prompts here.
+    is_question_turn = (last_intent == "question") or (_heuristic_intent(question or "") == "question")
+    is_update_turn = (last_intent == "update") or (_heuristic_intent(question or "") == "update")
+    is_status_turn = (last_intent == "status") or (_heuristic_intent(question or "") == "status")
+    if is_question_turn or is_update_turn or is_status_turn:
+        state["journey_ready"] = False
+        _set_status(state, "journey_guard", "question_or_update_turn")
+        _log_step(
+            "journey_guard",
+            company_ready=company_ready,
+            icp_ready=icp_ready,
+            discovery_ready=discovery_ready,
+            enrichment_ready=enrichment_ready,
+            intent=last_intent,
+            explanation_provided=False,
+            needs_website=(not company_ready) and _needs_company_website(profile),
+            question_turn=is_question_turn,
+            update_turn=is_update_turn,
+            status_turn=is_status_turn,
+        )
+        return state
+
     # Honor return-user decisions: reuse cached vs ask to re-run
     try:
         decisions = state.get("decisions") or {}
@@ -2033,6 +2082,67 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                             _log_step("tenant_context", source="journey_guard/db_fallback", tenant_id=tid_int)
             except Exception:
                 pass
+        # If a job is already queued or running for this tenant, inform the user and do not enqueue another
+        if tenant_id:
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT job_id, status
+                          FROM background_jobs
+                         WHERE tenant_id=%s
+                           AND job_type='icp_discovery_enrich'
+                           AND status IN ('queued','running')
+                         ORDER BY job_id DESC
+                         LIMIT 1
+                        """,
+                        (int(tenant_id),),
+                    )
+                    row = cur.fetchone()
+                if row and row[0] is not None:
+                    jid = int(row[0])
+                    st = str(row[1])
+                    msg = (
+                        f"You're all set — company and ICP are confirmed and {len(customer_sites)} customer sites are on file. "
+                        f"A background job (ID {jid}) is currently {st}. I can create a new job after it completes."
+                    )
+                    profile["outstanding_prompts"] = [msg]
+                    _append_message(state, "assistant", msg)
+                    _set_status(state, "journey_guard", msg)
+                    state["profile_state"] = profile
+                    return state
+            except Exception:
+                pass
+
+        # Ask for a quick confirmation before queuing the background job
+        try:
+            wants = _wants_enrichment(last_intent, normalized_command)
+            awaiting = bool(profile.get("awaiting_enrichment_confirmation"))
+            positive_intents = {"confirm_discovery", "confirm", "run_enrichment"}
+            positive_phrases = {"yes", "yep", "yeah", "ok", "okay", "proceed", "start", "go ahead", "do it", "run discovery", "run enrichment", "begin discovery"}
+            normalized = normalized_command
+            user_said_yes = (last_intent in positive_intents) or any(p in normalized for p in positive_phrases) or _looks_like_discovery_confirmation(normalized)
+            if not wants and not awaiting and tenant_id:
+                ask = (
+                    f"You're all set — company and ICP are confirmed and {len(customer_sites)} customer sites are on file. "
+                    f"Shall I queue a background discovery + enrichment job now? (yes/no)"
+                )
+                profile["awaiting_enrichment_confirmation"] = True
+                profile["outstanding_prompts"] = [ask]
+                _append_message(state, "assistant", ask)
+                _set_status(state, "journey_guard", "Awaiting enrichment confirmation")
+                state["profile_state"] = profile
+                return state
+            if awaiting and (not user_said_yes) and (not wants):
+                # Keep waiting for a clear yes/no
+                _set_status(state, "journey_guard", "Awaiting enrichment confirmation")
+                state["profile_state"] = profile
+                return state
+            if (awaiting and user_said_yes) or wants:
+                profile["awaiting_enrichment_confirmation"] = False
+        except Exception:
+            pass
+
         # Short-term UI auto-enqueue path: emit custom event for the UI to call FastAPI with user cookies
         ui_enqueue = str(os.getenv("UI_ENQUEUE_JOBS", "")).strip().lower() in {"1", "true", "yes", "on"}
         if ui_enqueue and _LGCommand is not None and tenant_id:
@@ -2107,16 +2217,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
         _set_status(state, "journey_guard", msg)
         return state
 
-    # If the last input is a question, defer to progress_report Q&A and do not append prompts here.
-    is_question_turn = (last_intent == "question") or (_heuristic_intent(question or "") == "question")
-    is_update_turn = (last_intent == "update") or (_heuristic_intent(question or "") == "update")
-
-    if is_question_turn or is_update_turn:
-        # Do not mutate outstanding_prompts here; progress_report will answer.
-        state["journey_ready"] = False
-        _set_status(state, "journey_guard", "question_or_update_turn")
-        _log_step("journey_guard", company_ready=company_ready, icp_ready=icp_ready, discovery_ready=discovery_ready, enrichment_ready=enrichment_ready, intent=last_intent, explanation_provided=False, needs_website=needs_website, question_turn=is_question_turn, update_turn=is_update_turn)
-        return state
+    # (Deferral handled earlier.)
 
     if journey_ready:
         profile["outstanding_prompts"] = []
@@ -2577,6 +2678,49 @@ async def progress_report(state: OrchestrationState) -> OrchestrationState:
                 _append_message(state, "assistant", answer)
             return state
 
+    # Explicit status request: surface latest job details directly (bypass prompts/LLM)
+    if intent_norm == "status":
+        tid = _get_tenant_id(state)
+        job_msg = None
+        job_payload = None
+        if tid:
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT job_id, status, processed, total, created_at, started_at, ended_at
+                          FROM background_jobs
+                         WHERE tenant_id=%s AND job_type='icp_discovery_enrich'
+                         ORDER BY created_at DESC
+                         LIMIT 1
+                        """,
+                        (int(tid),),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    jid = int(row[0]) if row[0] is not None else None
+                    st = str(row[1]) if row[1] is not None else "unknown"
+                    processed = int(row[2]) if row[2] is not None else 0
+                    total = int(row[3]) if row[3] is not None else 0
+                    pct = f"{int((processed/total)*100)}%" if total > 0 else "0%"
+                    started = str(row[5]) if row[5] else None
+                    ended = str(row[6]) if row[6] else None
+                    when = f"started {started}" if started and not ended else (f"finished {ended}" if ended else "")
+                    job_msg = (
+                        f"Latest ICP discovery/enrichment job: ID {jid} — {st}. "
+                        f"Progress: {processed}/{total} ({pct}). {when}"
+                    ).strip()
+                    job_payload = {"job_id": jid, "status": st, "processed": processed, "total": total, "started_at": started, "ended_at": ended}
+            except Exception:
+                job_msg = None
+        if not job_msg:
+            job_msg = "No background discovery/enrichment job found yet for this tenant."
+        _log_step("progress_report", outstanding=False, message=job_msg, latest_job=job_payload or {})
+        _set_status(state, "progress_report", job_msg)
+        if not state.get("suppress_output"):
+            _append_message(state, "assistant", job_msg)
+        return state
+
     summary = {
         "phase": state.get("status", {}).get("phase"),
         "candidates": len(state.get("discovery", {}).get("candidate_ids") or []),
@@ -2642,6 +2786,14 @@ Return JSON {{"message": "..."}}
     _set_status(state, "progress_report", message)
     # Avoid duplicating outputs when this run has no new user input
     if not state.get("suppress_output"):
+        # If the user greeted, add a friendly salutation
+        try:
+            ctx = state.get("entry_context") or {}
+            if bool(ctx.get("is_greeting")):
+                salutation = "Hi! " if (ctx.get("last_user_command") or "").strip().lower().startswith(("hi", "hello", "hey")) else "Hello! "
+                message = f"{salutation}{message}"
+        except Exception:
+            pass
         _append_message(state, "assistant", message)
     return state
 
