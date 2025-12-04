@@ -327,6 +327,10 @@ def _needs_company_website(profile: ProfileState) -> bool:
 
 
 def _domain_from_value(url: str) -> str:
+    """Extract apex domain from URL or host.
+
+    Mirrors the API’s normalization so threads, companies, and seeds align.
+    """
     try:
         parsed = urlparse(url)
         host = (parsed.netloc or parsed.path or url or "").strip().lower()
@@ -338,12 +342,37 @@ def _domain_from_value(url: str) -> str:
         host = host[7:]
     elif host.startswith("https://"):
         host = host[8:]
+    if "@" in host:
+        host = host.split("@", 1)[-1]
     for sep in ("/", "?", "#"):
         if sep in host:
             host = host.split(sep, 1)[0]
     if host.startswith("www."):
         host = host[4:]
-    return host
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    # IP literal
+    if all(ch.isdigit() or ch == "." for ch in host) or ":" in host:
+        return host
+    labels = [l for l in host.split(".") if l]
+    if len(labels) <= 2:
+        return host
+    multi = {
+        "co.uk","org.uk","gov.uk","ac.uk","sch.uk","ltd.uk","plc.uk",
+        "com.sg","net.sg","org.sg","gov.sg","edu.sg",
+        "com.au","net.au","org.au","gov.au","edu.au",
+        "co.nz","org.nz","govt.nz","ac.nz",
+        "co.jp","ne.jp","or.jp","ac.jp","go.jp",
+        "com.my","com.ph","com.id","co.id","or.id","ac.id",
+        "com.hk","org.hk","edu.hk","gov.hk","idv.hk",
+        "com.br","net.br","org.br","gov.br","edu.br",
+        "co.kr","ne.kr","or.kr","go.kr","ac.kr",
+        "com.cn","net.cn","org.cn","gov.cn","edu.cn",
+    }
+    sfx2 = ".".join(labels[-2:])
+    if sfx2 in multi and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return sfx2
 
 
 def _name_from_domain(url: str) -> str:

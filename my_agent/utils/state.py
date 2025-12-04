@@ -82,3 +82,4 @@ class OrchestrationState(MessagesState, total=False):
     scoring: ScoringState
     exports: ExportState
     status: StatusState
+    status_history: List[Dict[str, Any]]

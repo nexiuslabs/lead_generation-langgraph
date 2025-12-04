@@ -4,24 +4,55 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from src.database import get_conn
+import logging
+from src.troubleshoot_log import log_json
+
+_lg = logging.getLogger("threads.db")
+import psycopg2
+from psycopg2 import errors as pg_errors
 
 
 def _domain_from_value(url: str) -> str:
+    """Extract apex domain from URL or host (see app.main for rationale)."""
     try:
         from urllib.parse import urlparse as _parse
-
         u = url if url.startswith("http") else ("https://" + url)
         p = _parse(u)
         host = (p.netloc or p.path or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if ":" in host:
-            host = host.split(":", 1)[0]
-        if "/" in host:
-            host = host.split("/", 1)[0]
-        return host
     except Exception:
+        host = (url or "").strip().lower()
+    if not host:
         return ""
+    if "@" in host:
+        host = host.split("@", 1)[-1]
+    for sep in ("/", "?", "#"):
+        if sep in host:
+            host = host.split(sep, 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    if all(ch.isdigit() or ch == "." for ch in host) or ":" in host:
+        return host
+    labels = [l for l in host.split(".") if l]
+    if len(labels) <= 2:
+        return host
+    multi = {
+        "co.uk","org.uk","gov.uk","ac.uk","sch.uk","ltd.uk","plc.uk",
+        "com.sg","net.sg","org.sg","gov.sg","edu.sg",
+        "com.au","net.au","org.au","gov.au","edu.au",
+        "co.nz","org.nz","govt.nz","ac.nz",
+        "co.jp","ne.jp","or.jp","ac.jp","go.jp",
+        "com.my","com.ph","com.id","co.id","or.id","ac.id",
+        "com.hk","org.hk","edu.hk","gov.hk","idv.hk",
+        "com.br","net.br","org.br","gov.br","edu.br",
+        "co.kr","ne.kr","or.kr","go.kr","ac.kr",
+        "com.cn","net.cn","org.cn","gov.cn","edu.cn",
+    }
+    sfx2 = ".".join(labels[-2:])
+    if sfx2 in multi and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return sfx2
 
 
 def _first_url_from_messages(messages: List[Dict[str, str]] | None, text: str | None) -> Optional[str]:
@@ -98,18 +129,97 @@ def _row_to_dict(row: tuple, cols: List[str]) -> dict:
 
 
 def create_thread(tenant_id: Optional[int], user_id: Optional[str], agent: str, context_key: str, label: Optional[str] = None) -> str:
+    """Create an open thread if none exists; else return the existing open thread id.
+
+    Handles races against the partial unique index by catching UniqueViolation
+    and selecting the existing row.
+    """
     tid = str(uuid.uuid4())
-    with get_conn() as conn, conn.cursor() as cur:
-        if tenant_id is not None:
-            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
-        cur.execute(
-            """
-            INSERT INTO threads (id, tenant_id, user_id, agent, context_key, label, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'open')
-            """,
-            (tid, tenant_id, user_id, agent, context_key, label),
-        )
-    return tid
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if tenant_id is not None:
+                cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO threads (id, tenant_id, user_id, agent, context_key, label, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'open')
+                    """,
+                    (tid, tenant_id, user_id, agent, context_key, label),
+                )
+                try:
+                    _lg.info(
+                        "DB thread created id=%s tenant=%s user=%s agent=%s context_key=%s label=%s",
+                        tid,
+                        tenant_id,
+                        user_id,
+                        agent,
+                        context_key,
+                        (label or ""),
+                    )
+                    log_json(
+                        "threads",
+                        "info",
+                        "db_thread_created",
+                        {
+                            "thread_id": tid,
+                            "tenant_id": tenant_id,
+                            "user_id": user_id,
+                            "agent": agent,
+                            "context_key": context_key,
+                            "label": label or "",
+                        },
+                    )
+                except Exception:
+                    pass
+                return tid
+            except Exception as e:
+                # If unique constraint on open thread per context fired, return existing
+                pgcode = getattr(e, "pgcode", None)
+                if isinstance(e, psycopg2.errors.UniqueViolation) or (isinstance(e, psycopg2.IntegrityError) and pgcode == "23505"):
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    with conn.cursor() as cur2:
+                        if tenant_id is not None:
+                            cur2.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+                        cur2.execute(
+                            """
+                            SELECT id FROM threads
+                              WHERE status = 'open'
+                                AND agent = %s AND context_key = %s
+                                AND (%s IS NULL OR tenant_id = %s)
+                                AND (%s IS NULL OR user_id = %s)
+                              ORDER BY last_updated_at DESC
+                              LIMIT 1
+                            """,
+                            (agent, context_key, tenant_id, tenant_id, user_id, user_id),
+                        )
+                        row = cur2.fetchone()
+                        if row and row[0]:
+                            try:
+                                _lg.info(
+                                    "DB thread exists (open) id=%s tenant=%s user=%s agent=%s context_key=%s",
+                                    row[0], tenant_id, user_id, agent, context_key,
+                                )
+                                log_json(
+                                    "threads",
+                                    "info",
+                                    "db_thread_exists_open",
+                                    {
+                                        "thread_id": str(row[0]),
+                                        "tenant_id": tenant_id,
+                                        "user_id": user_id,
+                                        "agent": agent,
+                                        "context_key": context_key,
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            return str(row[0])
+                # Re-raise unknown errors
+                raise
 
 
 def lock_prior_open(tenant_id: Optional[int], user_id: Optional[str], agent: str, context_key: str, exclude_id: str) -> int:
@@ -251,3 +361,34 @@ def list_threads(tenant_id: Optional[int], user_id: Optional[str], show_archived
         ]
         return [_row_to_dict(r, cols) for r in rows]
 
+
+def archive_thread(thread_id: str, tenant_id: Optional[int], reason: Optional[str] = None) -> int:
+    """Soft-delete a thread by marking it archived.
+
+    Returns number of affected rows (0 if not found or blocked by RLS).
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        if tenant_id is not None:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+        cur.execute(
+            """
+            UPDATE threads
+               SET status = 'archived', archived_at = now(), last_updated_at = now(),
+                   reason = COALESCE(%s, reason)
+             WHERE id = %s
+            """,
+            (reason, thread_id),
+        )
+        return cur.rowcount or 0
+
+
+def hard_delete_thread(thread_id: str, tenant_id: Optional[int]) -> int:
+    """Hard-delete a thread row. Subject to RLS.
+
+    Returns number of affected rows (0 if not found or blocked by RLS).
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        if tenant_id is not None:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+        cur.execute("DELETE FROM threads WHERE id = %s", (thread_id,))
+        return cur.rowcount or 0

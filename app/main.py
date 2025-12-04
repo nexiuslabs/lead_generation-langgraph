@@ -317,21 +317,55 @@ def _first_url_from_messages(messages: List[Dict[str, str]] | None, text: str | 
 
 
 def _domain_from_value(url: str) -> str:
+    """Extract apex domain from URL or host.
+
+    Heuristics (no external deps):
+    - strip scheme, path, port, and leading www.
+    - collapse subdomains to registrable (apex) domain.
+    - handle common multi-part public suffixes (e.g., co.uk, com.sg, com.au).
+    """
     try:
         from urllib.parse import urlparse as _parse
-
         u = url if url.startswith("http") else ("https://" + url)
         p = _parse(u)
         host = (p.netloc or p.path or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if ":" in host:
-            host = host.split(":", 1)[0]
-        if "/" in host:
-            host = host.split("/", 1)[0]
-        return host
     except Exception:
+        host = (url or "").strip().lower()
+    if not host:
         return ""
+    # Trim auth/path/port fragments if present
+    if "@" in host:
+        host = host.split("@", 1)[-1]
+    for sep in ("/", "?", "#"):
+        if sep in host:
+            host = host.split(sep, 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    # If looks like IP, return as-is
+    if all(ch.isdigit() or ch == "." for ch in host) or ":" in host:
+        return host
+    labels = [l for l in host.split(".") if l]
+    if len(labels) <= 2:
+        return host
+    # Common multi-part public suffixes (non-exhaustive, covers SG/UK/AU/JP/HK/BR/NZ/ID/KR/CN)
+    multi = {
+        "co.uk","org.uk","gov.uk","ac.uk","sch.uk","ltd.uk","plc.uk",
+        "com.sg","net.sg","org.sg","gov.sg","edu.sg",
+        "com.au","net.au","org.au","gov.au","edu.au",
+        "co.nz","org.nz","govt.nz","ac.nz",
+        "co.jp","ne.jp","or.jp","ac.jp","go.jp",
+        "com.my","com.ph","com.id","co.id","or.id","ac.id",
+        "com.hk","org.hk","edu.hk","gov.hk","idv.hk",
+        "com.br","net.br","org.br","gov.br","edu.br",
+        "co.kr","ne.kr","or.kr","go.kr","ac.kr",
+        "com.cn","net.cn","org.cn","gov.cn","edu.cn",
+    }
+    sfx2 = ".".join(labels[-2:])
+    if sfx2 in multi and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return sfx2
 
 
 def _icp_fp(icp_payload: dict) -> str:
@@ -448,6 +482,42 @@ def _normalize_message_payload(messages: Any) -> List[Dict[str, str]]:
     return normalized
 
 
+def _label_from_payload(ctx_key: str, payload: Dict[str, Any]) -> str:
+    # 1) explicit label in payload
+    try:
+        raw = payload.get("label")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    except Exception:
+        pass
+    # 2) domain label
+    try:
+        if isinstance(ctx_key, str) and ctx_key.startswith("domain:"):
+            return ctx_key.split(":", 1)[1]
+    except Exception:
+        pass
+    # 3) input snippet
+    try:
+        txt = payload.get("input")
+        if isinstance(txt, str) and txt.strip():
+            return (" ".join(txt.strip().split()))[:60]
+    except Exception:
+        pass
+    # 4) last user message snippet
+    try:
+        msgs = payload.get("messages")
+        if isinstance(msgs, list):
+            for m in reversed(msgs):
+                if str(m.get("role") or "").lower() == "user":
+                    c = str(m.get("content") or "").strip()
+                    if c:
+                        return (" ".join(c.split()))[:60]
+    except Exception:
+        pass
+    # 5) fallback
+    return "ICP session"
+
+
 @app.post("/api/orchestrations")
 async def start_orchestration(
     request: Request,
@@ -536,7 +606,7 @@ async def start_orchestration(
                 }
             else:
                 # Create fresh thread and lock any unexpected prior opens
-                label = ctx_key.split(":", 1)[1] if ctx_key.startswith("domain:") else "ICP session"
+                label = _label_from_payload(ctx_key, payload)
                 thread_id = _create_thread(tenant_id, identity.get("sub"), "icp_finder", ctx_key, label)
                 try:
                     _lock_prior_open(tenant_id, identity.get("sub"), "icp_finder", ctx_key, thread_id)
@@ -786,11 +856,39 @@ async def get_orchestration_status(
     request: Request,
     identity: Dict[str, Any] = Depends(require_auth),
 ):
+    """Return latest orchestrator state for a thread.
+
+    Guard against missing state by seeding an idle snapshot so callers never see
+    a 404 solely because the process restarted or a run hasn't started yet.
+    """
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = ORCHESTRATOR.get_state(config)
     values = getattr(snapshot, "values", None) if snapshot else None
+
     if not values:
-        raise HTTPException(status_code=404, detail="Orchestration not found")
+        # Seed a minimal idle state so the UI does not see a 404 for fresh or
+        # restored threads. Best-effort: tolerate older LangGraph versions
+        # missing update_state by catching AttributeError.
+        idle = {
+            "thread_id": thread_id,
+            "status": {
+                "phase": "idle",
+                "message": "Thread created. No runs yet.",
+                "updated_at": _now_iso(),
+            },
+            "status_history": [],
+        }
+        try:
+            upd = getattr(ORCHESTRATOR, "update_state", None)
+            if callable(upd):
+                upd(config, idle)
+            # Re-fetch to return normalized structure
+            snapshot = ORCHESTRATOR.get_state(config)
+            values = getattr(snapshot, "values", None) if snapshot else None
+        except Exception:
+            # Fall back to returning the idle structure directly
+            values = idle
+
     status = values.get("status") or {}
     status_history = values.get("status_history") or []
     return {
@@ -1684,11 +1782,20 @@ async def jobs_status(job_id: int, _: dict = Depends(require_optional_identity))
         return dict(zip(cols, row))
 
 @app.get("/whoami")
-async def whoami(claims: dict = Depends(require_auth)):
+async def whoami(request: Request, claims: dict = Depends(require_auth)):
+    """Return identity info including the effective tenant_id.
+
+    Shows tenant_id from the JWT claim when present, otherwise falls back to
+    the value resolved by require_auth (e.g., X-Tenant-ID header).
+    """
+    effective_tid = claims.get("tenant_id")
+    if effective_tid is None:
+        # require_auth sets request.state.tenant_id from X-Tenant-ID when claim is missing
+        effective_tid = getattr(request.state, "tenant_id", None)
     return {
         "sub": claims.get("sub"),
         "email": claims.get("email"),
-        "tenant_id": claims.get("tenant_id"),
+        "tenant_id": effective_tid,
         "roles": claims.get("roles", []),
     }
 
