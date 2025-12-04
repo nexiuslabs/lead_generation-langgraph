@@ -7,21 +7,46 @@ from src.database import get_conn
 
 
 def _domain_from_value(url: str) -> str:
+    """Extract apex domain from URL or host (see app.main for rationale)."""
     try:
         from urllib.parse import urlparse as _parse
-
         u = url if url.startswith("http") else ("https://" + url)
         p = _parse(u)
         host = (p.netloc or p.path or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if ":" in host:
-            host = host.split(":", 1)[0]
-        if "/" in host:
-            host = host.split("/", 1)[0]
-        return host
     except Exception:
+        host = (url or "").strip().lower()
+    if not host:
         return ""
+    if "@" in host:
+        host = host.split("@", 1)[-1]
+    for sep in ("/", "?", "#"):
+        if sep in host:
+            host = host.split(sep, 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    if all(ch.isdigit() or ch == "." for ch in host) or ":" in host:
+        return host
+    labels = [l for l in host.split(".") if l]
+    if len(labels) <= 2:
+        return host
+    multi = {
+        "co.uk","org.uk","gov.uk","ac.uk","sch.uk","ltd.uk","plc.uk",
+        "com.sg","net.sg","org.sg","gov.sg","edu.sg",
+        "com.au","net.au","org.au","gov.au","edu.au",
+        "co.nz","org.nz","govt.nz","ac.nz",
+        "co.jp","ne.jp","or.jp","ac.jp","go.jp",
+        "com.my","com.ph","com.id","co.id","or.id","ac.id",
+        "com.hk","org.hk","edu.hk","gov.hk","idv.hk",
+        "com.br","net.br","org.br","gov.br","edu.br",
+        "co.kr","ne.kr","or.kr","go.kr","ac.kr",
+        "com.cn","net.cn","org.cn","gov.cn","edu.cn",
+    }
+    sfx2 = ".".join(labels[-2:])
+    if sfx2 in multi and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return sfx2
 
 
 def _first_url_from_messages(messages: List[Dict[str, str]] | None, text: str | None) -> Optional[str]:
@@ -251,3 +276,34 @@ def list_threads(tenant_id: Optional[int], user_id: Optional[str], show_archived
         ]
         return [_row_to_dict(r, cols) for r in rows]
 
+
+def archive_thread(thread_id: str, tenant_id: Optional[int], reason: Optional[str] = None) -> int:
+    """Soft-delete a thread by marking it archived.
+
+    Returns number of affected rows (0 if not found or blocked by RLS).
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        if tenant_id is not None:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+        cur.execute(
+            """
+            UPDATE threads
+               SET status = 'archived', archived_at = now(), last_updated_at = now(),
+                   reason = COALESCE(%s, reason)
+             WHERE id = %s
+            """,
+            (reason, thread_id),
+        )
+        return cur.rowcount or 0
+
+
+def hard_delete_thread(thread_id: str, tenant_id: Optional[int]) -> int:
+    """Hard-delete a thread row. Subject to RLS.
+
+    Returns number of affected rows (0 if not found or blocked by RLS).
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        if tenant_id is not None:
+            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+        cur.execute("DELETE FROM threads WHERE id = %s", (thread_id,))
+        return cur.rowcount or 0

@@ -12,6 +12,8 @@ from .threads_db import (
     resume_eligible,
     get_thread,
     list_threads,
+    archive_thread,
+    hard_delete_thread,
 )
 from src.settings import (
     THREAD_RESUME_WINDOW_DAYS,
@@ -29,6 +31,34 @@ def _label_for_context(context_key: str, fallback: Optional[str] = None) -> str:
     return fallback or "ICP session"
 
 
+def _derive_label(context_key: str, payload: Dict[str, Any]) -> str:
+    # 1) explicit label wins
+    raw = (payload or {}).get("label")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    # 2) domain label
+    if isinstance(context_key, str) and context_key.startswith("domain:"):
+        return context_key.split(":", 1)[1]
+    # 3) use input snippet
+    txt = (payload or {}).get("input")
+    if isinstance(txt, str) and txt.strip():
+        s = " ".join(txt.strip().split())
+        return s[:60]
+    # 4) fall back to last user message
+    msgs = (payload or {}).get("messages")
+    if isinstance(msgs, list):
+        for m in reversed(msgs):
+            try:
+                if str(m.get("role") or "").lower() == "user":
+                    c = str(m.get("content") or "").strip()
+                    if c:
+                        return (" ".join(c.split()))[:60]
+            except Exception:
+                continue
+    # 5) generic
+    return "ICP session"
+
+
 @router.post("/threads")
 async def create_thread_route(
     request: Request,
@@ -38,7 +68,7 @@ async def create_thread_route(
     tenant_id = getattr(request.state, "tenant_id", None)
     user_id = identity.get("sub")
     context_key = context_key_from_payload(payload, tenant_id)
-    label = _label_for_context(context_key, str(payload.get("label") or "").strip() or None)
+    label = _derive_label(context_key, payload)
 
     # Create new open thread and lock prior open threads for the same context
     tid = create_thread(tenant_id, user_id, "icp_finder", context_key, label)
@@ -122,3 +152,54 @@ async def get_thread_route(
         raise HTTPException(status_code=404, detail="thread_not_found")
     return row
 
+
+@router.patch("/threads/{thread_id}")
+async def rename_thread_route(
+    thread_id: str,
+    body: Dict[str, Any],
+    request: Request,
+    _: Dict[str, Any] = Depends(require_auth),
+):
+    tenant_id = getattr(request.state, "tenant_id", None)
+    new_label = (body or {}).get("label")
+    if not isinstance(new_label, str) or not new_label.strip():
+        raise HTTPException(status_code=400, detail="label required")
+    from src.database import get_conn
+    with get_conn() as conn, conn.cursor() as cur:
+        try:
+            if tenant_id is not None:
+                cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+        except Exception:
+            pass
+        cur.execute("UPDATE threads SET label=%s, last_updated_at=now() WHERE id=%s", (new_label.strip(), thread_id))
+        if (cur.rowcount or 0) <= 0:
+            raise HTTPException(status_code=404, detail="thread_not_found")
+    return {"ok": True, "id": thread_id, "label": new_label.strip()}
+
+
+@router.delete("/threads/{thread_id}")
+async def delete_thread_route(
+    thread_id: str,
+    request: Request,
+    hard: bool = False,
+    claims: Dict[str, Any] = Depends(require_auth),
+):
+    """Delete a thread.
+
+    - Default (hard=false): archive the thread (soft delete).
+    - hard=true: permanently delete. Requires 'admin' role.
+    """
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if hard:
+        roles = claims.get("roles", []) or []
+        if "admin" not in roles:
+            raise HTTPException(status_code=403, detail="admin role required for hard delete")
+        n = hard_delete_thread(thread_id, tenant_id)
+        if n <= 0:
+            raise HTTPException(status_code=404, detail="thread_not_found")
+        return {"ok": True, "deleted": True, "id": thread_id}
+    # Soft delete (archive)
+    n = archive_thread(thread_id, tenant_id, reason="user_archive")
+    if n <= 0:
+        raise HTTPException(status_code=404, detail="thread_not_found")
+    return {"ok": True, "archived": True, "id": thread_id}

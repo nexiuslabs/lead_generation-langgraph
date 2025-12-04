@@ -9,7 +9,10 @@ progresses, replace the TODO areas with the real business logic.
 from __future__ import annotations
 
 from langgraph.checkpoint.memory import MemorySaver
+import contextlib
+import atexit
 import os
+import logging
 from langgraph.graph import StateGraph
 
 from .utils import nodes
@@ -51,20 +54,36 @@ def build_orchestrator_graph():
 
     # Prefer durable checkpoint when available, else fall back to memory.
     checkpointer = None
+    dir_path = os.getenv("LANGGRAPH_CHECKPOINT_DIR", ".langgraph_api").rstrip("/")
+    os.makedirs(dir_path, exist_ok=True)
+    db_path = os.path.join(dir_path, "orchestrator.sqlite")
     try:
-        # Use sqlite-backed saver when library is available
-        from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
-
-        dir_path = os.getenv("LANGGRAPH_CHECKPOINT_DIR", ".langgraph_api").rstrip("/")
-        os.makedirs(dir_path, exist_ok=True)
-        db_path = os.path.join(dir_path, "orchestrator.sqlite")
-        # Some versions expose a convenient constructor:
+        # Use async sqlite saver when available (required for ainvoke)
         try:
-            checkpointer = SqliteSaver.from_conn_string(f"sqlite:///{db_path}")  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover - different API surface
-            # Fallback: attempt simple path-based init
-            checkpointer = SqliteSaver(db_path)  # type: ignore[call-arg]
-    except Exception:
+            import importlib.util as _ilu
+            if _ilu.find_spec("aiosqlite") is None:
+                raise RuntimeError("aiosqlite not installed")
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # type: ignore
+
+            # Construct from connection string with explicit aiosqlite driver
+            conn_str = f"sqlite+aiosqlite:///{db_path}"
+            cp = AsyncSqliteSaver.from_conn_string(conn_str)  # type: ignore[attr-defined]
+            # Defensive: if this version returns an async context manager, fall back to memory
+            if not hasattr(cp, "get_next_version"):
+                logging.getLogger(__name__).warning(
+                    "AsyncSqliteSaver.from_conn_string returned context manager; falling back to MemorySaver"
+                )
+                checkpointer = MemorySaver()
+            else:
+                checkpointer = cp
+        except Exception as _e:
+            # Fallback to memory; sync SqliteSaver is not compatible with async ainvoke
+            logging.getLogger(__name__).info(
+                "AsyncSqliteSaver unavailable (%s); using in-memory checkpointing", _e
+            )
+            checkpointer = MemorySaver()
+    except Exception as _e:
+        logging.getLogger(__name__).warning("Checkpoint init failed; using memory: %s", _e)
         checkpointer = MemorySaver()
 
     return graph.compile(checkpointer=checkpointer)

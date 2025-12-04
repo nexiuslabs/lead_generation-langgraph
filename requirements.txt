@@ -42,3 +42,4 @@ apscheduler
 langchain-mcp-adapters
 langgraph 
 langgraph-sdk>=0.1.36
+aiosqlite>=0.19,<1
