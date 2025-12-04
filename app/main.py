@@ -856,11 +856,39 @@ async def get_orchestration_status(
     request: Request,
     identity: Dict[str, Any] = Depends(require_auth),
 ):
+    """Return latest orchestrator state for a thread.
+
+    Guard against missing state by seeding an idle snapshot so callers never see
+    a 404 solely because the process restarted or a run hasn't started yet.
+    """
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = ORCHESTRATOR.get_state(config)
     values = getattr(snapshot, "values", None) if snapshot else None
+
     if not values:
-        raise HTTPException(status_code=404, detail="Orchestration not found")
+        # Seed a minimal idle state so the UI does not see a 404 for fresh or
+        # restored threads. Best-effort: tolerate older LangGraph versions
+        # missing update_state by catching AttributeError.
+        idle = {
+            "thread_id": thread_id,
+            "status": {
+                "phase": "idle",
+                "message": "Thread created. No runs yet.",
+                "updated_at": _now_iso(),
+            },
+            "status_history": [],
+        }
+        try:
+            upd = getattr(ORCHESTRATOR, "update_state", None)
+            if callable(upd):
+                upd(config, idle)
+            # Re-fetch to return normalized structure
+            snapshot = ORCHESTRATOR.get_state(config)
+            values = getattr(snapshot, "values", None) if snapshot else None
+        except Exception:
+            # Fall back to returning the idle structure directly
+            values = idle
+
     status = values.get("status") or {}
     status_history = values.get("status_history") or []
     return {

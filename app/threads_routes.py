@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from typing import Any, Dict, Optional
+import os
+import asyncio
+import httpx
 
 from app.auth import require_auth
 from .threads_db import (
@@ -79,7 +82,37 @@ async def create_thread_route(
         except Exception:
             pass
 
-    return {"id": tid, "status": "open", "context_key": context_key, "label": label}
+    # Best-effort: also create a matching LangGraph thread so SDK calls to
+    # /threads/{id}/history or /threads/{id}/runs do not 404 after dev reloads.
+    async def _create_remote_thread_if_configured(thread_id: str) -> None:
+        base = (os.getenv("LANGGRAPH_REMOTE_URL") or "").strip()
+        if not base:
+            return
+        try:
+            url = base.rstrip("/") + "/threads"
+            headers = {"content-type": "application/json"}
+            api_key = (os.getenv("LANGSMITH_API_KEY") or "").strip()
+            if api_key:
+                headers["x-api-key"] = api_key
+            tenant = getattr(request.state, "tenant_id", None)
+            if tenant is not None:
+                headers["x-tenant-id"] = str(tenant)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                # Some LangGraph servers accept explicit id in payload; ignore errors if unsupported
+                await client.post(url, headers=headers, json={"id": thread_id})
+        except Exception:
+            # Ignore failures; thread will be auto-recreated on first 404 by UI proxy
+            return
+
+    try:
+        # Fire-and-forget; do not delay response
+        asyncio.create_task(_create_remote_thread_if_configured(tid))
+    except Exception:
+        pass
+
+    # Return canonical DB row to reflect actual label/status
+    row = get_thread(tid, tenant_id)
+    return row or {"id": tid, "status": "open", "context_key": context_key, "label": label}
 
 
 @router.post("/threads/{thread_id}/resume")

@@ -4,6 +4,8 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from src.database import get_conn
+import psycopg2
+from psycopg2 import errors as pg_errors
 
 
 def _domain_from_value(url: str) -> str:
@@ -123,18 +125,53 @@ def _row_to_dict(row: tuple, cols: List[str]) -> dict:
 
 
 def create_thread(tenant_id: Optional[int], user_id: Optional[str], agent: str, context_key: str, label: Optional[str] = None) -> str:
+    """Create an open thread if none exists; else return the existing open thread id.
+
+    Handles races against the partial unique index by catching UniqueViolation
+    and selecting the existing row.
+    """
     tid = str(uuid.uuid4())
-    with get_conn() as conn, conn.cursor() as cur:
-        if tenant_id is not None:
-            cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
-        cur.execute(
-            """
-            INSERT INTO threads (id, tenant_id, user_id, agent, context_key, label, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'open')
-            """,
-            (tid, tenant_id, user_id, agent, context_key, label),
-        )
-    return tid
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if tenant_id is not None:
+                cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO threads (id, tenant_id, user_id, agent, context_key, label, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'open')
+                    """,
+                    (tid, tenant_id, user_id, agent, context_key, label),
+                )
+                return tid
+            except Exception as e:
+                # If unique constraint on open thread per context fired, return existing
+                pgcode = getattr(e, "pgcode", None)
+                if isinstance(e, psycopg2.errors.UniqueViolation) or (isinstance(e, psycopg2.IntegrityError) and pgcode == "23505"):
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    with conn.cursor() as cur2:
+                        if tenant_id is not None:
+                            cur2.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+                        cur2.execute(
+                            """
+                            SELECT id FROM threads
+                              WHERE status = 'open'
+                                AND agent = %s AND context_key = %s
+                                AND (%s IS NULL OR tenant_id = %s)
+                                AND (%s IS NULL OR user_id = %s)
+                              ORDER BY last_updated_at DESC
+                              LIMIT 1
+                            """,
+                            (agent, context_key, tenant_id, tenant_id, user_id, user_id),
+                        )
+                        row = cur2.fetchone()
+                        if row and row[0]:
+                            return str(row[0])
+                # Re-raise unknown errors
+                raise
 
 
 def lock_prior_open(tenant_id: Optional[int], user_id: Optional[str], agent: str, context_key: str, exclude_id: str) -> int:
