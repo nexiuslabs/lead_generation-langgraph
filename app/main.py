@@ -265,6 +265,15 @@ try:
 except Exception as _e:
     logger.warning("Chat SSE routes not mounted: %s", _e)
 
+# Mount DB-backed threads API
+try:
+    from app.threads_routes import router as threads_router
+
+    app.include_router(threads_router)
+    logger.info("/threads routes enabled")
+except Exception as _e:
+    logger.warning("Threads routes not mounted: %s", _e)
+
 # Background worker is managed exclusively by scripts/run_bg_worker.py. We do not
 # auto-start any worker in the API process to avoid lifespan conflicts and to
 # keep concerns separated.
@@ -446,6 +455,132 @@ async def start_orchestration(
     identity: Dict[str, Any] = Depends(require_auth),
 ):
     tenant_id = getattr(request.state, "tenant_id", None)
+
+    # If DB-backed threads are enabled, resolve/create the thread in Postgres
+    use_db_threads = False
+    try:
+        from src.settings import USE_DB_THREADS as _USE_DB_THREADS
+
+        use_db_threads = bool(_USE_DB_THREADS)
+    except Exception:
+        use_db_threads = False
+
+    if use_db_threads:
+        # Branch: DB-backed thread lifecycle
+        from app.threads_db import (
+            context_key_from_payload as _ctx_key_from_payload,
+            resume_eligible as _resume_eligible,
+            create_thread as _create_thread,
+            lock_prior_open as _lock_prior_open,
+            get_thread as _get_thread,
+            update_last_updated as _update_last_updated,
+        )
+        try:
+            from src.settings import THREAD_RESUME_WINDOW_DAYS as _WIN
+        except Exception:
+            _WIN = 7
+
+        ctx_key = _ctx_key_from_payload(payload, tenant_id)
+        provided_tid = str(payload.get("thread_id") or "").strip()
+
+        # If a thread was explicitly provided, ensure it's open
+        if provided_tid:
+            row = _get_thread(provided_tid, tenant_id)
+            if not row:
+                raise HTTPException(status_code=404, detail="thread_not_found")
+            if (row.get("status") or "open") != "open":
+                raise HTTPException(status_code=409, detail={"error": "thread_locked", "hint": "create_new"})
+            thread_id = provided_tid
+        else:
+            # Auto-resume when exactly one eligible open thread exists
+            cands = _resume_eligible(tenant_id, identity.get("sub"), "icp_finder", ctx_key, _WIN)
+            if len(cands) == 1:
+                thread_id = cands[0]["id"]
+            elif len(cands) > 1:
+                # Disambiguation flow (mirror legacy in-memory behavior)
+                top = cands[:3]
+                key = f"{tenant_id}|{identity.get('sub')}|{ctx_key}"
+                _PENDING_DISAMBIG[key] = top
+
+                def _label(c: dict) -> str:
+                    from app.threads_db import get_thread as __get_thread
+
+                    r = __get_thread(c["id"], tenant_id)
+                    if r and r.get("label"):
+                        return str(r.get("label"))
+                    ck = (r or {}).get("context_key") or ctx_key
+                    return ck.split(":", 1)[1] if str(ck).startswith("domain:") else (str(ck) or "ICP session")
+
+                lines = []
+                for i, c in enumerate(top, start=1):
+                    label = _label(c)
+                    ts = c.get("last_updated_at") or c.get("created_at") or "recently"
+                    lines.append(f"{i}) {label} — last updated {ts}")
+                msg = "You have multiple ongoing sessions for this ICP. Which should we continue?\n" + "\n".join(lines) + "\nReply with 1, 2, or 3."
+                placeholder_id = str(uuid.uuid4())
+                # Return a locked placeholder; clients can show status and call /threads to choose
+                return {
+                    "thread_id": placeholder_id,
+                    "status": {"phase": "disambiguation", "message": msg},
+                    "status_history": [{"phase": "disambiguation", "message": msg, "timestamp": _now_iso()}],
+                    "output": msg,
+                    "disambiguation_required": True,
+                    "candidates": [
+                        {
+                            "id": c["id"],
+                            "label": _label(c),
+                            "updated_at": c.get("last_updated_at") or c.get("created_at"),
+                        }
+                        for c in top
+                    ],
+                }
+            else:
+                # Create fresh thread and lock any unexpected prior opens
+                label = ctx_key.split(":", 1)[1] if ctx_key.startswith("domain:") else "ICP session"
+                thread_id = _create_thread(tenant_id, identity.get("sub"), "icp_finder", ctx_key, label)
+                try:
+                    _lock_prior_open(tenant_id, identity.get("sub"), "icp_finder", ctx_key, thread_id)
+                except Exception:
+                    pass
+
+        # Build state and run orchestrator
+        _msgs = _normalize_message_payload(payload.get("messages"))
+        _input_raw = str(payload.get("input") or "")
+        if not _input_raw and _msgs:
+            for _m in reversed(_msgs):
+                if (_m.get("role") or "").lower() == "user":
+                    _input_raw = str(_m.get("content") or "")
+                    break
+        state: OrchestrationState = {
+            "messages": _msgs,
+            "input": _input_raw,
+            "input_role": str(payload.get("role") or "user"),
+            "entry_context": {
+                "thread_id": thread_id,
+                "tenant_id": tenant_id,
+                "user_id": identity.get("sub"),
+                "run_mode": str(payload.get("run_mode") or "chat_top10"),
+            },
+            "icp_payload": payload.get("icp_payload") or {},
+        }
+        context = {"thread_id": thread_id, "tenant_id": tenant_id, "source": "api", "user_id": identity.get("sub")}
+        log_json("orchestrator", "info", "run_start", context)
+        t0 = time.perf_counter()
+        result = await ORCHESTRATOR.ainvoke(
+            state,
+            config={"configurable": {"thread_id": thread_id}, "callbacks": _orchestrator_callbacks(context)},
+        )
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        log_json("orchestrator", "info", "run_complete", {"thread_id": thread_id, "tenant_id": tenant_id, "output_status": (result or {}).get("status"), "duration_ms": duration_ms})
+        try:
+            _update_last_updated(thread_id, tenant_id)
+        except Exception:
+            pass
+        status = (result or {}).get("status") or {}
+        status_history = (result or {}).get("status_history") or []
+        return {"thread_id": thread_id, "status": status, "status_history": status_history, "output": status.get("message")}
+
+    # Legacy path: in-memory thread registry
     # Compute context key to enforce single-active-thread policy per context
     ctx_key = _context_key(payload, tenant_id)
 
@@ -642,12 +777,7 @@ async def start_orchestration(
     )
     status = (result or {}).get("status") or {}
     status_history = (result or {}).get("status_history") or []
-    return {
-        "thread_id": thread_id,
-        "status": status,
-        "status_history": status_history,
-        "output": status.get("message"),
-    }
+    return {"thread_id": thread_id, "status": status, "status_history": status_history, "output": status.get("message")}
 
 
 @app.get("/api/orchestrations/{thread_id}")
@@ -2567,3 +2697,104 @@ _load_threads()
 def _orchestrator_callbacks(context: Dict[str, Any] | None = None):
     ctx = context or {}
     return [LangGraphTroubleshootHandler(context=ctx)]
+
+
+# --- Admin: backfill legacy .langgraph_api/threads.json into DB threads ---
+@app.post("/admin/threads/backfill_legacy")
+async def admin_backfill_legacy_threads(request: Request, claims: dict = Depends(require_auth)):
+    roles = claims.get("roles", []) or []
+    if "admin" not in roles:
+        raise HTTPException(status_code=403, detail="admin role required")
+
+    base = os.getenv("LANGGRAPH_CHECKPOINT_DIR", ".langgraph_api").rstrip("/")
+    path = os.path.join(base, "threads.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"legacy threads file not found: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("invalid threads.json (expected object)")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"failed to read legacy file: {e}")
+
+    from app.threads_db import get_thread as _get_thread
+    created = 0
+    skipped = 0
+    exists = 0
+
+    def _parse_ts(val: Any):
+        if not val:
+            return None
+        try:
+            s = str(val)
+            if s.endswith("Z"):
+                s = s.replace("Z", "+00:00")
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    with get_conn() as conn, conn.cursor() as cur:
+        for tid, meta in data.items():
+            try:
+                if not isinstance(meta, dict):
+                    skipped += 1
+                    continue
+                tenant_id_row = meta.get("tenant_id")
+                # Skip if already present for this tenant
+                row = _get_thread(tid, getattr(request.state, "tenant_id", None))
+                if row:
+                    exists += 1
+                    continue
+                tenant_id = tenant_id_row
+                user_id = meta.get("user_id")
+                agent = (meta.get("agent") or "icp_finder").strip()
+                context_key = (meta.get("context_key") or "").strip()
+                if not context_key:
+                    skipped += 1
+                    continue
+                label = meta.get("label") or (context_key.split(":", 1)[1] if context_key.startswith("domain:") else "ICP session")
+                status = (meta.get("status") or "open").strip()
+                locked_at = _parse_ts(meta.get("locked_at"))
+                archived_at = _parse_ts(meta.get("archived_at"))
+                reason = meta.get("reason")
+                last_updated_at = _parse_ts(meta.get("updated_at")) or _parse_ts(meta.get("last_updated_at")) or datetime.now(timezone.utc)
+                created_at = _parse_ts(meta.get("created_at")) or datetime.now(timezone.utc)
+
+                # Apply tenant GUC for RLS
+                try:
+                    if tenant_id is not None:
+                        cur.execute("SELECT set_config('request.tenant_id', %s, true)", (str(int(tenant_id)),))
+                except Exception:
+                    pass
+
+                cur.execute(
+                    """
+                    INSERT INTO threads (id, tenant_id, user_id, agent, context_key, label, status, locked_at, archived_at, reason, last_updated_at, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        tid,
+                        tenant_id,
+                        user_id,
+                        agent,
+                        context_key,
+                        label,
+                        status,
+                        locked_at,
+                        archived_at,
+                        reason,
+                        last_updated_at,
+                        created_at,
+                    ),
+                )
+                if cur.rowcount and int(cur.rowcount) > 0:
+                    created += 1
+                else:
+                    exists += 1
+            except Exception:
+                skipped += 1
+                continue
+
+    return {"ok": True, "imported": created, "skipped": skipped, "exists": exists, "source": path}

@@ -596,6 +596,18 @@ AUTO_ARCHIVE_STALE_LOCKED = os.getenv("AUTO_ARCHIVE_STALE_LOCKED", "true").lower
     "on",
 )
 
+# Thread backend selection: use DB-backed threads (recommended) or legacy in-memory
+USE_DB_THREADS = os.getenv("USE_DB_THREADS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    MAX_OPEN_THREADS_PER_AGENT = int(os.getenv("MAX_OPEN_THREADS_PER_AGENT", "1") or 1)
+except Exception:
+    MAX_OPEN_THREADS_PER_AGENT = 1
+
 # Control whether nodes can pick a tenant_id by reading the first active row
 # from odoo_connections when no tenant metadata is present (dev-only convenience).
 ALLOW_DB_TENANT_FALLBACK = os.getenv("ALLOW_DB_TENANT_FALLBACK", "false").lower() in (
