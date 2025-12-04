@@ -5,6 +5,9 @@ from typing import Any, Dict, Optional
 import os
 import asyncio
 import httpx
+from .thread_runtime_map import get_runtime_id, set_runtime_id
+import logging
+from src.troubleshoot_log import log_json
 
 from app.auth import require_auth
 from .threads_db import (
@@ -26,6 +29,7 @@ from src.settings import (
 
 
 router = APIRouter()
+_lg = logging.getLogger("threads")
 
 
 def _label_for_context(context_key: str, fallback: Optional[str] = None) -> str:
@@ -75,7 +79,35 @@ async def create_thread_route(
 
     # Create new open thread and lock prior open threads for the same context
     tid = create_thread(tenant_id, user_id, "icp_finder", context_key, label)
-    lock_prior_open(tenant_id, user_id, "icp_finder", context_key, tid)
+    locked = 0
+    try:
+        locked = lock_prior_open(tenant_id, user_id, "icp_finder", context_key, tid)
+    finally:
+        try:
+            _lg.info(
+                "threads:create db_thread id=%s tenant=%s user=%s ctx=%s label=%s locked_prior=%s",
+                tid,
+                tenant_id,
+                user_id,
+                context_key,
+                label,
+                locked,
+            )
+            log_json(
+                "threads",
+                "info",
+                "db_thread_create",
+                {
+                    "thread_id": tid,
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "context_key": context_key,
+                    "label": label,
+                    "locked_prior": locked,
+                },
+            )
+        except Exception:
+            pass
     if AUTO_ARCHIVE_STALE_LOCKED:
         try:
             auto_archive_stale_locked(tenant_id, THREAD_STALE_DAYS)
@@ -84,10 +116,10 @@ async def create_thread_route(
 
     # Best-effort: also create a matching LangGraph thread so SDK calls to
     # /threads/{id}/history or /threads/{id}/runs do not 404 after dev reloads.
-    async def _create_remote_thread_if_configured(thread_id: str) -> None:
+    async def _create_remote_thread_if_configured(thread_id: str) -> Optional[str]:
         base = (os.getenv("LANGGRAPH_REMOTE_URL") or "").strip()
         if not base:
-            return
+            return None
         try:
             url = base.rstrip("/") + "/threads"
             headers = {"content-type": "application/json"}
@@ -97,12 +129,32 @@ async def create_thread_route(
             tenant = getattr(request.state, "tenant_id", None)
             if tenant is not None:
                 headers["x-tenant-id"] = str(tenant)
+            log_json("threads", "info", "runtime_create_attempt", {"thread_id": thread_id, "base": base})
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-                # Some LangGraph servers accept explicit id in payload; ignore errors if unsupported
-                await client.post(url, headers=headers, json={"id": thread_id})
-        except Exception:
+                # Create runtime thread using the same id as our DB thread when supported
+                # Many LangGraph servers accept `thread_id` as an override on POST /threads
+                resp = await client.post(url, headers=headers, json={"thread_id": thread_id})
+                rid: Optional[str] = None
+                if resp.status_code in (200, 201):
+                    try:
+                        data = resp.json()
+                        rid = str(data.get("thread_id") or data.get("id") or "") or None
+                    except Exception:
+                        rid = None
+                if rid:
+                    set_runtime_id(thread_id, rid)
+                    try:
+                        same = (rid == thread_id)
+                    except Exception:
+                        same = False
+                    log_json("threads", "info", "runtime_thread_bound", {"thread_id": thread_id, "runtime_thread_id": rid, "same_id": bool(same)})
+                else:
+                    log_json("threads", "warning", "runtime_create_failed", {"thread_id": thread_id, "status": getattr(resp, 'status_code', None)})
+                return rid
+        except Exception as e:
             # Ignore failures; thread will be auto-recreated on first 404 by UI proxy
-            return
+            log_json("threads", "warning", "runtime_create_exception", {"thread_id": thread_id, "error": str(e)})
+            return None
 
     try:
         # Fire-and-forget; do not delay response
@@ -113,6 +165,61 @@ async def create_thread_route(
     # Return canonical DB row to reflect actual label/status
     row = get_thread(tid, tenant_id)
     return row or {"id": tid, "status": "open", "context_key": context_key, "label": label}
+
+
+@router.get("/threads/{thread_id}/runtime")
+async def get_runtime_thread_route(thread_id: str, request: Request, _: Dict[str, Any] = Depends(require_auth)):
+    """Return or create the runtime thread id for a DB thread id.
+
+    - If a mapping exists, return it.
+    - Otherwise, attempt to create a runtime thread and store the mapping.
+    """
+    rid = get_runtime_id(thread_id)
+    if rid:
+        try:
+            log_json("threads", "info", "runtime_mapping_exists", {"thread_id": thread_id, "runtime_thread_id": rid})
+        except Exception:
+            pass
+        return {"thread_id": thread_id, "runtime_thread_id": rid}
+    # Create runtime thread now
+    # Attempt to create a new runtime thread now (same as on create)
+    rid = None
+    base = (os.getenv("LANGGRAPH_REMOTE_URL") or "").strip()
+    if base:
+        try:
+            url = base.rstrip("/") + "/threads"
+            headers = {"content-type": "application/json"}
+            api_key = (os.getenv("LANGSMITH_API_KEY") or "").strip()
+            if api_key:
+                headers["x-api-key"] = api_key
+            tenant = getattr(request.state, "tenant_id", None)
+            if tenant is not None:
+                headers["x-tenant-id"] = str(tenant)
+            log_json("threads", "info", "runtime_create_attempt", {"thread_id": thread_id, "base": base})
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                # Prefer a stable id equal to our DB thread id
+                resp = await client.post(url, headers=headers, json={"thread_id": thread_id})
+                if resp.status_code in (200, 201):
+                    try:
+                        data = resp.json()
+                        rid = str(data.get("thread_id") or data.get("id") or "") or None
+                    except Exception:
+                        rid = None
+        except Exception:
+            rid = None
+    if rid:
+        set_runtime_id(thread_id, rid)
+        try:
+            log_json("threads", "info", "runtime_thread_created", {"thread_id": thread_id, "runtime_thread_id": rid, "same_id": bool(rid == thread_id)})
+        except Exception:
+            pass
+    if not rid:
+        try:
+            log_json("threads", "warning", "runtime_thread_not_found", {"thread_id": thread_id})
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="runtime_thread_not_found")
+    return {"thread_id": thread_id, "runtime_thread_id": rid}
 
 
 @router.post("/threads/{thread_id}/resume")

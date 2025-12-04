@@ -4,6 +4,10 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from src.database import get_conn
+import logging
+from src.troubleshoot_log import log_json
+
+_lg = logging.getLogger("threads.db")
 import psycopg2
 from psycopg2 import errors as pg_errors
 
@@ -143,6 +147,31 @@ def create_thread(tenant_id: Optional[int], user_id: Optional[str], agent: str, 
                     """,
                     (tid, tenant_id, user_id, agent, context_key, label),
                 )
+                try:
+                    _lg.info(
+                        "DB thread created id=%s tenant=%s user=%s agent=%s context_key=%s label=%s",
+                        tid,
+                        tenant_id,
+                        user_id,
+                        agent,
+                        context_key,
+                        (label or ""),
+                    )
+                    log_json(
+                        "threads",
+                        "info",
+                        "db_thread_created",
+                        {
+                            "thread_id": tid,
+                            "tenant_id": tenant_id,
+                            "user_id": user_id,
+                            "agent": agent,
+                            "context_key": context_key,
+                            "label": label or "",
+                        },
+                    )
+                except Exception:
+                    pass
                 return tid
             except Exception as e:
                 # If unique constraint on open thread per context fired, return existing
@@ -169,6 +198,25 @@ def create_thread(tenant_id: Optional[int], user_id: Optional[str], agent: str, 
                         )
                         row = cur2.fetchone()
                         if row and row[0]:
+                            try:
+                                _lg.info(
+                                    "DB thread exists (open) id=%s tenant=%s user=%s agent=%s context_key=%s",
+                                    row[0], tenant_id, user_id, agent, context_key,
+                                )
+                                log_json(
+                                    "threads",
+                                    "info",
+                                    "db_thread_exists_open",
+                                    {
+                                        "thread_id": str(row[0]),
+                                        "tenant_id": tenant_id,
+                                        "user_id": user_id,
+                                        "agent": agent,
+                                        "context_key": context_key,
+                                    },
+                                )
+                            except Exception:
+                                pass
                             return str(row[0])
                 # Re-raise unknown errors
                 raise
