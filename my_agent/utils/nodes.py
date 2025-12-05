@@ -122,13 +122,29 @@ PROMPT_CANCEL_KEEP = (
     "Do you want me to cancel it and update your ICP instead, or keep it running? "
     "Reply ‘yes’ to cancel and update, or ‘no’ to keep running."
 )
+# When the user tries to start a new run while a job is queued/running
+PROMPT_QUEUE_CONFLICT_KEEP = (
+    "I see a discovery/enrichment job already queued or running (ID {job_id}). "
+    "Do you want me to cancel it and start a fresh run instead, or keep it as is? "
+    "Reply ‘yes’ to cancel and start fresh, or ‘no’ to keep the current job."
+)
 PROMPT_CANCEL_ACK = (
     "Okay — I’ve requested cancellation for job {job_id}. "
     "I’ll wait for it to stop safely before applying your ICP changes."
 )
+# Ack variant for rerun (no ICP edits)
+PROMPT_CANCEL_ACK_RERUN = (
+    "Okay — I’ve requested cancellation for job {job_id}. "
+    "Once it stops safely, you can say ‘start discovery’ and I’ll queue a fresh run."
+)
 PROMPT_CANCEL_DONE = (
     "Cancellation complete for job {job_id}. "
     "You can now share your ICP changes and I’ll proceed."
+)
+# Done variant for rerun (no ICP edits)
+PROMPT_CANCEL_DONE_RERUN = (
+    "Cancellation complete for job {job_id}. "
+    "You’re clear to start a fresh discovery — say ‘start discovery’ when ready."
 )
 DISCOVERY_CONFIRM_PHRASES = {
     "start discovery",
@@ -1511,6 +1527,39 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
                     profile["awaiting_enrichment_confirmation"] = True
                     state["profile_state"] = profile
                 _log_step("job_confirmation_intent", captured=True, kind="no")
+        elif last_role == "user":
+            # Fallback: if company+ICP+seeds are ready in this thread, treat a standalone "yes" as confirmation
+            # even if the prior assistant prompt is missing from messages (e.g., after restarts or memory resets).
+            try:
+                ready_company = bool(profile.get("company_profile_confirmed"))
+                ready_icp = bool(profile.get("icp_profile_confirmed"))
+                min_customers = _get_config_int("CUSTOMER_SITES_REQUIRED", 5)
+                ready_customers = len(profile.get("customer_websites") or []) >= max(0, min_customers)
+                if ready_company and ready_icp and ready_customers:
+                    user_text = (_message_text(last_msg) or "").strip().lower()
+                    yes_phrases = {
+                        "yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay", "kk", "alright",
+                        "proceed", "start", "begin", "go ahead", "do it", "run it", "run discovery",
+                        "run enrichment", "please proceed", "go for it", "sounds good"
+                    }
+                    no_phrases = {
+                        "no", "n", "nope", "not now", "later", "don't", "dont", "stop", "hold on",
+                        "wait", "cancel", "skip"
+                    }
+                    if any(p == user_text or p in user_text for p in yes_phrases):
+                        ctx2["intent"] = "confirm_discovery"
+                        state["entry_context"] = ctx2
+                        profile["awaiting_enrichment_confirmation"] = True
+                        state["profile_state"] = profile
+                        _log_step("job_confirmation_intent", captured=True, kind="yes_fallback")
+                    elif any(p == user_text or p in user_text for p in no_phrases):
+                        ctx2["intent"] = "decline_bg_job"
+                        state["entry_context"] = ctx2
+                        profile["awaiting_enrichment_confirmation"] = True
+                        state["profile_state"] = profile
+                        _log_step("job_confirmation_intent", captured=True, kind="no_fallback")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1910,6 +1959,11 @@ Current profile: {profile!r}
 
     ctx = state.get("entry_context") or {}
     last_intent = (ctx.get("intent") or "").strip().lower()
+    # Latest user command text (normalized), used for token checks
+    last_cmd = (ctx.get("last_user_command") or "").strip().lower()
+    # Normalize latest user command text for simple token checks
+    last_cmd = (ctx.get("last_user_command") or "").strip().lower()
+    last_cmd = (ctx.get("last_user_command") or "").strip().lower()
     last_command = (ctx.get("last_user_command") or "").strip().lower()
     normalized_command = last_command.translate(str.maketrans("", "", ".!?")).strip()
 
@@ -2049,6 +2103,7 @@ async def run_guard(state: OrchestrationState) -> OrchestrationState:
     run = state.get("run") or {}
     ctx = state.get("entry_context") or {}
     last_intent = (ctx.get("intent") or "").strip().lower()
+    last_cmd = (ctx.get("last_user_command") or "").strip().lower()
     tenant_id = _get_tenant_id(state)
 
     # Helper: lookup latest active icp_discovery_enrich job for tenant
@@ -2075,15 +2130,58 @@ async def run_guard(state: OrchestrationState) -> OrchestrationState:
             return None
 
     active_job_id = _lookup_active_job(tenant_id)
-    # Case 1: ask for cancel/keep on update intent when a job is active
-    if active_job_id and last_intent == "update_icp" and not run.get("awaiting_cancel_confirmation"):
+    # Case 1: ask for cancel/keep when a job is active and the user either
+    #         wants to update ICP or start a new discovery/enrichment run.
+    wants_new_run = last_intent in {"confirm_discovery", "run_enrichment"}
+    # Consider generic 'update' intent as profile update when it mentions company/ICP fields
+    update_tokens_company = {"company", "company profile", "profile", "website", "name", "summary"}
+    update_tokens_icp = {"icp", "ideal customer", "target", "persona", "industries", "buyers", "titles", "regions", "geos", "pains", "triggers"}
+    mentions_profile_update = last_intent == "update" and any(tok in last_cmd for tok in (update_tokens_company | update_tokens_icp))
+    # If user explicitly asks to cancel, honor it immediately
+    cancel_tokens = {
+        "cancel job", "cancel the job", "cancel run", "cancel current run", "stop job", "stop the job",
+        "abort job", "abort", "terminate job", "kill job", "cancel queued job", "cancel background job",
+        "cancel discovery", "cancel enrichment", "stop discovery", "stop enrichment", "cancel it", "please cancel",
+    }
+    user_requests_cancel = any(tok in last_cmd for tok in cancel_tokens) or last_intent in {"cancel_and_update"}
+    if active_job_id and user_requests_cancel:
+        jid = int(active_job_id)
+        if _request_cancel:
+            try:
+                _request_cancel(jid)
+            except Exception:
+                logger.warning("request_cancel failed for job_id=%s", jid, exc_info=True)
+        cancel_context = "update" if mentions_profile_update or (last_intent == "update_icp") else "rerun"
+        run = {
+            "active_job_id": jid,
+            "status": "pending_cancel",
+            "awaiting_cancel_confirmation": False,
+            "cancel_context": cancel_context,
+        }
+        state["run"] = run
+        ack = (
+            PROMPT_CANCEL_ACK if cancel_context == "update" else PROMPT_CANCEL_ACK_RERUN
+        ).format(job_id=jid)
+        profile.setdefault("outstanding_prompts", [])
+        profile["outstanding_prompts"] = [ack]
+        state["profile_state"] = profile
+        _append_message(state, "assistant", ack)
+        _set_status(state, "run_guard", "pending_cancel")
+        return state
+
+    if active_job_id and (last_intent == "update_icp" or mentions_profile_update or wants_new_run) and not run.get("awaiting_cancel_confirmation"):
+        # Mark the cancel context so downstream prompts/behavior are appropriate
+        cancel_context = "update" if last_intent == "update_icp" else "rerun"
         run = {
             "active_job_id": int(active_job_id),
             "status": "running",
             "awaiting_cancel_confirmation": True,
+            "cancel_context": cancel_context,
         }
         state["run"] = run
-        prompt = PROMPT_CANCEL_KEEP.format(job_id=active_job_id)
+        prompt = (
+            PROMPT_CANCEL_KEEP if cancel_context == "update" else PROMPT_QUEUE_CONFLICT_KEEP
+        ).format(job_id=active_job_id)
         # Make this the primary outstanding prompt so the guard defers work
         profile.setdefault("outstanding_prompts", [])
         profile["outstanding_prompts"] = [prompt]
@@ -2104,17 +2202,22 @@ async def run_guard(state: OrchestrationState) -> OrchestrationState:
             log_json("orchestrator", "info", "cancel_ack", {"tenant_id": _get_tenant_id(state), "job_id": jid or active_job_id})
         except Exception:
             pass
+        # Note the cancel context (update vs rerun) for tailored prompts/behavior
+        cancel_context = str(run.get("cancel_context") or "update")
         run["status"] = "pending_cancel"
         run["awaiting_cancel_confirmation"] = False
         state["run"] = run
-        # Reset ICP readiness and clear discovery cache so journey_guard re-gates work
-        try:
-            profile["icp_profile_confirmed"] = False
-            for key in ("candidate_ids", "planned_candidates", "web_candidates", "top10_details", "next40_details", "top10_domains", "next40_domains", "top10_ids", "next40_ids"):
-                state.setdefault("discovery", {}).pop(key, None)
-        except Exception:
-            pass
-        ack = PROMPT_CANCEL_ACK.format(job_id=jid or active_job_id or "?")
+        # Only reset ICP readiness if this was an update/edit flow. For rerun, keep current ICP confirmations.
+        if cancel_context == "update":
+            try:
+                profile["icp_profile_confirmed"] = False
+                for key in ("candidate_ids", "planned_candidates", "web_candidates", "top10_details", "next40_details", "top10_domains", "next40_domains", "top10_ids", "next40_ids"):
+                    state.setdefault("discovery", {}).pop(key, None)
+            except Exception:
+                pass
+        ack = (
+            PROMPT_CANCEL_ACK if cancel_context == "update" else PROMPT_CANCEL_ACK_RERUN
+        ).format(job_id=jid or active_job_id or "?")
         profile.setdefault("outstanding_prompts", [])
         profile["outstanding_prompts"] = [ack]
         state["profile_state"] = profile
@@ -2382,7 +2485,8 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             normalized = normalized_command
             user_said_yes = (last_intent in positive_intents) or any(p in normalized for p in positive_phrases) or _looks_like_discovery_confirmation(normalized)
             user_said_no = (last_intent in negative_intents) or any(p in normalized for p in negative_phrases)
-            if not wants and not awaiting and tenant_id:
+            # If user already said yes (confirm_discovery) or explicitly requested enrichment, proceed without re-asking
+            if not awaiting and not (wants or user_said_yes) and tenant_id:
                 ask = (
                     f"You're all set — company and ICP are confirmed and {len(customer_sites)} customer sites are on file. "
                     f"Shall I queue a background discovery + enrichment job now? (yes/no)"
@@ -2408,7 +2512,7 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 _set_status(state, "journey_guard", "Awaiting enrichment confirmation")
                 state["profile_state"] = profile
                 return state
-            if (awaiting and user_said_yes) or wants:
+            if user_said_yes or wants:
                 profile["awaiting_enrichment_confirmation"] = False
         except Exception:
             pass
@@ -3073,28 +3177,30 @@ async def progress_report(state: OrchestrationState) -> OrchestrationState:
         run = state.get("run") or {}
         if str(run.get("status") or "") == "pending_cancel" and run.get("active_job_id"):
             jid = int(run.get("active_job_id"))
-            job_msg = None
             status_val = None
-            cancelled_at = None
             try:
                 with get_conn() as conn, conn.cursor() as cur:
                     cur.execute("SELECT status, canceled_at FROM background_jobs WHERE job_id=%s", (jid,))
                     row = cur.fetchone()
                     if row:
                         status_val = str(row[0]) if row[0] is not None else None
-                        cancelled_at = row[1]
             except Exception:
-                pass
+                status_val = None
+            cancel_context = str(run.get("cancel_context") or "update")
             if status_val == "cancelled":
                 # Flip run status and clear outstanding prompt
                 run["status"] = "cancelled"
                 state["run"] = run
-                msg = PROMPT_CANCEL_DONE.format(job_id=jid)
+                msg = (
+                    PROMPT_CANCEL_DONE if cancel_context == "update" else PROMPT_CANCEL_DONE_RERUN
+                ).format(job_id=jid)
                 _set_status(state, "progress_report", msg)
                 _append_message(state, "assistant", msg)
                 return state
             else:
-                msg = PROMPT_CANCEL_ACK.format(job_id=jid)
+                msg = (
+                    PROMPT_CANCEL_ACK if cancel_context == "update" else PROMPT_CANCEL_ACK_RERUN
+                ).format(job_id=jid)
                 _set_status(state, "progress_report", msg)
                 if not state.get("suppress_output"):
                     _append_message(state, "assistant", msg)
