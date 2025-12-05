@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any
 from psycopg2.extras import Json
 
 # Import the dependency and helpers at module scope so tests can monkeypatch ep.* symbols
-from app.auth import require_auth  # noqa: F401  # exposed for monkeypatching in tests
+from app.auth import require_auth, require_optional_identity  # noqa: F401  # exposed for monkeypatching in tests
 from schemas.icp import IntakePayload, SuggestionCard, AcceptRequest
 from schemas.research import ResearchImportRequest, ResearchImportResult
 from src.database import get_conn
@@ -26,6 +26,8 @@ from src.enrichment import enrich_company_with_tavily  # async enrich by company
 from src.chat_events import emit as emit_chat_event
 from src.settings import DEFAULT_NOTIFY_EMAIL, EMAIL_DEV_ACCEPT_TENANT_USER_ID_AS_EMAIL
 from src.jobs import enqueue_icp_discovery_enrich
+from src.troubleshoot_log import log_json
+from urllib.parse import urlparse as _urlparse
 
 ICP_DISCOVERY_CONFIRMATION_PROMPT = (
     "Ready for me to start ICP discovery and refresh the micro-ICP suggestions? Reply **start discovery** (or tell me what to adjust)."
@@ -91,6 +93,23 @@ def _resolve_notify_email(req: Request, x_notify_email: Optional[str], tenant_id
     return None
 
 
+def _dsn_hint() -> Dict[str, Any]:
+    """Return a sanitized DSN hint (host + db name) for troubleshooting logs."""
+    try:
+        from src.settings import POSTGRES_DSN as _DSN  # type: ignore
+    except Exception:
+        _DSN = os.getenv("POSTGRES_DSN", "")
+    if not _DSN:
+        return {"host": None, "database": None}
+    try:
+        pr = _urlparse(_DSN)
+        host = pr.hostname
+        db = (pr.path or "/").lstrip("/")
+        return {"host": host, "database": db}
+    except Exception:
+        return {"host": None, "database": None}
+
+
 def _save_icp_rule(tid: int, payload: Dict[str, Any], name: str = "Default ICP") -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -112,6 +131,19 @@ async def _auth_dep(request: Request):
     wrapper and calling our module-level symbol, tests can replace `require_auth`
     on this module and the wrapper will use the patched function at request time.
     """
+    # In local dev or when DEV_AUTH_BYPASS is true, allow optional identity so curl/UI can call without JWT
+    try:
+        dev = (os.getenv("DEV_AUTH_BYPASS") or "").strip().lower() in ("1","true","yes","on")
+        variant = (os.getenv("LANGSMITH_LANGGRAPH_API_VARIANT") or "").strip().lower()
+        if dev or variant == "local_dev":
+            # Emit a small troubleshooting log
+            try:
+                log_json("icp_api", "info", "auth_bypass", {"variant": variant or None, "dev": dev})
+            except Exception:
+                pass
+            return await require_optional_identity(request)  # type: ignore[misc]
+    except Exception:
+        pass
     return await require_auth(request)  # type: ignore[misc]
 
 
@@ -185,6 +217,21 @@ async def post_enqueue_discovery_enrich(
         raise HTTPException(status_code=400, detail="tenant_id is required")
     email = _resolve_notify_email(req, x_notify_email, tid)
     try:
+        # Structured log for end-to-end traceability
+        try:
+            log_json(
+                "icp_api",
+                "info",
+                "icp_enqueue_try",
+                {
+                    "tenant_id": int(tid),
+                    "notify_email": email,
+                    "client_host": getattr(req.client, "host", None),
+                    "dsn_hint": _dsn_hint(),
+                },
+            )
+        except Exception:
+            pass
         log.info(
             "icp:enqueue request tenant_id=%s email=%s from=%s",
             tid,
@@ -197,9 +244,33 @@ async def post_enqueue_discovery_enrich(
             tid,
             res.get("job_id"),
         )
+        try:
+            log_json(
+                "icp_api",
+                "info",
+                "icp_enqueue_ok",
+                {"tenant_id": int(tid), "job_id": res.get("job_id")},
+            )
+        except Exception:
+            pass
         return {"status": "queued", "job_id": res.get("job_id"), "notify_email": email}
     except Exception as e:
         log.exception("icp:enqueue failed tenant_id=%s error=%s", tid, e)
+        try:
+            log_json(
+                "icp_api",
+                "error",
+                "icp_enqueue_exception",
+                {
+                    "tenant_id": int(tid),
+                    "notify_email": email,
+                    "client_host": getattr(req.client, "host", None),
+                    "dsn_hint": _dsn_hint(),
+                    "error": str(e),
+                },
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"enqueue failed: {e}")
 
 

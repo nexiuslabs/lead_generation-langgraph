@@ -26,6 +26,8 @@ def build_orchestrator_graph():
     # New: probe returning-user context before building profiles
     graph.add_node("return_user_probe", nodes.return_user_probe)
     graph.add_node("profile_builder", nodes.profile_builder)
+    # New: mid-run update/cancel gating
+    graph.add_node("run_guard", nodes.run_guard)
     graph.add_node("journey_guard", nodes.journey_guard)
     graph.add_node("normalize", nodes.normalize)
     graph.add_node("refresh_icp", nodes.refresh_icp)
@@ -37,7 +39,9 @@ def build_orchestrator_graph():
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "return_user_probe")
     graph.add_edge("return_user_probe", "profile_builder")
-    graph.add_edge("profile_builder", "journey_guard")
+    # Interpose run_guard between profile_builder and journey_guard
+    graph.add_edge("profile_builder", "run_guard")
+    graph.add_edge("run_guard", "journey_guard")
     graph.add_conditional_edges(
         "journey_guard",
         lambda state: "ready" if state.get("journey_ready") else "pending",

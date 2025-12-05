@@ -1771,15 +1771,58 @@ async def jobs_staging_upsert(body: dict, claims: dict = Depends(require_optiona
 @app.get("/jobs/{job_id}")
 async def jobs_status(job_id: int, _: dict = Depends(require_optional_identity)):
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT job_id, job_type, status, processed, total, error, created_at, started_at, ended_at FROM background_jobs WHERE job_id=%s",
-            (job_id,),
-        )
+        # Include cancel flags when present
+        try:
+            cur.execute(
+                "SELECT job_id, job_type, status, processed, total, error, created_at, started_at, ended_at, cancel_requested, canceled_at FROM background_jobs WHERE job_id=%s",
+                (job_id,),
+            )
+        except Exception:
+            cur.execute(
+                "SELECT job_id, job_type, status, processed, total, error, created_at, started_at, ended_at, NULL::boolean AS cancel_requested, NULL::timestamptz AS canceled_at FROM background_jobs WHERE job_id=%s",
+                (job_id,),
+            )
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="job not found")
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, row))
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def jobs_cancel(job_id: int, claims: dict = Depends(require_auth)):
+    roles = claims.get("roles", []) or []
+    # Resolve job tenant and authorize
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT tenant_id, status FROM background_jobs WHERE job_id=%s", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="job not found")
+        job_tid = row[0]
+        status = str(row[1]) if row[1] is not None else None
+    # Only allow cancel on queued/running
+    if status not in {"queued", "running"}:
+        raise HTTPException(status_code=400, detail="job not cancellable")
+    # Allow if admin or same tenant
+    effective_tid = claims.get("tenant_id")
+    if (job_tid is not None) and (effective_tid is not None) and int(job_tid) != int(effective_tid) and ("admin" not in roles):
+        raise HTTPException(status_code=403, detail="forbidden")
+    # Request cancel
+    try:
+        from src.jobs import request_cancel as _request_cancel  # type: ignore
+        res = _request_cancel(int(job_id))
+        if not res.get("ok"):
+            raise HTTPException(status_code=400, detail=str(res.get("error")))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cancel_failed: {e}")
+    # Log
+    try:
+        log_json("jobs", "info", "cancel_request", {"job_id": int(job_id), "tenant_id": int(job_tid) if job_tid is not None else None})
+    except Exception:
+        pass
+    return {"ok": True, "job_id": int(job_id), "status": "pending_cancel"}
 
 @app.get("/whoami")
 async def whoami(request: Request, claims: dict = Depends(require_auth)):

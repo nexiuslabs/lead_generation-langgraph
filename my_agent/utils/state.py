@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict, Literal
 
 from langgraph.graph import MessagesState
 
@@ -67,6 +67,12 @@ class StatusState(TypedDict, total=False):
     updated_at: Optional[str]
 
 
+class RunState(TypedDict, total=False):
+    active_job_id: Optional[int]
+    status: Literal['idle','running','pending_cancel','cancelled']
+    awaiting_cancel_confirmation: bool
+
+
 class OrchestrationState(MessagesState, total=False):
     tenant_id: Optional[int]
     thread_id: Optional[str]
@@ -83,3 +89,5 @@ class OrchestrationState(MessagesState, total=False):
     exports: ExportState
     status: StatusState
     status_history: List[Dict[str, Any]]
+    # Run-cancellation guard: captures mid-run update/cancel state
+    run: RunState

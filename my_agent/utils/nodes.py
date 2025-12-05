@@ -22,6 +22,10 @@ import requests
 from src.icp import icp_by_ssic_agent, icp_refresh_agent, normalize_agent
 from src.lead_scoring import lead_scoring_agent
 from src.jobs import _odoo_export_for_ids
+try:
+    from src.jobs import request_cancel as _request_cancel  # type: ignore
+except Exception:  # pragma: no cover
+    _request_cancel = None  # type: ignore
 
 try:
     from src.jobs import enqueue_web_discovery_bg_enrich as _enqueue_next40  # legacy stub
@@ -99,6 +103,33 @@ RUN_ENRICH_PHRASES = {
     "enrich ten",
     "please enrich",
 }
+ICP_UPDATE_TRIGGERS = {
+    "update icp",
+    "change icp",
+    "revise icp",
+    "update target",
+    "change target",
+    "revise target",
+    "update persona",
+    "change persona",
+    "update ideal customer",
+    "revise ideal customer",
+}
+
+# Cancel prompts used by run_guard/progress_report
+PROMPT_CANCEL_KEEP = (
+    "I see a discovery/enrichment job running now (ID {job_id}). "
+    "Do you want me to cancel it and update your ICP instead, or keep it running? "
+    "Reply ‘yes’ to cancel and update, or ‘no’ to keep running."
+)
+PROMPT_CANCEL_ACK = (
+    "Okay — I’ve requested cancellation for job {job_id}. "
+    "I’ll wait for it to stop safely before applying your ICP changes."
+)
+PROMPT_CANCEL_DONE = (
+    "Cancellation complete for job {job_id}. "
+    "You can now share your ICP changes and I’ll proceed."
+)
 DISCOVERY_CONFIRM_PHRASES = {
     "start discovery",
     "begin discovery",
@@ -1367,7 +1398,7 @@ async def ingest_message(state: OrchestrationState) -> OrchestrationState:
 You normalize chat inputs for a lead-generation orchestrator.
 Respond with JSON {{"normalized_text": "...", "intent": "...", "tags": [...]}}.
 Input: {incoming!r}
-Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery, accept_micro_icp, question, chat, idle.
+Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery, accept_micro_icp, update_icp, cancel_and_update, keep_running, status, question, chat, idle.
 """
         fallback = {
             "normalized_text": incoming,
@@ -1393,6 +1424,30 @@ Intent options: run_enrichment, confirm_company, confirm_icp, confirm_discovery,
                 "is_greeting": _is_greeting(incoming),
             }
         )
+        # Specialize intents for mid-run update/cancel flows using simple heuristics
+        norm = (analysis.get("normalized_text") or incoming).strip().lower()
+        # If user mentions updating ICP/target, refine to update_icp
+        if any(p in norm for p in ICP_UPDATE_TRIGGERS):
+            analysis["intent"] = "update_icp"
+        # If awaiting cancel confirmation, map yes/no to cancel_and_update/keep_running
+        try:
+            run = state.get("run") or {}
+            if bool(run.get("awaiting_cancel_confirmation")):
+                yes_set = {"yes", "y", "yeah", "yep", "please cancel", "cancel", "stop"}
+                no_set = {"no", "n", "nope", "keep", "keep running", "continue"}
+                txt = norm
+                if any(tok == txt or tok in txt for tok in yes_set):
+                    analysis["intent"] = "cancel_and_update"
+                elif any(tok == txt or tok in txt for tok in no_set):
+                    analysis["intent"] = "keep_running"
+        except Exception:
+            pass
+        # If we refined the intent, mirror it into entry_context
+        try:
+            if analysis.get("intent") and ctx.get("intent") != analysis.get("intent"):
+                ctx["intent"] = analysis.get("intent")
+        except Exception:
+            pass
         state["entry_context"] = ctx
         if ctx.get("tenant_id"):
             state["tenant_id"] = ctx["tenant_id"]
@@ -1979,9 +2034,136 @@ Current profile: {profile!r}
     return state
 
 
+async def run_guard(state: OrchestrationState) -> OrchestrationState:
+    """Intercept mid-run ICP updates and coordinate cooperative cancellation.
+
+    - If an active icp_discovery_enrich job exists and user intent is update_icp,
+      ask to cancel or keep running and set awaiting_cancel_confirmation.
+    - If awaiting_cancel_confirmation and intent is cancel_and_update, request cancel
+      and mark pending_cancel.
+    - If awaiting_cancel_confirmation and intent is keep_running, clear the flag and pass through.
+    Idempotent: safe to re-enter with the same state.
+    """
+    # Default: pass-through
+    profile = _ensure_profile_state(state)
+    run = state.get("run") or {}
+    ctx = state.get("entry_context") or {}
+    last_intent = (ctx.get("intent") or "").strip().lower()
+    tenant_id = _get_tenant_id(state)
+
+    # Helper: lookup latest active icp_discovery_enrich job for tenant
+    def _lookup_active_job(tid: Optional[int]) -> Optional[int]:
+        if tid is None:
+            return None
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT job_id, status
+                      FROM background_jobs
+                     WHERE tenant_id=%s
+                       AND job_type='icp_discovery_enrich'
+                       AND status IN ('queued','running')
+                     ORDER BY job_id DESC
+                     LIMIT 1
+                    """,
+                    (int(tid),),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+        except Exception:
+            return None
+
+    active_job_id = _lookup_active_job(tenant_id)
+    # Case 1: ask for cancel/keep on update intent when a job is active
+    if active_job_id and last_intent == "update_icp" and not run.get("awaiting_cancel_confirmation"):
+        run = {
+            "active_job_id": int(active_job_id),
+            "status": "running",
+            "awaiting_cancel_confirmation": True,
+        }
+        state["run"] = run
+        prompt = PROMPT_CANCEL_KEEP.format(job_id=active_job_id)
+        # Make this the primary outstanding prompt so the guard defers work
+        profile.setdefault("outstanding_prompts", [])
+        profile["outstanding_prompts"] = [prompt]
+        state["profile_state"] = profile
+        _append_message(state, "assistant", prompt)
+        _set_status(state, "run_guard", "awaiting_cancel_confirmation")
+        return state
+
+    # Case 2: awaiting confirmation, user chose cancel
+    if bool(run.get("awaiting_cancel_confirmation")) and last_intent == "cancel_and_update":
+        jid = int(run.get("active_job_id") or active_job_id or 0)
+        if jid and _request_cancel:
+            try:
+                _request_cancel(jid)
+            except Exception:
+                logger.warning("request_cancel failed for job_id=%s", jid, exc_info=True)
+        try:
+            log_json("orchestrator", "info", "cancel_ack", {"tenant_id": _get_tenant_id(state), "job_id": jid or active_job_id})
+        except Exception:
+            pass
+        run["status"] = "pending_cancel"
+        run["awaiting_cancel_confirmation"] = False
+        state["run"] = run
+        # Reset ICP readiness and clear discovery cache so journey_guard re-gates work
+        try:
+            profile["icp_profile_confirmed"] = False
+            for key in ("candidate_ids", "planned_candidates", "web_candidates", "top10_details", "next40_details", "top10_domains", "next40_domains", "top10_ids", "next40_ids"):
+                state.setdefault("discovery", {}).pop(key, None)
+        except Exception:
+            pass
+        ack = PROMPT_CANCEL_ACK.format(job_id=jid or active_job_id or "?")
+        profile.setdefault("outstanding_prompts", [])
+        profile["outstanding_prompts"] = [ack]
+        state["profile_state"] = profile
+        _append_message(state, "assistant", ack)
+        _set_status(state, "run_guard", "pending_cancel")
+        return state
+
+    # Case 3: awaiting confirmation, user chose to keep running
+    if bool(run.get("awaiting_cancel_confirmation")) and last_intent == "keep_running":
+        run["awaiting_cancel_confirmation"] = False
+        # Preserve any ICP draft implicitly; just clear the prompt
+        state["run"] = run
+        try:
+            # Remove prior cancel prompts
+            outs = profile.get("outstanding_prompts") or []
+            profile["outstanding_prompts"] = [p for p in outs if "cancel" not in (p or "").lower()]
+        except Exception:
+            pass
+        state["profile_state"] = profile
+        _set_status(state, "run_guard", "kept_running")
+        return state
+
+    # Default: no-op
+    _set_status(state, "run_guard", "pass")
+    return state
+
 async def journey_guard(state: OrchestrationState) -> OrchestrationState:
     """Ensure prerequisites exist before backend work."""
     profile = _ensure_profile_state(state)
+    # Mid-run cancel gating: if awaiting confirmation or pending cancel, do not enqueue new work
+    try:
+        run = state.get("run") or {}
+        if bool(run.get("awaiting_cancel_confirmation")) or (str(run.get("status") or "") == "pending_cancel"):
+            # Surface the most recent cancel prompt/status and route to progress
+            prompt = None
+            outs = profile.get("outstanding_prompts") or []
+            if outs:
+                prompt = outs[0]
+            else:
+                jid = run.get("active_job_id")
+                prompt = (PROMPT_CANCEL_ACK if str(run.get("status") or "") == "pending_cancel" else PROMPT_CANCEL_KEEP).format(job_id=jid or "?")
+                profile["outstanding_prompts"] = [prompt]
+                state["profile_state"] = profile
+            _append_message(state, "assistant", prompt)
+            state["journey_ready"] = False
+            _set_status(state, "journey_guard", "run_cancel_gate")
+            return state
+    except Exception:
+        pass
     company_ready = bool(profile.get("company_profile_confirmed"))
     icp_ready = bool(profile.get("icp_profile_confirmed"))
     discovery_ready = bool(profile.get("icp_discovery_confirmed"))
@@ -2243,8 +2425,26 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             profile["outstanding_prompts"] = [msg]
             _append_message(state, "assistant", msg)
             _set_status(state, "journey_guard", msg)
-            _log_step("enqueue_ui", tenant_id=int(tenant_id), event_type="queue_job")
+            _log_step(
+                "enqueue_ui",
+                tenant_id=int(tenant_id),
+                event_type="queue_job",
+                ui_enqueue=True,
+                has_lgcommand=True,
+            )
             return _LGCommand(update={}, custom=evt)  # type: ignore
+        elif ui_enqueue:
+            # UI enqueue desired but missing prerequisites; log why it was skipped
+            try:
+                _log_step(
+                    "enqueue_ui_skipped",
+                    tenant_id=int(tenant_id) if tenant_id else None,
+                    ui_enqueue=True,
+                    has_lgcommand=bool(_LGCommand is not None),
+                    has_tenant=bool(tenant_id),
+                )
+            except Exception:
+                pass
 
         # Resolve notify email using policy similar to API endpoint
         def _resolve_email() -> Optional[str]:
@@ -2273,6 +2473,14 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
             return None
 
         notify_email = _resolve_email()
+        try:
+            _log_step(
+                "notify_email_resolved",
+                tenant_id=int(tenant_id) if tenant_id else None,
+                notify_email=(notify_email or "<none>")[:200],
+            )
+        except Exception:
+            pass
         job_id = None
         try:
             if _enqueue_unified is not None and tenant_id:
@@ -2280,9 +2488,19 @@ async def journey_guard(state: OrchestrationState) -> OrchestrationState:
                 job_id = (res or {}).get("job_id")
                 if not job_id:
                     _log_step("enqueue_bg", ok=False, reason="no_job_id", tenant_id=tenant_id, response=res)
-        except Exception:
+        except Exception as e:
             job_id = None
-            _log_step("enqueue_bg", ok=False, reason="exception", tenant_id=tenant_id)
+            try:
+                # Include error detail for diagnosis
+                _log_step(
+                    "enqueue_bg",
+                    ok=False,
+                    reason="exception",
+                    tenant_id=tenant_id,
+                    error=str(e),
+                )
+            except Exception:
+                pass
         if tenant_id and job_id:
             msg = (
                 f"Thanks — I’ve queued background discovery and enrichment for your ICP. "
@@ -2850,6 +3068,40 @@ async def progress_report(state: OrchestrationState) -> OrchestrationState:
                     pass
     except Exception:
         pass
+    # If a cancel is pending, poll job and surface status
+    try:
+        run = state.get("run") or {}
+        if str(run.get("status") or "") == "pending_cancel" and run.get("active_job_id"):
+            jid = int(run.get("active_job_id"))
+            job_msg = None
+            status_val = None
+            cancelled_at = None
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT status, canceled_at FROM background_jobs WHERE job_id=%s", (jid,))
+                    row = cur.fetchone()
+                    if row:
+                        status_val = str(row[0]) if row[0] is not None else None
+                        cancelled_at = row[1]
+            except Exception:
+                pass
+            if status_val == "cancelled":
+                # Flip run status and clear outstanding prompt
+                run["status"] = "cancelled"
+                state["run"] = run
+                msg = PROMPT_CANCEL_DONE.format(job_id=jid)
+                _set_status(state, "progress_report", msg)
+                _append_message(state, "assistant", msg)
+                return state
+            else:
+                msg = PROMPT_CANCEL_ACK.format(job_id=jid)
+                _set_status(state, "progress_report", msg)
+                if not state.get("suppress_output"):
+                    _append_message(state, "assistant", msg)
+                return state
+    except Exception:
+        pass
+
     outstanding = (state.get("profile_state") or {}).get("outstanding_prompts") or []
     if outstanding:
         message = outstanding[0]

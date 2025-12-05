@@ -14,6 +14,7 @@ import json
 import threading
 from src.settings import ICP_RULE_NAME
 from src.troubleshoot_log import log_json
+from urllib.parse import urlparse as _urlparse
 
 # Reuse the batched/streaming implementation from lg_entry
 try:
@@ -33,6 +34,109 @@ CRAWL_CONCURRENCY = int(os.getenv("CRAWL_CONCURRENCY", "4") or 4)
 
 log = logging.getLogger("jobs")
 _DEFAULT_DISCOVERY_COUNTRY = (os.getenv("MCP_SEARCH_COUNTRY") or os.getenv("DEFAULT_DISCOVERY_COUNTRY") or "").strip() or None
+
+
+def request_cancel(job_id: int) -> dict:
+    """Mark a queued/running job as cancel_requested.
+
+    Uses both a dedicated boolean column (when available via migrations) and params JSONB for compatibility.
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        # Write params flag unconditionally; set cancel_requested column when it exists
+        try:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                   SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('cancel_requested', true),
+                       cancel_requested = TRUE
+                 WHERE job_id=%s AND status IN ('queued','running')
+             RETURNING job_id, status
+                """,
+                (int(job_id),),
+            )
+        except Exception:
+            cur.execute(
+                """
+                UPDATE background_jobs
+                   SET params = COALESCE(params,'{}'::jsonb) || jsonb_build_object('cancel_requested', true)
+                 WHERE job_id=%s AND status IN ('queued','running')
+             RETURNING job_id, status
+                """,
+                (int(job_id),),
+            )
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "error": "not_cancellable"}
+        try:
+            log.info('{"job":"cancel_request","job_id":%s,"status":"%s"}', int(row[0]), str(row[1]))
+        except Exception:
+            pass
+        return {"ok": True, "job_id": int(row[0]), "status": str(row[1])}
+
+
+def request_cancel_current(tenant_id: int) -> dict:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT job_id
+              FROM background_jobs
+             WHERE tenant_id=%s AND job_type='icp_discovery_enrich' AND status IN ('queued','running')
+             ORDER BY job_id DESC
+             LIMIT 1
+            """,
+            (int(tenant_id),),
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return {"ok": False, "error": "no_active_job"}
+        jid = int(row[0])
+    return request_cancel(jid)
+
+
+def _should_cancel(job_id: int) -> bool:
+    """Return True when cancel has been requested for the job."""
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT cancel_requested, params FROM background_jobs WHERE job_id=%s",
+                    (int(job_id),),
+                )
+            except Exception:
+                cur.execute(
+                    "SELECT NULL::boolean AS cancel_requested, params FROM background_jobs WHERE job_id=%s",
+                    (int(job_id),),
+                )
+            row = cur.fetchone()
+            if not row:
+                return False
+            col = bool(row[0]) if row[0] is not None else False
+            params = row[1] or {}
+            flag = False
+            try:
+                flag = bool(params.get("cancel_requested")) if isinstance(params, dict) else False
+            except Exception:
+                flag = False
+            return bool(col or flag)
+    except Exception:
+        return False
+
+
+def _dsn_hint() -> dict:
+    """Return a sanitized DSN hint for logs (host + db name only)."""
+    try:
+        from src.settings import POSTGRES_DSN as _DSN  # type: ignore
+    except Exception:
+        _DSN = os.getenv("POSTGRES_DSN", "")
+    if not _DSN:
+        return {"host": None, "database": None}
+    try:
+        pr = _urlparse(_DSN)
+        host = pr.hostname
+        db = (pr.path or "/").lstrip("/")
+        return {"host": host, "database": db}
+    except Exception:
+        return {"host": None, "database": None}
 
 
 def _normalize_domain(value: str) -> Optional[str]:
@@ -572,68 +676,135 @@ def enqueue_icp_discovery_enrich(tenant_id: int, notify_email: Optional[str] = N
     params = {"notify_email": notify_email} if notify_email else {}
     if fp:
         params["fp"] = fp
-    with get_conn() as conn, conn.cursor() as cur:
-        # Acquire a short-lived advisory lock on (tenant_id, fp_key) to prevent races
-        try:
-            if fp_key:
-                cur.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (int(tenant_id), int(fp_key)))
-        except Exception:
-            pass
-        # Check for an existing queued/running job with the same fingerprint
-        if fp:
+    # Emit a structured "try" log to aid diagnosis
+    try:
+        log_json(
+            "jobs",
+            "info",
+            "enqueue_try",
+            {
+                "tenant_id": int(tenant_id),
+                "job_type": "icp_discovery_enrich",
+                "fp": fp or None,
+                "dsn_hint": _dsn_hint(),
+            },
+        )
+    except Exception:
+        pass
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            # Acquire a short-lived advisory lock on (tenant_id, fp_key) to prevent races
+            # If this fails on the managed DB, log + rollback and continue without the lock.
             try:
-                cur.execute(
-                    """
-                    SELECT job_id
-                      FROM background_jobs
-                     WHERE tenant_id = %s
-                       AND job_type = 'icp_discovery_enrich'
-                       AND status IN ('queued','running')
-                       AND COALESCE(params->>'fp','') = %s
-                     ORDER BY job_id DESC
-                     LIMIT 1
-                    """,
-                    (int(tenant_id), fp),
-                )
-                r = cur.fetchone()
-                if r and r[0] is not None:
-                    jid = int(r[0])
+                if fp_key:
+                    cur.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (int(tenant_id), int(fp_key)))
+            except Exception as aex:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    log_json(
+                        "jobs",
+                        "warning",
+                        "advisory_lock_failed",
+                        {
+                            "tenant_id": int(tenant_id),
+                            "job_type": "icp_discovery_enrich",
+                            "dsn_hint": _dsn_hint(),
+                            "error": str(aex),
+                        },
+                    )
+                except Exception:
+                    pass
+                # Best-effort: proceed without the lock; dedup SELECT guards duplicates
+            # Check for an existing queued/running job with the same fingerprint
+            if fp:
+                try:
+                    cur.execute(
+                        """
+                        SELECT job_id
+                          FROM background_jobs
+                         WHERE tenant_id = %s
+                           AND job_type = 'icp_discovery_enrich'
+                           AND status IN ('queued','running')
+                           AND COALESCE(params->>'fp','') = %s
+                         ORDER BY job_id DESC
+                         LIMIT 1
+                        """,
+                        (int(tenant_id), fp),
+                    )
+                    r = cur.fetchone()
+                    if r and r[0] is not None:
+                        jid = int(r[0])
+                        try:
+                            log.info(
+                                '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"dedup":"existing","fp":"%s"}',
+                                int(tenant_id),
+                                jid,
+                                fp,
+                            )
+                        except Exception:
+                            pass
+                        return {"job_id": jid, "dedup": True}
+                except Exception as dex:
+                    # If the dedup SELECT fails (e.g., table missing/perms), rollback and raise a clear error
                     try:
-                        log.info(
-                            '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"dedup":"existing","fp":"%s"}',
-                            int(tenant_id),
-                            jid,
-                            fp,
-                        )
+                        conn.rollback()
                     except Exception:
                         pass
-                    return {"job_id": jid, "dedup": True}
+                    raise RuntimeError(f"dedup_select_failed: {dex}")
+            # Insert new job
+            cur.execute(
+                "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'icp_discovery_enrich','queued', %s) RETURNING job_id",
+                (int(tenant_id), Json(params)),
+            )
+            row = cur.fetchone()
+            jid = int(row[0]) if row and row[0] is not None else 0
+            try:
+                log.info(
+                    '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"notify_email":%s,"fp":"%s"}',
+                    int(tenant_id),
+                    int(jid),
+                    json.dumps(notify_email) if notify_email else 'null',
+                    fp or ''
+                )
             except Exception:
                 pass
-        # Insert new job
-        cur.execute(
-            "INSERT INTO background_jobs(tenant_id, job_type, status, params) VALUES (%s,'icp_discovery_enrich','queued', %s) RETURNING job_id",
-            (int(tenant_id), Json(params)),
-        )
-        row = cur.fetchone()
-        jid = int(row[0]) if row and row[0] is not None else 0
+            try:
+                if jid:
+                    payload = json.dumps({"job_id": jid, "type": "icp_discovery_enrich"})
+                    cur.execute("NOTIFY bg_jobs, %s", (payload,))
+            except Exception:
+                pass
+            try:
+                log_json(
+                    "jobs",
+                    "info",
+                    "enqueue_ok",
+                    {"tenant_id": int(tenant_id), "job_id": int(jid), "job_type": "icp_discovery_enrich"},
+                )
+            except Exception:
+                pass
+            return {"job_id": jid}
+    except Exception as e:
+        # Surface detailed diagnostics while preserving exception behavior for callers
         try:
-            log.info(
-                '{"job":"enqueue","job_type":"icp_discovery_enrich","tenant_id":%s,"job_id":%s,"notify_email":%s,"fp":"%s"}',
-                int(tenant_id),
-                int(jid),
-                json.dumps(notify_email) if notify_email else 'null',
-                fp or ''
+            log_json(
+                "jobs",
+                "error",
+                "enqueue_exception",
+                {
+                    "tenant_id": int(tenant_id),
+                    "job_type": "icp_discovery_enrich",
+                    "fp": fp or None,
+                    "dsn_hint": _dsn_hint(),
+                    "error": str(e),
+                },
             )
         except Exception:
             pass
-        try:
-            if jid:
-                payload = json.dumps({"job_id": jid, "type": "icp_discovery_enrich"})
-                cur.execute("NOTIFY bg_jobs, %s", (payload,))
-        except Exception:
-            pass
-        return {"job_id": jid}
+        raise
 
 
 async def run_icp_discovery_enrich(job_id: int) -> None:
@@ -676,6 +847,22 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
 
     run_id = _begin_run(tenant_id)
     try:
+        # Early cancel check right after start
+        if _should_cancel(job_id):
+            with get_conn() as conn, conn.cursor() as cur:
+                try:
+                    cur.execute("UPDATE background_jobs SET status='cancelled', canceled_at=now(), ended_at=now() WHERE job_id=%s", (job_id,))
+                except Exception:
+                    cur.execute("UPDATE background_jobs SET status='cancelled', ended_at=now() WHERE job_id=%s", (job_id,))
+            try:
+                log.info('{"job":"icp_discovery_enrich","phase":"cancelled","job_id":%s,"at":"start"}', job_id)
+            except Exception:
+                pass
+            try:
+                log_json("background_worker", "info", "cancelled", {"job_id": int(job_id), "tenant_id": int(tenant_id) if tenant_id is not None else None, "phase": "start"})
+            except Exception:
+                pass
+            return
         # 1) Discovery via Deep Research (simple seed = tenant name or fallback)
         # Load a seed/company name from tenant profile or companies table as a placeholder
         with get_conn() as conn, conn.cursor() as cur:
@@ -744,6 +931,22 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
                     )
                 except Exception:
                     pass
+            # Cooperate: cancel after discovery
+            if _should_cancel(job_id):
+                with get_conn() as conn, conn.cursor() as cur:
+                    try:
+                        cur.execute("UPDATE background_jobs SET status='cancelled', canceled_at=now(), ended_at=now() WHERE job_id=%s", (job_id,))
+                    except Exception:
+                        cur.execute("UPDATE background_jobs SET status='cancelled', ended_at=now() WHERE job_id=%s", (job_id,))
+                try:
+                    log.info('{"job":"icp_discovery_enrich","phase":"cancelled","job_id":%s,"at":"post_discovery"}', job_id)
+                except Exception:
+                    pass
+                try:
+                    log_json("background_worker", "info", "cancelled", {"job_id": int(job_id), "tenant_id": int(tenant_id) if tenant_id is not None else None, "phase": "post_discovery"})
+                except Exception:
+                    pass
+                return
             if not domains:
                 from src.settings import JINA_DEEP_RESEARCH_DISCOVERY_MAX_URLS
 
@@ -884,6 +1087,27 @@ async def run_icp_discovery_enrich(job_id: int) -> None:
             except Exception:
                 pass
             for idx, d in enumerate(stage_domains, start=1):
+                if _should_cancel(job_id):
+                    with get_conn() as conn, conn.cursor() as cur:
+                        try:
+                            cur.execute(
+                                "UPDATE background_jobs SET status='cancelled', canceled_at=now(), ended_at=now(), processed=%s, total=%s WHERE job_id=%s",
+                                (processed, total_seq, job_id),
+                            )
+                        except Exception:
+                            cur.execute(
+                                "UPDATE background_jobs SET status='cancelled', ended_at=now(), processed=%s, total=%s WHERE job_id=%s",
+                                (processed, total_seq, job_id),
+                            )
+                    try:
+                        log.info('{"job":"icp_discovery_enrich","phase":"cancelled","job_id":%s,"at":"enrich_loop","processed":%s}', job_id, processed)
+                    except Exception:
+                        pass
+                    try:
+                        log_json("background_worker", "info", "cancelled", {"job_id": int(job_id), "tenant_id": int(tenant_id) if tenant_id is not None else None, "phase": "enrich_loop", "processed": int(processed), "total": int(total_seq)})
+                    except Exception:
+                        pass
+                    return
                 # Prepare or reuse company row for this domain
                 cid = None
                 cname_hint = None
